@@ -35,6 +35,7 @@ import com.infomaniak.drive.data.documentprovider.AppLockState
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.databinding.ViewSwitchSettingsBinding
 import com.infomaniak.drive.twoFactorAuthManager
+import kotlinx.coroutines.launch
 
 class AppSecuritySettingsActivity : AppCompatActivity() {
 

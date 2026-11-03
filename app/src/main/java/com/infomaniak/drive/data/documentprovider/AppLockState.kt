@@ -18,6 +18,7 @@
 package com.infomaniak.drive.data.documentprovider
 
 import com.infomaniak.drive.data.models.AppSettings
+import kotlinx.coroutines.CompletableDeferred
 
 /**
  * Storage-aware, thread-safe source of truth for the app-lock gate of [CloudStorageProvider].
