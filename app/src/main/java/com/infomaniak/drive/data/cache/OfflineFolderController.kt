@@ -307,6 +307,83 @@ object OfflineFolderController {
         }
     }
 
+    /**
+     * Reconciles an inherited copy at its OLD location with the NEW remote identity after a
+     * rename/move, BEFORE the new metadata is committed anywhere it would be needed (issue:
+     * round 3 #7):
+     *  - a copy backing a pending upload keeps its bytes (the upload reads that exact path);
+     *  - an edited copy is snapshotted into the durable upload queue under the NEW identity;
+     *  - an already-uploaded revision's stale local duplicate is deleted (content is on server);
+     *  - a clean copy is migrated to the new location (rename keeps content and timestamp);
+     *    if the migration fails, the new location is simply queued for a fresh download.
+     *
+     * [oldIdentityName]/[oldIdentityParentId]/[oldLastModifiedAt] describe the OLD row (the only
+     * reliable identity for the old bytes); [newIdentity] is the fresh remote File.
+     */
+    fun reconcileMovedInheritedCopy(
+        context: Context,
+        oldOfflineFile: IOFile,
+        oldIdentityName: String,
+        oldIdentityParentId: Int,
+        oldLastModifiedAt: Long,
+        newIdentity: File,
+        userDrive: UserDrive,
+    ) {
+        val fileModifiedAt = Date(oldOfflineFile.lastModified())
+        when {
+            UploadFile.hasPendingUpload(uri = Uri.fromFile(oldOfflineFile).toString()) ||
+                UploadFile.hasUploadRecordFor(
+                    fileName = oldIdentityName,
+                    remoteFolder = oldIdentityParentId,
+                    driveId = userDrive.driveId,
+                    userId = userDrive.userId,
+                    fileModifiedAt = fileModifiedAt,
+                    pendingOnly = true,
+                ) -> Unit
+            UploadFile.hasUploadRecordFor(
+                fileName = oldIdentityName,
+                remoteFolder = oldIdentityParentId,
+                driveId = userDrive.driveId,
+                userId = userDrive.userId,
+                fileModifiedAt = fileModifiedAt,
+                pendingOnly = false,
+            ) -> runCatching { oldOfflineFile.delete() }
+            OfflineFolderPolicy.isLocallyModified(
+                offlineFileLastModifiedMillis = oldOfflineFile.lastModified(),
+                remoteLastModifiedAtSeconds = oldLastModifiedAt,
+            ) -> {
+                registerDirtySnapshot(context, newIdentity, oldOfflineFile, userDrive)
+                runCatching { oldOfflineFile.delete() }
+            }
+            else -> {
+                val target = newIdentity.getOfflineFile(context, userDrive.userId)
+                runCatching {
+                    if (target != null && (!target.exists() || target.delete()) && oldOfflineFile.renameTo(target)) {
+                        Unit
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Preservation hook for row-removal paths such as remote trash/delete propagation (issue:
+     * round 3 #6): a copy backing a pending upload keeps its bytes (the upload reads them); an
+     * edited copy not yet registered is snapshotted into the durable upload queue first. Returns
+     * true when the offline bytes must be KEPT on the device; in every case the content survives.
+     */
+    fun preserveInheritedCopyBeforeRemoval(file: File, userDrive: UserDrive): Boolean {
+        val context = Realm.getApplicationContext() ?: return false
+        if (file.isOffline || !file.isInOfflineFolder) return false
+        val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return false
+        if (!offlineFile.exists()) return false
+        return when (protectionStateOf(file, offlineFile, userDrive)) {
+            CopyProtection.PENDING_UPLOAD -> true
+            CopyProtection.DIRTY -> !registerDirtySnapshot(context, file, offlineFile, userDrive)
+            CopyProtection.UPLOADED, CopyProtection.NONE -> false
+        }
+    }
+
     private fun updateRootFolderFlags(folderId: Int, realm: Realm, isInOfflineFolder: Boolean, isMarkedAsOffline: Boolean) {
         FileController.updateFile(folderId, realm) { file ->
             file.isInOfflineFolder = isInOfflineFolder
@@ -455,8 +532,7 @@ object OfflineFolderController {
         }
     }
 
-    internal fun registerDirtySnapshot(context: Context, file: File, offlineFile: IOFile, userDrive: UserDrive): Boolean {
-        return runCatching {
+    internal fun registerDirtySnapshot(context: Context, file: File, offlineFile: IOFile, userDrive: UserDrive): Boolean {        return runCatching {
             val fileModifiedAt = Date(offlineFile.lastModified())
             val snapshotUri = UploadFile.createDurableOfflineSnapshot(
                 context = context,

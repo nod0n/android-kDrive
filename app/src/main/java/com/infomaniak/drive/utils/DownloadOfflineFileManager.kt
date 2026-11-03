@@ -156,9 +156,7 @@ class DownloadOfflineFileManager(
 
     /**
      * Preserves an inherited copy at its OLD location before the remote rename/move metadata is
-     * committed: a clean copy is migrated to the new location, a pending upload keeps its source
-     * bytes in place, and a dirty copy is snapshotted into the durable upload queue under the NEW
-     * identity (issue: round 3 #7). Explicit pins keep their existing sync behavior.
+     * committed, through the same reconciliation the folder walk uses (issue: round 3 #7).
      */
     private fun preserveOldInheritedCopyBeforeRemoteRefresh(
         context: Context,
@@ -172,27 +170,15 @@ class DownloadOfflineFileManager(
         val locationChanged = newOffline == null || newOffline.path != oldOffline.path
         if (!locationChanged) return
 
-        when (OfflineFolderController.protectionStateOf(oldRow, oldOffline, userDrive)) {
-            OfflineFolderController.CopyProtection.PENDING_UPLOAD -> Unit
-            // Keep the old bytes: the upload still reads from this exact path. The new location
-            // is queued for download by the regular guards below.
-            OfflineFolderController.CopyProtection.DIRTY -> {
-                // Snapshot the edited bytes under the NEW identity so the upload targets the
-                // renamed/moved remote file, then the old path can go.
-                OfflineFolderController.registerDirtySnapshot(context, remoteFile, oldOffline, userDrive)
-                runCatching { oldOffline.delete() }
-            }
-            OfflineFolderController.CopyProtection.UPLOADED, OfflineFolderController.CopyProtection.NONE -> {
-                // Clean copy: migrate it to the new location (rename keeps content and remote
-                // timestamp); if the migration fails the regular guards queue a fresh download.
-                runCatching {
-                    newOffline?.parentFile?.mkdirs()
-                    if (newOffline != null && (!newOffline.exists() || newOffline.delete()) && oldOffline.renameTo(newOffline)) {
-                        Unit
-                    }
-                }
-            }
-        }
+        OfflineFolderController.reconcileMovedInheritedCopy(
+            context = context,
+            oldOfflineFile = oldOffline,
+            oldIdentityName = oldRow.name,
+            oldIdentityParentId = oldRow.parentId,
+            oldLastModifiedAt = oldRow.lastModifiedAt,
+            newIdentity = remoteFile,
+            userDrive = userDrive,
+        )
     }
 
     /**

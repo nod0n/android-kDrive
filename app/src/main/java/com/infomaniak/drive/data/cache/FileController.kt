@@ -284,6 +284,7 @@ object FileController {
         keepFiles: ArrayList<Int> = arrayListOf(),
         customRealm: Realm? = null,
         recursive: Boolean = true,
+        userDrive: UserDrive? = null,
     ) {
         val block: (Realm) -> Unit? = { realm ->
             getFileById(realm, fileId)?.let { file ->
@@ -293,7 +294,15 @@ object FileController {
                     }
                 }
                 runCatching {
-                    if (!keepFileCaches.contains(fileId)) file.deleteCaches(Realm.getApplicationContext()!!)
+                    if (!keepFileCaches.contains(fileId)) {
+                        // Inherited copies are preserved before any deletion (issue: round 3 #6):
+                        // a pending upload keeps its bytes, a dirty copy is snapshotted first.
+                        val offlineBytesMustStay = OfflineFolderController.preserveInheritedCopyBeforeRemoval(
+                            file,
+                            userDrive ?: UserDrive(driveId = file.driveId),
+                        )
+                        if (!offlineBytesMustStay) file.deleteCaches(Realm.getApplicationContext()!!)
+                    }
                     if (!keepFiles.contains(fileId)) realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                 }.onFailure { exception ->
                     Sentry.captureException(exception) { scope ->
@@ -763,10 +772,39 @@ object FileController {
     fun removeOrphanFiles(customRealm: Realm? = null) {
         val block: (Realm) -> Unit = { realm ->
             realm.executeTransaction {
+                // Offline-owned rows (explicit pins, inherited coverage, pending markers) and the
+                // ancestor chain they are reached through survive presentation-cache collection:
+                // deleting them would strand durable offline copies and their metadata, which no
+                // reconciliation can recover (issue: round 3 #15).
+                val ownedRows = realm.where(File::class.java)
+                    .beginGroup()
+                    .equalTo(File::isOffline.name, true)
+                    .or()
+                    .equalTo(File::isInOfflineFolder.name, true)
+                    .or()
+                    .equalTo(File::isMarkedAsOffline.name, true)
+                    .endGroup()
+                    .greaterThan(File::id.name, ROOT_ID)
+                    .findAll()
+
+                val protectedIds = mutableSetOf<Int>()
+                ownedRows.createSnapshot().forEach { owned ->
+                    protectedIds.add(owned.id)
+                    val visited = mutableSetOf(owned.id)
+                    var parentId: Int = owned.parentId
+                    while (parentId > ROOT_ID && visited.add(parentId)) {
+                        protectedIds.add(parentId)
+                        parentId = getFileById(realm, parentId)?.parentId ?: 0
+                    }
+                }
+
                 realm.where(File::class.java)
                     .greaterThan(File::id.name, ROOT_ID)
                     .isEmpty(File::localParent.name)
-                    .findAll().deleteAllFromRealm()
+                    .findAll()
+                    .createSnapshot()
+                    .filter { it.id !in protectedIds }
+                    .forEach { it.deleteFromRealm() }
             }
         }
         customRealm?.let(block) ?: getRealmInstance().use(block)

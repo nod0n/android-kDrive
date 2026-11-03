@@ -416,11 +416,29 @@ open class UploadFile(
         }
 
         /**
-         * Whether [uri] points inside the durable offline snapshots folder, i.e. the file is owned
-         * by this feature and can be deleted once its upload completed.
+         * Whether [uri] is a file whose CANONICAL parent is exactly the app's durable offline
+         * snapshots directory. Ownership is never inferred from a substring: an ordinary offline
+         * file inside a user-created folder named like the snapshot directory must not match
+         * (issue: round 3 #5).
          */
         fun isDurableOfflineSnapshot(uri: String): Boolean {
-            return uri.contains(OFFLINE_SNAPSHOTS_FOLDER)
+            val context = Realm.getApplicationContext() ?: return false
+            return runCatching {
+                val snapshotsDir = IOFile(context.filesDir, OFFLINE_SNAPSHOTS_FOLDER).canonicalFile
+                val path = uri.toUri().path ?: return@runCatching false
+                IOFile(path).canonicalFile.parentFile == snapshotsDir
+            }.getOrDefault(false)
+        }
+
+        /**
+         * Disposes a verified owned snapshot together with its upload record; ordinary offline
+         * sources are never touched here (issue: round 3 #14).
+         */
+        private fun deleteOwnedSnapshotFile(uploadFile: UploadFile) {
+            val uri = uploadFile.getUriObject()
+            if (isDurableOfflineSnapshot(uri.toString())) {
+                runCatching { uri.toFile().apply { if (exists()) delete() } }
+            }
         }
 
         fun deleteAll(uploadFiles: List<UploadFile>) {
@@ -451,7 +469,11 @@ open class UploadFile(
                 } else {
                     // Delete definitively
                     val uri = uploadFileRealm.getUriObject()
-                    if (uri.scheme.equals(ContentResolver.SCHEME_FILE) && !uploadFileRealm.isSyncOffline()) {
+                    if (uploadFileRealm.isSyncOffline()) {
+                        // Owned durable snapshots go with their record; ordinary offline sources
+                        // keep their bytes, which back offline availability (issue: round 3 #14).
+                        deleteOwnedSnapshotFile(uploadFileRealm)
+                    } else if (uri.scheme.equals(ContentResolver.SCHEME_FILE)) {
                         uri.toFile().apply { if (exists()) delete() }
                     }
                     uploadFileRealm.deleteFromRealm()
@@ -481,7 +503,13 @@ open class UploadFile(
                         .apply { folderId?.let { equalTo(UploadFile::remoteFolder.name, folderId) } }
                         .beginsWith(UploadFile::uri.name, ContentResolver.SCHEME_FILE)
                         .findAll().forEach { uploadFile ->
-                            if (!uploadFile.isSyncOffline()) uploadFile.getUriObject().toFile().apply { if (exists()) delete() }
+                            if (!uploadFile.isSyncOffline()) {
+                                uploadFile.getUriObject().toFile().apply { if (exists()) delete() }
+                            } else {
+                                // Owned durable snapshots are disposed with their record
+                                // (issue: round 3 #14).
+                                deleteOwnedSnapshotFile(uploadFile)
+                            }
                         }
 
                     if (permanently) {

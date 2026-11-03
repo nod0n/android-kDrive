@@ -252,6 +252,17 @@ object OfflineFolderUtils {
         val remoteFiles = apiResponse.data ?: return
         val folderProxy = FileController.getFileById(realm, folderId)
 
+        // Capture inherited copies at their OLD location BEFORE the metadata replacement: a
+        // remote rename/move would otherwise leave edited copies stranded at the old path
+        // (issue: round 3 #7).
+        data class OldInheritedCopy(val fileId: Int, val oldOfflinePath: String, val oldName: String, val oldParentId: Int, val oldLastModifiedAt: Long)
+        val oldInheritedCopies = remoteFiles.mapNotNull { remoteFile ->
+            val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@mapNotNull null
+            if (oldRow.isOffline || !oldRow.isInOfflineFolder) return@mapNotNull null
+            val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() } ?: return@mapNotNull null
+            OldInheritedCopy(remoteFile.id, oldOffline.path, oldRow.name, oldRow.parentId, oldRow.lastModifiedAt)
+        }
+
         FileController.saveRemoteFiles(
             realm = realm,
             localFolderProxy = folderProxy,
@@ -313,6 +324,24 @@ object OfflineFolderUtils {
                     fileIds.add(localFile.id)
                 }
             }
+        }
+
+        // Reconcile the captured old copies with the NEW identity now that the metadata is
+        // committed (issue: round 3 #7).
+        oldInheritedCopies.forEach { old ->
+            val newRow = FileController.getFileById(realm, old.fileId) ?: return@forEach
+            val newOffline = newRow.getOfflineFile(context, userDrive.userId)
+            val oldOffline = IOFile(old.oldOfflinePath)
+            if (newOffline == null || newOffline.path == old.oldOfflinePath || !oldOffline.exists()) return@forEach
+            OfflineFolderController.reconcileMovedInheritedCopy(
+                context = context,
+                oldOfflineFile = oldOffline,
+                oldIdentityName = old.oldName,
+                oldIdentityParentId = old.oldParentId,
+                oldLastModifiedAt = old.oldLastModifiedAt,
+                newIdentity = newRow,
+                userDrive = userDrive,
+            )
         }
     }
 
