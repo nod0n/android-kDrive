@@ -375,7 +375,7 @@ open class FileAdapter(
             menuButton.isGone = true
         } else {
             menuButton.isVisible = true
-            menuButton.isEnabled = file.isFolder() || !(offlineMode && !file.isOfflineFile(context, checkLocalFile = false))
+            menuButton.isEnabled = file.isFolder() || !(offlineMode && !file.isOfflineFile(binding.context, checkLocalFile = false))
             menuButton.setOnClickListener { onMenuClicked?.invoke(file) }
         }
     }
@@ -419,7 +419,7 @@ open class FileAdapter(
         when {
             uploadInProgress -> displayUploadStatus(file)
             isSelectingFolder || offlineMode -> enableFile(
-                file.isFolderPartOfTheMove() || (offlineMode && file.isOfflineFile(context, checkLocalFile = false))
+                file.isFolderPartOfTheMove() || (offlineMode && file.isOfflineFile(binding.context, checkLocalFile = false))
             )
             else -> enableFile()
         }
