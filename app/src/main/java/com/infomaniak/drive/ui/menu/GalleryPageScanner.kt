@@ -41,8 +41,10 @@ sealed interface GalleryScanResult<out T> {
     data class Complete<out T>(val items: List<T>) : GalleryScanResult<T>
 
     /**
-     * The scan hit its page budget after pages yielding no match. More matching files may exist
-     * server-side: [nextCursor] must be preserved to resume where the scan stopped.
+     * The scan paused with [items] and [nextCursor] to resume from. Two reasons: the page just
+     * fetched yielded matches (handed back immediately so a filtered gallery displays without
+     * scanning the whole drive), or the budget of consecutive matchless pages was spent while
+     * still searching for the first match. Both resume from [nextCursor].
      */
     data class Suspended<out T>(val items: List<T>, val nextCursor: String?) : GalleryScanResult<T>
 
@@ -62,8 +64,9 @@ sealed interface GalleryScanResult<out T> {
  *
  * A page with zero matches is NOT the end of the collection: the scan keeps walking pages
  * while the server reports more, until either a match is found or the page budget is spent.
- * This bounds the work done per call (per UI tick) without ever mistaking an empty filtered
- * page for an empty gallery.
+ * A page with matches is handed back immediately with its resume cursor. Both bounds keep the
+ * work done per call (per UI tick) finite without ever mistaking an empty filtered page for an
+ * empty gallery.
  */
 class GalleryPageScanner<T>(
     private val predicate: (T) -> Boolean,
@@ -73,8 +76,9 @@ class GalleryPageScanner<T>(
     /**
      * @param startCursor cursor to resume from, or null for a first page.
      * @param onRawPage called for every successfully fetched page, matched or not, before filtering.
-     * @param checkActive called before every page fetch; throwing here aborts the scan without
-     * any result (e.g. coroutine cancellation via [kotlinx.coroutines.Job.ensureActive]).
+     * @param checkActive called before every page fetch and right after each blocking fetch
+     * returns; throwing here aborts the scan without storing or returning any page (e.g.
+     * coroutine cancellation via [kotlinx.coroutines.Job.ensureActive]).
      * @param fetchPage fetches the page starting at [cursor]; must never return null pages.
      */
     fun scan(
@@ -97,6 +101,10 @@ class GalleryPageScanner<T>(
                     else GalleryScanResult.Interrupted(ArrayList(matches), retryCursor = cursor)
                 }
                 is GalleryPage.Success -> {
+                    // The fetch above is blocking: cancellation may have happened while it ran.
+                    // Check again so a dead scan neither stores the page nor returns it.
+                    checkActive()
+
                     onRawPage(page.data)
                     val pageMatches = page.data.filter(predicate)
                     matches.addAll(pageMatches)
@@ -107,13 +115,16 @@ class GalleryPageScanner<T>(
                         return GalleryScanResult.Complete(ArrayList(matches))
                     }
 
-                    if (pageMatches.isEmpty()) {
-                        emptyPagesInARow++
-                        if (emptyPagesInARow >= maxEmptyPagesPerScan) {
-                            return GalleryScanResult.Suspended(ArrayList(matches), nextCursor = page.nextCursor)
-                        }
-                    } else {
-                        emptyPagesInARow = 0
+                    // Hand matching pages back right away (with the resume cursor): displaying
+                    // must not wait for the whole drive to be scanned. The page budget only
+                    // bounds the search through consecutive matchless pages.
+                    if (pageMatches.isNotEmpty()) {
+                        return GalleryScanResult.Suspended(ArrayList(matches), nextCursor = page.nextCursor)
+                    }
+
+                    emptyPagesInARow++
+                    if (emptyPagesInARow >= maxEmptyPagesPerScan) {
+                        return GalleryScanResult.Suspended(ArrayList(matches), nextCursor = page.nextCursor)
                     }
 
                     cursor = page.nextCursor

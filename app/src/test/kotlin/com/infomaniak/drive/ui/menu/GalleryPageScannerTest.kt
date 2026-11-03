@@ -92,20 +92,21 @@ class GalleryPageScannerTest {
     }
 
     @Test
-    fun `empty page budget resets once a match is found`() {
+    fun `a matching page is handed back immediately with its resume cursor`() {
+        val cursors = mutableListOf<String?>()
         val pages = buildList {
             repeat(9) { i -> add(success(emptyList(), nextCursor = "x$i")) }
             add(success(listOf("m"), nextCursor = "y0"))
-            repeat(11) { i -> add(success(emptyList(), nextCursor = "y${i + 1}")) }
+            add(success(listOf("m"), nextCursor = "y1"))
         }
-        val cursors = mutableListOf<String?>()
         val result = keepM.scan(fetchPage = fetcher(pages, requestedCursors = cursors))
 
-        // 9 empty pages, then the match resets the budget, then 10 more matchless pages suspend the scan.
+        // The first match (right after 9 matchless pages) ends the scan without walking the
+        // rest of the drive; the resume cursor points at the following page.
         assertTrue(result is GalleryScanResult.Suspended)
         assertEquals(listOf("m"), (result as GalleryScanResult.Suspended).items)
-        assertEquals("y10", result.nextCursor)
-        assertEquals(20, cursors.size)
+        assertEquals("y0", result.nextCursor)
+        assertEquals(10, cursors.size)
     }
 
     @Test
@@ -126,7 +127,7 @@ class GalleryPageScannerTest {
         val result = keepM.scan(
             fetchPage = fetcher(
                 pages = listOf(
-                    success(listOf("m"), nextCursor = "c1"),
+                    success(emptyList(), nextCursor = "c1"),
                     GalleryPage.Error,
                 ),
                 requestedCursors = cursors,
@@ -134,7 +135,7 @@ class GalleryPageScannerTest {
         )
 
         assertTrue(result is GalleryScanResult.Interrupted)
-        assertEquals(listOf("m"), (result as GalleryScanResult.Interrupted).items)
+        assertEquals(emptyList<String>(), (result as GalleryScanResult.Interrupted).items)
         assertEquals("c1", result.retryCursor)
         assertEquals(listOf(null, "c1"), cursors)
     }
@@ -164,16 +165,35 @@ class GalleryPageScannerTest {
             keepM.scan(
                 checkActive = checkActive,
                 fetchPage = fetcher(
-                    pages = listOf(
-                        success(listOf("m"), nextCursor = "c1"),
-                        success(listOf("m"), nextCursor = "c2"),
-                    ),
+                    pages = (0 until 12).map { i -> success(emptyList(), nextCursor = "c$i") },
                     requestedCursors = cursors,
                 ),
             )
         }
 
-        // Thrown before the third fetch, after the first two pages returned matching results.
+        // Thrown by the post-fetch check of the second page: no third fetch, no result.
         assertEquals(2, cursors.size)
+    }
+
+    @Test
+    fun `cancellation after a blocking fetch aborts before the page reaches the cache`() {
+        val rawPages = mutableListOf<List<String>>()
+        var checkActiveCalls = 0
+        val checkActive = {
+            // 1st call: before the fetch. 2nd call: right after the blocking fetch returned.
+            if (++checkActiveCalls >= 2) throw CancellationException("job cancelled")
+        }
+
+        assertThrows<CancellationException> {
+            keepM.scan(
+                onRawPage = { rawPages.add(it) },
+                checkActive = checkActive,
+                fetchPage = { _ -> success(listOf("m"), nextCursor = "c1") },
+            )
+        }
+
+        // Two checks ran (pre-fetch, post-fetch); the page was never stored or returned.
+        assertEquals(2, checkActiveCalls)
+        assertTrue(rawPages.isEmpty())
     }
 }
