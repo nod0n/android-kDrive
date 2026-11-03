@@ -50,7 +50,14 @@ object UploadWorkerErrorHandling {
 
         } catch (_: UploadTask.FolderNotFoundException) {
             currentUploadFile?.let { uploadFile ->
-                UploadFile.deleteAll(uploadFile.remoteFolder, permanently = true)
+                // Scope the destructive cleanup to the failing upload's account and drive; owned
+                // snapshots of unsent offline edits are retained by deleteAll (issue: round 4 #3).
+                UploadFile.deleteAll(
+                    folderId = uploadFile.remoteFolder,
+                    permanently = true,
+                    userId = uploadFile.userId,
+                    driveId = uploadFile.driveId,
+                )
                 if (uploadFile.isSync()) {
                     Sentry.captureMessage("FolderNotFoundNotification: disableAutoSync")
                     disableAutoSync()

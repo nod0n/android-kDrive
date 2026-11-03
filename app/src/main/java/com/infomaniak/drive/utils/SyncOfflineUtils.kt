@@ -254,23 +254,28 @@ object SyncOfflineUtils {
         val fileModifiedAt = Date(ioFile.lastModified())
 
         if (UploadFile.canUpload(uri, fileModifiedAt)) {
-            if (remoteFile != null) {
-                remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
-                remoteFile.size = ioFile.length()
-                FileController.updateExistingFile(newFile = remoteFile, realm = realm)
-            }
-            UploadFile(
-                uri = uri.toString(),
-                driveId = userDrive.driveId,
-                fileModifiedAt = fileModifiedAt,
-                fileName = localFile.name,
-                fileSize = ioFile.length(),
-                remoteFolder = localFile.parentId,
-                type = UploadFile.Type.SYNC_OFFLINE.name,
-                userId = userDrive.userId,
-            ).store()
+            // Upload-source registration is a mutation owner of these bytes: it holds the shared
+            // per-file coordination so a publication or cleanup cannot interleave (issue:
+            // round 4 #4).
+            synchronized(OfflineFileCoordination.lockFor(userDrive, localFile.id)) {
+                if (remoteFile != null) {
+                    remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
+                    remoteFile.size = ioFile.length()
+                    FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+                }
+                UploadFile(
+                    uri = uri.toString(),
+                    driveId = userDrive.driveId,
+                    fileModifiedAt = fileModifiedAt,
+                    fileName = localFile.name,
+                    fileSize = ioFile.length(),
+                    remoteFolder = localFile.parentId,
+                    type = UploadFile.Type.SYNC_OFFLINE.name,
+                    userId = userDrive.userId,
+                ).store()
 
-            context.syncImmediately(isAutomaticTrigger = false)
+                context.syncImmediately(isAutomaticTrigger = false)
+            }
         }
     }
 

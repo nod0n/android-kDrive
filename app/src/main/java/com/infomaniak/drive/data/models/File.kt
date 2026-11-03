@@ -328,9 +328,9 @@ open class File(
         return IOFile(folder, id.toString())
     }
 
-    fun deleteCaches(context: Context) {
+    fun deleteCaches(context: Context, userId: Int = AccountUtils.currentUserId) {
         if (isOffline || isInOfflineFolder) {
-            getOfflineFile(context)?.apply {
+            getOfflineFile(context, userId)?.apply {
                 // Never drop the bytes backing a pending upload when the cache row goes away
                 // (issue #1902); the upload still reads from this file.
                 if (exists() && !UploadFile.hasPendingUpload(uri = Uri.fromFile(this).toString())) delete()

@@ -97,7 +97,7 @@ object OfflineFolderController {
             } else {
                 // If the folder is still covered by an ancestor root, everything below stays
                 // covered: only the root record goes away.
-                val isCoveredByAncestorRoot = isInsideAnotherRoot(realm, folderId)
+                val isCoveredByAncestorRoot = isInsideActiveRoot(realm, folderId)
 
                 if (isCoveredByAncestorRoot) {
                     realm.executeTransaction { if (root.isValid) root.deleteFromRealm() }
@@ -108,7 +108,13 @@ object OfflineFolderController {
                     // round 3 #8).
                     realm.executeTransaction { if (root.isValid) root.isPendingRemoval = true }
 
-                    val result = clearCoverageRecursively(context, realm, folderId, userDrive)
+                    val result = clearCoverageRecursively(context, realm, folderId, userDrive) {
+                        // Abort as soon as the record is gone (completed elsewhere) or revived.
+                        realm.where(OfflineRoot::class.java)
+                            .equalTo(OfflineRoot::folderId.name, folderId)
+                            .findFirst()
+                            ?.takeIf { it.isValid && it.isPendingRemoval } == null
+                    }
                     result.rootExisted = true
 
                     if (hasProtectedFilesRecursively(folderId, context, userDrive, realm)) {
@@ -152,7 +158,7 @@ object OfflineFolderController {
 
     /**
      * Whether [fileId] is itself an active offline root or lies under one. Unlike
-     * [isInsideAnotherRoot], this counts the item's own root row, so top-level root rows are
+     * [isInsideRootRecord], this counts the item's own root row, so top-level root rows are
      * never classified as orphans by the drive-wide sweep (issue: round 3 #10).
      */
     fun isCoveredByRootIncludingSelf(fileId: Int, userDrive: UserDrive = UserDrive(), customRealm: Realm? = null): Boolean {
@@ -161,7 +167,7 @@ object OfflineFolderController {
                 .equalTo(OfflineRoot::folderId.name, fileId)
                 .findFirst()
                 ?.takeIf { it.isValid && !it.isPendingRemoval } != null
-                    || isInsideAnotherRoot(realm, fileId)
+                    || isInsideRootRecord(realm, fileId)
         }
         return customRealm?.let(block) ?: FileController.getRealmInstance(userDrive).use(block)
     }
@@ -228,16 +234,35 @@ object OfflineFolderController {
     }
 
     /**
-     * Whether [folderId] has an ancestor — other than itself — which is itself an
-     * offline root, i.e. whether the folder stays covered after removing one of its own roots.
+     * Whether [folderId] has an ancestor — other than itself — which is an ACTIVE offline root
+     * (not pending removal). This is the AUTHORIZATION predicate: only active roots establish
+     * coverage for publications, completions and unpin materialization (issue: round 4 #10).
      * Works for files too: it walks the durable parentId chain.
      */
-    fun isInsideAnotherRoot(realm: Realm, folderId: Int): Boolean {
+    fun isInsideActiveRoot(realm: Realm, folderId: Int): Boolean {
+        return walkAncestryForRoot(realm, folderId) { it.isValid && !it.isPendingRemoval }
+    }
+
+    /**
+     * Whether [folderId] has an ancestor — other than itself — with ANY offline root record,
+     * including records pending removal. This is the PROTECTION predicate: a pending-removal
+     * record still owns its subtree's deferred cleanup, so the drive-wide sweep must not clear
+     * its rows (issue: round 4 #10).
+     */
+    fun isInsideRootRecord(realm: Realm, folderId: Int): Boolean {
+        return walkAncestryForRoot(realm, folderId) { it.isValid }
+    }
+
+    private fun walkAncestryForRoot(realm: Realm, folderId: Int, isMatchingRoot: (OfflineRoot) -> Boolean): Boolean {
         val visited = mutableSetOf(folderId)
         var currentId: Int? = folderId
         while (currentId != null && currentId != ROOT_ID) {
             val folder = FileController.getFileById(realm, currentId) ?: return false
-            if (folder.id != folderId && getOfflineRoot(folder.id, customRealm = realm) != null) return true
+            if (folder.id != folderId) {
+                getOfflineRoot(folder.id, customRealm = realm)?.let { root ->
+                    if (isMatchingRoot(root)) return true
+                }
+            }
             currentId = folder.parentId.takeIf { visited.add(it) }
         }
         return false
@@ -248,7 +273,7 @@ object OfflineFolderController {
      * and offline copy must be preserved even when its explicit pin is removed.
      */
     fun isFileCoveredByAnyRoot(fileId: Int, userDrive: UserDrive = UserDrive(), customRealm: Realm? = null): Boolean {
-        val block: (Realm) -> Boolean = { realm -> isInsideAnotherRoot(realm, fileId) }
+        val block: (Realm) -> Boolean = { realm -> isInsideRootRecord(realm, fileId) }
         return customRealm?.let(block) ?: FileController.getRealmInstance(userDrive).use(block)
     }
 
@@ -295,30 +320,50 @@ object OfflineFolderController {
      */
     fun processPendingRemovalRoots(context: Context, userDrive: UserDrive, customRealm: Realm) {
         getOfflineRoots(customRealm = customRealm).filter { it.isPendingRemoval }.forEach { root ->
-            clearCoverageRecursively(context, customRealm, root.folderId, userDrive)
-            val stillProtected = hasProtectedFilesRecursively(root.folderId, context, userDrive, customRealm)
-            if (!stillProtected) {
-                customRealm.executeTransaction {
-                    getOfflineRoot(root.folderId, customRealm = customRealm)?.let { pendingRoot ->
-                        if (pendingRoot.isValid) pendingRoot.deleteFromRealm()
-                    }
-                }
+            // Re-validate against the live record: the root may have been revived since the
+            // detached list was built (issue: round 4 #11).
+            val stillPending = customRealm.where(OfflineRoot::class.java)
+                .equalTo(OfflineRoot::folderId.name, root.folderId)
+                .findFirst()
+                ?.takeIf { it.isValid && it.isPendingRemoval } != null
+            if (!stillPending) return@forEach
+
+            clearCoverageRecursively(context, customRealm, root.folderId, userDrive) {
+                customRealm.where(OfflineRoot::class.java)
+                    .equalTo(OfflineRoot::folderId.name, root.folderId)
+                    .findFirst()
+                    ?.takeIf { it.isValid && it.isPendingRemoval } == null
+            }
+
+            // Delete only the still-pending generation: a revived root keeps its record.
+            customRealm.executeTransaction {
+                customRealm.where(OfflineRoot::class.java)
+                    .equalTo(OfflineRoot::folderId.name, root.folderId)
+                    .findFirst()
+                    ?.takeIf { it.isValid && it.isPendingRemoval }
+                    ?.deleteFromRealm()
             }
         }
     }
 
     /**
-     * Reconciles an inherited copy at its OLD location with the NEW remote identity after a
-     * rename/move, BEFORE the new metadata is committed anywhere it would be needed (issue:
-     * round 3 #7):
+     * Reconciles an inherited or pinned copy at its OLD location with the NEW remote identity
+     * after a rename/move, BEFORE the new metadata is committed (issue: round 4 #9):
      *  - a copy backing a pending upload keeps its bytes (the upload reads that exact path);
-     *  - an edited copy is snapshotted into the durable upload queue under the NEW identity;
+     *  - an edited copy is snapshotted into the durable upload queue under the NEW identity, and
+     *    the old bytes are deleted ONLY after that durable registration succeeded — on failure
+     *    the caller must keep the old location (issue: round 4 #2);
      *  - an already-uploaded revision's stale local duplicate is deleted (content is on server);
-     *  - a clean copy is migrated to the new location (rename keeps content and timestamp);
-     *    if the migration fails, the new location is simply queued for a fresh download.
+     *  - a clean copy is migrated by ATOMIC rename, never over a protected destination (an
+     *    existing target with a pending upload or a newer revision keeps its bytes, and both
+     *    sources are retained by deferring the commit — issue: round 4 #5).
+     *
+     * Returns true when the old location is fully handled and the caller may commit the new
+     * metadata; false means preservation is incomplete and committing would strand the old copy.
      *
      * [oldIdentityName]/[oldIdentityParentId]/[oldLastModifiedAt] describe the OLD row (the only
-     * reliable identity for the old bytes); [newIdentity] is the fresh remote File.
+     * reliable identity for the old bytes); [newIdentity] is the fresh remote File. Directory
+     * rows are not file content and must not be passed here (issue: round 4 #12).
      */
     fun reconcileMovedInheritedCopy(
         context: Context,
@@ -328,59 +373,95 @@ object OfflineFolderController {
         oldLastModifiedAt: Long,
         newIdentity: File,
         userDrive: UserDrive,
-    ) {
-        val fileModifiedAt = Date(oldOfflineFile.lastModified())
-        when {
-            UploadFile.hasPendingUpload(uri = Uri.fromFile(oldOfflineFile).toString()) ||
+    ): Boolean {
+        // Copy ownership and mutation coordination (issue: round 4 #4): move reconciliation
+        // competes with publication, cleanup and upload registration for the same bytes.
+        synchronized(OfflineFileCoordination.lockFor(userDrive, newIdentity.id)) {
+            val fileModifiedAt = Date(oldOfflineFile.lastModified())
+            return when {
+                UploadFile.hasPendingUpload(uri = Uri.fromFile(oldOfflineFile).toString()) ||
+                    UploadFile.hasUploadRecordFor(
+                        fileName = oldIdentityName,
+                        remoteFolder = oldIdentityParentId,
+                        driveId = userDrive.driveId,
+                        userId = userDrive.userId,
+                        fileModifiedAt = fileModifiedAt,
+                        pendingOnly = true,
+                    ) -> true
                 UploadFile.hasUploadRecordFor(
                     fileName = oldIdentityName,
                     remoteFolder = oldIdentityParentId,
                     driveId = userDrive.driveId,
                     userId = userDrive.userId,
                     fileModifiedAt = fileModifiedAt,
-                    pendingOnly = true,
-                ) -> Unit
-            UploadFile.hasUploadRecordFor(
-                fileName = oldIdentityName,
-                remoteFolder = oldIdentityParentId,
-                driveId = userDrive.driveId,
-                userId = userDrive.userId,
-                fileModifiedAt = fileModifiedAt,
-                pendingOnly = false,
-            ) -> runCatching { oldOfflineFile.delete() }
-            OfflineFolderPolicy.isLocallyModified(
-                offlineFileLastModifiedMillis = oldOfflineFile.lastModified(),
-                remoteLastModifiedAtSeconds = oldLastModifiedAt,
-            ) -> {
-                registerDirtySnapshot(context, newIdentity, oldOfflineFile, userDrive)
-                runCatching { oldOfflineFile.delete() }
-            }
-            else -> {
-                val target = newIdentity.getOfflineFile(context, userDrive.userId)
-                runCatching {
-                    if (target != null && (!target.exists() || target.delete()) && oldOfflineFile.renameTo(target)) {
-                        Unit
+                    pendingOnly = false,
+                ) -> {
+                    runCatching { oldOfflineFile.delete() }.isSuccess
+                }
+                OfflineFolderPolicy.isLocallyModified(
+                    offlineFileLastModifiedMillis = oldOfflineFile.lastModified(),
+                    remoteLastModifiedAtSeconds = oldLastModifiedAt,
+                ) -> {
+                    val registered = registerDirtySnapshot(context, newIdentity, oldOfflineFile, userDrive)
+                    if (registered) runCatching { oldOfflineFile.delete() }.isSuccess else false
+                }
+                else -> {
+                    val target = newIdentity.getOfflineFile(context, userDrive.userId)
+                    if (target == null) {
+                        false
+                    } else {
+                        val targetProtected = target.exists() && (
+                            UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
+                                OfflineFolderPolicy.isLocallyModified(
+                                    offlineFileLastModifiedMillis = target.lastModified(),
+                                    remoteLastModifiedAtSeconds = newIdentity.lastModifiedAt,
+                                )
+                            )
+                        when {
+                            targetProtected -> false
+                            else -> runCatching {
+                                target.parentFile?.mkdirs()
+                                oldOfflineFile.renameTo(target)
+                            }.getOrDefault(false)
+                        }
                     }
                 }
             }
         }
     }
 
+    /** Outcome of the removal preservation hook (issue: round 4 #6). */
+    enum class PreservationOutcome {
+        /** Content is durably safe (uploaded, snapshotted, or nothing to preserve): bytes and row can go. */
+        CONTENT_SAFE,
+        /** An unsent revision is only local: bytes AND row/metadata must be retained. */
+        PRESERVED,
+    }
+
     /**
-     * Preservation hook for row-removal paths such as remote trash/delete propagation (issue:
-     * round 3 #6): a copy backing a pending upload keeps its bytes (the upload reads them); an
-     * edited copy not yet registered is snapshotted into the durable upload queue first. Returns
-     * true when the offline bytes must be KEPT on the device; in every case the content survives.
+     * Preservation hook for row-removal paths such as remote trash/delete propagation (issues:
+     * round 3 #6 and round 4 #6): a copy backing a pending upload is PRESERVED together with its
+     * row and metadata (deleting the row would make the unsent edit undiscoverable); an edited
+     * copy not yet registered is snapshotted into the durable upload queue first — and if that
+     * registration fails, the row is retained too. Only a content-safe copy allows deletion.
+     * Directories are not file-content: their children are preserved individually by the
+     * recursive removal (issue: round 4 #12).
      */
-    fun preserveInheritedCopyBeforeRemoval(file: File, userDrive: UserDrive): Boolean {
-        val context = Realm.getApplicationContext() ?: return false
-        if (file.isOffline || !file.isInOfflineFolder) return false
-        val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return false
-        if (!offlineFile.exists()) return false
+    fun preserveInheritedCopyBeforeRemoval(file: File, userDrive: UserDrive): PreservationOutcome {
+        val context = Realm.getApplicationContext() ?: return PreservationOutcome.PRESERVED
+        if (file.isOffline || file.isFolder() || !file.isInOfflineFolder) return PreservationOutcome.CONTENT_SAFE
+        val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return PreservationOutcome.CONTENT_SAFE
+        if (!offlineFile.exists()) return PreservationOutcome.CONTENT_SAFE
         return when (protectionStateOf(file, offlineFile, userDrive)) {
-            CopyProtection.PENDING_UPLOAD -> true
-            CopyProtection.DIRTY -> !registerDirtySnapshot(context, file, offlineFile, userDrive)
-            CopyProtection.UPLOADED, CopyProtection.NONE -> false
+            CopyProtection.PENDING_UPLOAD -> PreservationOutcome.PRESERVED
+            CopyProtection.DIRTY ->
+                if (registerDirtySnapshot(context, file, offlineFile, userDrive)) {
+                    PreservationOutcome.CONTENT_SAFE
+                } else {
+                    // Snapshot registration failed: keep bytes AND identity/metadata (round 4 #6).
+                    PreservationOutcome.PRESERVED
+                }
+            CopyProtection.UPLOADED, CopyProtection.NONE -> PreservationOutcome.CONTENT_SAFE
         }
     }
 
@@ -400,7 +481,13 @@ object OfflineFolderController {
      * removing a folder can never lose an offline edit. Traversal uses the durable parentId
      * relationships, and only files inside the app offline storage are ever deleted.
      */
-    private fun clearCoverageRecursively(context: Context, realm: Realm, rootFolderId: Int, userDrive: UserDrive): RemovalResult {
+    private fun clearCoverageRecursively(
+        context: Context,
+        realm: Realm,
+        rootFolderId: Int,
+        userDrive: UserDrive,
+        isAborted: () -> Boolean = { false },
+    ): RemovalResult {
         val result = RemovalResult()
         val visited = mutableSetOf(rootFolderId)
         val skippedSubtreeIds = mutableSetOf<Int>()
@@ -409,6 +496,12 @@ object OfflineFolderController {
         while (queue.isNotEmpty()) {
             val folderId = queue.removeFirst()
             if (folderId in skippedSubtreeIds) continue
+            if (isAborted()) {
+                // The root was revived or its cleanup completed elsewhere mid-traversal: stop
+                // mutating on its behalf (issue: round 4 #11).
+                SentryLog.i(TAG, "Deferred cleanup of root $rootFolderId aborted mid-traversal")
+                return result
+            }
 
             val folder = FileController.getFileById(realm, folderId)
             if (folder == null || !folder.isUsable()) continue
@@ -472,27 +565,31 @@ object OfflineFolderController {
             return
         }
 
-        when (protectionStateOf(file, offlineFile, userDrive)) {
-            CopyProtection.PENDING_UPLOAD -> result.keptOfflineFilesCount++
-            CopyProtection.UPLOADED -> {
-                // The revision is on the server: the local copy is a stale duplicate.
-                clearInheritedFlags(realm, file)
-                deleteOfflineCopy(context, file, offlineFile, userDrive, result)
-            }
-            CopyProtection.DIRTY -> {
-                val uploadRegistered = registerDirtySnapshot(context, file, offlineFile, userDrive)
-                if (!uploadRegistered) {
-                    // Keep the bytes and the flags rather than losing the edit; a later attempt
-                    // (next sync) retries the snapshot.
-                    result.keptOfflineFilesCount++
-                    return
+        // Copy ownership and mutation coordination (issue: round 4 #4): the protection check and
+        // the flag/byte writes are one coordinated section.
+        synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
+            when (protectionStateOf(file, offlineFile, userDrive)) {
+                CopyProtection.PENDING_UPLOAD -> result.keptOfflineFilesCount++
+                CopyProtection.UPLOADED -> {
+                    // The revision is on the server: the local copy is a stale duplicate.
+                    clearInheritedFlags(realm, file)
+                    deleteOfflineCopy(context, file, offlineFile, userDrive, result)
                 }
-                clearInheritedFlags(realm, file)
-                deleteOfflineCopy(context, file, offlineFile, userDrive, result)
-            }
-            CopyProtection.NONE -> {
-                clearInheritedFlags(realm, file)
-                deleteOfflineCopy(context, file, offlineFile, userDrive, result)
+                CopyProtection.DIRTY -> {
+                    val uploadRegistered = registerDirtySnapshot(context, file, offlineFile, userDrive)
+                    if (!uploadRegistered) {
+                        // Keep the bytes and the flags rather than losing the edit; a later attempt
+                        // (next sync) retries the snapshot.
+                        result.keptOfflineFilesCount++
+                        return@synchronized
+                    }
+                    clearInheritedFlags(realm, file)
+                    deleteOfflineCopy(context, file, offlineFile, userDrive, result)
+                }
+                CopyProtection.NONE -> {
+                    clearInheritedFlags(realm, file)
+                    deleteOfflineCopy(context, file, offlineFile, userDrive, result)
+                }
             }
         }
     }
@@ -532,30 +629,35 @@ object OfflineFolderController {
         }
     }
 
-    internal fun registerDirtySnapshot(context: Context, file: File, offlineFile: IOFile, userDrive: UserDrive): Boolean {        return runCatching {
-            val fileModifiedAt = Date(offlineFile.lastModified())
-            val snapshotUri = UploadFile.createDurableOfflineSnapshot(
-                context = context,
-                source = offlineFile,
-                fileModifiedAt = fileModifiedAt,
-                fileId = file.id,
-                driveId = userDrive.driveId,
-            ) ?: return@runCatching false
-            UploadFile(
-                uri = snapshotUri.toString(),
-                driveId = userDrive.driveId,
-                fileModifiedAt = fileModifiedAt,
-                fileName = file.name,
-                fileSize = offlineFile.length(),
-                remoteFolder = file.parentId,
-                type = UploadFile.Type.SYNC_OFFLINE.name,
-                userId = userDrive.userId,
-            ).store()
-            context.syncImmediately(isAutomaticTrigger = false)
-            true
-        }.onFailure { exception ->
-            SentryLog.e(TAG, "Failed to snapshot a locally modified offline file", exception)
-        }.getOrDefault(false)
+    internal fun registerDirtySnapshot(context: Context, file: File, offlineFile: IOFile, userDrive: UserDrive): Boolean {
+        // Upload-source registration competes with publication and cleanup for these bytes
+        // (issue: round 4 #4).
+        return synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
+            runCatching {
+                val fileModifiedAt = Date(offlineFile.lastModified())
+                val snapshotUri = UploadFile.createDurableOfflineSnapshot(
+                    context = context,
+                    source = offlineFile,
+                    fileModifiedAt = fileModifiedAt,
+                    fileId = file.id,
+                    driveId = userDrive.driveId,
+                ) ?: return@synchronized false
+                UploadFile(
+                    uri = snapshotUri.toString(),
+                    driveId = userDrive.driveId,
+                    fileModifiedAt = fileModifiedAt,
+                    fileName = file.name,
+                    fileSize = offlineFile.length(),
+                    remoteFolder = file.parentId,
+                    type = UploadFile.Type.SYNC_OFFLINE.name,
+                    userId = userDrive.userId,
+                ).store()
+                context.syncImmediately(isAutomaticTrigger = false)
+                true
+            }.onFailure { exception ->
+                SentryLog.e(TAG, "Failed to snapshot a locally modified offline file", exception)
+            }.getOrDefault(false)
+        }
     }
 
     private fun deleteOfflineCopy(

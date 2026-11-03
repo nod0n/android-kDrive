@@ -207,9 +207,47 @@ object OfflineFolderUtils {
         val last = lastResponse ?: return false
         val remoteIds = allPages.mapTo(mutableSetOf()) { it.id }
 
+        // Capture every locally owned copy (explicit pins included — the walk would otherwise
+        // replace their metadata too — and directories excluded, since directories are not file
+        // content) at its OLD location, BEFORE any metadata replacement (issue: round 4 #9).
+        data class OldOwnedCopy(val fileId: Int, val oldOffline: IOFile, val oldName: String, val oldParentId: Int, val oldLastModifiedAt: Long)
+        val oldOwnedCopies = allPages.mapNotNull { remoteFile ->
+            val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@mapNotNull null
+            if (oldRow.isFolder()) return@mapNotNull null
+            val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() } ?: return@mapNotNull null
+            OldOwnedCopy(remoteFile.id, oldOffline, oldRow.name, oldRow.parentId, oldRow.lastModifiedAt)
+        }
+
+        // Preserve BEFORE committing replacement metadata: files whose reconciliation did not
+        // complete keep their OLD metadata (excluded from this page's commit) so no edited bytes
+        // are ever stranded at an untracked path (issues: round 4 #2, #5, #9).
+        val unresolvedMoveIds = mutableSetOf<Int>()
+        oldOwnedCopies.forEach { old ->
+            val newIdentity = allPages.firstOrNull { it.id == old.fileId } ?: return@forEach
+            val locationChanged = newIdentity.path != old.oldOffline.parentFile?.path ||
+                    newIdentity.name != old.oldOffline.name
+            if (locationChanged && !OfflineFolderController.reconcileMovedInheritedCopy(
+                    context = context,
+                    oldOfflineFile = old.oldOffline,
+                    oldIdentityName = old.oldName,
+                    oldIdentityParentId = old.oldParentId,
+                    oldLastModifiedAt = old.oldLastModifiedAt,
+                    newIdentity = newIdentity,
+                    userDrive = userDrive,
+                )
+            ) {
+                unresolvedMoveIds.add(old.fileId)
+            }
+        }
+        if (unresolvedMoveIds.isNotEmpty()) {
+            SentryLog.i(TAG, "Deferred ${unresolvedMoveIds.size} move(s) whose old copies are not safely preserved yet")
+        }
+
+        val committableFiles = allPages.filterNot { it.id in unresolvedMoveIds }
+
         val completeResponse = CursorApiResponse<List<File>>(
             result = last.result,
-            data = allPages,
+            data = committableFiles,
             error = last.error,
             responseAt = last.responseAt,
             cursor = last.cursor,
@@ -231,12 +269,17 @@ object OfflineFolderUtils {
 
         // Fully listed: children confirmed absent from this authoritative listing are reconciled
         // from durable coverage membership, not from the replaceable presentation child list
-        // (issue #1902).
-        cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds)
+        // (issue #1902). Unresolved moves keep their old metadata and are absent from the fresh
+        // listing comparison, so they are never treated as stale here.
+        cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds - unresolvedMoveIds)
 
         return true
     }
 
+    /**
+     * Commits the (already preservation-filtered) remote children of [folderId] into the local
+     * cache and materializes the folder coverage on them.
+     */
     private fun processPage(
         context: Context,
         realm: Realm,
@@ -251,17 +294,6 @@ object OfflineFolderUtils {
     ) {
         val remoteFiles = apiResponse.data ?: return
         val folderProxy = FileController.getFileById(realm, folderId)
-
-        // Capture inherited copies at their OLD location BEFORE the metadata replacement: a
-        // remote rename/move would otherwise leave edited copies stranded at the old path
-        // (issue: round 3 #7).
-        data class OldInheritedCopy(val fileId: Int, val oldOfflinePath: String, val oldName: String, val oldParentId: Int, val oldLastModifiedAt: Long)
-        val oldInheritedCopies = remoteFiles.mapNotNull { remoteFile ->
-            val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@mapNotNull null
-            if (oldRow.isOffline || !oldRow.isInOfflineFolder) return@mapNotNull null
-            val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() } ?: return@mapNotNull null
-            OldInheritedCopy(remoteFile.id, oldOffline.path, oldRow.name, oldRow.parentId, oldRow.lastModifiedAt)
-        }
 
         FileController.saveRemoteFiles(
             realm = realm,
@@ -324,24 +356,6 @@ object OfflineFolderUtils {
                     fileIds.add(localFile.id)
                 }
             }
-        }
-
-        // Reconcile the captured old copies with the NEW identity now that the metadata is
-        // committed (issue: round 3 #7).
-        oldInheritedCopies.forEach { old ->
-            val newRow = FileController.getFileById(realm, old.fileId) ?: return@forEach
-            val newOffline = newRow.getOfflineFile(context, userDrive.userId)
-            val oldOffline = IOFile(old.oldOfflinePath)
-            if (newOffline == null || newOffline.path == old.oldOfflinePath || !oldOffline.exists()) return@forEach
-            OfflineFolderController.reconcileMovedInheritedCopy(
-                context = context,
-                oldOfflineFile = oldOffline,
-                oldIdentityName = old.oldName,
-                oldIdentityParentId = old.oldParentId,
-                oldLastModifiedAt = old.oldLastModifiedAt,
-                newIdentity = newRow,
-                userDrive = userDrive,
-            )
         }
     }
 

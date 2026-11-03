@@ -470,13 +470,16 @@ open class UploadFile(
                     // Delete definitively
                     val uri = uploadFileRealm.getUriObject()
                     if (uploadFileRealm.isSyncOffline()) {
-                        // Owned durable snapshots go with their record; ordinary offline sources
-                        // keep their bytes, which back offline availability (issue: round 3 #14).
-                        deleteOwnedSnapshotFile(uploadFileRealm)
-                    } else if (uri.scheme.equals(ContentResolver.SCHEME_FILE)) {
-                        uri.toFile().apply { if (exists()) delete() }
+                        // Owned snapshots may hold the ONLY copy of an unsent offline edit:
+                        // cancellation soft-deletes the record and keeps the file; disposal is
+                        // reserved for confirmed successful uploads (issue: round 4 #3).
+                        uploadFileRealm.deletedAt = Date()
+                    } else {
+                        if (uri.scheme.equals(ContentResolver.SCHEME_FILE)) {
+                            uri.toFile().apply { if (exists()) delete() }
+                        }
+                        uploadFileRealm.deleteFromRealm()
                     }
-                    uploadFileRealm.deleteFromRealm()
                 }
             }
         }
@@ -495,40 +498,64 @@ open class UploadFile(
             }
         }
 
-        fun deleteAll(folderId: Int?, permanently: Boolean = false) {
+        /**
+         * Bulk removal of upload records. Owned durable snapshots hold the ONLY copy of unsent
+         * offline edits: they are never disposed here — not on errors, not on cancellation
+         * (issue: round 4 #3). Disposal happens exclusively after a confirmed successful upload
+         * ([uploadFinished]); soft-deleted records keep owning their snapshot files until then.
+         * Destructive queries are scoped by user and drive in addition to the folder.
+         */
+        fun deleteAll(
+            folderId: Int? = null,
+            permanently: Boolean = false,
+            userId: Int? = null,
+            driveId: Int? = null,
+        ) {
             getRealmInstance().use {
                 it.executeTransaction { realm ->
-                    // Delete all data files for all uploads with scheme FILE
+                    fun RealmQuery<UploadFile>.scoped(): RealmQuery<UploadFile> = this.apply {
+                        folderId?.let { equalTo(UploadFile::remoteFolder.name, folderId) }
+                        userId?.let { equalTo(UploadFile::userId.name, it) }
+                        driveId?.let { equalTo(UploadFile::driveId.name, it) }
+                    }
+
+                    // Delete data files of ordinary (non-offline) uploads with scheme FILE.
                     realm.uploadTable
-                        .apply { folderId?.let { equalTo(UploadFile::remoteFolder.name, folderId) } }
+                        .scoped()
                         .beginsWith(UploadFile::uri.name, ContentResolver.SCHEME_FILE)
                         .findAll().forEach { uploadFile ->
                             if (!uploadFile.isSyncOffline()) {
                                 uploadFile.getUriObject().toFile().apply { if (exists()) delete() }
-                            } else {
-                                // Owned durable snapshots are disposed with their record
-                                // (issue: round 3 #14).
-                                deleteOwnedSnapshotFile(uploadFile)
                             }
+                            // Owned snapshots keep their files: they may be the only unsent edit.
                         }
 
                     if (permanently) {
                         realm.uploadTable
-                            .apply { folderId?.let { equalTo(UploadFile::remoteFolder.name, folderId) } }
+                            .scoped()
                             .isNull(UploadFile::uploadAt.name)
-                            .findAll().deleteAllFromRealm()
+                            .findAll().forEach { uploadFile ->
+                                if (uploadFile.isSyncOffline()) {
+                                    // Keep the record as the durable owner of the retained
+                                    // snapshot; only its pending state is cleared.
+                                    uploadFile.deletedAt = Date()
+                                } else {
+                                    uploadFile.deleteFromRealm()
+                                }
+                            }
                     } else {
                         // Delete all uploads with type SYNC
-                        pendingUploadsQuery(realm, folderId)
+                        pendingUploadsQuery(realm, folderId, driveIds = driveId?.let { arrayOf(it) })
                             .equalTo(UploadFile::type.name, Type.SYNC.name)
                             .isNull(UploadFile::uploadAt.name)
                             .findAll().forEach { uploadFile -> uploadFile.deletedAt = Date() }
 
-                        // Delete all uploads without type SYNC
+                        // Soft-delete all uploads without type SYNC, owned snapshots included:
+                        // their records keep owning the retained files.
                         realm.uploadTable
-                            .apply { folderId?.let { equalTo(UploadFile::remoteFolder.name, folderId) } }
+                            .scoped()
                             .notEqualTo(UploadFile::type.name, Type.SYNC.name)
-                            .findAll().deleteAllFromRealm()
+                            .findAll().forEach { uploadFile -> uploadFile.deletedAt = Date() }
                     }
                 }
             }

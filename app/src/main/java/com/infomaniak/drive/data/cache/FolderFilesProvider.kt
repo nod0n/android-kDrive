@@ -405,7 +405,7 @@ object FolderFilesProvider {
             val actionsFiles = apiResponseData.actionsFiles.associateBy(File::id)
             SentryLog.i(TAG, "loadActivitiesFromFolderRec: actions ${apiResponseData.actions.count()}")
             apiResponseData.actions.asReversed().forEach { fileActivity ->
-                fileActivity.applyFileAction(realm, actionsFiles, returnResponse, folderProxy)
+                fileActivity.applyFileAction(realm, actionsFiles, returnResponse, folderProxy, userDrive)
             }
         }
 
@@ -440,6 +440,7 @@ object FolderFilesProvider {
         actionFiles: Map<Int, File>,
         returnResponse: ArrayMap<Int, FileAction>,
         currentFolder: File,
+        userDrive: UserDrive,
     ) {
         val actionFile = actionFiles[fileId]
 
@@ -450,7 +451,7 @@ object FolderFilesProvider {
                 // We used to have this condition, but it doesn't exist on the ios side, according to commit it was an api fix.
                 // returnResponse[fileId]?.createdAt?.time == createdAt.time
                 if (returnResponse[fileId] == null) {
-                    removeAction(realm, currentFolder, actionFile)
+                    removeAction(realm, currentFolder, actionFile, userDrive)
                     returnResponse[fileId] = this
                 }
             }
@@ -460,28 +461,28 @@ object FolderFilesProvider {
                 }
                 // The file has not yet been managed and is not the parent folder.
                 if (returnResponse[fileId] == null && actionFile?.id != currentFolder.id) {
-                    upsertAction(realm, currentFolder, actionFile)
+                    upsertAction(realm, currentFolder, actionFile, userDrive)
                     returnResponse[fileId] = this
                 }
             }
         }
     }
 
-    private fun FileAction.removeAction(realm: Realm, currentFolder: File, actionFile: File?) {
+    private fun FileAction.removeAction(realm: Realm, currentFolder: File, actionFile: File?, userDrive: UserDrive) {
         FileController.getParentFile(fileId = fileId, realm = realm)?.let { localFolder ->
             if (localFolder.id != currentFolder.id) return@let
 
             if (actionType == FileActivityType.FILE_MOVE_OUT) {
                 FileController.updateFile(localFolder.id, realm) { it.children.remove(actionFile) }
             } else {
-                FileController.removeFile(fileId, customRealm = realm, recursive = false)
+                FileController.removeFile(fileId, customRealm = realm, recursive = false, userDrive = userDrive)
             }
         }
     }
 
-    private fun FileAction.upsertAction(realm: Realm, currentFolder: File, actionFile: File?) {
+    private fun FileAction.upsertAction(realm: Realm, currentFolder: File, actionFile: File?, userDrive: UserDrive) {
         if (actionFile == null) {
-            FileController.removeFile(fileId, customRealm = realm, recursive = false)
+            FileController.removeFile(fileId, customRealm = realm, recursive = false, userDrive = userDrive)
         } else {
             if (actionFile.isImporting()) MqttClientWrapper.start(actionFile.externalImport?.id)
             FileController.upsertActionFile(realm, currentFolder.id, actionFile)

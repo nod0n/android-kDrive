@@ -44,6 +44,7 @@ import com.infomaniak.drive.data.models.file.SpecialFolder.RecentChanges
 import com.infomaniak.drive.data.models.file.SpecialFolder.SharedWithMe
 import com.infomaniak.drive.data.services.MqttClientWrapper
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.RealmModules
 import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
@@ -294,16 +295,32 @@ object FileController {
                     }
                 }
                 runCatching {
-                    if (!keepFileCaches.contains(fileId)) {
-                        // Inherited copies are preserved before any deletion (issue: round 3 #6):
-                        // a pending upload keeps its bytes, a dirty copy is snapshotted first.
-                        val offlineBytesMustStay = OfflineFolderController.preserveInheritedCopyBeforeRemoval(
-                            file,
-                            userDrive ?: UserDrive(driveId = file.driveId),
-                        )
-                        if (!offlineBytesMustStay) file.deleteCaches(Realm.getApplicationContext()!!)
+                    val resolvedUserDrive = userDrive ?: UserDrive(driveId = file.driveId)
+                    // Row removal is a mutation owner of the offline copy: preservation, cache
+                    // deletion and row deletion are one coordinated section (issue: round 4 #4).
+                    synchronized(OfflineFileCoordination.lockFor(resolvedUserDrive, fileId)) {
+                        if (!keepFileCaches.contains(fileId)) {
+                            // Inherited copies are preserved before any deletion (issue: round 3 #6):
+                            // a pending upload keeps its bytes, a dirty copy is snapshotted first.
+                            when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(file, resolvedUserDrive)) {
+                                // Content safe (or nothing to preserve): bytes and row can go.
+                                OfflineFolderController.PreservationOutcome.CONTENT_SAFE -> {
+                                    if (!keepFileCaches.contains(fileId)) {
+                                        file.deleteCaches(Realm.getApplicationContext()!!, resolvedUserDrive.userId)
+                                    }
+                                    if (!keepFiles.contains(fileId)) {
+                                        realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                                    }
+                                }
+                                // Preservation pending: retain bytes AND the row (with its durable
+                                // metadata and ancestry) until the upload completes; the next sync
+                                // re-processes the remote deletion then (issue: round 4 #6).
+                                OfflineFolderController.PreservationOutcome.PRESERVED -> Unit
+                            }
+                        } else if (!keepFiles.contains(fileId)) {
+                            realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                        }
                     }
-                    if (!keepFiles.contains(fileId)) realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                 }.onFailure { exception ->
                     Sentry.captureException(exception) { scope ->
                         scope.setExtra("with custom realm", "${customRealm != null}")
@@ -313,7 +330,7 @@ object FileController {
                 Unit
             }
         }
-        customRealm?.let(block) ?: getRealmInstance().use(block)
+        customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
     fun renameFile(file: File, newName: String, realm: Realm? = null): ApiResponse<CancellableAction> {
@@ -381,7 +398,7 @@ object FileController {
                             // result (issue #1902): a file still covered by a root keeps its
                             // inherited state (even when the pin was the only flag so far),
                             // while an uncovered file loses any stale inherited flag.
-                            file.isInOfflineFolder = OfflineFolderController.isInsideAnotherRoot(currentRealm, fileId)
+                            file.isInOfflineFolder = OfflineFolderController.isInsideActiveRoot(currentRealm, fileId)
                         }
                     }
                 }

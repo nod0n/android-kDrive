@@ -69,6 +69,7 @@ import com.infomaniak.drive.ui.fileList.FolderNavigationRestrictions
 import com.infomaniak.drive.ui.fileList.SelectFolderActivityArgs
 import com.infomaniak.drive.ui.fileList.ShareLinkViewModel
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.DrivePermissions
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.SingleOperation
@@ -391,10 +392,33 @@ class FileInfoActionsView @JvmOverloads constructor(
 
         if (cacheFile.exists() && path.isNotEmpty() && !isObsoleteOrNotIntact(cacheFile)) {
             getOfflineFile(context)?.let { offlineFile ->
-                Utils.moveCacheFileToOffline(context, file = this, cacheFile, offlineFile)
-                CoroutineScope(Dispatchers.IO).launch { FileController.updateOfflineStatus(id, isOffline = true) }
-                isOffline = true
-                onItemClickListener.onCacheAddedToOffline()
+                val file = this
+                // UI promotion routes through the same protected, coordinated publication as the
+                // workers (issue: round 4 #8): the explicit pin is set first so the publication
+                // intent check sees the user's request; the cache source is deleted and the
+                // offline state kept only after a confirmed publication.
+                CoroutineScope(Dispatchers.IO).launch {
+                    FileController.updateOfflineStatus(id, isOffline = true)
+                    val published = DownloadOfflineFileManager.promoteCacheToOffline(
+                        context = context,
+                        file = file,
+                        cacheFile = cacheFile,
+                        offlineFile = offlineFile,
+                        userDrive = UserDrive(driveId = driveId),
+                    )
+                    CoroutineScope(Dispatchers.Main).launch {
+                        if (published) {
+                            file.isOffline = true
+                            onItemClickListener.onCacheAddedToOffline()
+                        } else {
+                            CoroutineScope(Dispatchers.IO).launch {
+                                FileController.updateOfflineStatus(id, isOffline = false)
+                            }
+                            file.isOffline = false
+                        }
+                        refreshBottomSheetUi(currentFile)
+                    }
+                }
             }
         } else {
             Utils.downloadAsOfflineFile(context, file = this)
