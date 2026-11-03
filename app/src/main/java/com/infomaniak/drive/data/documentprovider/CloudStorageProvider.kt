@@ -139,16 +139,17 @@ class CloudStorageProvider : DocumentsProvider() {
     }
 
     /**
-     * Cancellable admission for remote mutations (Astra review R2-2 follow-up).
+     * Cancellable admission for remote mutations (Astra reviews R2-2/R3-2).
      *
      * Linearization/issuance point: the final policy revalidation, the registration of the
      * dispatch handle and the start of the request job happen atomically inside the admission
      * boundary. The boundary is then released — no transition lock is held across network I/O —
      * and the response is awaited outside it. Any transition after admission cancels the handle,
-     * so the request's network I/O only proceeds if it starts running before that cancellation
-     * lands; a request already on the wire may complete remotely (blocking call, not
-     * interruptible) but its result is refused, no local state applies and the caller is denied.
-     * Local Realm bookkeeping must therefore stay in the caller, on its original thread.
+     * and because [block] must use the cancellable suspend API layer (Core `Call.await`), that
+     * cancellation reaches the actual OkHttp call: request setup and in-flight exchanges are
+     * aborted. Once the server has accepted a request it cannot be recalled (already-dispatched
+     * territory); such a completed result is still applied so local state does not diverge from
+     * the server. Request inputs must be detached from Realm before [block] runs (R3-1).
      */
     private fun <T> admitAndDispatch(block: suspend () -> T): T {
         var handle: AppLockTransitions.AdmittedWork? = null
@@ -213,16 +214,19 @@ class CloudStorageProvider : DocumentsProvider() {
         SentryLog.d(TAG, "queryRoots")
         val cursor = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
 
-        val isAccessBlocked = isExternalAccessBlocked()
-        AccountUtils.getAllUsersSync().forEach { user ->
-            // While external access is blocked, do not disclose account identities via root summaries.
-            cursor.addRoot(user.id.toString(), user.id.toString(), if (isAccessBlocked) "" else user.email)
+        // Root identity redaction and refresh scheduling are decided atomically with
+        // publication (R3-3): while access is blocked, account emails stay undisclosed.
+        AppLockState.withAdmission {
+            val isAccessBlocked = isExternalAccessBlocked()
+            AccountUtils.getAllUsersSync().forEach { user ->
+                cursor.addRoot(user.id.toString(), user.id.toString(), if (isAccessBlocked) "" else user.email)
 
-            if (!isAccessBlocked) {
-                cloudScope.launch {
-                    context?.let {
-                        val okHttpClient = AccountUtils.getHttpClient(user.id)
-                        AccountUtils.updateCurrentUserAndDrives(it, fromCloudStorage = true, okHttpClient = okHttpClient)
+                if (!isAccessBlocked) {
+                    cloudScope.launch {
+                        context?.let {
+                            val okHttpClient = AccountUtils.getHttpClient(user.id)
+                            AccountUtils.updateCurrentUserAndDrives(it, fromCloudStorage = true, okHttpClient = okHttpClient)
+                        }
                     }
                 }
             }
@@ -243,33 +247,36 @@ class CloudStorageProvider : DocumentsProvider() {
             }
         }
 
-        return MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION).apply {
-            val userId = getUserId(documentId)
-            val driveDocument = getDriveFromDocId(documentId)
-            val isDriveFolder = getFileIdFromDocumentId(documentId) == 1
-            val isRootFolder = documentId == userId
-            val isSharedWithMeFolder = getFileIdFromDocumentId(documentId) == SHARED_WITHME_FOLDER_ID
-            val isMySharesFolder = getFileIdFromDocumentId(documentId) == MY_SHARES_FOLDER_ID
-            val fromSharedWithMe = comeFromSharedWithMe(documentId)
+        // Metadata preparation and publication are admitted atomically (R3-3).
+        return withFinalAdmission {
+            MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION).apply {
+                val userId = getUserId(documentId)
+                val driveDocument = getDriveFromDocId(documentId)
+                val isDriveFolder = getFileIdFromDocumentId(documentId) == 1
+                val isRootFolder = documentId == userId
+                val isSharedWithMeFolder = getFileIdFromDocumentId(documentId) == SHARED_WITHME_FOLDER_ID
+                val isMySharesFolder = getFileIdFromDocumentId(documentId) == MY_SHARES_FOLDER_ID
+                val fromSharedWithMe = comeFromSharedWithMe(documentId)
 
-            when {
-                isRootFolder || isDriveFolder -> addFile(null, documentId, driveDocument.name)
-                isSharedWithMeFolder -> addFile(
-                    null,
-                    documentId,
-                    context?.getString(R.string.sharedWithMeTitle) ?: "Shared with me"
-                )
-                isMySharesFolder -> addFile(
-                    null,
-                    documentId,
-                    context?.getString(R.string.mySharesTitle) ?: "My Shares"
-                )
-                else -> { // isFile
-                    val fileId = getFileIdFromDocumentId(documentId)
-                    val userDrive = UserDrive(userId.toInt(), driveDocument.id, fromSharedWithMe)
-                    FileController.getRealmInstance(userDrive).use { realm ->
-                        FileController.getFileProxyById(fileId, customRealm = realm)?.let { file ->
-                            addFile(file, documentId)
+                when {
+                    isRootFolder || isDriveFolder -> addFile(null, documentId, driveDocument.name)
+                    isSharedWithMeFolder -> addFile(
+                        null,
+                        documentId,
+                        context?.getString(R.string.sharedWithMeTitle) ?: "Shared with me"
+                    )
+                    isMySharesFolder -> addFile(
+                        null,
+                        documentId,
+                        context?.getString(R.string.mySharesTitle) ?: "My Shares"
+                    )
+                    else -> { // isFile
+                        val fileId = getFileIdFromDocumentId(documentId)
+                        val userDrive = UserDrive(userId.toInt(), driveDocument.id, fromSharedWithMe)
+                        FileController.getRealmInstance(userDrive).use { realm ->
+                            FileController.getFileProxyById(fileId, customRealm = realm)?.let { file ->
+                                addFile(file, documentId)
+                            }
                         }
                     }
                 }
@@ -300,9 +307,12 @@ class CloudStorageProvider : DocumentsProvider() {
 
         if (restoredCursor != null) {
             SentryLog.i(TAG, "Restore old cursor")
-            cursor.restore(restoredCursor)
-            cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to false)
-            cursor.setNotificationUri(context?.contentResolver, uri)
+            // Row copying is publication: admit it atomically against transitions (R3-3).
+            withFinalAdmission {
+                cursor.restore(restoredCursor)
+                cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to false)
+                cursor.setNotificationUri(context?.contentResolver, uri)
+            }
             return cursor
         }
 
@@ -424,18 +434,25 @@ class CloudStorageProvider : DocumentsProvider() {
         uri: Uri,
         isSharedWithMeFolder: Boolean = false,
     ): (files: ArrayList<File>) -> Unit = { files ->
-        // A queued page must not be appended if the lock was enabled while it was being fetched.
-        if (isExternalAccessBlocked()) job.cancel()
-        job.ensureActive()
-        files.forEach { file ->
-            val sharedWithMePath = StringBuilder(SHARED_WITHME_FOLDER_ID.toString())
-                .append(SEPARATOR)
-                .append("${file.name}$DRIVE_SEPARATOR${file.driveId}")
-            val drivePath = if (isSharedWithMeFolder) sharedWithMePath.toString() else null
-            this.addFile(file, createFileDocumentId(parentDocumentId, file.id, parent = drivePath))
-            job.ensureActive()
+        // Page publication is admitted atomically: either the whole page appends while access
+        // is allowed, or nothing appends and the listing job is cancelled (R3-3).
+        try {
+            withFinalAdmission {
+                files.forEach { file ->
+                    job.ensureActive()
+                    val sharedWithMePath = StringBuilder(SHARED_WITHME_FOLDER_ID.toString())
+                        .append(SEPARATOR)
+                        .append("${file.name}$DRIVE_SEPARATOR${file.driveId}")
+                    val drivePath = if (isSharedWithMeFolder) sharedWithMePath.toString() else null
+                    this.addFile(file, createFileDocumentId(parentDocumentId, file.id, parent = drivePath))
+                    job.ensureActive()
+                }
+                context?.contentResolver?.notifyChange(uri, null)
+            }
+        } catch (exception: SecurityException) {
+            job.cancel()
         }
-        context?.contentResolver?.notifyChange(uri, null)
+        job.ensureActive()
     }
 
     override fun openDocument(
@@ -513,9 +530,12 @@ class CloudStorageProvider : DocumentsProvider() {
         val restoredSearchCursor = retainedCursors.acquireSearch(uri, cursor)
 
         if (restoredSearchCursor != null) {
-            cursor.restore(restoredSearchCursor)
-            cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to false)
-            cursor.setNotificationUri(context?.contentResolver, uri)
+            // Row copying is publication: admit it atomically against transitions (R3-3).
+            withFinalAdmission {
+                cursor.restore(restoredSearchCursor)
+                cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to false)
+                cursor.setNotificationUri(context?.contentResolver, uri)
+            }
             return cursor
         }
 
@@ -525,14 +545,20 @@ class CloudStorageProvider : DocumentsProvider() {
 
         runSuspendOnPlatformAdaptively(cursor.job) {
             FileController.cloudStorageSearch(userDrive, query, onResponse = { files ->
-                // A queued result page must not be appended after the lock was enabled.
-                if (isExternalAccessBlocked()) cursor.job.cancel()
-                cursor.job.ensureActive()
-                files.forEach { file ->
-                    cursor.addFile(file, createFileDocumentId(parentDocumentId, file.id))
-                    cursor.job.ensureActive()
+                // Page publication is admitted atomically (R3-3); a blocked page is dropped.
+                try {
+                    withFinalAdmission {
+                        cursor.job.ensureActive()
+                        files.forEach { file ->
+                            cursor.addFile(file, createFileDocumentId(parentDocumentId, file.id))
+                            cursor.job.ensureActive()
+                        }
+                        if (files.isNotEmpty()) context?.contentResolver?.notifyChange(uri, null)
+                    }
+                } catch (exception: SecurityException) {
+                    cursor.job.cancel()
                 }
-                if (files.isNotEmpty()) context?.contentResolver?.notifyChange(uri, null)
+                cursor.job.ensureActive()
             })
         }
 
@@ -660,9 +686,13 @@ class CloudStorageProvider : DocumentsProvider() {
         FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
+                // Detach the immutable request arguments on this (Realm-owning) thread before
+                // dispatch: managed proxies must never be read from the IO dispatcher (R3-1).
+                val detachedFile = File(id = file.id, driveId = file.driveId)
+
                 // Remote delete: admitted through the transition boundary; local bookkeeping
                 // below stays on this thread with the provider-owned Realm.
-                val apiResponse = admitAndDispatch { ApiRepository.deleteFile(file) }
+                val apiResponse = admitAndDispatch { ApiRepository.deleteFileSuspend(detachedFile) }
 
                 if (apiResponse.isSuccess()) {
                     runCatching {
@@ -698,9 +728,9 @@ class CloudStorageProvider : DocumentsProvider() {
         FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
-                // Remote rename: admitted through the transition boundary; the local update
-                // below stays on this thread with the provider-owned Realm.
-                val apiResponse = admitAndDispatch { ApiRepository.renameFile(file, displayName) }
+                // Detach request arguments on this thread (R3-1), then dispatch admitted.
+                val detachedFile = File(id = file.id, driveId = file.driveId)
+                val apiResponse = admitAndDispatch { ApiRepository.renameFileSuspend(detachedFile, displayName) }
 
                 if (apiResponse.isSuccess()) {
                     FileController.updateFile(file.id, realm) { localFile -> localFile.name = displayName }
@@ -732,7 +762,8 @@ class CloudStorageProvider : DocumentsProvider() {
                 FileController.getFileProxyById(fileId, customRealm = realm) ?: throw IllegalStateException("File not found")
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
 
-            val apiResponse = admitAndDispatch { ApiRepository.duplicateFile(file, targetParentFileId) }
+            val detachedFile = File(id = file.id, driveId = file.driveId)
+            val apiResponse = admitAndDispatch { ApiRepository.duplicateFileSuspend(detachedFile, targetParentFileId) }
 
             if (apiResponse.isSuccess()) {
 
@@ -771,7 +802,10 @@ class CloudStorageProvider : DocumentsProvider() {
             val targetParentFile =
                 FileController.getFileProxyById(targetParentFileId, customRealm = realm) ?: throw fileNotFoundException
 
-            val apiResponse = admitAndDispatch { ApiRepository.moveFile(file, targetParentFile) }
+            // Detach both source and target request arguments on this thread (R3-1).
+            val detachedFile = File(id = file.id, driveId = file.driveId)
+            val detachedTarget = File(id = targetParentFile.id, driveId = targetParentFile.driveId)
+            val apiResponse = admitAndDispatch { ApiRepository.moveFileSuspend(detachedFile, detachedTarget) }
 
             if (apiResponse.isSuccess()) {
                 realm.executeTransaction { file.deleteFromRealm() }

@@ -330,6 +330,24 @@ object ApiRepository : ApiRepositoryCore() {
         return callApi(ApiRoutes.moveFile(file, newParent.id), POST)
     }
 
+    // Cancellable suspend variants used by the DocumentsProvider mutation dispatcher, whose
+    // transition cancellation must reach the actual HTTP call (Core Call.await linkage).
+    suspend fun deleteFileSuspend(file: File): ApiResponse<CancellableAction> {
+        return callApiSuspend(ApiRoutes.fileURLV2(file), DELETE)
+    }
+
+    suspend fun renameFileSuspend(file: File, newName: String): ApiResponse<CancellableAction> {
+        return callApiSuspend(ApiRoutes.renameFile(file), POST, mapOf("name" to newName))
+    }
+
+    suspend fun duplicateFileSuspend(file: File, destinationId: Int): ApiResponse<File> {
+        return callApiSuspend(ApiRoutes.duplicateFile(file, destinationId), POST)
+    }
+
+    suspend fun moveFileSuspend(file: File, newParent: File): ApiResponse<CancellableAction> {
+        return callApiSuspend(ApiRoutes.moveFile(file, newParent.id), POST)
+    }
+
     fun getFileShare(okHttpClient: OkHttpClient, file: File): ApiResponse<Share> {
         return callApi(ApiRoutes.getFileShare(file), GET, okHttpClient = okHttpClient)
     }
