@@ -826,7 +826,17 @@ class CloudStorageProvider : DocumentsProvider() {
         val userDrive = createUserDrive(parentDocumentId)
         val parentId = getFileIdFromDocumentId(parentDocumentId)
 
-        val apiResponse = admitAndDispatch { FileController.createFolder(displayName, parentId, true, userDrive) }
+        // Slow client preparation happens before the admission boundary; only scalars cross it.
+        val okHttpClient = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+        val apiResponse = admitAndDispatch {
+            FileController.createFolderSuspend(
+                okHttpClient = okHttpClient,
+                driveId = userDrive.driveId,
+                parentId = parentId,
+                name = displayName,
+                onlyForMe = true,
+            )
+        }
         val file = apiResponse.data
 
         if (apiResponse.isSuccess() && file != null) {
@@ -865,7 +875,7 @@ class CloudStorageProvider : DocumentsProvider() {
         // Slow client preparation happens before the admission boundary.
         val okHttpClient = runBlocking { AccountUtils.getHttpClient(userDrive.userId, 120) }
         val apiResponse = admitAndDispatch {
-            ApiController.callApiBlocking<ApiResponse<File>>(
+            ApiController.callApi<ApiResponse<File>>(
                 uploadUrl,
                 ApiController.ApiMethod.POST,
                 okHttpClient = okHttpClient,

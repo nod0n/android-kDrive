@@ -979,6 +979,21 @@ object FileController {
         return ApiRepository.createFolder(okHttpClient, driveId, parentId, name, onlyForMe)
     }
 
+    /**
+     * Cancellable variant of [createFolder] for the DocumentsProvider mutation dispatcher:
+     * routes through Core's suspend `callApi` so transition cancellation reaches the real
+     * OkHttp call (Astra review R4-2).
+     */
+    suspend fun createFolderSuspend(
+        okHttpClient: OkHttpClient,
+        driveId: Int,
+        parentId: Int,
+        name: String,
+        onlyForMe: Boolean = false,
+    ): ApiResponse<File> {
+        return ApiRepository.createFolderSuspend(okHttpClient, driveId, parentId, name, onlyForMe)
+    }
+
     suspend fun createCommonFolder(name: String, forAllUsers: Boolean, userDrive: UserDrive?): ApiResponse<File> {
         val okHttpClient =
             userDrive?.userId?.let { AccountUtils.getHttpClient(it) } ?: AuthHttpClientProvider.authOkHttpClient

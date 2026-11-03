@@ -348,6 +348,21 @@ object ApiRepository : ApiRepositoryCore() {
         return callApiSuspend(ApiRoutes.moveFile(file, newParent.id), POST)
     }
 
+    suspend fun createFolderSuspend(
+        okHttpClient: OkHttpClient,
+        driveId: Int,
+        parentId: Int,
+        name: String,
+        onlyForMe: Boolean = false,
+    ): ApiResponse<File> {
+        return callApiSuspend(
+            ApiRoutes.createFolder(driveId, parentId),
+            POST,
+            mapOf("name" to name, "only_for_me" to onlyForMe),
+            okHttpClient = okHttpClient
+        )
+    }
+
     fun getFileShare(okHttpClient: OkHttpClient, file: File): ApiResponse<Share> {
         return callApi(ApiRoutes.getFileShare(file), GET, okHttpClient = okHttpClient)
     }
