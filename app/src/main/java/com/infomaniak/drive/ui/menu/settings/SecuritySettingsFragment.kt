@@ -81,12 +81,27 @@ class SecuritySettingsFragment : Fragment() {
             }
         }
 
+        updateContentProviderDescription()
+
         binding.root.enableEdgeToEdge()
+    }
+
+    /**
+     * While app lock is enabled, external file access is blocked no matter how this switch is set;
+     * make that visible instead of letting the switch silently appear ineffective.
+     */
+    private fun updateContentProviderDescription() {
+        val isAppLockEnabled = AppSettings.appSecurityLock
+        binding.contentProviderSwitch.description = getString(
+            if (isAppLockEnabled) R.string.fileProviderExtensionAppLockDescription
+            else R.string.fileProviderExtensionDescription
+        )
     }
 
     override fun onResume() = with(binding) {
         super.onResume()
         appLock.endText = getString(if (AppSettings.appSecurityLock) R.string.allActivated else R.string.allDisabled)
+        updateContentProviderDescription()
         val isContentProviderEnabled = !CloudStorageProvider.isDisabled(appCtx)
         if (contentProviderSwitch.isChecked != isContentProviderEnabled) {
             contentProviderSwitch.isChecked = isContentProviderEnabled
