@@ -116,15 +116,23 @@ object OfflineFolderUtils {
                 }
             }
 
+            // Drive-wide reconciliation net over the durable coverage membership; uses only
+            // local durable state, so it is safe after an incomplete walk too.
+            if (OfflineFolderController.getOfflineRoot(rootFolderId, customRealm = realm) != null) {
+                sweepOrphanInheritedCoverage(context, realm, userDrive)
+            }
+
             WalkResult(rootExists = true, completed = completed, fileIds = fileIds)
         }
     }
 
     /**
-     * Aggregates all pages of one remote folder, then upserts and marks its children. The cached
-     * membership is only replaced once the folder has been fully listed, so a mid-listing failure
-     * leaves the previous children (and their coverage links) intact for later walks and for the
-     * root removal traversal. Returns false when the folder could not be listed.
+     * Aggregates all pages of one remote folder, then upserts and marks its children. The cache
+     * membership is only replaced, and the stale reconciliation only runs, once the folder has
+     * been fully listed with valid pages and a terminating response: an incomplete pagination
+     * (missing data, `hasMore` without cursor, non-advancing cursor) mutates nothing and reports
+     * an incomplete outcome so the walk is retried (issue #1902). Returns false when the folder
+     * could not be completely listed.
      */
     private suspend fun walkSingleFolder(
         context: Context,
@@ -166,22 +174,39 @@ object OfflineFolderUtils {
                 return false
             }
 
-            allPages.addAll(apiResponse.data ?: emptyList())
-            if (apiResponse.hasMoreAndCursorExists) {
-                cursor = apiResponse.cursor
-            } else {
-                lastResponse = apiResponse
-                break
+            val pageData = apiResponse.data
+            if (pageData == null) {
+                // A successful response without data is not an empty page: treat it as
+                // incomplete rather than reconciling against nothing.
+                SentryLog.i(TAG, "Incomplete listing for folder $folderId (null page data)")
+                return false
+            }
+            allPages.addAll(pageData)
+
+            when {
+                apiResponse.hasMoreAndCursorExists -> {
+                    val nextCursor = apiResponse.cursor
+                    if (nextCursor == cursor) {
+                        SentryLog.i(TAG, "Incomplete listing for folder $folderId (cursor not advancing)")
+                        return false
+                    }
+                    cursor = nextCursor
+                }
+                apiResponse.hasMore -> {
+                    // hasMore without a cursor cannot be continued: incomplete.
+                    SentryLog.i(TAG, "Incomplete listing for folder $folderId (hasMore without cursor)")
+                    return false
+                }
+                else -> {
+                    lastResponse = apiResponse
+                    break
+                }
             }
         }
 
-        // Fully listed: capture the previous membership BEFORE replacing it, reconcile coverage
-        // (including whole disappeared subfolders), then upsert the fresh children.
-        val oldChildIds = FileController.getFileById(realm, folderId)
-            ?.children?.createSnapshot()?.map { it.id }?.toSet() ?: emptySet()
+        val last = lastResponse ?: return false
         val remoteIds = allPages.mapTo(mutableSetOf()) { it.id }
 
-        val last = lastResponse ?: return false
         val completeResponse = CursorApiResponse<List<File>>(
             result = last.result,
             data = allPages,
@@ -198,13 +223,16 @@ object OfflineFolderUtils {
             folderId = folderId,
             userDrive = userDrive,
             apiResponse = completeResponse,
-            isCompleteFolder = !last.hasMore,
+            isCompleteFolder = true,
             fileIds = fileIds,
             folderQueue = folderQueue,
             visitedFolderIds = visitedFolderIds,
         )
 
-        cleanupStaleCoveredChildren(context, realm, folderId, rootFolderId, userDrive, oldChildIds, remoteIds)
+        // Fully listed: children confirmed absent from this authoritative listing are reconciled
+        // from durable coverage membership, not from the replaceable presentation child list
+        // (issue #1902).
+        cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds)
 
         return true
     }
@@ -289,109 +317,139 @@ object OfflineFolderUtils {
     }
 
     /**
-     * Drops the coverage of children of [folderId] that are not part of [remoteFileIds] anymore.
-     * Only called once the folder has been fully listed. Files (or whole disappeared subtrees)
-     * are only cleared when no other remaining root covers them and no pending upload protects
-     * them; [OfflineFolderController.clearFileCoverage] owns the per-file decision.
+     * Reconciles the direct children of [folderId] (and the subtrees of subfolders that
+     * disappeared entirely) against the freshly confirmed remote membership.
+     *
+     * Candidates come from the durable parentId chains and inherited flags, never from the
+     * presentation child list a normal folder refresh may already have replaced (issue #1902).
+     * A disappearance confirmed by the authoritative listing invalidates inherited coverage from
+     * every root, subject to the edit protection inside [OfflineFolderController.clearFileCoverage];
+     * obsolete cached ancestry cannot establish protection. A vanished subfolder that is itself
+     * a remaining root is skipped: its own durable record owns its subtree's cleanup.
      */
-    private fun cleanupStaleCoveredChildren(
+    private fun cleanupConfirmedAbsentChildren(
         context: Context,
         realm: Realm,
         folderId: Int,
-        rootFolderId: Int,
         userDrive: UserDrive,
-        oldChildIds: Set<Int>,
         remoteFileIds: Set<Int>,
     ) {
-        val staleIds = oldChildIds - remoteFileIds
-        if (staleIds.isEmpty()) return
-
         val result = OfflineFolderController.RemovalResult()
-        val visited = mutableSetOf<Int>()
-        val queue = ArrayDeque<Int>()
+        val children = realm.where(File::class.java)
+            .equalTo(File::parentId.name, folderId)
+            .findAll()
+            .createSnapshot()
 
-        staleIds.forEach { staleId ->
-            val staleChild = FileController.getFileById(realm, staleId) ?: return@forEach
-            if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
-                    isOffline = staleChild.isOffline,
-                    isInOfflineFolder = staleChild.isInOfflineFolder,
-                ) || staleChild.isFolder()
+        children.forEach { child ->
+            if (child.id in remoteFileIds) return@forEach
+
+            if (child.isFolder()) {
+                if (OfflineFolderController.isOfflineRoot(child.id, customRealm = realm)) return@forEach
+                clearConfirmedAbsentSubtree(context, realm, child.id, userDrive, result)
+            } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
+                    isOffline = child.isOffline,
+                    isInOfflineFolder = child.isInOfflineFolder,
+                )
             ) {
-                if (staleChild.isFolder()) {
-                    if (visited.add(staleId)) queue.add(staleId)
-                } else {
-                    clearIfNotCoveredByOtherRoot(context, realm, staleChild, rootFolderId, userDrive, result)
-                }
+                OfflineFolderController.clearFileCoverage(
+                    context = context,
+                    realm = realm,
+                    file = child,
+                    userDrive = userDrive,
+                    result = result,
+                    isFolder = false,
+                )
             }
         }
 
-        // A disappeared subfolder takes its whole subtree with it.
+        if (result.keptOfflineFilesCount > 0 || result.removedOfflineFilesCount > 0) {
+            SentryLog.i(
+                TAG,
+                "Folder $folderId reconciliation: kept ${result.keptOfflineFilesCount}, removed ${result.removedOfflineFilesCount}"
+            )
+        }
+    }
+
+    /** Clears the inherited coverage of the whole subtree below [rootFolderId], cache only. */
+    private fun clearConfirmedAbsentSubtree(
+        context: Context,
+        realm: Realm,
+        rootFolderId: Int,
+        userDrive: UserDrive,
+        result: OfflineFolderController.RemovalResult,
+    ) {
+        val visited = mutableSetOf(rootFolderId)
+        val queue = ArrayDeque(listOf(rootFolderId))
+
         while (queue.isNotEmpty()) {
-            val subFolderId = queue.removeFirst()
-            val subFolder = FileController.getFileById(realm, subFolderId) ?: continue
-            val subFolderCleared = clearIfNotCoveredByOtherRoot(
-                context,
-                realm,
-                subFolder,
-                rootFolderId,
-                userDrive,
-                result,
+            val currentId = queue.removeFirst()
+            val currentFolder = FileController.getFileById(realm, currentId) ?: continue
+            OfflineFolderController.clearFileCoverage(
+                context = context,
+                realm = realm,
+                file = currentFolder,
+                userDrive = userDrive,
+                result = result,
                 isFolder = true,
             )
-            if (!subFolderCleared) {
-                // The subfolder is still covered (another root or a nested root record): its
-                // whole subtree stays covered.
-                continue
-            }
+
             realm.where(File::class.java)
-                .equalTo(File::parentId.name, subFolderId)
+                .equalTo(File::parentId.name, currentId)
                 .findAll()
                 .createSnapshot()
                 .forEach { child ->
                     if (child.isFolder()) {
                         if (visited.add(child.id)) queue.add(child.id)
-                    } else {
-                        clearIfNotCoveredByOtherRoot(context, realm, child, rootFolderId, userDrive, result)
+                    } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
+                            isOffline = child.isOffline,
+                            isInOfflineFolder = child.isInOfflineFolder,
+                        )
+                    ) {
+                        OfflineFolderController.clearFileCoverage(
+                            context = context,
+                            realm = realm,
+                            file = child,
+                            userDrive = userDrive,
+                            result = result,
+                            isFolder = false,
+                        )
                     }
                 }
-        }
-
-        if (result.keptOfflineFilesCount > 0) {
-            SentryLog.i(TAG, "Kept ${result.keptOfflineFilesCount} offline copies during stale cleanup")
         }
     }
 
     /**
-     * Drops the file's (or folder row's) inherited coverage unless it is still covered by another
-     * root or is itself a remaining root. Returns true when the coverage was actually cleared.
+     * Second, drive-wide reconciliation net: inherited rows whose durable ancestry no longer
+     * leads to any active offline root (moved out, root removed while their upload was pending,
+     * leftovers of an interrupted cleanup) are cleared, subject to the same edit protection.
+     * Independent of any presentation child list (issue #1902).
      */
-    private fun clearIfNotCoveredByOtherRoot(
-        context: Context,
-        realm: Realm,
-        file: File,
-        rootFolderId: Int,
-        userDrive: UserDrive,
-        result: OfflineFolderController.RemovalResult,
-        isFolder: Boolean = false,
-    ): Boolean {
-        // Recheck remaining roots before dropping a moved/deleted descendant: it may still be
-        // covered by another root (e.g. an ancestor of the walked root or a nested one).
-        val isCoveredByOtherRoot = OfflineFolderController.isInsideAnotherRoot(
-            realm,
-            file.id,
-            excludedFolderId = rootFolderId,
-        )
-        if (isCoveredByOtherRoot || OfflineFolderController.isOfflineRoot(file.id, customRealm = realm)) return false
+    private fun sweepOrphanInheritedCoverage(context: Context, realm: Realm, userDrive: UserDrive) {
+        val result = OfflineFolderController.RemovalResult()
+        val orphans = realm.where(File::class.java)
+            .equalTo(File::isInOfflineFolder.name, true)
+            .notEqualTo(File::isOffline.name, true)
+            .findAll()
+            .createSnapshot()
+            .filter { !OfflineFolderController.isInsideAnotherRoot(realm, it.id) }
 
-        OfflineFolderController.clearFileCoverage(
-            context = context,
-            realm = realm,
-            file = file,
-            userDrive = userDrive,
-            result = result,
-            isFolder = isFolder,
-        )
-        return true
+        orphans.forEach { orphan ->
+            OfflineFolderController.clearFileCoverage(
+                context = context,
+                realm = realm,
+                file = orphan,
+                userDrive = userDrive,
+                result = result,
+                isFolder = orphan.isFolder(),
+            )
+        }
+
+        if (result.keptOfflineFilesCount > 0 || result.removedOfflineFilesCount > 0) {
+            SentryLog.i(
+                TAG,
+                "Inherited coverage sweep: kept ${result.keptOfflineFilesCount}, removed ${result.removedOfflineFilesCount}"
+            )
+        }
     }
 
     /**

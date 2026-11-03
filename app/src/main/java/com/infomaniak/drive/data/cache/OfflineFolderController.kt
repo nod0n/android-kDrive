@@ -168,18 +168,16 @@ object OfflineFolderController {
     }
 
     /**
-     * Whether [folderId] has an ancestor — other than [excludedFolderId] — which is itself an
+     * Whether [folderId] has an ancestor — other than itself — which is itself an
      * offline root, i.e. whether the folder stays covered after removing one of its own roots.
      * Works for files too: it walks the durable parentId chain.
      */
-    fun isInsideAnotherRoot(realm: Realm, folderId: Int, excludedFolderId: Int? = null): Boolean {
+    fun isInsideAnotherRoot(realm: Realm, folderId: Int): Boolean {
         val visited = mutableSetOf(folderId)
         var currentId: Int? = folderId
         while (currentId != null && currentId != ROOT_ID) {
             val folder = FileController.getFileById(realm, currentId) ?: return false
-            val isSelf = folder.id == folderId
-            val isExcluded = folder.id == excludedFolderId
-            if (!isSelf && !isExcluded && getOfflineRoot(folder.id, customRealm = realm) != null) return true
+            if (folder.id != folderId && getOfflineRoot(folder.id, customRealm = realm) != null) return true
             currentId = folder.parentId.takeIf { visited.add(it) }
         }
         return false
