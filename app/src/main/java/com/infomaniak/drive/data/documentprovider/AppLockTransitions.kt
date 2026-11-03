@@ -59,6 +59,31 @@ class AppLockTransitions(
     /** Bumped on every observable policy state change (request registered, commit attempted). */
     private var policyGeneration = 0L
 
+    /** In-flight work admitted under the boundary; cancelled by any later transition. */
+    private val admittedWork = HashSet<AdmittedWork>()
+
+    /** Guards [admittedWork]; acquired inside admission sections and by transitions. */
+    private val workLock = Any()
+
+    /**
+     * Registers work whose network issuance was admitted under the current policy. A later
+     * transition cancels it, so network I/O for admitted mutations only proceeds while no
+     * transition has occurred (or best-effort aborts one already on the wire).
+     */
+    fun registerAdmittedWork(work: AdmittedWork) = synchronized(workLock) { admittedWork.add(work) }
+
+    fun unregisterAdmittedWork(work: AdmittedWork) = synchronized(workLock) { admittedWork.remove(work) }
+
+    private fun cancelAdmittedWork() = synchronized(workLock) {
+        admittedWork.forEach { work -> runCatching { work.cancel() } }
+        admittedWork.clear()
+    }
+
+    /** Minimal handle for cancellable work admitted under the boundary. */
+    fun interface AdmittedWork {
+        fun cancel()
+    }
+
     /** Runs [block] atomically against transitions; the final authorization/issuance boundary. */
     fun <T> withAdmission(block: () -> T): T = admission.read { block() }
 
@@ -81,6 +106,7 @@ class AppLockTransitions(
             pendingGeneration = ++latestRequestedGeneration
             latestRequestedGeneration
         }
+        cancelAdmittedWork()
         onTransition()
         writer.execute { complete(generation, enabled, onResult) }
         return generation
@@ -100,6 +126,7 @@ class AppLockTransitions(
             policyGeneration += 1
             if (pendingGeneration == generation && persisted) pendingGeneration = null
         }
+        cancelAdmittedWork()
         onTransition()
         onResult?.invoke(persisted)
     }

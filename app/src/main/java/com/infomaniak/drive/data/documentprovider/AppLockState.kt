@@ -62,6 +62,11 @@ object AppLockState {
     /** Shared transition boundary for final authorization/issuance (see [AppLockTransitions]). */
     fun <T> withAdmission(block: () -> T): T = transitions.withAdmission(block)
 
+    /** Registers/unregisters work admitted under the boundary; transitions cancel it. */
+    fun registerAdmittedWork(work: AppLockTransitions.AdmittedWork) = transitions.registerAdmittedWork(work)
+
+    fun unregisterAdmittedWork(work: AppLockTransitions.AdmittedWork) = transitions.unregisterAdmittedWork(work)
+
     /** Current policy generation, for tagging retained state such as cursors. */
     fun policyGeneration(): Long = transitions.policyGeneration()
 

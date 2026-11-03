@@ -69,10 +69,15 @@ import io.sentry.Sentry
 import io.sentry.SentryEvent
 import io.sentry.SentryLevel
 import io.sentry.protocol.Message
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -93,6 +98,9 @@ class CloudStorageProvider : DocumentsProvider() {
     private val cloudScope = CoroutineScope(
         CoroutineName("CloudStorage") + Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     )
+
+    /** Executes admitted remote mutations off the Binder thread; cancellable by transitions. */
+    private val mutationScope = CoroutineScope(CoroutineName("CloudStorageMutation") + SupervisorJob() + Dispatchers.IO)
 
     private fun isProviderDisabled(): Boolean {
         val ctx = context ?: return true
@@ -131,12 +139,38 @@ class CloudStorageProvider : DocumentsProvider() {
     }
 
     /**
-     * Final authorization for mutation dispatch: atomically revalidates against transitions.
-     * The remote call itself follows outside the boundary; once dispatched it is
-     * already-dispatched territory (an accepted server operation cannot be recalled).
+     * Cancellable admission for remote mutations (Astra review R2-2 follow-up).
+     *
+     * Linearization/issuance point: the final policy revalidation, the registration of the
+     * dispatch handle and the start of the request job happen atomically inside the admission
+     * boundary. The boundary is then released — no transition lock is held across network I/O —
+     * and the response is awaited outside it. Any transition after admission cancels the handle,
+     * so the request's network I/O only proceeds if it starts running before that cancellation
+     * lands; a request already on the wire may complete remotely (blocking call, not
+     * interruptible) but its result is refused, no local state applies and the caller is denied.
+     * Local Realm bookkeeping must therefore stay in the caller, on its original thread.
      */
-    private fun ensureAdmitted() {
-        AppLockState.withAdmission { ensureExternalAccessAllowed() }
+    private fun <T> admitAndDispatch(block: suspend () -> T): T {
+        var handle: AppLockTransitions.AdmittedWork? = null
+        val deferred: Deferred<T> = withFinalAdmission {
+            val dispatch = mutationScope.async(start = CoroutineStart.LAZY) { block() }
+            handle = AppLockTransitions.AdmittedWork { dispatch.cancel() }
+                .also { AppLockState.registerAdmittedWork(it) }
+            dispatch.start()
+            dispatch
+        }
+
+        return try {
+            runBlocking { deferred.await() }
+        } catch (exception: CancellationException) {
+            // The admitted dispatch was cancelled by a transition: deny with the current reason.
+            if (isExternalAccessBlocked()) {
+                throw SecurityException(blockedReasonMessage(accessDecision()))
+            }
+            throw exception
+        } finally {
+            handle?.let { AppLockState.unregisterAdmittedWork(it) }
+        }
     }
 
     private fun blockedReasonMessage(decision: ProviderAccessPolicy.Reason): String = when (decision) {
@@ -626,11 +660,19 @@ class CloudStorageProvider : DocumentsProvider() {
         FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
-                // Delete
-                ensureAdmitted()
-                val apiResponse = FileController.deleteFile(file, realm, context = context)
+                // Remote delete: admitted through the transition boundary; local bookkeeping
+                // below stays on this thread with the provider-owned Realm.
+                val apiResponse = admitAndDispatch { ApiRepository.deleteFile(file) }
 
                 if (apiResponse.isSuccess()) {
+                    runCatching {
+                        FileController.deleteFileAndChildrenRec(
+                            filesToDelete = mutableListOf(file),
+                            realm = realm,
+                            userDrive = null,
+                            context = context,
+                        )
+                    }.onFailure(Sentry::captureException)
 
                     // Delete orphans
                     FileController.removeOrphanAndActivityFiles(realm)
@@ -656,11 +698,13 @@ class CloudStorageProvider : DocumentsProvider() {
         FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
-                // Rename
-                ensureAdmitted()
-                val apiResponse = FileController.renameFile(file, displayName, realm)
+                // Remote rename: admitted through the transition boundary; the local update
+                // below stays on this thread with the provider-owned Realm.
+                val apiResponse = admitAndDispatch { ApiRepository.renameFile(file, displayName) }
 
                 if (apiResponse.isSuccess()) {
+                    FileController.updateFile(file.id, realm) { localFile -> localFile.name = displayName }
+
                     // Refresh
                     scheduleRefresh()
 
@@ -688,8 +732,7 @@ class CloudStorageProvider : DocumentsProvider() {
                 FileController.getFileProxyById(fileId, customRealm = realm) ?: throw IllegalStateException("File not found")
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
 
-            ensureAdmitted()
-            val apiResponse = ApiRepository.duplicateFile(file, targetParentFileId)
+            val apiResponse = admitAndDispatch { ApiRepository.duplicateFile(file, targetParentFileId) }
 
             if (apiResponse.isSuccess()) {
 
@@ -728,8 +771,7 @@ class CloudStorageProvider : DocumentsProvider() {
             val targetParentFile =
                 FileController.getFileProxyById(targetParentFileId, customRealm = realm) ?: throw fileNotFoundException
 
-            ensureAdmitted()
-            val apiResponse = ApiRepository.moveFile(file, targetParentFile)
+            val apiResponse = admitAndDispatch { ApiRepository.moveFile(file, targetParentFile) }
 
             if (apiResponse.isSuccess()) {
                 realm.executeTransaction { file.deleteFromRealm() }
@@ -750,8 +792,7 @@ class CloudStorageProvider : DocumentsProvider() {
         val userDrive = createUserDrive(parentDocumentId)
         val parentId = getFileIdFromDocumentId(parentDocumentId)
 
-        ensureAdmitted()
-        val apiResponse = runBlocking { FileController.createFolder(displayName, parentId, true, userDrive) }
+        val apiResponse = admitAndDispatch { FileController.createFolder(displayName, parentId, true, userDrive) }
         val file = apiResponse.data
 
         if (apiResponse.isSuccess() && file != null) {
@@ -787,12 +828,15 @@ class CloudStorageProvider : DocumentsProvider() {
             lastModifiedAt = newDate,
         )
 
-        ensureAdmitted()
-        val apiResponse = ApiController.callApiBlocking<ApiResponse<File>>(
-            uploadUrl,
-            ApiController.ApiMethod.POST,
-            okHttpClient = runBlocking { AccountUtils.getHttpClient(userDrive.userId, 120) }
-        )
+        // Slow client preparation happens before the admission boundary.
+        val okHttpClient = runBlocking { AccountUtils.getHttpClient(userDrive.userId, 120) }
+        val apiResponse = admitAndDispatch {
+            ApiController.callApiBlocking<ApiResponse<File>>(
+                uploadUrl,
+                ApiController.ApiMethod.POST,
+                okHttpClient = okHttpClient,
+            )
+        }
         val file = apiResponse.data
 
         if (apiResponse.isSuccess() && file != null) {
