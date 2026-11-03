@@ -52,6 +52,7 @@ import com.infomaniak.drive.data.api.UploadTask.Companion.ConflictOption
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FolderFilesProvider
+import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
@@ -99,6 +100,30 @@ class CloudStorageProvider : DocumentsProvider() {
     }
 
     /**
+     * App lock state, read from persisted app settings. Fails closed (treated as locked) if the
+     * state cannot be read: an unreadable store would break the rest of the provider anyway, and
+     * blocking is the safe direction.
+     */
+    private fun isAppLockActive(): Boolean = runCatching {
+        AppSettings.appSecurityLock
+    }.getOrDefault(true)
+
+    private fun accessDecision(): ProviderAccessPolicy.Reason = ProviderAccessPolicy.evaluate(
+        appLockEnabled = isAppLockActive(),
+        providerDisabledByUser = isProviderDisabled(),
+    )
+
+    private fun isExternalAccessBlocked(): Boolean = accessDecision() != ProviderAccessPolicy.Reason.ALLOWED
+
+    private fun blockedReasonMessage(decision: ProviderAccessPolicy.Reason): String = when (decision) {
+        ProviderAccessPolicy.Reason.BLOCKED_BY_APP_LOCK ->
+            context?.getString(R.string.cloudStorageAppLockError) ?: "kDrive is locked by App lock"
+        ProviderAccessPolicy.Reason.BLOCKED_BY_SETTING ->
+            context?.getString(R.string.fileProviderExtensionError) ?: "kDrive access is disabled"
+        ProviderAccessPolicy.Reason.ALLOWED -> ""
+    }
+
+    /**
      * Indicates whether the current platform is Chrome OS.
      *
      * ### Why this matters:
@@ -133,7 +158,7 @@ class CloudStorageProvider : DocumentsProvider() {
         AccountUtils.getAllUsersSync().forEach { user ->
             cursor.addRoot(user.id.toString(), user.id.toString(), user.email)
 
-            if (!isProviderDisabled()) {
+            if (!isExternalAccessBlocked()) {
                 cloudScope.launch {
                     context?.let {
                         val okHttpClient = AccountUtils.getHttpClient(user.id)
@@ -150,6 +175,13 @@ class CloudStorageProvider : DocumentsProvider() {
         projection: Array<out String>?
     ): Cursor = withLaxStrictMode {
         SentryLog.d(TAG, "queryDocument(), documentId=$documentId")
+
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            return MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION).apply {
+                extras = bundleOf(DocumentsContract.EXTRA_ERROR to blockedReasonMessage(decision))
+            }
+        }
 
         return MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION).apply {
             val userId = getUserId(documentId)
@@ -192,8 +224,10 @@ class CloudStorageProvider : DocumentsProvider() {
     ): Cursor = withLaxStrictMode {
         val cursor = DocumentCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION, isAutoCloseableJob = false)
 
-        if (isProviderDisabled()) {
-            cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to (context?.getString(R.string.fileProviderExtensionError)))
+        // Gate before any cursor restoration, so a listing captured before the lock cannot be replayed.
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to blockedReasonMessage(decision))
             return cursor
         }
 
@@ -346,8 +380,9 @@ class CloudStorageProvider : DocumentsProvider() {
         signal: CancellationSignal?
     ): ParcelFileDescriptor? = withLaxStrictMode {
         SentryLog.d(TAG, "openDocument(), id=$documentId, mode=$mode, signalIsCancelled: ${signal?.isCanceled}")
-        if (isProviderDisabled()) {
-            throw SecurityException(context?.getString(R.string.fileProviderExtensionError))
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
         }
         val context = context ?: return null
 
@@ -383,6 +418,12 @@ class CloudStorageProvider : DocumentsProvider() {
         SentryLog.d(TAG, "querySearchDocuments(), rootId=$rootId, projectionSize=${projection?.size}, $currentParentDocumentId")
 
         val cursor = DocumentCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION, isAutoCloseableJob = false)
+
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to blockedReasonMessage(decision))
+            return cursor
+        }
 
         if (currentParentDocumentId == null ||
             currentParentDocumentId == getUserId(currentParentDocumentId!!) ||
@@ -437,6 +478,11 @@ class CloudStorageProvider : DocumentsProvider() {
     ): AssetFileDescriptor = withLaxStrictMode {
         SentryLog.d(TAG, "openDocumentThumbnail(), id=$documentId, signalIsCancelled: ${signal?.isCanceled}")
 
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
+        }
+
         val fileId = getFileIdFromDocumentId(documentId)
         val userId = getUserId(documentId)
 
@@ -450,6 +496,21 @@ class CloudStorageProvider : DocumentsProvider() {
 
             } ?: super.openDocumentThumbnail(documentId, sizeHint, signal)
         }
+    }
+
+    override fun openTypedAssetFile(
+        documentId: String,
+        mimeTypeFilter: String,
+        signal: CancellationSignal?
+    ): AssetFileDescriptor = withLaxStrictMode {
+        SentryLog.d(TAG, "openTypedAssetFile(), id=$documentId, mimeTypeFilter=$mimeTypeFilter")
+
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
+        }
+
+        return super.openTypedAssetFile(documentId, mimeTypeFilter, signal)
     }
 
     private fun generateThumbnail(fileId: Int, file: File, userId: String, signal: CancellationSignal?): ParcelFileDescriptor? {
@@ -496,6 +557,11 @@ class CloudStorageProvider : DocumentsProvider() {
     ): String = withLaxStrictMode {
         SentryLog.d(TAG, "createDocument(), parentId=$parentDocumentId, mimeType=$mimeType")
 
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
+        }
+
         return if (mimeType.equals(DocumentsContract.Document.MIME_TYPE_DIR, true)) {
             createNewFolder(parentDocumentId, displayName) // If we want to create a new folder
         } else {
@@ -505,6 +571,11 @@ class CloudStorageProvider : DocumentsProvider() {
 
     override fun deleteDocument(documentId: String): Unit = withLaxStrictMode {
         SentryLog.d(TAG, "deleteDocument(), id=$documentId")
+
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
+        }
 
         val context = context ?: throw IllegalStateException("Delete document failed: missing Android Context")
 
@@ -535,6 +606,11 @@ class CloudStorageProvider : DocumentsProvider() {
     ): String? = withLaxStrictMode {
         SentryLog.d(TAG, "renameDocument(), id=$documentId")
 
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
+        }
+
         FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
@@ -559,6 +635,11 @@ class CloudStorageProvider : DocumentsProvider() {
         targetParentDocumentId: String
     ): String = withLaxStrictMode {
         SentryLog.d(TAG, "copyDocument(), sourceId=$sourceDocumentId, targetParentId=$targetParentDocumentId")
+
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
+        }
 
         return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
 
@@ -592,6 +673,11 @@ class CloudStorageProvider : DocumentsProvider() {
                     "sourceParentId=$sourceParentDocumentId, " +
                     "targetParentId=$targetParentDocumentId"
         )
+
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
+        }
 
         return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
 
