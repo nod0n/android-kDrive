@@ -82,6 +82,7 @@
     <string name="allVideo">Videos</string>
     <string name="allYesterday">Yesterday</string>
     <string name="appSecurityDescription">Protect access to your app by enabling your phone lock.</string>
+    <string name="appSecurityPersistError">App lock could not be saved. Please try again.</string>
     <string name="appSecurityTitle">App lock</string>
     <string name="backgroundSyncCheckboxTitle">I’ve taken the appropriate steps</string>
     <string name="backgroundSyncDescription">To ensure proper kDrive’s functioning, please enable background synchronization on your phone</string>

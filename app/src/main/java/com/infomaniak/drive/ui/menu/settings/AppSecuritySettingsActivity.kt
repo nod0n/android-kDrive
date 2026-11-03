@@ -24,6 +24,7 @@ import androidx.core.view.isVisible
 import com.infomaniak.core.applock.AppLockHelper.silentlyReverseSwitch
 import com.infomaniak.core.applock.AppLockManager
 import com.infomaniak.core.common.extensions.isNightModeEnabled
+import com.infomaniak.core.ui.view.utils.SnackbarUtils.showSnackbar
 import com.infomaniak.core.twofactorauth.front.TwoFactorAuthApprovalAutoManagedBottomSheet
 import com.infomaniak.core.twofactorauth.front.addComposeOverlay
 import com.infomaniak.drive.R
@@ -35,6 +36,9 @@ import com.infomaniak.drive.twoFactorAuthManager
 class AppSecuritySettingsActivity : AppCompatActivity() {
 
     private val binding: ViewSwitchSettingsBinding by lazy { ViewSwitchSettingsBinding.inflate(layoutInflater) }
+
+    /** Guards against overlapping app-lock change requests while one is being persisted. */
+    private var appLockRequestInFlight = false
 
     override fun onCreate(savedInstanceState: Bundle?): Unit = with(binding) {
         super.onCreate(savedInstanceState)
@@ -57,14 +61,49 @@ class AppSecuritySettingsActivity : AppCompatActivity() {
         enableFaceIdSwitch.apply {
             enableFaceId.setOnClickListener { isChecked = !isChecked }
             isChecked = AppSettings.appSecurityLock
-            setOnCheckedChangeListener { _, _ ->
+            setOnCheckedChangeListener { switch, _ ->
+                // Programmatic reconciliations set the tag to skip the interactive flow.
+                if (switch.tag != null) return@setOnCheckedChangeListener
                 // Reverse switch (before official parameter changed) by silent click
                 silentlyReverseSwitch(this) { shouldLock ->
-                    // Serialized durable transition: external provider access is denied while pending.
-                    AppLockState.requestAppLock(shouldLock)
-                    if (shouldLock) AppLockManager.unlock()
+                    requestAppLockChange(shouldLock)
                 }
             }
         }
+    }
+
+    /**
+     * Sends the change through AppLockState's durable transition and only acknowledges it once
+     * persistence succeeded, showing a pending state and rejecting overlapping requests in
+     * between (Astra review R2-6).
+     */
+    private fun requestAppLockChange(shouldLock: Boolean) = with(binding) {
+        if (appLockRequestInFlight) {
+            // Ignore overlapping requests; reconcile with the last durably committed value.
+            setSwitchCheckedSilently(AppSettings.appSecurityLock)
+            return@with
+        }
+        appLockRequestInFlight = true
+        enableFaceIdSwitch.isEnabled = false
+        // Serialized durable transition: external provider access is denied while pending.
+        AppLockState.requestAppLock(shouldLock) { persisted ->
+            enableFaceIdSwitch.post {
+                appLockRequestInFlight = false
+                enableFaceIdSwitch.isEnabled = true
+                setSwitchCheckedSilently(AppSettings.appSecurityLock)
+                if (!persisted) {
+                    showSnackbar(R.string.appSecurityPersistError)
+                } else if (shouldLock) {
+                    AppLockManager.unlock()
+                }
+            }
+        }
+    }
+
+    private fun setSwitchCheckedSilently(checked: Boolean) = with(binding) {
+        // silentlyReverseSwitch and the listener skip switches whose tag is non-null.
+        enableFaceIdSwitch.tag = true
+        enableFaceIdSwitch.isChecked = checked
+        enableFaceIdSwitch.tag = null
     }
 }
