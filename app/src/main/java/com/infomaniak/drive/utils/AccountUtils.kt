@@ -274,10 +274,14 @@ object AccountUtils : CredentialManager(
 
     private suspend fun resetApp(context: Context) {
         if (getAllUsersCount() == 0) {
-            // Ordered security reset: durable disabled value, published cache, provider
-            // notification. Queued older security writes are skipped by generation, so none of
-            // them can overwrite or resurrect state after the settings-file deletion below.
-            AppLockState.requestAppLock(enabled = false)
+            // Awaited ordered security reset: returns only once the request has been durably
+            // persisted (or has failed, reported below); queued security writes drain first and
+            // newer ones cannot overtake it.
+            val resetPersisted = AppLockState.requestAppLockAwait(enabled = false)
+            if (!resetPersisted) {
+                SentryLog.w("AccountUtils", "resetApp> app lock reset could not be persisted")
+            }
+
             AppSettings.resetAppSettings()
             UiSettings(context).removeUiSettings()
             AppReviewSettingsRepository(context).clear()
@@ -288,10 +292,14 @@ object AccountUtils : CredentialManager(
                 disableAutoSync()
             }
 
-            // Delete all app data
-            with(context) {
-                filesDir.deleteRecursively()
-                cacheDir.deleteRecursively()
+            // Delete all app data with the transition writer quiesced: no queued or running
+            // security write can touch or recreate the settings store during deletion, and new
+            // requests are refused until the deletion is done.
+            AppLockState.runWithWriterQuiesced {
+                with(context) {
+                    filesDir.deleteRecursively()
+                    cacheDir.deleteRecursively()
+                }
             }
             SentryLog.i("AccountUtils", "resetApp> all user data has been deleted")
         }

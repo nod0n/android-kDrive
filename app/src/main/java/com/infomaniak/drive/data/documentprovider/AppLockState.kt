@@ -59,6 +59,23 @@ object AppLockState {
     fun requestAppLock(enabled: Boolean, onResult: ((Boolean) -> Unit)? = null): Long =
         transitions.request(enabled, onResult)
 
+    /**
+     * Requests a change of the app-lock setting and suspends until it has fully completed:
+     * returns true only when the requested value became the durable one (false on persist
+     * failure, supersession, or refusal while the writer is under maintenance).
+     */
+    suspend fun requestAppLockAwait(enabled: Boolean): Boolean {
+        val result = CompletableDeferred<Boolean>()
+        transitions.request(enabled) { persisted -> result.complete(persisted) }
+        return result.await()
+    }
+
+    /**
+     * Runs [block] after all queued transition tasks have completed and with new requests
+     * refused; see [AppLockTransitions.runWithWriterQuiesced].
+     */
+    suspend fun <T> runWithWriterQuiesced(block: () -> T): T = transitions.runWithWriterQuiesced(block)
+
     /** Shared transition boundary for final authorization/issuance (see [AppLockTransitions]). */
     fun <T> withAdmission(block: () -> T): T = transitions.withAdmission(block)
 

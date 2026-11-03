@@ -17,6 +17,7 @@
  */
 package com.infomaniak.drive.data.documentprovider
 
+import kotlinx.coroutines.CompletableDeferred
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -65,6 +66,15 @@ class AppLockTransitions(
     /** Guards [admittedWork]; acquired inside admission sections and by transitions. */
     private val workLock = Any()
 
+    /** Transition tasks enqueued but not yet fully completed; the writer drains them in order. */
+    private var outstandingTasks = 0
+
+    /** Completed whenever [outstandingTasks] returns to zero; replaced when it leaves zero. */
+    private var quiescenceSignal: CompletableDeferred<Unit> = CompletableDeferred(Unit).apply { complete(Unit) }
+
+    /** True while a maintenance section (e.g. logout settings deletion) excludes the writer. */
+    private var maintenanceActive = false
+
     /**
      * Registers work whose network issuance was admitted under the current policy. A later
      * transition cancels it, so network I/O for admitted mutations only proceeds while no
@@ -101,10 +111,20 @@ class AppLockTransitions(
     fun request(enabled: Boolean, onResult: ((Boolean) -> Unit)? = null): Long {
         // Register the generation and its pending marker atomically: request() is the only
         // writer here, but both fields must flip under one exclusive acquisition regardless.
-        val generation: Long = admission.write {
-            policyGeneration += 1
-            pendingGeneration = ++latestRequestedGeneration
-            latestRequestedGeneration
+        val generation: Long? = admission.write {
+            if (maintenanceActive) {
+                null // the writer is excluded (e.g. logout cleanup); refuse rather than queue
+            } else {
+                policyGeneration += 1
+                pendingGeneration = ++latestRequestedGeneration
+                outstandingTasks += 1
+                if (outstandingTasks == 1) quiescenceSignal = CompletableDeferred()
+                latestRequestedGeneration
+            }
+        }
+        if (generation == null) {
+            onResult?.invoke(false)
+            return -1L
         }
         cancelAdmittedWork()
         onTransition()
@@ -114,21 +134,44 @@ class AppLockTransitions(
 
     private fun complete(generation: Long, enabled: Boolean, onResult: ((Boolean) -> Unit)?) {
         val isLatest = admission.read { generation == latestRequestedGeneration }
-        if (!isLatest) {
-            // A newer request supersedes this one: skip persisting so an older value can never
-            // overwrite or resurrect later state (e.g. a logout reset racing a queued enable).
-            onResult?.invoke(false)
-            return
-        }
+        try {
+            if (!isLatest) {
+                // A newer request supersedes this one: skip persisting so an older value can never
+                // overwrite or resurrect later state (e.g. a logout reset racing a queued enable).
+                onResult?.invoke(false)
+                return
+            }
 
-        val persisted = persist(enabled)
-        admission.write {
-            policyGeneration += 1
-            if (pendingGeneration == generation && persisted) pendingGeneration = null
+            val persisted = persist(enabled)
+            admission.write {
+                policyGeneration += 1
+                if (pendingGeneration == generation && persisted) pendingGeneration = null
+            }
+            cancelAdmittedWork()
+            onTransition()
+            onResult?.invoke(persisted)
+        } finally {
+            admission.write {
+                outstandingTasks -= 1
+                if (outstandingTasks == 0) quiescenceSignal.complete(Unit)
+            }
         }
-        cancelAdmittedWork()
-        onTransition()
-        onResult?.invoke(persisted)
+    }
+
+    /**
+     * Runs [block] after every queued transition task has fully completed (persist included),
+     * while new requests are refused for the duration. Used to exclude settings-file deletion
+     * from queued or running security writers; failure of the maintenance work itself is the
+     * caller's to handle before declaring its lifecycle step complete.
+     */
+    suspend fun <T> runWithWriterQuiesced(block: () -> T): T {
+        admission.write { maintenanceActive = true }
+        try {
+            quiescenceSignal.await()
+            return block()
+        } finally {
+            admission.write { maintenanceActive = false }
+        }
     }
 
     private companion object {
