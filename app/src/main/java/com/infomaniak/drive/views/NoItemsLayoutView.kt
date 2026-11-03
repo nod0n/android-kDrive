@@ -47,7 +47,12 @@ class NoItemsLayoutView @JvmOverloads constructor(
         binding.noItemsIconLayout.root.setBackgroundResource(R.drawable.round_empty_secondary)
     }
 
-    fun toggleVisibility(isVisible: Boolean, noNetwork: Boolean = false, showRefreshButton: Boolean = true) = with(binding) {
+    fun toggleVisibility(
+        isVisible: Boolean,
+        noNetwork: Boolean = false,
+        showRefreshButton: Boolean = true,
+        refreshAction: (() -> Unit)? = null,
+    ) = with(binding) {
 
         if (isVisible) {
             this@NoItemsLayoutView.isVisible = true
@@ -65,7 +70,12 @@ class NoItemsLayoutView @JvmOverloads constructor(
                 noItemsIconLayout.icon.setImageResource(iNoItemsLayoutView.noItemsIcon)
                 noItemsIconLayout.icon.imageTintList = ColorStateList.valueOf(ContextCompat.getColor(context, R.color.iconColor))
                 noItemsTitle.setText(iNoItemsLayoutView.noItemsTitle)
-                noItemsRefreshButton.isGone = true
+                if (refreshAction != null) {
+                    noItemsRefreshButton.isVisible = true
+                    noItemsRefreshButton.setOnClickListener { refreshAction() }
+                } else {
+                    noItemsRefreshButton.isGone = true
+                }
             }
 
             description?.let {

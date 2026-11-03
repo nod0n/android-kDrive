@@ -128,6 +128,7 @@ class GalleryFragment : MultiSelectFragment(
             configGalleryLayoutManager()
 
             noGalleryLayout.iNoItemsLayoutView = this@GalleryFragment
+            noGalleryLayout.onNetworkUnavailableRefresh = { onRefreshGallery() }
 
             observeAndDisplayNetworkAvailability(
                 mainViewModel = mainViewModel,
@@ -185,6 +186,13 @@ class GalleryFragment : MultiSelectFragment(
         }
 
         galleryViewModel.galleryApiResult.observe(viewLifecycleOwner) { result ->
+            // Drop results superseded between publication and delivery (a filter, drive or
+            // account change since their load started): they must never apply on top of the
+            // newer state, even when their post was already queued.
+            if (result != null && (result.loadGeneration != galleryViewModel.currentLoadGeneration || result.driveId != AccountUtils.currentDriveId)) {
+                return@observe
+            }
+
             galleryAdapter.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.PREVENT_WHEN_EMPTY
             if (dataAlreadyLoaded) {
                 // When the data is still available after the fragment is recreated, there's no need to reload it again.
@@ -231,11 +239,23 @@ class GalleryFragment : MultiSelectFragment(
             }
         }
 
+        // While the gallery list is empty the RecyclerView is hidden, so its scroll listener
+        // cannot drive pagination. A scan that is not complete still holds a resumable cursor:
+        // offer an explicit continuation from the empty state instead of relying on scrolling
+        // (or on restarting the pagination).
+        val canResumeFromCursor = isGalleryEmpty && !galleryAdapter.isComplete && mainViewModel.hasNetwork
         when {
-            isError -> binding.noGalleryLayout.toggleVisibility(
+            isError && !canResumeFromCursor -> binding.noGalleryLayout.toggleVisibility(
                 noNetwork = !mainViewModel.hasNetwork,
                 isVisible = isGalleryEmpty,
                 showRefreshButton = true,
+            )
+            canResumeFromCursor -> binding.noGalleryLayout.toggleVisibility(
+                isVisible = true,
+                refreshAction = {
+                    if (mainViewModel.hasNetwork) loadGallery(AccountUtils.currentDriveId)
+                    else toggleNoGalleryLayout(isError = true)
+                },
             )
             else -> binding.noGalleryLayout.toggleVisibility(isVisible = isGalleryEmpty)
         }
