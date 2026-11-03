@@ -562,6 +562,7 @@
     <string name="offlineFileNoFile">No files offline</string>
     <string name="offlineFileNoFileDescription">Select a file and make it available offline so you can find it here when you’re not logged in.</string>
     <string name="offlineFileTitle">Offline</string>
+    <string name="snackOfflineManagedByFolder">This file is available offline through its offline folder.</string>
     <string name="onBoardingDescription1">kDrive is compatible with all devices. Whether you’re at the office, at home or on the move, you can work, share and access all your data with peace of mind.</string>
     <string name="onBoardingDescription2">Easily share files and collaborate in real time on text documents, spreadsheets or team presentations.</string>
     <string name="onBoardingDescription3">Your photos, videos and screenshots will be automatically saved in your kDrive and available on all your devices.</string>

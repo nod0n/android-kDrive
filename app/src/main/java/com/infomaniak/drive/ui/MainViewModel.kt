@@ -65,6 +65,7 @@ import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.data.models.deeplink.DeeplinkType.DeeplinkAction
 import com.infomaniak.drive.data.models.file.FileExternalImport.FileExternalImportStatus
 import com.infomaniak.drive.data.models.file.SpecialFolder.Trash
+import com.infomaniak.drive.data.services.BulkDownloadWorker
 import com.infomaniak.drive.data.services.CopyToDriveProgressWorker
 import com.infomaniak.drive.data.services.DownloadWorker
 import com.infomaniak.drive.ui.addFiles.UploadFilesHelper
@@ -613,10 +614,13 @@ class MainViewModel(
     }
 
     /**
-     * Removes the offline root on [file]: covered files lose their offline copy (offline cache
-     * only), while explicit pins and files still covered by another root are kept.
+     * Removes the offline root on [file]: cancels its own work chain, then clears covered files'
+     * offline copies (offline cache only), while explicit pins and files still covered by
+     * another root are kept. If protected copies remain, the root record stays as the durable
+     * owner of the deferred cleanup until the offline sync finishes it (issue #1902).
      */
     fun removeOfflineFolderRoot(file: File, userDrive: UserDrive = UserDrive()) = viewModelScope.launch(Dispatchers.IO) {
+        WorkManager.getInstance(getContext()).cancelUniqueWork(BulkDownloadWorker.uniqueWorkName(file.id))
         OfflineFolderController.removeOfflineRoot(file.id, userDrive)
     }
 

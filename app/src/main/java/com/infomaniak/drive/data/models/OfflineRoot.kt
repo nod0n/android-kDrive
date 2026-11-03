@@ -43,6 +43,14 @@ open class OfflineRoot(
     var path: String = "",
     var createdAt: Date = Date(),
     var lastSyncedAt: Date? = null,
+
+    /**
+     * True while the root has been unmarked but its deferred cleanup has not completed: some
+     * descendants still hold protected offline copies (pending uploads or unsynchronized edits).
+     * The record is the durable owner of that cleanup; it is deleted once the reconciliation
+     * finishes with nothing protected left (issue #1902).
+     */
+    var isPendingRemoval: Boolean = false,
 ) : RealmObject() {
 
     fun initUid() {

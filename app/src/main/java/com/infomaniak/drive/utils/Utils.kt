@@ -343,6 +343,7 @@ object Utils {
             .build()
         val downloadRequest = OneTimeWorkRequestBuilder<DownloadWorker>()
             .addTag(file.getWorkerTag())
+            .addTag(DownloadWorker.TAG)
             .setInputData(inputData)
             .setConstraints(constraints)
             .setExpeditedIfAvailable()
@@ -384,7 +385,14 @@ object Utils {
             .setExpeditedIfAvailable()
             .build()
 
-        workManager.enqueueUniqueWork(BulkDownloadWorker.TAG, ExistingWorkPolicy.APPEND_OR_REPLACE, downloadRequest)
+        // One independently deduplicated, cancellable work chain per root (issue #1902): a root
+        // that keeps failing can no longer block the other roots, repeated sync triggers do not
+        // append duplicate work, and removing a root cancels exactly its own chain.
+        workManager.enqueueUniqueWork(
+            BulkDownloadWorker.uniqueWorkName(folderId),
+            ExistingWorkPolicy.KEEP,
+            downloadRequest,
+        )
     }
 
     fun getInvalidFileNameCharacter(fileName: String): String? = DownloadManagerUtils.regexInvalidSystemChar.find(fileName)?.value

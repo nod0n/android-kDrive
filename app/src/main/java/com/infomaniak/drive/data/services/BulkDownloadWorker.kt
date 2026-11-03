@@ -46,6 +46,12 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
     private var walkCompleted = false
     private var synchronizationSucceeded = false
 
+    /**
+     * Files whose download completed successfully: only their pending markers may be cleared at
+     * the end, unfinished work keeps its evidence for the offline sync (issue #1902).
+     */
+    private val completedFileIds = mutableListOf<Int>()
+
     private val userDrive: UserDrive by lazy {
         UserDrive(
             userId = inputData.getInt(USER_ID, AccountUtils.currentUserId),
@@ -112,20 +118,22 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
     override fun onFinish() {
         FileController.markFilesAsOffline(
             customRealm = null,
-            filesId = files.map { it.id },
+            filesId = completedFileIds,
             isMarkedAsOffline = false,
             userDrive = userDrive,
         )
         if (recursive) {
-            // The root folder itself carries the "walk in progress" marker.
-            FileController.markFilesAsOffline(
-                customRealm = null,
-                filesId = listOf(folderId),
-                isMarkedAsOffline = false,
-                userDrive = userDrive,
-            )
-            if (walkCompleted && synchronizationSucceeded) {
-                OfflineFolderController.updateLastSyncedAt(folderId, userDrive)
+            // The root folder itself carries the "walk in progress" marker; it is only cleared
+            // for a successful synchronization so unfinished work keeps its pending state
+            // (issue #1902). An explicit removal clears it through the pending-removal path.
+            if (synchronizationSucceeded) {
+                FileController.markFilesAsOffline(
+                    customRealm = null,
+                    filesId = listOf(folderId),
+                    isMarkedAsOffline = false,
+                    userDrive = userDrive,
+                )
+                if (walkCompleted) OfflineFolderController.updateLastSyncedAt(folderId, userDrive)
             }
         }
         clearLastDownloadedFile()
@@ -158,8 +166,9 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
 
         files.forEach { file ->
             // Validate effective coverage before starting each download: unmarking the root
-            // must not leave this batch converting the remaining files into explicit pins.
-            if (recursive && !OfflineFolderController.isOfflineRoot(folderId, userDrive)) {
+            // must not leave this batch converting the remaining files into explicit pins. A
+            // root pending removal no longer validates coverage (issue #1902).
+            if (recursive && !OfflineFolderController.hasActiveOfflineRoot(folderId, userDrive)) {
                 SentryLog.i(TAG, "Offline root $folderId was removed mid-batch, stopping the remaining downloads")
                 allFilesSucceeded = false
                 return@forEach
@@ -168,7 +177,11 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
             val result = downloadOfflineFileManager.execute(applicationContext, file) { progress, downloadedFileId ->
                 setProgressAsync(workDataOf(PROGRESS to progress, FILE_ID to downloadedFileId))
             }
-            if (result != Result.success()) allFilesSucceeded = false
+            if (result == Result.success()) {
+                completedFileIds.add(file.id)
+            } else {
+                allFilesSucceeded = false
+            }
         }
 
         if (allFilesSucceeded) {
@@ -182,5 +195,10 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
         const val TAG = "BulkDownloadWorker"
         const val FOLDER_ID = "folder_id"
         const val RECURSIVE = "recursive"
+
+        /**
+         * Independently deduplicated and cancellable work identity per root (issue #1902).
+         */
+        fun uniqueWorkName(folderId: Int) = "${TAG}_$folderId"
     }
 }

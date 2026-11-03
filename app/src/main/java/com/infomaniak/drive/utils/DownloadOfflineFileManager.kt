@@ -375,19 +375,21 @@ class DownloadOfflineFileManager(
 
         fun getFailedDownloadWorkerOffline(context: Context) = WorkManager.getInstance(context).getWorkInfosLiveData(
             WorkQuery.Builder
-                .fromUniqueWorkNames(arrayListOf(BulkDownloadWorker.TAG, DownloadWorker.TAG))
+                .fromTags(arrayListOf(BulkDownloadWorker::class.java.toString(), DownloadWorker.TAG))
                 .addStates(arrayListOf(WorkInfo.State.FAILED))
                 .build()
         )
 
         suspend fun isBulkDownloadWorkerRunning(context: Context): Boolean {
+            // One work chain per root (issue #1902): match the shared class tag instead of a
+            // single unique name.
             val workQuery = WorkQuery.Builder
-                .fromUniqueWorkNames(arrayListOf(BulkDownloadWorker.TAG))
+                .fromTags(arrayListOf(BulkDownloadWorker::class.java.toString()))
                 .addStates(arrayListOf(WorkInfo.State.RUNNING, WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED))
                 .build()
             val workInfoList = WorkManager.getInstance(context).getWorkInfos(workQuery).await()
 
-            return workInfoList.isNotEmpty() && workInfoList.first().state == WorkInfo.State.RUNNING
+            return workInfoList.any { it.state == WorkInfo.State.RUNNING }
         }
 
         fun createDownloadNotification(context: Context, id: UUID, title: String): NotificationCompat.Builder {

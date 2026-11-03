@@ -367,10 +367,12 @@ object FileController {
                 currentRealm.executeTransaction {
                     getFileById(currentRealm, fileId)?.let { file ->
                         file.isOffline = isOffline
-                        // Removing the explicit pin must not strip coverage from a file that
-                        // another offline root still covers (issue #1902).
-                        if (!isOffline && !OfflineFolderController.isInsideAnotherRoot(currentRealm, fileId)) {
-                            file.isInOfflineFolder = false
+                        if (!isOffline) {
+                            // Removing the explicit pin must materialize the current coverage
+                            // result (issue #1902): a file still covered by a root keeps its
+                            // inherited state (even when the pin was the only flag so far),
+                            // while an uncovered file loses any stale inherited flag.
+                            file.isInOfflineFolder = OfflineFolderController.isInsideAnotherRoot(currentRealm, fileId)
                         }
                     }
                 }

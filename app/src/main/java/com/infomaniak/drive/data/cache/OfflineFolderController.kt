@@ -55,9 +55,14 @@ object OfflineFolderController {
         customRealm: Realm? = null,
     ): Boolean {
         val block: (Realm) -> Boolean = { realm ->
-            val alreadyExists = getOfflineRoot(folder.id, customRealm = realm) != null
-            if (alreadyExists) {
+            val existingRoot = getOfflineRoot(folder.id, customRealm = realm)
+            if (existingRoot != null && !existingRoot.isPendingRemoval) {
                 false
+            } else if (existingRoot != null) {
+                // Re-marking a root whose deferred cleanup is still running revives it.
+                realm.executeTransaction { if (existingRoot.isValid) existingRoot.isPendingRemoval = false }
+                updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
+                true
             } else {
                 realm.executeTransaction {
                     val root = OfflineRoot(
@@ -99,11 +104,40 @@ object OfflineFolderController {
                 if (isCoveredByAncestorRoot) {
                     RemovalResult(rootExisted = true)
                 } else {
-                    clearCoverageRecursively(context, realm, folderId, userDrive).also { it.rootExisted = true }
+                    clearCoverageRecursively(context, realm, folderId, userDrive)
+                        .also { result ->
+                            result.rootExisted = true
+                            if (hasProtectedFilesRecursively(folderId, context, userDrive, realm)) {
+                                // Protected copies remain (pending uploads or unsynchronized
+                                // edits): the record stays as the durable owner of the deferred
+                                // cleanup until the offline sync finishes it (issue #1902).
+                                realm.executeTransaction {
+                                    getOfflineRoot(folderId, customRealm = realm)?.let { pendingRoot ->
+                                        if (pendingRoot.isValid) pendingRoot.isPendingRemoval = true
+                                    }
+                                }
+                            } else {
+                                // Nothing protected remains: the removal completes now.
+                                realm.executeTransaction {
+                                    getOfflineRoot(folderId, customRealm = realm)?.let { finishedRoot ->
+                                        if (finishedRoot.isValid) finishedRoot.deleteFromRealm()
+                                    }
+                                }
+                            }
+                        }
                 }
             }
         }
         return customRealm?.let(block) ?: FileController.getRealmInstance(userDrive).use(block)
+    }
+
+    /**
+     * Whether a root record exists and is active (not pending removal). Only active roots
+     * establish coverage and validate downloads (issue #1902).
+     */
+    fun hasActiveOfflineRoot(folderId: Int, userDrive: UserDrive = UserDrive(), customRealm: Realm? = null): Boolean {
+        val root = getOfflineRoot(folderId, userDrive, customRealm) ?: return false
+        return !root.isPendingRemoval
     }
 
     fun getOfflineRoot(folderId: Int, userDrive: UserDrive = UserDrive(), customRealm: Realm? = null): OfflineRoot? {
@@ -190,6 +224,61 @@ object OfflineFolderController {
     fun isFileCoveredByAnyRoot(fileId: Int, userDrive: UserDrive = UserDrive(), customRealm: Realm? = null): Boolean {
         val block: (Realm) -> Boolean = { realm -> isInsideAnotherRoot(realm, fileId) }
         return customRealm?.let(block) ?: FileController.getRealmInstance(userDrive).use(block)
+    }
+
+    /**
+     * Whether any non-pinned descendant of [rootFolderId] still holds a protected offline copy
+     * (pending upload or unsynchronized edit): while that is true, the root record must stay as
+     * the durable owner of the deferred cleanup (issue #1902).
+     */
+    fun hasProtectedFilesRecursively(
+        rootFolderId: Int,
+        context: Context,
+        userDrive: UserDrive,
+        customRealm: Realm,
+    ): Boolean {
+        val visited = mutableSetOf(rootFolderId)
+        val queue = ArrayDeque(listOf(rootFolderId))
+
+        while (queue.isNotEmpty()) {
+            val folderId = queue.removeFirst()
+            val children = customRealm.where(File::class.java)
+                .equalTo(File::parentId.name, folderId)
+                .findAll()
+            for (child in children.createSnapshot()) {
+                if (child.isFolder()) {
+                    if (visited.add(child.id)) queue.add(child.id)
+                    continue
+                }
+                if (child.isOffline) continue
+                val offlineFile = child.getOfflineFile(context, userDrive.userId) ?: continue
+                if (!offlineFile.exists()) continue
+                when (protectionStateOf(child, offlineFile, userDrive)) {
+                    CopyProtection.PENDING_UPLOAD, CopyProtection.DIRTY -> return true
+                    CopyProtection.UPLOADED, CopyProtection.NONE -> Unit
+                }
+            }
+        }
+        return false
+    }
+
+    /**
+     * Revisit of roots whose removal was deferred because protected copies remained: re-run the
+     * coverage clearing, then delete the record once nothing protected is left. Called by the
+     * offline sync so the deferred intent always has a durable owner (issue #1902).
+     */
+    fun processPendingRemovalRoots(context: Context, userDrive: UserDrive, customRealm: Realm) {
+        getOfflineRoots(customRealm = customRealm).filter { it.isPendingRemoval }.forEach { root ->
+            clearCoverageRecursively(context, customRealm, root.folderId, userDrive)
+            val stillProtected = hasProtectedFilesRecursively(root.folderId, context, userDrive, customRealm)
+            if (!stillProtected) {
+                customRealm.executeTransaction {
+                    getOfflineRoot(root.folderId, customRealm = customRealm)?.let { pendingRoot ->
+                        if (pendingRoot.isValid) pendingRoot.deleteFromRealm()
+                    }
+                }
+            }
+        }
     }
 
     private fun updateRootFolderFlags(folderId: Int, realm: Realm, isInOfflineFolder: Boolean, isMarkedAsOffline: Boolean) {
@@ -312,7 +401,7 @@ object OfflineFolderController {
      * completion check (issue #1902): [PENDING_UPLOAD] and [DIRTY] copies must survive cleanup,
      * [UPLOADED] copies are content-safe duplicates, [NONE] copies are clearable.
      */
-    private fun protectionStateOf(file: File, offlineFile: IOFile, userDrive: UserDrive): CopyProtection {
+    fun protectionStateOf(file: File, offlineFile: IOFile, userDrive: UserDrive): CopyProtection {
         val fileModifiedAt = Date(offlineFile.lastModified())
         return when {
             UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) -> CopyProtection.PENDING_UPLOAD

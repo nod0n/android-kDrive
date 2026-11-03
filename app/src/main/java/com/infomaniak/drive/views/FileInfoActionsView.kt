@@ -463,11 +463,13 @@ class FileInfoActionsView @JvmOverloads constructor(
     }
 
     /**
-     * Whether [this] folder carries its own durable offline root record (issue #1902) — the
-     * actionable intent, as opposed to the derived coverage shown by [File.isOfflineFile].
+     * Whether [this] folder carries its own active durable offline root record (issue #1902) —
+     * the actionable intent, as opposed to the derived coverage shown by [File.isOfflineFile].
+     * A root pending removal (deferred cleanup) is not active: the switch shows unchecked while
+     * the durable record finishes its work in the background.
      */
     private fun File.isFolderOfflineRoot(): Boolean {
-        return isFolder() && OfflineFolderController.isOfflineRoot(id, UserDrive(driveId = driveId))
+        return isFolder() && OfflineFolderController.hasActiveOfflineRoot(id, UserDrive(driveId = driveId))
     }
 
     fun observeOfflineProgression(lifecycleOwner: LifecycleOwner, updateFile: ((fileId: Int) -> Unit)? = null) {
@@ -680,6 +682,12 @@ class FileInfoActionsView @JvmOverloads constructor(
                 }
                 when {
                     isOffline && isChecked -> Unit
+                    !isOffline && !isChecked && isInOfflineFolder -> {
+                        // Coverage comes from an offline folder (issue #1902); individual
+                        // exclusions are out of scope, so the switch explains itself instead of
+                        // doing nothing.
+                        ownerFragment?.showSnackbar(R.string.snackOfflineManagedByFolder)
+                    }
                     !isOffline && !isChecked -> Unit
                     isChecked -> {
                         trackFileActionEvent(MatomoName.Offline, true)

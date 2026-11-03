@@ -409,6 +409,17 @@ class FileMigration : RealmMigration {
 
             oldVersionTemp++
         }
+
+        // Migrated to version 13
+        // - Add new field `isPendingRemoval` in OfflineRoot table (durable owner of the deferred
+        //   cleanup after a root removal, issue #1902)
+        if (oldVersionTemp == 12L) {
+            schema[OfflineRoot::class.java.simpleName]?.apply {
+                addField(OfflineRoot::isPendingRemoval.name, Boolean::class.java, FieldAttribute.REQUIRED)
+            }
+
+            oldVersionTemp++
+        }
     }
 
     override fun equals(other: Any?): Boolean {
@@ -436,7 +447,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 12L // Must be bumped when the schema changes
+        const val DB_VERSION = 13L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }

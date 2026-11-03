@@ -73,7 +73,7 @@ object OfflineFolderUtils {
 
             // The durable root intent must still be there: it may have been removed while this
             // walk was queued.
-            if (OfflineFolderController.getOfflineRoot(rootFolderId, customRealm = realm) == null) {
+            if (!OfflineFolderController.hasActiveOfflineRoot(rootFolderId, customRealm = realm)) {
                 return@withContext WalkResult(rootExists = false, completed = false, fileIds = emptyList())
             }
 
@@ -90,7 +90,7 @@ object OfflineFolderUtils {
                 ensureActive()
                 val folderId = folderQueue.removeFirst()
 
-                if (OfflineFolderController.getOfflineRoot(rootFolderId, customRealm = realm) == null) {
+                if (!OfflineFolderController.hasActiveOfflineRoot(rootFolderId, customRealm = realm)) {
                     // Root removed while walking: stop marking new files as covered.
                     return@withContext WalkResult(rootExists = false, completed = false, fileIds = fileIds)
                 }
@@ -295,7 +295,7 @@ object OfflineFolderUtils {
         realm.executeTransaction {
             // Re-check inside the transaction: the root may have been unmarked while this folder
             // was being listed, and the coverage flags must not be (re)introduced by a stale walk.
-            if (OfflineFolderController.getOfflineRoot(rootFolderId, customRealm = realm) == null) {
+            if (!OfflineFolderController.hasActiveOfflineRoot(rootFolderId, customRealm = realm)) {
                 return@executeTransaction
             }
             // Materialize coverage on descendant folders too, so browsing a downloaded
@@ -472,13 +472,22 @@ object OfflineFolderUtils {
     }
 
     /**
-     * Enqueues a recursive walk for every offline root of [userDrive] that needs one: either it
-     * still has files waiting for download, or its last completed walk is stale.
+     * Offline-sync hook (issue #1902): finishes the deferred cleanup of roots whose removal is
+     * still pending (durable owner), then enqueues a recursive walk for every active root that
+     * needs one — either it still has files waiting for download, or its last completed walk is
+     * stale.
      */
     suspend fun enqueueStaleOfflineFolderSyncs(context: Context, userDrive: UserDrive, customRealm: Realm) {
         val nowMillis = System.currentTimeMillis()
+
+        // Durable owner of the deferred cleanups: nothing to download for these roots, but their
+        // leftover protected copies must be revisited until the removal completes.
+        OfflineFolderController.processPendingRemovalRoots(context, userDrive, customRealm)
+
         OfflineFolderController.getOfflineRoots(customRealm = customRealm).forEach { root ->
             coroutineContext.ensureActive()
+            if (root.isPendingRemoval) return@forEach
+
             val hasPendingFiles = OfflineFolderController.hasPendingFilesRecursively(
                 rootFolderId = root.folderId,
                 customRealm = customRealm,
