@@ -73,6 +73,9 @@ class GalleryFragment : MultiSelectFragment(
     private var paginationListener: RecyclerView.OnScrollListener? = null
     private var isDownloadingGallery = false
 
+    /** The last result actually applied to the adapter: replays of it (view recreation) are skipped. */
+    private var lastAppliedResult: GalleryResult? = null
+
     var menuGalleryBinding: FragmentMenuGalleryBinding? = null
 
     override val userDrive = null
@@ -128,7 +131,7 @@ class GalleryFragment : MultiSelectFragment(
             configGalleryLayoutManager()
 
             noGalleryLayout.iNoItemsLayoutView = this@GalleryFragment
-            noGalleryLayout.onNetworkUnavailableRefresh = { onRefreshGallery() }
+            noGalleryLayout.onNetworkUnavailableRefresh = { retryGalleryOrRefresh() }
 
             observeAndDisplayNetworkAvailability(
                 mainViewModel = mainViewModel,
@@ -175,14 +178,10 @@ class GalleryFragment : MultiSelectFragment(
     }
 
     private fun observeApiResultPagination() {
-        var dataAlreadyLoaded = galleryViewModel.needToRestoreFiles
-
         if (galleryViewModel.needToRestoreFiles && galleryAdapter.galleryList.isEmpty()) {
-            // When the activity is recreated, the old data needs to be restored.
-            // The livedata will return the last page, which is not what is needed.
-            // TODO: (Realm kotlin) - Should be improved with realm kotlin, the current problem will no longer exist
+            // When the view is recreated with an empty adapter, the accumulated data of the
+            // current query needs to be restored (the stored result alone is a single page).
             galleryViewModel.restoreGalleryFiles()
-            dataAlreadyLoaded = false
         }
 
         galleryViewModel.galleryApiResult.observe(viewLifecycleOwner) { result ->
@@ -193,12 +192,13 @@ class GalleryFragment : MultiSelectFragment(
                 return@observe
             }
 
+            // A view recreation replays the last delivered result verbatim: skip only that
+            // exact, already-applied result. Anything newer (e.g. a page that completed while
+            // the view was gone) must still apply, whatever its page-request generation.
+            if (result === lastAppliedResult) return@observe
+            lastAppliedResult = result
+
             galleryAdapter.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.PREVENT_WHEN_EMPTY
-            if (dataAlreadyLoaded) {
-                // When the data is still available after the fragment is recreated, there's no need to reload it again.
-                dataAlreadyLoaded = false
-                return@observe
-            }
 
             when (result) {
                 null -> {
@@ -224,7 +224,10 @@ class GalleryFragment : MultiSelectFragment(
     }
 
     private fun addGalleryFiles(files: ArrayList<File>) {
-        if (files.isNotEmpty()) galleryAdapter.addAll(galleryAdapter.formatList(files))
+        // Always route through addAll, empty batches included: LoaderAdapter hides its loading
+        // placeholders inside addAll, so a terminal empty success or failure must still pass
+        // through or the placeholders would stay forever.
+        galleryAdapter.addAll(galleryAdapter.formatList(files))
     }
 
     private fun toggleNoGalleryLayout(isError: Boolean) {
@@ -252,10 +255,7 @@ class GalleryFragment : MultiSelectFragment(
             )
             canResumeFromCursor -> binding.noGalleryLayout.toggleVisibility(
                 isVisible = true,
-                refreshAction = {
-                    if (mainViewModel.hasNetwork) loadGallery(AccountUtils.currentDriveId)
-                    else toggleNoGalleryLayout(isError = true)
-                },
+                refreshAction = { retryGalleryOrRefresh() },
             )
             else -> binding.noGalleryLayout.toggleVisibility(isVisible = isGalleryEmpty)
         }
@@ -313,6 +313,23 @@ class GalleryFragment : MultiSelectFragment(
             val isNetworkAvailable = mainViewModel.hasNetwork
             if (isRefresh) galleryViewModel.loadLastGallery(driveId, ignoreCloud = !isNetworkAvailable)
             else if (isNetworkAvailable) galleryViewModel.loadMoreGallery(driveId, ignoreCloud = false)
+        }
+    }
+
+    private fun retryGalleryOrRefresh() {
+        // One active load at a time: the empty-state buttons bypass the scroll listener's
+        // isDownloadingGallery guard, so re-check here.
+        if (galleryViewModel.isLoadRunning) return
+
+        when {
+            // A preserved cursor means a suspended or failed scan: resume from it once the
+            // network is back. While offline, keep the retry state untouched instead of
+            // replacing it with a complete cache result or restarting pagination.
+            galleryViewModel.hasResumableCursor -> {
+                if (mainViewModel.hasNetwork) loadGallery(AccountUtils.currentDriveId)
+            }
+            // Nothing to resume: an explicit full refresh (reload page one).
+            else -> onRefreshGallery()
         }
     }
 
