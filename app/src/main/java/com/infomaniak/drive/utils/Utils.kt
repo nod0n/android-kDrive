@@ -313,11 +313,19 @@ object Utils {
         return if (type == "application/pdf") applicationContext.intentExcludingPdfReader(openWithIntent) else openWithIntent
     }
 
-    fun moveCacheFileToOffline(file: File, cacheFile: IOFile, offlineFile: IOFile) {
-        if (offlineFile.exists()) offlineFile.delete()
-        cacheFile.copyTo(offlineFile)
+    fun moveCacheFileToOffline(context: Context, file: File, cacheFile: IOFile, offlineFile: IOFile) {
+        // Stage, timestamp, then atomic rename (issue: round 3 #3): an interruption can never
+        // leave partial bytes at the offline path looking like a local edit, and the previous
+        // copy survives a failed publication.
+        val staged = DownloadOfflineFileManager.newStagedFile(context, file)
+        runCatching {
+            cacheFile.copyTo(staged, overwrite = true)
+            staged.setLastModified(file.getLastModifiedInMilliSecond())
+            staged.renameTo(offlineFile)
+        }.onFailure {
+            runCatching { if (staged.exists()) staged.delete() }
+        }
         cacheFile.delete()
-        offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
     }
 
     fun downloadAsOfflineFile(

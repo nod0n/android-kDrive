@@ -64,6 +64,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class DownloadOfflineFileManager(
     private val userDrive: UserDrive,
@@ -89,7 +90,22 @@ class DownloadOfflineFileManager(
         onProgress: (progress: Int, fileId: Int) -> Unit,
     ): ListenableWorker.Result {
 
-        val file = getFileFromRemote(context, file.id, userDrive)
+        // Reset the per-transfer cleanup state BEFORE any early return (issue: round 3 #13): a
+        // previous transfer's file must never be examined or deleted by this transfer's cleanup.
+        currentFile = file
+        lastDownloadedFile = null
+
+        // Fetch first WITHOUT committing metadata, so an inherited copy at the old location can
+        // be preserved (migrated or snapshotted) before the remote rename/move upsert would
+        // forget that location (issue: round 3 #7).
+        val remoteFile = fetchRemoteFileDetails(context, file.id)
+        preserveOldInheritedCopyBeforeRemoteRefresh(context, file.id, remoteFile)
+
+        FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+        }
+
+        val file = remoteFile
         currentFile = file
         val cacheFile = file.getCacheFile(context, userDrive)
         val offlineFile = file.getOfflineFile(context, userDrive.userId)
@@ -117,18 +133,14 @@ class DownloadOfflineFileManager(
             // We can have this case for example when we try to put a lot of files at once in offline mode
             // and for some reason, the worker is cancelled after a long time, the worker is restarted
             filesDownloaded += 1
-            lastDownloadedFile = offlineFile
             return ListenableWorker.Result.success()
         }
 
         onProgress(0, file.id)
 
-        // Reset the per-transfer cleanup state (issue #1902): the previous transfer's file must
-        // not be deleted by this transfer's final cleanup when this one early-returns.
-        lastDownloadedFile = null
-        // The published offline file is not deleted upfront: the fresh download is written to a
-        // temporary file and published by an atomic rename, so a failed transfer never destroys
-        // the previous copy (issue #1902).
+        // The previous published copy is never deleted upfront: the fresh download is staged in
+        // an app-owned directory and published by an atomic rename, so a failed transfer never
+        // destroys it (issue: round 3 #2/#4).
         if (cacheFile.exists()) cacheFile.delete()
 
         return if (currentFile?.rights?.canRead == false) {
@@ -142,31 +154,64 @@ class DownloadOfflineFileManager(
         }
     }
 
-    fun cleanLastDownloadedFile() {
-        lastDownloadedFile?.let {
-            if (it.exists() && currentFile?.isIntactFile(it) == false) it.delete()
-        }
-    }
-
-    private suspend fun moveCacheFileIfIntact(
-        context: Context,
-        file: File,
-        cacheFile: IOFile,
-        offlineFile: IOFile,
-    ): Boolean = withContext(Dispatchers.IO) {
-        if (!file.isObsoleteOrNotIntact(cacheFile)) {
-            Utils.moveCacheFileToOffline(file, cacheFile, offlineFile)
-            notifyCompleted(file, offlineFile, context)
-            lastDownloadedFile = offlineFile
-            return@withContext true
-        }
-        return@withContext false
-    }
-
-    private suspend fun getFileFromRemote(
+    /**
+     * Preserves an inherited copy at its OLD location before the remote rename/move metadata is
+     * committed: a clean copy is migrated to the new location, a pending upload keeps its source
+     * bytes in place, and a dirty copy is snapshotted into the durable upload queue under the NEW
+     * identity (issue: round 3 #7). Explicit pins keep their existing sync behavior.
+     */
+    private fun preserveOldInheritedCopyBeforeRemoteRefresh(
         context: Context,
         fileId: Int,
-        userDrive: UserDrive = UserDrive(),
+        remoteFile: File,
+    ) {
+        val oldRow = FileController.getFileByUidOrId(fileId, userDrive) ?: return
+        if (oldRow.isOffline || !oldRow.isInOfflineFolder) return
+        val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() } ?: return
+        val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
+        val locationChanged = newOffline == null || newOffline.path != oldOffline.path
+        if (!locationChanged) return
+
+        when (OfflineFolderController.protectionStateOf(oldRow, oldOffline, userDrive)) {
+            OfflineFolderController.CopyProtection.PENDING_UPLOAD -> Unit
+            // Keep the old bytes: the upload still reads from this exact path. The new location
+            // is queued for download by the regular guards below.
+            OfflineFolderController.CopyProtection.DIRTY -> {
+                // Snapshot the edited bytes under the NEW identity so the upload targets the
+                // renamed/moved remote file, then the old path can go.
+                OfflineFolderController.registerDirtySnapshot(context, remoteFile, oldOffline, userDrive)
+                runCatching { oldOffline.delete() }
+            }
+            OfflineFolderController.CopyProtection.UPLOADED, OfflineFolderController.CopyProtection.NONE -> {
+                // Clean copy: migrate it to the new location (rename keeps content and remote
+                // timestamp); if the migration fails the regular guards queue a fresh download.
+                runCatching {
+                    newOffline?.parentFile?.mkdirs()
+                    if (newOffline != null && (!newOffline.exists() || newOffline.delete()) && oldOffline.renameTo(newOffline)) {
+                        Unit
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Cleanup only ever concerns this transfer's owned staged file: it is deleted on failure and
+     * renamed on success, so at cleanup time an existing staged file is always residue.
+     */
+    fun cleanLastDownloadedFile() {
+        lastDownloadedFile?.let { staged ->
+            runCatching { if (staged.exists()) staged.delete() }
+        }
+    }
+
+    /**
+     * Fetches the fresh remote metadata WITHOUT committing it to Realm: the caller preserves any
+     * old inherited copy first, then upserts (issue: round 3 #7).
+     */
+    private suspend fun fetchRemoteFileDetails(
+        context: Context,
+        fileId: Int,
     ): File {
         // Always use the captured account's HTTP client: the walk may target another account/drive
         // than the currently active one (issue #1902).
@@ -177,10 +222,7 @@ class DownloadOfflineFileManager(
             )
         }
         val remoteFile = fileDetails.data
-        val file = if (fileDetails.isSuccess() && remoteFile != null) {
-            FileController.getRealmInstance(userDrive).use { realm ->
-                FileController.updateExistingFile(newFile = remoteFile, realm = realm)
-            }
+        return if (fileDetails.isSuccess() && remoteFile != null) {
             remoteFile
         } else {
             if (fileDetails.error?.exception is NetworkException) throw UploadTask.NetworkException()
@@ -191,8 +233,101 @@ class DownloadOfflineFileManager(
             val responseJson = ApiController.gson.toJson(fileDetails, responseGsonType)
             throw RemoteFileException("$responseJson $translatedErrorText")
         }
+    }
 
-        return file
+    /**
+     * Promotes an intact cache file through the same staged, validated publication as network
+     * downloads (issue: round 3 #3): partial promotion bytes never appear at the offline path,
+     * and the final coordinated recheck runs before the atomic replace.
+     */
+    private suspend fun moveCacheFileIfIntact(
+        context: Context,
+        file: File,
+        cacheFile: IOFile,
+        offlineFile: IOFile,
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (file.isObsoleteOrNotIntact(cacheFile)) return@withContext false
+
+        val staged = newStagedFile(context, file)
+        val published = runCatching {
+            cacheFile.copyTo(staged, overwrite = true)
+            publishStagedOfflineFile(file, offlineFile, staged)
+        }.onFailure { exception ->
+            SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
+        }.getOrDefault(PublicationOutcome.FAILED)
+
+        runCatching { if (staged.exists()) staged.delete() }
+        when (published) {
+            PublicationOutcome.PUBLISHED -> {
+                notifyCompleted(file, offlineFile, context)
+                true
+            }
+            // Nothing was replaced (target protected or intent gone): the transfer is done.
+            PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
+                fileDownloaded(context, file.id)
+                true
+            }
+            PublicationOutcome.FAILED -> false
+        }
+    }
+
+    /**
+     * Final coordinated publication, shared by network downloads and cache promotion (issues:
+     * round 3 #2 and #4). Serialized per account/drive/file across bulk and single-file workers;
+     * under the lock it revalidates cancellation, the live intent, pending uploads on the target
+     * and the target's revision, then replaces the destination by atomic POSIX rename WITHOUT
+     * pre-deleting it, so a failed publication never destroys the previous copy.
+     */
+    private suspend fun publishStagedOfflineFile(
+        file: File,
+        target: IOFile,
+        staged: IOFile,
+    ): PublicationOutcome = withContext(Dispatchers.IO) {
+        synchronized(publicationLock(userDrive, file.id)) {
+            coroutineContext.ensureActive()
+
+            // Live intent: an inherited download requires a current pin or durable root
+            // ancestry (a materialized inherited flag alone never authorizes retention); a pin
+            // download accepts its own pending marker as the user's request.
+            val intentOk = FileController.getRealmInstance(userDrive).use { realm ->
+                val live = FileController.getFileById(realm, file.id)
+                val pinned = live?.isOffline == true
+                val ancestryCovers = OfflineFolderController.isInsideAnotherRoot(realm, file.id)
+                if (isInheritedDownload) {
+                    pinned || ancestryCovers
+                } else {
+                    pinned || live?.isMarkedAsOffline == true || ancestryCovers
+                }
+            }
+
+            if (!intentOk) {
+                runCatching { staged.delete() }
+                return@withContext PublicationOutcome.SKIPPED_INVALIDATED
+            }
+
+            // The existing copy may have been edited or registered for upload during the
+            // transfer: those bytes always win over the freshly downloaded ones.
+            if (target.exists()) {
+                val targetProtected = UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
+                        OfflineFolderPolicy.isLocallyModified(
+                            offlineFileLastModifiedMillis = target.lastModified(),
+                            remoteLastModifiedAtSeconds = file.lastModifiedAt,
+                        )
+                if (targetProtected) {
+                    runCatching { staged.delete() }
+                    return@withContext PublicationOutcome.SKIPPED_PROTECTED
+                }
+            }
+
+            staged.setLastModified(file.getLastModifiedInMilliSecond())
+            if (staged.renameTo(target)) {
+                PublicationOutcome.PUBLISHED
+            } else {
+                SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                runCatching { staged.delete() }
+                PublicationOutcome.FAILED
+            }
+        }
     }
 
     private suspend fun startOfflineDownload(
@@ -231,38 +366,34 @@ class DownloadOfflineFileManager(
 
         if (!response.isSuccessful) return@withContext ListenableWorker.Result.failure()
 
-        // Download into a temporary file and publish by atomic rename (issue #1902): in-progress
-        // bytes are never visible at the offline path, so a removal or crash during the transfer
-        // can neither mistake partial content for a user edit nor destroy the previous copy.
-        val tempFile = IOFile(offlineFile.parentFile, "${offlineFile.name}.tmp")
-        runCatching { if (tempFile.exists()) tempFile.delete() }
-        makeSureFileExists(tempFile) ?: return@withContext ListenableWorker.Result.failure()
+        // Download into a unique, app-owned staged file (issue: round 3 #2): never a sibling of
+        // the offline path (a user file could live there), never shared between concurrent
+        // workers. In-progress bytes are never visible at the offline path.
+        val staged = newStagedFile(context, file)
+        lastDownloadedFile = staged
+        makeSureFileExists(staged) ?: return@withContext ListenableWorker.Result.failure()
 
         runCatching {
-            val remoteDataHasBeenSaved = saveRemoteData(downloadWorker.workerTag(), response, tempFile)
+            val remoteDataHasBeenSaved = saveRemoteData(downloadWorker.workerTag(), response, staged)
 
-            // Validate before publishing (size when the remote metadata carries one), timestamp,
-            // then publish by atomic rename.
-            val sizeIsValidated = file.size == null || file.isIntactFile(tempFile)
-            if (remoteDataHasBeenSaved && tempFile.exists() && sizeIsValidated) {
-                // Validate and timestamp before publishing: the published file carries the remote
-                // modification date, so it can never look like a locally newer edit.
-                tempFile.setLastModified(file.getLastModifiedInMilliSecond())
-                if (offlineFile.exists()) offlineFile.delete()
-                if (!tempFile.renameTo(offlineFile)) {
-                    SentryLog.e(TAG, "Failed to publish downloaded file to ${offlineFile.path}")
-                    tempFile.delete()
+            // Validate before publishing (size when the remote metadata carries one), then hand
+            // over to the final coordinated publication (intent, pending uploads, target
+            // revision, atomic replace).
+            val sizeIsValidated = file.size == null || file.isIntactFile(staged)
+            if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated) {
+                val outcome = publishStagedOfflineFile(file, offlineFile, staged)
+                if (outcome == PublicationOutcome.FAILED) {
                     return@withContext ListenableWorker.Result.failure()
                 }
                 onProgress(100, file.id)
                 notifyCompleted(file, offlineFile, context)
                 ListenableWorker.Result.success()
             } else {
-                tempFile.delete()
+                runCatching { staged.delete() }
                 ListenableWorker.Result.failure()
             }
         }.cancellable().getOrElse {
-            tempFile.delete()
+            runCatching { staged.delete() }
             throw it
         }
     }
@@ -375,6 +506,31 @@ class DownloadOfflineFileManager(
     companion object {
         private const val MAX_INTERVAL_BETWEEN_PROGRESS_UPDATE_MS = 1000L
         private val TAG = DownloadOfflineFileManager::class.java.simpleName
+
+        private const val STAGING_FOLDER = "offline_staging"
+
+        private enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_INVALIDATED, FAILED }
+
+        /** Per account/drive/file publication locks, shared by bulk and single-file workers. */
+        private val publicationLocks = ConcurrentHashMap<String, Any>()
+
+        private fun publicationLock(userDrive: UserDrive, fileId: Int): Any =
+            publicationLocks.getOrPut("${userDrive.userId}_${userDrive.driveId}_$fileId") { Any() }
+
+        /**
+         * App-owned staging directory on the SAME volume as the offline storage (so publication
+         * is an atomic rename), but OUTSIDE it: remote file paths can never resolve here, so no
+         * user content can be staged-over or mistaken for residue (issue: round 3 #2).
+         */
+        private fun stagingDirectory(context: Context): IOFile =
+            IOFile(File.getOfflineFolder(context).parentFile, STAGING_FOLDER).apply { if (!exists()) mkdirs() }
+
+        /**
+         * A unique staged file per transfer: identical downloads by concurrent workers (e.g. an
+         * ancestor and a nested root) never collide (issue: round 3 #2).
+         */
+        internal fun newStagedFile(context: Context, file: File): IOFile =
+            IOFile(stagingDirectory(context), "${file.id}_${file.driveId}_${UUID.randomUUID()}.part")
 
         fun getFailedDownloadWorkerOffline(context: Context) = WorkManager.getInstance(context).getWorkInfosLiveData(
             WorkQuery.Builder
