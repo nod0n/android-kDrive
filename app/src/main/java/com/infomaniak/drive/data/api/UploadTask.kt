@@ -137,7 +137,10 @@ class UploadTask(
                 scope.setExtra("fileModifiedAt", "${uploadFile.fileModifiedAt.time}")
                 scope.setExtra("fileCreatedAt", "${uploadFile.fileCreatedAt?.time}")
             }
-            if (uploadFile.isSchemeFile()) Dispatchers.IO { uploadFile.getUriObject().toFile().delete() }
+            // An unsent offline-edit snapshot (or offline source) must never be deleted by a
+            // validation failure: the record is retained by deleteIfExists and the bytes stay
+            // retrievable for a later retry (issue: round 5 #1).
+            if (uploadFile.isSchemeFile() && !uploadFile.isSyncOffline()) Dispatchers.IO { uploadFile.getUriObject().toFile().delete() }
             uploadFile.deleteIfExists(keepFile = uploadFile.isSync())
         } catch (exception: FileNotFoundException) {
             uploadFile.deleteIfExists(keepFile = uploadFile.isSync())

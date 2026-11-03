@@ -235,8 +235,10 @@ object FileController {
         }
     }
 
-    fun getFolderOfflineFilesId(folderId: Int, sortType: SortType): List<Int> {
-        return getRealmInstance().use { realm ->
+    fun getFolderOfflineFilesId(folderId: Int, sortType: SortType, userDrive: UserDrive? = null): List<Int> {
+        // Enumerate in the caller's captured account scope, not the currently active one
+        // (issue: round 5 #16).
+        return getRealmInstance(userDrive).use { realm ->
             val realmFiles = realm.where(File::class.java)
                 .equalTo(File::parentId.name, folderId)
                 .equalTo(File::isMarkedAsOffline.name, true)

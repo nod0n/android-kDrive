@@ -54,7 +54,15 @@ class UploadInProgressViewModel(application: Application) : AndroidViewModel(app
 
         if (localFolder == null) {
             with(ApiRepository.getFileDetails(File(id = folderId, driveId = userDrive.driveId))) {
-                if (error?.code == "object_not_found") UploadFile.deleteAll(folderId, permanently = true)
+                if (error?.code == "object_not_found") {
+                        // Scoped to the viewed account and drive (issue: round 5 #14).
+                        UploadFile.deleteAll(
+                            folderId = folderId,
+                            permanently = true,
+                            userId = userDrive.userId,
+                            driveId = userDrive.driveId,
+                        )
+                    }
                 remoteFolder = data
             }
         }

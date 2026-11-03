@@ -168,10 +168,13 @@ open class UploadFile(
             val response = ApiRepository.cancelSession(uploadFileProxy.driveId, uploadToken, okHttpClient)
             if (response.error?.exception is NetworkException) throw UploadTask.NetworkException()
         }
-        // Delete in realm
+        // Delete in realm. An UNSENT SYNC_OFFLINE record (validation failure, quota, cancel) is
+        // the durable owner of the only copy of an offline edit: it is always retained as a
+        // soft-deleted record, regardless of the caller's keepFile request (issue: round 5 #1).
+        val unsentOfflineEdit = uploadFileProxy.isSyncOffline() && uploadFileProxy.uploadAt == null
         realm.executeTransaction {
             if (uploadFileProxy.isValid) {
-                if (keepFile) uploadFileProxy.deletedAt = Date() else uploadFileProxy.deleteFromRealm()
+                if (keepFile || unsentOfflineEdit) uploadFileProxy.deletedAt = Date() else uploadFileProxy.deleteFromRealm()
             }
         }
     }
@@ -484,10 +487,17 @@ open class UploadFile(
             }
         }
 
-        fun cancelAllPendingFilesSessions(folderId: Int) {
+        /**
+         * Cancels in-flight sessions for a folder, scoped by account and drive so one account's
+         * cancellation cannot reach another account's snapshots in a shared folder (issue:
+         * round 5 #14).
+         */
+        fun cancelAllPendingFilesSessions(folderId: Int, userId: Int? = null, driveId: Int? = null) {
             getRealmInstance().use { realm ->
                 realm.uploadTable
-                    .equalTo(UploadFile::remoteFolder.name, folderId)
+                    .apply { folderId.let { equalTo(UploadFile::remoteFolder.name, folderId) } }
+                    .apply { userId?.let { equalTo(UploadFile::userId.name, it) } }
+                    .apply { driveId?.let { equalTo(UploadFile::driveId.name, it) } }
                     .isNull(UploadFile::uploadAt.name)
                     .isNotNull(UploadFile::uploadToken.name)
                     .findAll()?.onEach { uploadFileProxy ->
@@ -545,7 +555,8 @@ open class UploadFile(
                             }
                     } else {
                         // Delete all uploads with type SYNC
-                        pendingUploadsQuery(realm, folderId, driveIds = driveId?.let { arrayOf(it) })
+                        realm.uploadTable
+                            .scoped()
                             .equalTo(UploadFile::type.name, Type.SYNC.name)
                             .isNull(UploadFile::uploadAt.name)
                             .findAll().forEach { uploadFile -> uploadFile.deletedAt = Date() }

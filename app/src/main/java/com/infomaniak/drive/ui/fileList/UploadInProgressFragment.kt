@@ -206,9 +206,12 @@ class UploadInProgressFragment : FileListFragment() {
                 UploadFile.deleteAll(listOf(it))
             }
             folderId?.let {
-                UploadFile.cancelAllPendingFilesSessions(folderId = it)
-                if (isPendingFolders()) UploadFile.deleteAll(null)
-                else UploadFile.deleteAll(folderId = it)
+                // Scope bulk cancellation/removal to the viewed account and drive (issue: round 5 #14).
+                val userId = AccountUtils.currentUserId
+                val driveId = AccountUtils.currentDriveId
+                UploadFile.cancelAllPendingFilesSessions(folderId = it, userId = userId, driveId = driveId)
+                if (isPendingFolders()) UploadFile.deleteAll(null, userId = userId, driveId = driveId)
+                else UploadFile.deleteAll(folderId = it, userId = userId, driveId = driveId)
 
                 fileRecyclerView?.post { fileAdapter.setFiles(listOf()) }
 

@@ -97,8 +97,11 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
 
             files = walkResult.fileIds.mapNotNull { FileController.getFileByUidOrId(it, userDrive) }
         } else {
-            files = FileController.getFolderOfflineFilesId(folderId = folderId, sortType = UiSettings(applicationContext).sortType)
-                .mapNotNull { FileController.getFileByUidOrId(it, userDrive) }
+            files = FileController.getFolderOfflineFilesId(
+                folderId = folderId,
+                sortType = UiSettings(applicationContext).sortType,
+                userDrive = userDrive,
+            ).mapNotNull { FileController.getFileByUidOrId(it, userDrive) }
         }
 
         // Perform the size check with the actual list in both branches: the base pre-check runs
