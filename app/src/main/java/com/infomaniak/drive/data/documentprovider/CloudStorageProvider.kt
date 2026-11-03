@@ -119,6 +119,26 @@ class CloudStorageProvider : DocumentsProvider() {
         }
     }
 
+    /**
+     * Shared transition boundary: runs [block] atomically against app-lock transitions after
+     * revalidating the policy. Slow preparation (metadata fetch, downloads) must happen BEFORE
+     * this call; only fast issuance (descriptor/pipe creation, cursor publication) and dispatch
+     * decisions belong inside.
+     */
+    private fun <T> withFinalAdmission(block: () -> T): T = AppLockState.withAdmission {
+        ensureExternalAccessAllowed()
+        block()
+    }
+
+    /**
+     * Final authorization for mutation dispatch: atomically revalidates against transitions.
+     * The remote call itself follows outside the boundary; once dispatched it is
+     * already-dispatched territory (an accepted server operation cannot be recalled).
+     */
+    private fun ensureAdmitted() {
+        AppLockState.withAdmission { ensureExternalAccessAllowed() }
+    }
+
     private fun blockedReasonMessage(decision: ProviderAccessPolicy.Reason): String = when (decision) {
         ProviderAccessPolicy.Reason.BLOCKED_BY_APP_LOCK ->
             context?.getString(R.string.cloudStorageAppLockError) ?: "kDrive is locked by App lock"
@@ -240,19 +260,13 @@ class CloudStorageProvider : DocumentsProvider() {
         }
 
         val uri = DocumentCursor.createUri(context, parentDocumentId)
-        val isNewJob = uri != oldQueryChildUri || needRefresh
 
-        SentryLog.d(TAG, "queryChildDocuments(), parentDocumentId=$parentDocumentId, sort=$sortOrder, isNew=$isNewJob")
+        val restoredCursor = retainedCursors.acquireChild(uri, cursor, parentDocumentId)
+        SentryLog.d(TAG, "queryChildDocuments(), parentDocumentId=$parentDocumentId, sort=$sortOrder, isRestore=${restoredCursor != null}")
 
-        if (isNewJob || oldQueryChildCursor == null) {
-            oldQueryChildCursor?.cancelJob()
-            oldQueryChildUri = uri
-            oldQueryChildCursor = cursor
-            currentParentDocumentId = parentDocumentId
-            needRefresh = false
-        } else {
+        if (restoredCursor != null) {
             SentryLog.i(TAG, "Restore old cursor")
-            cursor.restore(oldQueryChildCursor!!)
+            cursor.restore(restoredCursor)
             cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to false)
             cursor.setNotificationUri(context?.contentResolver, uri)
             return cursor
@@ -324,9 +338,11 @@ class CloudStorageProvider : DocumentsProvider() {
             }
         }
 
-        cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to true)
-        cursor.setNotificationUri(context?.contentResolver, uri)
-        return cursor
+        return withFinalAdmission {
+            cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to true)
+            cursor.setNotificationUri(context?.contentResolver, uri)
+            cursor
+        }
     }
 
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
@@ -419,7 +435,11 @@ class CloudStorageProvider : DocumentsProvider() {
             if (isWrite) {
                 writeDataFile(context, updatedFile, userDrive, accessMode)
             } else {
-                getDataFile(context, updatedFile, userDrive, accessMode)
+                // Resolve the local file first (may download: slow prep), then create and return
+                // the descriptor atomically against app-lock transitions.
+                resolveDataFile(context, updatedFile, userDrive)?.let { target ->
+                    withFinalAdmission { ParcelFileDescriptor.open(target, accessMode) }
+                }
             }
         }
     }
@@ -429,8 +449,6 @@ class CloudStorageProvider : DocumentsProvider() {
         query: String,
         projection: Array<out String>?
     ): Cursor = withLaxStrictMode {
-        SentryLog.d(TAG, "querySearchDocuments(), rootId=$rootId, projectionSize=${projection?.size}, $currentParentDocumentId")
-
         val cursor = DocumentCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION, isAutoCloseableJob = false)
 
         val decision = accessDecision()
@@ -441,27 +459,27 @@ class CloudStorageProvider : DocumentsProvider() {
             return cursor
         }
 
-        if (currentParentDocumentId == null ||
-            currentParentDocumentId == getUserId(currentParentDocumentId!!) ||
-            getFileIdFromDocumentId(currentParentDocumentId!!) == SHARED_WITHME_FOLDER_ID ||
-            getFileIdFromDocumentId(currentParentDocumentId!!) == MY_SHARES_FOLDER_ID
+        val browsingParentId = retainedCursors.parentDocumentId()
+        if (browsingParentId == null ||
+            browsingParentId == getUserId(browsingParentId) ||
+            getFileIdFromDocumentId(browsingParentId) == SHARED_WITHME_FOLDER_ID ||
+            getFileIdFromDocumentId(browsingParentId) == MY_SHARES_FOLDER_ID
         ) {
             val errorText = context?.getString(R.string.cloudStorageQuerySearchImpossibleSelectDrive)
             cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to errorText)
             return cursor
         }
 
-        val parentDocumentId = currentParentDocumentId!!
+        val parentDocumentId = browsingParentId
+
+        SentryLog.d(TAG, "querySearchDocuments(), rootId=$rootId, projectionSize=${projection?.size}, $parentDocumentId")
 
         val uri = DocumentCursor.createUri(context, "$rootId/search/$query")
-        val isNewSearch = uri != oldSearchUri
 
-        if (isNewSearch) {
-            oldSearchCursor?.close()
-            oldSearchUri = uri
-            oldSearchCursor = cursor
-        } else {
-            cursor.restore(oldSearchCursor!!)
+        val restoredSearchCursor = retainedCursors.acquireSearch(uri, cursor)
+
+        if (restoredSearchCursor != null) {
+            cursor.restore(restoredSearchCursor)
             cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to false)
             cursor.setNotificationUri(context?.contentResolver, uri)
             return cursor
@@ -484,9 +502,11 @@ class CloudStorageProvider : DocumentsProvider() {
             })
         }
 
-        cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to true)
-        cursor.setNotificationUri(context?.contentResolver, uri)
-        return cursor
+        return withFinalAdmission {
+            cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to true)
+            cursor.setNotificationUri(context?.contentResolver, uri)
+            cursor
+        }
     }
 
     override fun openDocumentThumbnail(
@@ -540,35 +560,44 @@ class CloudStorageProvider : DocumentsProvider() {
         val outputFile = IOFile(outputFolder, name)
         val thumbnailUrl = ApiRoutes.getThumbnailUrl(file)
 
-        val (readPipe, writePipe) = ParcelFileDescriptor.createReliablePipe()
+        // Issue the pipe atomically against transitions; the download below rechecks the policy
+        // generation before spending network I/O on behalf of an already-issued pipe.
+        return withFinalAdmission {
+            val issuedGeneration = AppLockState.policyGeneration()
+            val (readPipe, writePipe) = ParcelFileDescriptor.createReliablePipe()
 
-        val job = cloudScope.launch(Dispatchers.IO) {
-            ParcelFileDescriptor.AutoCloseOutputStream(writePipe).use { writeStream ->
-                runCatching {
-                    val okHttpClient = AccountUtils.getHttpClient(userId.toInt())
-                    val response = DownloadOfflineFileManager.downloadFileResponseAsync(thumbnailUrl, okHttpClient)
+            val job = cloudScope.launch(Dispatchers.IO) {
+                ParcelFileDescriptor.AutoCloseOutputStream(writePipe).use { writeStream ->
+                    runCatching {
+                        if (AppLockState.policyGeneration() != issuedGeneration || isExternalAccessBlocked()) {
+                            writePipe.closeWithError("kDrive is locked")
+                            return@launch
+                        }
+                        val okHttpClient = AccountUtils.getHttpClient(userId.toInt())
+                        val response = DownloadOfflineFileManager.downloadFileResponseAsync(thumbnailUrl, okHttpClient)
 
-                    if (response.isSuccessful && DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
-                        writeStream.loadFromFile(outputFile)
-                    } else if (outputFile.exists()) {
-                        writeStream.loadFromFile(outputFile)
-                    } else {
-                        writePipe.closeWithError("No thumbnail available")
+                        if (response.isSuccessful && DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
+                            writeStream.loadFromFile(outputFile)
+                        } else if (outputFile.exists()) {
+                            writeStream.loadFromFile(outputFile)
+                        } else {
+                            writePipe.closeWithError("No thumbnail available")
+                        }
+
+                    }.cancellable().onFailure { exception ->
+                        val event = SentryEvent(exception).apply {
+                            message = Message().apply { message = "An error has occurred on generateThumbnail" }
+                        }
+                        if (exception !is IOException) Sentry.captureEvent(event)
+                        writePipe.closeWithError(exception.message)
                     }
-
-                }.cancellable().onFailure { exception ->
-                    val event = SentryEvent(exception).apply {
-                        message = Message().apply { message = "An error has occurred on generateThumbnail" }
-                    }
-                    if (exception !is IOException) Sentry.captureEvent(event)
-                    writePipe.closeWithError(exception.message)
                 }
             }
+
+            signal?.setOnCancelListener { job.cancel() }
+
+            readPipe
         }
-
-        signal?.setOnCancelListener { job.cancel() }
-
-        return readPipe
     }
 
     override fun createDocument(
@@ -598,7 +627,7 @@ class CloudStorageProvider : DocumentsProvider() {
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
                 // Delete
-                ensureExternalAccessAllowed()
+                ensureAdmitted()
                 val apiResponse = FileController.deleteFile(file, realm, context = context)
 
                 if (apiResponse.isSuccess()) {
@@ -628,7 +657,7 @@ class CloudStorageProvider : DocumentsProvider() {
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
                 // Rename
-                ensureExternalAccessAllowed()
+                ensureAdmitted()
                 val apiResponse = FileController.renameFile(file, displayName, realm)
 
                 if (apiResponse.isSuccess()) {
@@ -659,7 +688,7 @@ class CloudStorageProvider : DocumentsProvider() {
                 FileController.getFileProxyById(fileId, customRealm = realm) ?: throw IllegalStateException("File not found")
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
 
-            ensureExternalAccessAllowed()
+            ensureAdmitted()
             val apiResponse = ApiRepository.duplicateFile(file, targetParentFileId)
 
             if (apiResponse.isSuccess()) {
@@ -699,7 +728,7 @@ class CloudStorageProvider : DocumentsProvider() {
             val targetParentFile =
                 FileController.getFileProxyById(targetParentFileId, customRealm = realm) ?: throw fileNotFoundException
 
-            ensureExternalAccessAllowed()
+            ensureAdmitted()
             val apiResponse = ApiRepository.moveFile(file, targetParentFile)
 
             if (apiResponse.isSuccess()) {
@@ -721,7 +750,7 @@ class CloudStorageProvider : DocumentsProvider() {
         val userDrive = createUserDrive(parentDocumentId)
         val parentId = getFileIdFromDocumentId(parentDocumentId)
 
-        ensureExternalAccessAllowed()
+        ensureAdmitted()
         val apiResponse = runBlocking { FileController.createFolder(displayName, parentId, true, userDrive) }
         val file = apiResponse.data
 
@@ -758,7 +787,7 @@ class CloudStorageProvider : DocumentsProvider() {
             lastModifiedAt = newDate,
         )
 
-        ensureExternalAccessAllowed()
+        ensureAdmitted()
         val apiResponse = ApiController.callApiBlocking<ApiResponse<File>>(
             uploadUrl,
             ApiController.ApiMethod.POST,
@@ -787,52 +816,53 @@ class CloudStorageProvider : DocumentsProvider() {
         val cacheFile = file.getCacheFile(context, userDrive)
         val handler = Handler(context.mainLooper)
 
-        return ParcelFileDescriptor.open(tempFile, accessMode, handler) { exception: IOException? ->
-            if (exception == null) {
-                cloudScope.launch {
-                    // A descriptor issued before lock-on must not trigger a new upload after it.
-                    if (isExternalAccessBlocked()) {
-                        SentryLog.i(TAG, "Skipping close-time upload of ${file.name}: external access is blocked")
-                        return@launch
+        return withFinalAdmission {
+            ParcelFileDescriptor.open(tempFile, accessMode, handler) { exception: IOException? ->
+                if (exception == null) {
+                    cloudScope.launch {
+                        // Completion capability for an already-authorized writable descriptor:
+                        // edits written before lock activation must not be silently dropped, so
+                        // the close-time upload runs even if access is now blocked (the remote
+                        // mutation it dispatches was authorized at issuance time).
+                        UploadFile(
+                            uri = tempFile.toUri().toString(),
+                            driveId = userDrive.driveId,
+                            fileCreatedAt = Date(),
+                            fileName = file.name,
+                            fileSize = tempFile.length(),
+                            remoteFolder = file.parentId,
+                            type = UploadFile.Type.CLOUD_STORAGE.name,
+                            userId = userDrive.userId,
+                        ).store()
+                        context.syncImmediately(isAutomaticTrigger = false)
+                        cacheFile.delete() // Delete old cache
                     }
-                    UploadFile(
-                        uri = tempFile.toUri().toString(),
-                        driveId = userDrive.driveId,
-                        fileCreatedAt = Date(),
-                        fileName = file.name,
-                        fileSize = tempFile.length(),
-                        remoteFolder = file.parentId,
-                        type = UploadFile.Type.CLOUD_STORAGE.name,
-                        userId = userDrive.userId,
-                    ).store()
-                    context.syncImmediately(isAutomaticTrigger = false)
-                    cacheFile.delete() // Delete old cache
+                } else {
+                    exception.printStackTrace()
+                    Sentry.captureException(exception) { scope -> scope.level = SentryLevel.INFO }
                 }
-            } else {
-                exception.printStackTrace()
-                Sentry.captureException(exception) { scope -> scope.level = SentryLevel.INFO }
             }
         }
     }
 
-    private fun getDataFile(
-        context: Context,
-        file: File,
-        userDrive: UserDrive,
-        accessMode: Int,
-    ): ParcelFileDescriptor? {
+    /**
+     * Resolves the local file backing [file] without opening it: the intact offline file, the
+     * fresh cache file, or a freshly downloaded cache file. Slow preparation only — callers open
+     * the returned file under [withFinalAdmission].
+     */
+    private fun resolveDataFile(context: Context, file: File, userDrive: UserDrive): IOFile? {
         val cacheFile = file.getCacheFile(context, userDrive)
         val offlineFile = file.getOfflineFile(context, userDrive.userId)
 
-        try {
-            // Get offline file if it's intact
+        return try {
+            // Use the offline file if it's intact
             if (offlineFile != null && file.isOfflineAndIntact(offlineFile)) {
-                return ParcelFileDescriptor.open(offlineFile, accessMode)
+                return offlineFile
             }
 
-            // Get cache file if it's exists and if the file is updated
+            // Use the cache file if it exists and if the file is updated
             if (!file.isObsolete(cacheFile) && file.size == cacheFile.length()) {
-                return ParcelFileDescriptor.open(cacheFile, accessMode)
+                return cacheFile
             }
 
             // Download data file
@@ -850,13 +880,14 @@ class CloudStorageProvider : DocumentsProvider() {
                     DownloadOfflineFileManager.saveRemoteData(TAG, response, cacheFile)
                 }
                 cacheFile.setLastModified(file.getLastModifiedInMilliSecond())
-                return ParcelFileDescriptor.open(cacheFile, accessMode)
+                cacheFile
+            } else {
+                null
             }
         } catch (exception: Exception) {
             SentryLog.e(TAG, "An error has occurred on getDataFile", exception)
+            null
         }
-
-        return null
     }
 
     private suspend fun ParcelFileDescriptor.AutoCloseOutputStream.loadCachedData(
@@ -879,9 +910,9 @@ class CloudStorageProvider : DocumentsProvider() {
         }
     }
 
-    private fun scheduleRefresh(sourceParentDocumentId: String? = currentParentDocumentId) {
+    private fun scheduleRefresh(sourceParentDocumentId: String? = retainedCursors.parentDocumentId()) {
         sourceParentDocumentId?.let {
-            needRefresh = true
+            retainedCursors.requestRefresh()
             context?.contentResolver?.notifyChange(DocumentCursor.createUri(context, it), null)
         }
     }
@@ -1080,18 +1111,86 @@ class CloudStorageProvider : DocumentsProvider() {
         }
 
         /**
+         * Synchronized registry of the retained child/search cursors and their browsing state.
+         * Each entry is tagged with the AppLockState policy generation it was created under;
+         * restoration is refused when a transition happened in between, and invalidation
+         * (cancelling jobs, clearing state) is atomic against registration and restoration.
+         */
+        private class RetainedCursors {
+
+            private var childUri: Uri? = null
+            private var childCursor: DocumentCursor? = null
+            private var childGeneration: Long = -1
+            private var searchUri: Uri? = null
+            private var searchCursor: DocumentCursor? = null
+            private var searchGeneration: Long = -1
+            private var parentDocumentId: String? = null
+            private var needRefresh = false
+
+            /**
+             * Registers [cursor] as a new child job, or returns the retained cursor when it can
+             * be restored (same URI, no pending refresh, same policy generation).
+             */
+            fun acquireChild(uri: Uri, cursor: DocumentCursor, parentDocumentId: String): DocumentCursor? = synchronized(this) {
+                val retained = childCursor
+                val canRestore = retained != null
+                        && childUri == uri
+                        && !needRefresh
+                        && childGeneration == AppLockState.policyGeneration()
+                if (canRestore) {
+                    retained
+                } else {
+                    retained?.cancelJob()
+                    childUri = uri
+                    childCursor = cursor
+                    childGeneration = AppLockState.policyGeneration()
+                    this.parentDocumentId = parentDocumentId
+                    needRefresh = false
+                    null
+                }
+            }
+
+            /** Same contract as [acquireChild] for search cursors (a new search closes the old one). */
+            fun acquireSearch(uri: Uri, cursor: DocumentCursor): DocumentCursor? = synchronized(this) {
+                val retained = searchCursor
+                val canRestore = retained != null
+                        && searchUri == uri
+                        && searchGeneration == AppLockState.policyGeneration()
+                if (canRestore) {
+                    retained
+                } else {
+                    retained?.close()
+                    searchUri = uri
+                    searchCursor = cursor
+                    searchGeneration = AppLockState.policyGeneration()
+                    null
+                }
+            }
+
+            fun invalidateAll() = synchronized(this) {
+                childCursor?.cancelJob()
+                searchCursor?.cancelJob()
+                childUri = null
+                childCursor = null
+                searchUri = null
+                searchCursor = null
+                parentDocumentId = null
+                needRefresh = false
+            }
+
+            fun parentDocumentId(): String? = synchronized(this) { parentDocumentId }
+
+            fun requestRefresh() = synchronized(this) { needRefresh = true }
+        }
+
+        private val retainedCursors = RetainedCursors()
+
+        /**
          * Invalidates listing/search state retained across calls (so stale or blocked cursors are
          * never restored) and reannounces the roots, letting observers replace stale content.
          */
         internal fun onAppLockTransition() {
-            oldQueryChildCursor?.cancelJob()
-            oldSearchCursor?.cancelJob()
-            oldQueryChildCursor = null
-            oldQueryChildUri = null
-            oldSearchCursor = null
-            oldSearchUri = null
-            currentParentDocumentId = null
-            needRefresh = false
+            retainedCursors.invalidateAll()
             notifyProviderChanged()
         }
 
@@ -1106,16 +1205,6 @@ class CloudStorageProvider : DocumentsProvider() {
         private const val KEY_PROVIDER_DISABLED = "provider_disabled"
 
         private val SHARED_URI_REGEX = Regex("\\d+/-\\d+/.+$DRIVE_SEPARATOR\\d+/\\d+")
-
-        private var currentParentDocumentId: String? = null
-
-        private var oldQueryChildUri: Uri? = null
-        private var oldQueryChildCursor: DocumentCursor? = null
-
-        private var oldSearchUri: Uri? = null
-        private var oldSearchCursor: DocumentCursor? = null
-
-        private var needRefresh: Boolean = false
 
         private val syncPermissionNotifId = UUID.randomUUID().hashCode()
 
