@@ -405,7 +405,6 @@ class FileMigration : RealmMigration {
                 addField(OfflineRoot::path.name, String::class.java, FieldAttribute.REQUIRED)
                 addField(OfflineRoot::createdAt.name, Date::class.java, FieldAttribute.REQUIRED)
                 addField(OfflineRoot::lastSyncedAt.name, Date::class.java)
-                    .setNullable(OfflineRoot::lastSyncedAt.name, true)
             }
 
             oldVersionTemp++

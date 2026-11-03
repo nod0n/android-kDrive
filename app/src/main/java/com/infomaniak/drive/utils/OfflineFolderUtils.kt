@@ -341,7 +341,7 @@ object OfflineFolderUtils {
                     nowMillis = nowMillis,
                 )
             ) {
-                enqueueBulkDownloadWorker(context, root.folderId, userDrive, recursive = true)
+                Utils.enqueueBulkDownloadWorker(context, root.folderId, userDrive, recursive = true)
             }
         }
     }
