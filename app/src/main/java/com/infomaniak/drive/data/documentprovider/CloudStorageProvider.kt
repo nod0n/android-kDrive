@@ -26,6 +26,7 @@ import android.database.Cursor
 import android.database.MatrixCursor
 import android.graphics.Point
 import android.net.Uri
+import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.Handler
 import android.os.ParcelFileDescriptor
@@ -498,19 +499,25 @@ class CloudStorageProvider : DocumentsProvider() {
         }
     }
 
-    override fun openTypedAssetFile(
+    /**
+     * Typed-content hook actually exposed by [DocumentsProvider] (the Uri-level
+     * openTypedAssetFile wrappers are final and funnel every typed request through here,
+     * before delegating to the gated openDocument by default).
+     */
+    override fun openTypedDocument(
         documentId: String,
         mimeTypeFilter: String,
+        opts: Bundle?,
         signal: CancellationSignal?
     ): AssetFileDescriptor = withLaxStrictMode {
-        SentryLog.d(TAG, "openTypedAssetFile(), id=$documentId, mimeTypeFilter=$mimeTypeFilter")
+        SentryLog.d(TAG, "openTypedDocument(), id=$documentId, mimeTypeFilter=$mimeTypeFilter")
 
         val decision = accessDecision()
         if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
             throw SecurityException(blockedReasonMessage(decision))
         }
 
-        return super.openTypedAssetFile(documentId, mimeTypeFilter, signal)
+        return super.openTypedDocument(documentId, mimeTypeFilter, opts, signal)
     }
 
     private fun generateThumbnail(fileId: Int, file: File, userId: String, signal: CancellationSignal?): ParcelFileDescriptor? {
