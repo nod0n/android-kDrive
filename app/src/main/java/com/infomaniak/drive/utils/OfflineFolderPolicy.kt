@@ -43,17 +43,19 @@ object OfflineFolderPolicy {
     }
 
     /**
-     * Whether [fileId] should be queued for download during an offline folder walk.
+     * Whether a file should be queued for download during an offline folder walk.
      *
-     * A file already covered by an explicit pin and intact doesn't need the folder coverage to
-     * download it again; anything without an intact offline copy does (the download engine then
-     * skips files it can resolve from an intact cache).
+     * Anything with an intact offline copy is skipped (explicit pins included: they are
+     * reconciled by the per-file offline sync). Copies backing a pending upload or a locally
+     * newer modification are also skipped so the walk can never overwrite unsynchronized edits;
+     * the sync layer uploads them and a later walk re-evaluates.
      */
     fun needsDownload(
-        isOffline: Boolean,
         hasIntactOfflineCopy: Boolean,
+        hasPendingUpload: Boolean,
+        isLocallyModified: Boolean,
     ): Boolean {
-        return !isOffline || !hasIntactOfflineCopy
+        return !hasIntactOfflineCopy && !hasPendingUpload && !isLocallyModified
     }
 
     /**
@@ -81,5 +83,14 @@ object OfflineFolderPolicy {
         isInOfflineFolder: Boolean,
     ): Boolean {
         return !isOffline && isInOfflineFolder
+    }
+
+    /**
+     * Whether an offline copy is locally newer than the remote file, i.e. it carries an
+     * unsynchronized edit (downloads set the copy's mtime to the remote timestamp, so any newer
+     * mtime means the user modified it).
+     */
+    fun isLocallyModified(offlineFileLastModifiedMillis: Long, remoteLastModifiedAtSeconds: Long): Boolean {
+        return offlineFileLastModifiedMillis / 1_000L > remoteLastModifiedAtSeconds
     }
 }

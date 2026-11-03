@@ -79,29 +79,74 @@ class OfflineFolderPolicyTest {
     @Test
     fun `covered file without intact offline copy needs download`() {
         assertTrue(
-            OfflineFolderPolicy.needsDownload(isOffline = false, hasIntactOfflineCopy = false)
+            OfflineFolderPolicy.needsDownload(
+                hasIntactOfflineCopy = false,
+                hasPendingUpload = false,
+                isLocallyModified = false,
+            )
         )
     }
 
     @Test
     fun `covered file with intact offline copy does not need download`() {
         assertFalse(
-            OfflineFolderPolicy.needsDownload(isOffline = false, hasIntactOfflineCopy = true)
+            OfflineFolderPolicy.needsDownload(
+                hasIntactOfflineCopy = true,
+                hasPendingUpload = false,
+                isLocallyModified = false,
+            )
         )
     }
 
     @Test
     fun `pinned file with intact offline copy is not re-downloaded by the folder walk`() {
         assertFalse(
-            OfflineFolderPolicy.needsDownload(isOffline = true, hasIntactOfflineCopy = true)
+            OfflineFolderPolicy.needsDownload(
+                hasIntactOfflineCopy = true,
+                hasPendingUpload = false,
+                isLocallyModified = false,
+            )
         )
     }
 
     @Test
     fun `pinned file without offline copy is downloaded by the folder walk`() {
         assertTrue(
-            OfflineFolderPolicy.needsDownload(isOffline = true, hasIntactOfflineCopy = false)
+            OfflineFolderPolicy.needsDownload(
+                hasIntactOfflineCopy = false,
+                hasPendingUpload = false,
+                isLocallyModified = false,
+            )
         )
+    }
+
+    @Test
+    fun `file backing a pending upload is never queued for download`() {
+        assertFalse(
+            OfflineFolderPolicy.needsDownload(
+                hasIntactOfflineCopy = false,
+                hasPendingUpload = true,
+                isLocallyModified = false,
+            )
+        )
+    }
+
+    @Test
+    fun `locally modified copy is never queued for download`() {
+        assertFalse(
+            OfflineFolderPolicy.needsDownload(
+                hasIntactOfflineCopy = false,
+                hasPendingUpload = false,
+                isLocallyModified = true,
+            )
+        )
+    }
+
+    @Test
+    fun `copy with newer mtime than remote is locally modified`() {
+        assertTrue(OfflineFolderPolicy.isLocallyModified(offlineFileLastModifiedMillis = 2_000L, remoteLastModifiedAtSeconds = 1L))
+        assertFalse(OfflineFolderPolicy.isLocallyModified(offlineFileLastModifiedMillis = 1_000L, remoteLastModifiedAtSeconds = 1L))
+        assertFalse(OfflineFolderPolicy.isLocallyModified(offlineFileLastModifiedMillis = 500L, remoteLastModifiedAtSeconds = 1L))
     }
 
     @Test
