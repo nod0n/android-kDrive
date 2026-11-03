@@ -24,6 +24,7 @@ import com.infomaniak.drive.MatomoDrive.trackSettingsEvent
 import com.infomaniak.drive.R
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.ui.menu.settings.SettingsFragment.Companion.KEY_BACK_ACTION_BOTTOM_SHEET
+import com.infomaniak.drive.utils.Utils
 
 class SyncOfflineSelectBottomSheetDialog : SyncSelectBottomSheetDialog() {
 

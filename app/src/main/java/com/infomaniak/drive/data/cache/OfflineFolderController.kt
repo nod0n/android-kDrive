@@ -27,6 +27,7 @@ import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.OfflineFolderPolicy
 import com.infomaniak.drive.utils.SyncUtils.syncImmediately
 import com.infomaniak.drive.utils.Utils.ROOT_ID
