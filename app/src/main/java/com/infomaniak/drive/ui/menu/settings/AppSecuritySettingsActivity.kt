@@ -21,6 +21,9 @@ import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.isGone
 import androidx.core.view.isVisible
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.infomaniak.core.applock.AppLockHelper.silentlyReverseSwitch
 import com.infomaniak.core.applock.AppLockManager
 import com.infomaniak.core.common.extensions.isNightModeEnabled
@@ -36,9 +39,6 @@ import com.infomaniak.drive.twoFactorAuthManager
 class AppSecuritySettingsActivity : AppCompatActivity() {
 
     private val binding: ViewSwitchSettingsBinding by lazy { ViewSwitchSettingsBinding.inflate(layoutInflater) }
-
-    /** Guards against overlapping app-lock change requests while one is being persisted. */
-    private var appLockRequestInFlight = false
 
     override fun onCreate(savedInstanceState: Bundle?): Unit = with(binding) {
         super.onCreate(savedInstanceState)
@@ -66,36 +66,44 @@ class AppSecuritySettingsActivity : AppCompatActivity() {
                 if (switch.tag != null) return@setOnCheckedChangeListener
                 // Reverse switch (before official parameter changed) by silent click
                 silentlyReverseSwitch(this) { shouldLock ->
-                    requestAppLockChange(shouldLock)
+                    AppLockRequest.request(shouldLock)
                 }
+            }
+        }
+
+        // Pending/completion state is process-wide: every instance of this screen reconciles
+        // with it, including one opened while a persistence is still running (R3-5).
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                AppLockRequest.state.collect { uiState -> renderAppLockRequestState(uiState) }
             }
         }
     }
 
-    /**
-     * Sends the change through AppLockState's durable transition and only acknowledges it once
-     * persistence succeeded, showing a pending state and rejecting overlapping requests in
-     * between (Astra review R2-6).
-     */
-    private fun requestAppLockChange(shouldLock: Boolean) = with(binding) {
-        if (appLockRequestInFlight) {
-            // Ignore overlapping requests; reconcile with the last durably committed value.
-            setSwitchCheckedSilently(AppSettings.appSecurityLock)
-            return@with
-        }
-        appLockRequestInFlight = true
-        enableFaceIdSwitch.isEnabled = false
-        // Serialized durable transition: external provider access is denied while pending.
-        AppLockState.requestAppLock(shouldLock) { persisted ->
-            enableFaceIdSwitch.post {
-                appLockRequestInFlight = false
+    private fun renderAppLockRequestState(uiState: AppLockRequest.UiState) = with(binding) {
+        when (uiState) {
+            is AppLockRequest.UiState.Idle -> {
+                enableFaceId.isEnabled = true
                 enableFaceIdSwitch.isEnabled = true
                 setSwitchCheckedSilently(AppSettings.appSecurityLock)
-                if (!persisted) {
+            }
+            is AppLockRequest.UiState.Pending -> {
+                // Disable the whole interactive row: the card click would otherwise flip the
+                // switch while its change is still being persisted.
+                enableFaceId.isEnabled = false
+                enableFaceIdSwitch.isEnabled = false
+            }
+            is AppLockRequest.UiState.Completed -> {
+                enableFaceId.isEnabled = true
+                enableFaceIdSwitch.isEnabled = true
+                // Acknowledge only the durably committed value; the published cache tracks it.
+                setSwitchCheckedSilently(AppSettings.appSecurityLock)
+                if (!uiState.persisted) {
                     showSnackbar(R.string.appSecurityPersistError)
-                } else if (shouldLock) {
+                } else if (uiState.shouldLock) {
                     AppLockManager.unlock()
                 }
+                AppLockRequest.markDelivered()
             }
         }
     }
