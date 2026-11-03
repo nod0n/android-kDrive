@@ -320,7 +320,12 @@ object Utils {
         offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
     }
 
-    fun downloadAsOfflineFile(context: Context, file: File, userDrive: UserDrive = UserDrive()) {
+    fun downloadAsOfflineFile(
+        context: Context,
+        file: File,
+        userDrive: UserDrive = UserDrive(),
+        isInheritedDownload: Boolean = false,
+    ) {
         val workManager = WorkManager.getInstance(context)
 
         if (file.isMarkedAsOffline) workManager.cancelAllWorkByTag(file.getWorkerTag())
@@ -329,6 +334,7 @@ object Utils {
             DownloadWorker.FILE_NAME to file.name,
             BaseDownloadWorker.USER_ID to userDrive.userId,
             BaseDownloadWorker.DRIVE_ID to userDrive.driveId,
+            DownloadWorker.IS_INHERITED_DOWNLOAD to isInheritedDownload,
         )
         val networkType = if (AppSettings.onlyWifiSyncOffline) NetworkType.UNMETERED else NetworkType.CONNECTED
         val constraints = Constraints.Builder()

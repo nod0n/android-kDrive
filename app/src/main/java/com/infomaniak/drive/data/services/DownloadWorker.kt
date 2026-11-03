@@ -30,6 +30,7 @@ import com.infomaniak.drive.utils.NotificationUtils.cancelNotification
 class DownloadWorker(context: Context, workerParams: WorkerParameters) : BaseDownloadWorker(context, workerParams) {
 
     private val fileId: Int by lazy { inputData.getInt(FILE_ID, 0) }
+    private val isInheritedDownload: Boolean by lazy { inputData.getBoolean(IS_INHERITED_DOWNLOAD, false) }
     private val file: File? by lazy {
         // Resolve in the captured account/drive scope, not the currently active one.
         FileController.getFileByUidOrId(fileId, userDrive)
@@ -46,7 +47,11 @@ class DownloadWorker(context: Context, workerParams: WorkerParameters) : BaseDow
             userDrive,
             filesCount = 1,
             downloadWorker = this,
-            notificationManagerCompat
+            notificationManagerCompat = notificationManagerCompat,
+            // Per-file refreshes of files covered by an offline folder carry their origin, so
+            // completion applies the same membership/invalidation checks as folder downloads
+            // and never manufactures an explicit pin after an unmark (issue #1902).
+            isInheritedDownload = isInheritedDownload,
         )
     }
 
@@ -87,5 +92,6 @@ class DownloadWorker(context: Context, workerParams: WorkerParameters) : BaseDow
     companion object {
         const val TAG = "DownloadWorker"
         const val FILE_NAME = "file_name"
+        const val IS_INHERITED_DOWNLOAD = "is_inherited_download"
     }
 }

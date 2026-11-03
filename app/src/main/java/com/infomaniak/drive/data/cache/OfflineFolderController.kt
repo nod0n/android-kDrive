@@ -24,11 +24,11 @@ import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.OfflineRoot
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.OfflineFolderPolicy
 import com.infomaniak.drive.utils.SyncUtils.syncImmediately
-import com.infomaniak.drive.utils.Utils
 import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
 import java.util.Date
@@ -248,13 +248,17 @@ object OfflineFolderController {
 
     /**
      * Single decision point for dropping a file's (or folder row's) inherited coverage, shared by
-     * the root removal and the walk's stale cleanup. Decides flags AND bytes together:
+     * the root removal, the walk's stale cleanup and the per-file sync. Decides flags AND bytes
+     * together:
      *  - explicit pins are never touched;
-     *  - copies backing a pending upload keep their bytes and their flags, so the per-file
-     *    offline sync keeps discovering and uploading the edit (the file then behaves like a pin
-     *    until the user removes it individually);
-     *  - a locally modified copy with no registered upload is first snapshotted into the upload
-     *    queue (the regular worker uploads the snapshot), then coverage is cleared;
+     *  - copies backing a pending upload (by uri or by content revision) keep their bytes and
+     *    their flags, so the per-file offline sync keeps discovering and uploading the edit (the
+     *    file then behaves like a pin until the user removes it individually);
+     *  - a locally modified copy with no registered upload is first snapshotted into a unique,
+     *    durable per-revision upload file, then coverage is cleared; the regular worker uploads
+     *    the snapshot and the owned snapshot file is removed on completion;
+     *  - a revision that was already uploaded is content-safe: the stale local duplicate is
+     *    cleared;
      *  - plain covered copies are cleared and deleted (offline cache only).
      */
     fun clearFileCoverage(
@@ -278,44 +282,100 @@ object OfflineFolderController {
             return
         }
 
-        val hasPendingUpload = UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())
-        if (hasPendingUpload) {
-            result.keptOfflineFilesCount++
-            return
-        }
-
-        val isLocallyModified = OfflineFolderPolicy.isLocallyModified(
-            offlineFileLastModifiedMillis = offlineFile.lastModified(),
-            remoteLastModifiedAtSeconds = file.lastModifiedAt,
-        )
-        if (isLocallyModified) {
-            val uploadRegistered = runCatching {
-                val fileModifiedAt = Date(offlineFile.lastModified())
-                val snapshotUri = Utils.copyDataToUploadCache(context, offlineFile, fileModifiedAt)
-                UploadFile(
-                    uri = snapshotUri.toString(),
-                    driveId = userDrive.driveId,
-                    fileModifiedAt = fileModifiedAt,
-                    fileName = file.name,
-                    fileSize = offlineFile.length(),
-                    remoteFolder = file.parentId,
-                    type = UploadFile.Type.SYNC_OFFLINE.name,
-                    userId = userDrive.userId,
-                ).store()
-                context.syncImmediately(isAutomaticTrigger = false)
-            }.onFailure { exception ->
-                SentryLog.e(TAG, "Failed to snapshot a locally modified offline file", exception)
-            }.isSuccess
-
-            if (!uploadRegistered) {
-                // Keep the bytes and the flags rather than losing the edit; a later attempt
-                // (next sync) retries the snapshot.
-                result.keptOfflineFilesCount++
-                return
+        when (protectionStateOf(file, offlineFile, userDrive)) {
+            CopyProtection.PENDING_UPLOAD -> result.keptOfflineFilesCount++
+            CopyProtection.UPLOADED -> {
+                // The revision is on the server: the local copy is a stale duplicate.
+                clearInheritedFlags(realm, file)
+                deleteOfflineCopy(context, file, offlineFile, userDrive, result)
+            }
+            CopyProtection.DIRTY -> {
+                val uploadRegistered = registerDirtySnapshot(context, file, offlineFile, userDrive)
+                if (!uploadRegistered) {
+                    // Keep the bytes and the flags rather than losing the edit; a later attempt
+                    // (next sync) retries the snapshot.
+                    result.keptOfflineFilesCount++
+                    return
+                }
+                clearInheritedFlags(realm, file)
+                deleteOfflineCopy(context, file, offlineFile, userDrive, result)
+            }
+            CopyProtection.NONE -> {
+                clearInheritedFlags(realm, file)
+                deleteOfflineCopy(context, file, offlineFile, userDrive, result)
             }
         }
+    }
 
-        clearInheritedFlags(realm, file)
+    private enum class CopyProtection { NONE, PENDING_UPLOAD, UPLOADED, DIRTY }
+
+    /**
+     * Preservation state of an existing offline copy, shared with the deferred-cleanup
+     * completion check (issue #1902): [PENDING_UPLOAD] and [DIRTY] copies must survive cleanup,
+     * [UPLOADED] copies are content-safe duplicates, [NONE] copies are clearable.
+     */
+    private fun protectionStateOf(file: File, offlineFile: IOFile, userDrive: UserDrive): CopyProtection {
+        val fileModifiedAt = Date(offlineFile.lastModified())
+        return when {
+            UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) -> CopyProtection.PENDING_UPLOAD
+            UploadFile.hasUploadRecordFor(
+                fileName = file.name,
+                remoteFolder = file.parentId,
+                driveId = userDrive.driveId,
+                userId = userDrive.userId,
+                fileModifiedAt = fileModifiedAt,
+                pendingOnly = true,
+            ) -> CopyProtection.PENDING_UPLOAD
+            UploadFile.hasUploadRecordFor(
+                fileName = file.name,
+                remoteFolder = file.parentId,
+                driveId = userDrive.driveId,
+                userId = userDrive.userId,
+                fileModifiedAt = fileModifiedAt,
+                pendingOnly = false,
+            ) -> CopyProtection.UPLOADED
+            OfflineFolderPolicy.isLocallyModified(
+                offlineFileLastModifiedMillis = offlineFile.lastModified(),
+                remoteLastModifiedAtSeconds = file.lastModifiedAt,
+            ) -> CopyProtection.DIRTY
+            else -> CopyProtection.NONE
+        }
+    }
+
+    private fun registerDirtySnapshot(context: Context, file: File, offlineFile: IOFile, userDrive: UserDrive): Boolean {
+        return runCatching {
+            val fileModifiedAt = Date(offlineFile.lastModified())
+            val snapshotUri = UploadFile.createDurableOfflineSnapshot(
+                context = context,
+                source = offlineFile,
+                fileModifiedAt = fileModifiedAt,
+                fileId = file.id,
+                driveId = userDrive.driveId,
+            ) ?: return@runCatching false
+            UploadFile(
+                uri = snapshotUri.toString(),
+                driveId = userDrive.driveId,
+                fileModifiedAt = fileModifiedAt,
+                fileName = file.name,
+                fileSize = offlineFile.length(),
+                remoteFolder = file.parentId,
+                type = UploadFile.Type.SYNC_OFFLINE.name,
+                userId = userDrive.userId,
+            ).store()
+            context.syncImmediately(isAutomaticTrigger = false)
+            true
+        }.onFailure { exception ->
+            SentryLog.e(TAG, "Failed to snapshot a locally modified offline file", exception)
+        }.getOrDefault(false)
+    }
+
+    private fun deleteOfflineCopy(
+        context: Context,
+        file: File,
+        offlineFile: IOFile,
+        userDrive: UserDrive,
+        result: RemovalResult,
+    ) {
         runCatching { offlineFile.delete() }.onFailure { exception ->
             SentryLog.e(TAG, "Failed to delete offline file ${offlineFile.path}", exception)
         }.onSuccess {

@@ -37,6 +37,7 @@ import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.RealmModules
 import io.realm.Realm
+import java.util.UUID
 import io.realm.RealmConfiguration
 import io.realm.RealmObject
 import io.realm.RealmQuery
@@ -182,6 +183,9 @@ open class UploadFile(
     companion object {
         private const val DB_NAME = "Sync.realm"
         private const val ONE_DAY = SECONDS_IN_A_DAY * 1_000L
+
+        /** Durable (filesDir) folder holding per-revision offline folder upload snapshots. */
+        const val OFFLINE_SNAPSHOTS_FOLDER = "offline_snapshots"
         private var realmConfiguration: RealmConfiguration = RealmConfiguration.Builder().name(DB_NAME)
             .schemaVersion(UploadMigration.DB_VERSION)
             .modules(RealmModules.SyncFilesModule())
@@ -307,10 +311,16 @@ open class UploadFile(
         fun uploadFinished(uri: Uri) {
             getRealmInstance().use { realm ->
                 uploadFileByUriQuery(realm, uri.toString()).findFirst()?.let { uploadFile ->
+                    val isOwnedSnapshot = isDurableOfflineSnapshot(uploadFile.uri)
                     realm.executeTransaction {
                         uploadFile.uploadToken = null
                         uploadFile.uploadHost = null
                         uploadFile.uploadAt = Date()
+                    }
+                    if (isOwnedSnapshot) {
+                        // The snapshot was the only copy of this revision: its upload completed,
+                        // so the owned file can go (issue #1902).
+                        runCatching { IOFile(uri.path ?: "").takeIf { it.exists() }?.delete() }
                     }
                 }
             }
@@ -353,6 +363,64 @@ open class UploadFile(
                     .count() > 0
             }
             return customRealm?.let(block) ?: getRealmInstance().use(block)
+        }
+
+        /**
+         * Whether an upload record already exists for this exact content revision (identified by
+         * file name, target folder, drive, user and modification date). Distinct from
+         * [hasPendingUpload]: the uri of an offline folder snapshot changes per revision, so the
+         * identity check must not rely on the uri alone.
+         */
+        fun hasUploadRecordFor(
+            fileName: String,
+            remoteFolder: Int,
+            driveId: Int,
+            userId: Int,
+            fileModifiedAt: Date,
+            pendingOnly: Boolean,
+            customRealm: Realm? = null,
+        ): Boolean {
+            val block: (Realm) -> Boolean = { realm ->
+                realm.uploadTable
+                    .equalTo(UploadFile::fileName.name, fileName)
+                    .equalTo(UploadFile::remoteFolder.name, remoteFolder)
+                    .equalTo(UploadFile::driveId.name, driveId)
+                    .equalTo(UploadFile::userId.name, userId)
+                    .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
+                    .isNull(UploadFile::deletedAt.name)
+                    .apply { if (pendingOnly) isNull(UploadFile::uploadAt.name) }
+                    .count() > 0
+            }
+            return customRealm?.let(block) ?: getRealmInstance().use(block)
+        }
+
+        /**
+         * Allocates a unique, durable snapshot file for one upload revision of an offline copy.
+         * Unlike the shared upload cache (hash-named, evictable), each snapshot is a distinct
+         * file under filesDir, so a later revision can never overwrite a still-pending one.
+         */
+        fun createDurableOfflineSnapshot(
+            context: Context,
+            source: IOFile,
+            fileModifiedAt: Date,
+            fileId: Int,
+            driveId: Int,
+        ): Uri? {
+            return runCatching {
+                val folder = IOFile(context.filesDir, OFFLINE_SNAPSHOTS_FOLDER).apply { if (!exists()) mkdirs() }
+                val snapshot = IOFile(folder, "offline_${fileId}_$driveId_${UUID.randomUUID()}")
+                source.copyTo(snapshot, overwrite = true)
+                snapshot.setLastModified(fileModifiedAt.time)
+                snapshot.toUri()
+            }.getOrNull()
+        }
+
+        /**
+         * Whether [uri] points inside the durable offline snapshots folder, i.e. the file is owned
+         * by this feature and can be deleted once its upload completed.
+         */
+        fun isDurableOfflineSnapshot(uri: String): Boolean {
+            return uri.contains(OFFLINE_SNAPSHOTS_FOLDER)
         }
 
         fun deleteAll(uploadFiles: List<UploadFile>) {

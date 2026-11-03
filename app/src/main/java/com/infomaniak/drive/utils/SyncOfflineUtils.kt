@@ -174,7 +174,24 @@ object SyncOfflineUtils {
         migrateOfflineIfNeeded(context, localFile, ioFile, userDrive)
 
         when (fileAction.lastAction) {
-            FileActivityType.FILE_DELETE, FileActivityType.FILE_TRASH -> ioFile.delete()
+            FileActivityType.FILE_DELETE, FileActivityType.FILE_TRASH -> {
+                if (localFile.isOffline) {
+                    // Explicit pins keep the existing remote-wins behavior.
+                    ioFile.delete()
+                } else {
+                    // Inherited copies (issue #1902) go through the same preservation policy as
+                    // root removal: pending uploads and locally modified copies are protected
+                    // (snapshotted into the upload queue when needed) before bytes are dropped.
+                    OfflineFolderController.clearFileCoverage(
+                        context = context,
+                        realm = realm,
+                        file = localFile,
+                        userDrive = userDrive,
+                        result = OfflineFolderController.RemovalResult(),
+                        isFolder = false,
+                    )
+                }
+            }
             else -> updateFile(context, ioFile, localFile, fileAction, userDrive, realm)
         }
     }
@@ -270,6 +287,12 @@ object SyncOfflineUtils {
         val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return
         val pathChanged = offlineFile.path != remoteOfflineFile.path
 
+        if (pathChanged && UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())) {
+            // The old copy backs a pending upload: keep its bytes in place and retry this
+            // refresh after the upload completed (issue #1902).
+            return
+        }
+
         if (pathChanged) {
             if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
             offlineFile.delete()
@@ -277,7 +300,15 @@ object SyncOfflineUtils {
 
         if (!file.isMarkedAsOffline && (!remoteFile.isOfflineAndIntact(remoteOfflineFile) || pathChanged)) {
             FileController.updateExistingFile(newFile = remoteFile, realm = realm)
-            Utils.downloadAsOfflineFile(context, remoteFile, userDrive)
+            // Preserve the download origin: a refresh of a file covered by an offline folder is
+            // an inherited download, so its completion can never manufacture an explicit pin
+            // after an unmark (issue #1902).
+            Utils.downloadAsOfflineFile(
+                context = context,
+                file = remoteFile,
+                userDrive = userDrive,
+                isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+            )
         }
     }
 }

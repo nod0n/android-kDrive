@@ -122,10 +122,13 @@ class DownloadOfflineFileManager(
 
         onProgress(0, file.id)
 
-        if (offlineFile.exists()) offlineFile.delete()
+        // Reset the per-transfer cleanup state (issue #1902): the previous transfer's file must
+        // not be deleted by this transfer's final cleanup when this one early-returns.
+        lastDownloadedFile = null
+        // The published offline file is not deleted upfront: the fresh download is written to a
+        // temporary file and published by an atomic rename, so a failed transfer never destroys
+        // the previous copy (issue #1902).
         if (cacheFile.exists()) cacheFile.delete()
-
-        lastDownloadedFile = offlineFile
 
         return if (currentFile?.rights?.canRead == false) {
             ListenableWorker.Result.failure()
@@ -226,45 +229,80 @@ class DownloadOfflineFileManager(
         )
 
         if (!response.isSuccessful) return@withContext ListenableWorker.Result.failure()
-        makeSureFileExists(offlineFile) ?: return@withContext ListenableWorker.Result.failure()
+
+        // Download into a temporary file and publish by atomic rename (issue #1902): in-progress
+        // bytes are never visible at the offline path, so a removal or crash during the transfer
+        // can neither mistake partial content for a user edit nor destroy the previous copy.
+        val tempFile = IOFile(offlineFile.parentFile, "${offlineFile.name}.tmp")
+        runCatching { if (tempFile.exists()) tempFile.delete() }
+        makeSureFileExists(tempFile) ?: return@withContext ListenableWorker.Result.failure()
 
         runCatching {
-            val remoteDataHasBeenSaved = saveRemoteData(downloadWorker.workerTag(), response, offlineFile)
+            val remoteDataHasBeenSaved = saveRemoteData(downloadWorker.workerTag(), response, tempFile)
 
-            if (remoteDataHasBeenSaved && offlineFile.exists()) {
+            // Validate before publishing (size when the remote metadata carries one), timestamp,
+            // then publish by atomic rename.
+            val sizeIsValidated = file.size == null || file.isIntactFile(tempFile)
+            if (remoteDataHasBeenSaved && tempFile.exists() && sizeIsValidated) {
+                // Validate and timestamp before publishing: the published file carries the remote
+                // modification date, so it can never look like a locally newer edit.
+                tempFile.setLastModified(file.getLastModifiedInMilliSecond())
+                if (offlineFile.exists()) offlineFile.delete()
+                if (!tempFile.renameTo(offlineFile)) {
+                    SentryLog.e(TAG, "Failed to publish downloaded file to ${offlineFile.path}")
+                    tempFile.delete()
+                    return@withContext ListenableWorker.Result.failure()
+                }
                 onProgress(100, file.id)
                 notifyCompleted(file, offlineFile, context)
                 ListenableWorker.Result.success()
             } else {
+                tempFile.delete()
                 ListenableWorker.Result.failure()
             }
         }.cancellable().getOrElse {
-            offlineFile.delete()
+            tempFile.delete()
             throw it
         }
     }
 
     private fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
-        val liveFile = FileController.getFileByUidOrId(fileId = file.id, userDrive = userDrive)
-        val stillWanted = liveFile?.isOffline == true || liveFile?.isInOfflineFolder == true
+        var coverageInvalidated = false
 
-        if (isInheritedDownload && !stillWanted) {
+        // Validate inside the committing transaction (issue #1902): the state read must not be
+        // separated from the flag write, or a root removal in between would be undone. Root
+        // membership is re-established from the durable ancestry, not from the materialized
+        // boolean alone (a moved file can retain a stale inherited flag).
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val liveFile = FileController.getFileById(realm, file.id)
+            val pinOrInherited = liveFile?.isOffline == true || liveFile?.isInOfflineFolder == true
+            val ancestorRootCovers = OfflineFolderController.isInsideAnotherRoot(realm, file.id)
+
+            when {
+                isInheritedDownload && !pinOrInherited && !ancestorRootCovers -> {
+                    coverageInvalidated = true
+                }
+                isInheritedDownload && ancestorRootCovers -> realm.executeTransaction {
+                    if (liveFile != null && liveFile.isValid) liveFile.isInOfflineFolder = true
+                }
+                else -> realm.executeTransaction {
+                    if (liveFile != null && liveFile.isValid) {
+                        // A file covered by an offline folder keeps its inherited state: it must
+                        // not become an explicit pin, otherwise removing the folder could not
+                        // clean it up without stripping separately pinned files.
+                        liveFile.isOffline = liveFile.isOffline || !liveFile.isInOfflineFolder
+                    }
+                }
+            }
+        }
+
+        if (coverageInvalidated) {
             // The coverage (or pin) was removed while this download was in flight: an inherited
             // download must never manufacture an explicit pin, so the orphaned copy is dropped
             // (offline cache only).
             runCatching { if (offlineFile.exists()) offlineFile.delete() }
             if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
         } else {
-            FileController.updateFile(file.id, userDrive = userDrive) { localFile ->
-                if (isInheritedDownload) {
-                    localFile.isInOfflineFolder = true
-                } else {
-                    // A file covered by an offline folder keeps its inherited state: it must not
-                    // become an explicit pin, otherwise removing the folder could not clean it up
-                    // without stripping separately pinned files.
-                    localFile.isOffline = localFile.isOffline || !localFile.isInOfflineFolder
-                }
-            }
             offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
             if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
         }

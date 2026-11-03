@@ -329,8 +329,15 @@ open class File(
     }
 
     fun deleteCaches(context: Context) {
-        if (isOffline || isInOfflineFolder) getOfflineFile(context)?.apply { if (exists()) delete() }
-        else getCacheFile(context).apply { if (exists()) delete() }
+        if (isOffline || isInOfflineFolder) {
+            getOfflineFile(context)?.apply {
+                // Never drop the bytes backing a pending upload when the cache row goes away
+                // (issue #1902); the upload still reads from this file.
+                if (exists() && !UploadFile.hasPendingUpload(uri = Uri.fromFile(this).toString())) delete()
+            }
+        } else {
+            getCacheFile(context).apply { if (exists()) delete() }
+        }
     }
 
     private fun getPublicShareCache(context: Context): IOFile {
