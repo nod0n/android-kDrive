@@ -401,7 +401,7 @@ object OfflineFolderController {
      * completion check (issue #1902): [PENDING_UPLOAD] and [DIRTY] copies must survive cleanup,
      * [UPLOADED] copies are content-safe duplicates, [NONE] copies are clearable.
      */
-    fun protectionStateOf(file: File, offlineFile: IOFile, userDrive: UserDrive): CopyProtection {
+    private fun protectionStateOf(file: File, offlineFile: IOFile, userDrive: UserDrive): CopyProtection {
         val fileModifiedAt = Date(offlineFile.lastModified())
         return when {
             UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) -> CopyProtection.PENDING_UPLOAD

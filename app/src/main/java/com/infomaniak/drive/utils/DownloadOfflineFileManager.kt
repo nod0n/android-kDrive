@@ -45,6 +45,7 @@ import com.infomaniak.drive.data.api.ApiRoutes
 import com.infomaniak.drive.data.api.ProgressResponseBody
 import com.infomaniak.drive.data.api.UploadTask
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive

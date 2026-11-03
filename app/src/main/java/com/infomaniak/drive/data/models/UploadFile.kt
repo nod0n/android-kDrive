@@ -408,7 +408,7 @@ open class UploadFile(
         ): Uri? {
             return runCatching {
                 val folder = IOFile(context.filesDir, OFFLINE_SNAPSHOTS_FOLDER).apply { if (!exists()) mkdirs() }
-                val snapshot = IOFile(folder, "offline_${fileId}_$driveId_${UUID.randomUUID()}")
+                val snapshot = IOFile(folder, "offline_${fileId}_${driveId}_${UUID.randomUUID()}")
                 source.copyTo(snapshot, overwrite = true)
                 snapshot.setLastModified(fileModifiedAt.time)
                 snapshot.toUri()
