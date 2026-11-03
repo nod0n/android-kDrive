@@ -54,4 +54,25 @@ class ProviderAccessPolicyTest {
 
         assertEquals(Reason.ALLOWED, reason)
     }
+
+    @Test
+    fun `a pending transition in either direction keeps the lock active`() {
+        assertEquals(true, AppLockState.Policy.isActive(pendingTarget = true, persistedValue = false))
+        assertEquals(true, AppLockState.Policy.isActive(pendingTarget = false, persistedValue = true))
+    }
+
+    @Test
+    fun `a committed disabled transition deactivates the lock`() {
+        assertEquals(false, AppLockState.Policy.isActive(pendingTarget = null, persistedValue = false))
+    }
+
+    @Test
+    fun `a committed enabled transition activates the lock`() {
+        assertEquals(true, AppLockState.Policy.isActive(pendingTarget = null, persistedValue = true))
+    }
+
+    @Test
+    fun `an unreadable durable store denies access`() {
+        assertEquals(true, AppLockState.Policy.isActive(pendingTarget = null, persistedValue = null))
+    }
 }

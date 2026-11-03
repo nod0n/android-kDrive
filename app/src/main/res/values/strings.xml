@@ -453,9 +453,9 @@
     <string name="filePermissionTitle">Select the right</string>
     <string name="fileProviderExtensionDescription">If this option is disabled, kDrive will no longer be available in the Files application and in third-party applications.</string>
     <string name="fileProviderExtensionError">You have disabled file display from kDrive. You can re-enable it in the app settings.</string>
-    <string name="fileProviderExtensionAppLockDescription">Files are hidden in the Files application while App lock is enabled.</string>
+    <string name="fileProviderExtensionAppLockDescription">Files are hidden in the Files application while App lock is enabled. To restore them, turn App lock off in the security settings; if it cannot be turned off, restore your device screen lock first.</string>
     <string name="fileProviderExtensionTitle">Show in Files</string>
-    <string name="cloudStorageAppLockError">kDrive files are hidden while App lock is enabled. Open kDrive and turn off App lock in the security settings to display them here.</string>
+    <string name="cloudStorageAppLockError">kDrive files are hidden while App lock is enabled. Open kDrive and turn App lock off in its security settings; if App lock cannot be turned off, restore your device screen lock first.</string>
     <string name="fileShareAddMessage">Add a message for guests (optional)</string>
     <string name="fileShareDetailsFileTitle">File %s sharing and rights</string>
     <string name="fileShareDetailsFolderTitle">Folder %s sharing and rights</string>

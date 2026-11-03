@@ -59,7 +59,9 @@ class SecuritySettingsFragment : Fragment() {
         }
 
         appLock.apply {
-            if (AppLockManager.hasBiometrics()) {
+            // Keep an enabled lock discoverable even when device authentication became
+            // unavailable: that is the only path to turn it off again.
+            if (AppLockManager.hasBiometrics() || AppSettings.appSecurityLock) {
                 isVisible = true
                 setOnClickListener {
                     trackSettingsEvent(MatomoName.LockApp)
