@@ -189,7 +189,7 @@ class GalleryFragment : MultiSelectFragment(
             // Drop results superseded between publication and delivery (a filter, drive or
             // account change since their load started): they must never apply on top of the
             // newer state, even when their post was already queued.
-            if (result != null && (result.loadGeneration != galleryViewModel.currentLoadGeneration || result.driveId != AccountUtils.currentDriveId)) {
+            if (result != null && (result.loadGeneration != galleryViewModel.currentLoadGeneration || result.userDrive.userId != AccountUtils.currentUserId || result.userDrive.driveId != AccountUtils.currentDriveId)) {
                 return@observe
             }
 

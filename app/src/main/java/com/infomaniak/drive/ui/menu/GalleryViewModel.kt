@@ -23,18 +23,21 @@ import androidx.lifecycle.viewModelScope
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
+import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.AccountUtils
+import io.realm.Realm
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.coroutines.coroutineContext
 
-/** Result of a gallery load, posted on [GalleryViewModel.galleryApiResult]. */
+/** Result of a gallery load, published on [GalleryViewModel.galleryApiResult]. */
 sealed interface GalleryResult {
     val files: ArrayList<File>
-    val driveId: Int
+    val userDrive: UserDrive
     val loadGeneration: Long
     val isComplete: Boolean
 
@@ -45,7 +48,7 @@ sealed interface GalleryResult {
      */
     data class Success(
         override val files: ArrayList<File>,
-        override val driveId: Int,
+        override val userDrive: UserDrive,
         override val loadGeneration: Long,
         override val isComplete: Boolean,
         val nextCursor: String? = null,
@@ -58,7 +61,7 @@ sealed interface GalleryResult {
      */
     data class PageFailure(
         override val files: ArrayList<File>,
-        override val driveId: Int,
+        override val userDrive: UserDrive,
         override val loadGeneration: Long,
         val retryCursor: String?,
     ) : GalleryResult {
@@ -73,8 +76,14 @@ class GalleryViewModel : ViewModel() {
     /** In-memory only (like [period]): never persisted, so it cannot leak between users and always resets to All. */
     val mediaFilter = MutableStateFlow(GalleryMediaFilter.ALL)
 
-    /** Identifies the current load: results of superseded loads are dropped instead of applied. */
+    /** Identifies the current page request: results of superseded requests are dropped instead of applied. */
     val currentLoadGeneration: Long get() = loadGeneration
+
+    /** True between a load's start and its main-thread application (blocking fetches included). */
+    val isLoadRunning: Boolean get() = getGalleryJob?.isActive == true
+
+    /** A preserved cursor exists: pagination can resume from it instead of restarting. */
+    val hasResumableCursor: Boolean get() = currentCursor != null
 
     private var loadGeneration = 0L
 
@@ -88,9 +97,16 @@ class GalleryViewModel : ViewModel() {
     val needToRestoreFiles get() = galleryApiResult.isInitialized
 
     fun setMediaFilter(filter: GalleryMediaFilter) {
-        // Invalidate any in-flight load produced with the previous filter: its queued results
-        // must not apply on top of the new filter's list.
+        // Selecting the already-selected filter must not invalidate anything: the equal
+        // StateFlow value would not re-emit, so the invalidated in-flight load would never be
+        // replaced and loading would never finish.
+        if (filter == mediaFilter.value) return
+
+        // The accumulated files and cursor belong to the previous query: drop them together
+        // with its in-flight loads.
         loadGeneration++
+        currentCursor = null
+        lastGalleryFiles = arrayListOf()
         mediaFilter.value = filter
     }
 
@@ -101,6 +117,11 @@ class GalleryViewModel : ViewModel() {
     }
 
     fun loadMoreGallery(driveId: Int, ignoreCloud: Boolean) {
+        // One active continuation at a time: a repeat trigger (scroll or empty-state button)
+        // while a load is running must neither cancel it nor restart from the still-published
+        // cursor, which would fetch and cache the same raw pages again.
+        if (getGalleryJob?.isActive == true) return
+
         currentCursor?.let {
             loadGallery(driveId, ignoreCloud, isFirstPage = false, startCursor = it)
         }
@@ -108,19 +129,21 @@ class GalleryViewModel : ViewModel() {
 
     fun restoreGalleryFiles() {
         if (needToRestoreFiles) {
-            // Restore the exact subtype: a mid-pagination failure must stay a failure (with its
-            // retry cursor), not be coerced into a successful completion.
+            // Restore the exact subtype and its retry/next-cursor state. The accumulated data
+            // belongs to the current gallery query (it is cleared on any query change), so it is
+            // stamped with the current page-request generation: the delivery guard then accepts
+            // it as long as the query is unchanged, while query or account changes still reject it.
             when (val current = galleryApiResult.value) {
                 is GalleryResult.PageFailure -> galleryApiResult.value = GalleryResult.PageFailure(
                     files = ArrayList(lastGalleryFiles),
-                    driveId = current.driveId,
-                    loadGeneration = current.loadGeneration,
+                    userDrive = current.userDrive,
+                    loadGeneration = loadGeneration,
                     retryCursor = current.retryCursor,
                 )
                 is GalleryResult.Success -> galleryApiResult.value = GalleryResult.Success(
                     files = ArrayList(lastGalleryFiles),
-                    driveId = current.driveId,
-                    loadGeneration = current.loadGeneration,
+                    userDrive = current.userDrive,
+                    loadGeneration = loadGeneration,
                     isComplete = current.isComplete,
                     nextCursor = current.nextCursor,
                 )
@@ -133,44 +156,62 @@ class GalleryViewModel : ViewModel() {
         getGalleryJob?.cancel()
         val generation = ++loadGeneration
         val filter = mediaFilter.value
+        // Capture the exact account+drive this load belongs to: every cache operation runs
+        // against this identity's own Realm and every acceptance check compares against it,
+        // never against the live global account.
+        val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = driveId)
         getGalleryJob = viewModelScope.launch(Dispatchers.IO) {
             val job = requireNotNull(coroutineContext[Job])
-            val isLoadCurrent = {
-                generation == loadGeneration && driveId == AccountUtils.currentDriveId && !job.isCancelled
-            }
-            val result = if (ignoreCloud) {
-                emitCachedGallery(driveId, filter, generation)
-            } else {
-                fetchGallery(driveId, filter, isFirstPage, startCursor, generation, { job.ensureActive() }, isLoadCurrent)
-            }
+            val realm = FileController.getRealmInstance(userDrive)
+            try {
+                val result = if (ignoreCloud) {
+                    emitCachedGallery(userDrive, filter, generation, realm)
+                } else {
+                    fetchGallery(userDrive, filter, isFirstPage, startCursor, generation, { job.ensureActive() }, realm)
+                }
 
-            // The fetch above was blocking: a cancelled (superseded or cleared) load stops here,
-            // before publishing anything or mutating any state.
-            job.ensureActive()
-            if (!isLoadCurrent()) return@launch
-
-            galleryApiResult.postValue(result)
-            currentCursor = when (result) {
-                is GalleryResult.Success -> result.nextCursor
-                is GalleryResult.PageFailure -> result.retryCursor
+                // Apply on Main as one atomic step: re-check the load identity there (Main is
+                // where invalidation happens), then mutate the cursor and accumulator first and
+                // publish synchronously last. A replacement load started meanwhile can neither
+                // interleave between the check and the mutations nor observe a half-applied one.
+                withContext(Dispatchers.Main) {
+                    job.ensureActive()
+                    val isLoadCurrent = generation == loadGeneration &&
+                        userDrive.userId == AccountUtils.currentUserId &&
+                        userDrive.driveId == AccountUtils.currentDriveId
+                    if (isLoadCurrent) {
+                        currentCursor = when (result) {
+                            is GalleryResult.Success -> result.nextCursor
+                            is GalleryResult.PageFailure -> result.retryCursor
+                        }
+                        lastGalleryFiles.addAll(result.files)
+                        galleryApiResult.value = result
+                    }
+                }
+            } finally {
+                realm.close()
             }
-            lastGalleryFiles.addAll(result.files)
         }
     }
 
-    private fun emitCachedGallery(driveId: Int, filter: GalleryMediaFilter, generation: Long): GalleryResult {
-        val cachedFiles = ArrayList(FileController.getGalleryDrive().filter { it.matchesMediaFilter(filter) })
-        return GalleryResult.Success(cachedFiles, driveId, generation, isComplete = true)
+    private fun emitCachedGallery(
+        userDrive: UserDrive,
+        filter: GalleryMediaFilter,
+        generation: Long,
+        realm: Realm,
+    ): GalleryResult {
+        val cachedFiles = ArrayList(FileController.getGalleryDrive(customRealm = realm).filter { it.matchesMediaFilter(filter) })
+        return GalleryResult.Success(cachedFiles, userDrive, generation, isComplete = true)
     }
 
     private fun fetchGallery(
-        driveId: Int,
+        userDrive: UserDrive,
         filter: GalleryMediaFilter,
         isFirstPage: Boolean,
         startCursor: String?,
         generation: Long,
         checkActive: () -> Unit,
-        isLoadCurrent: () -> Boolean,
+        realm: Realm,
     ): GalleryResult {
         var isStoringFirstPage = isFirstPage
         var didFetchAnyPage = false
@@ -178,20 +219,21 @@ class GalleryViewModel : ViewModel() {
         val outcome = GalleryPageScanner<File>(predicate = { it.matchesMediaFilter(filter) }).scan(
             startCursor = startCursor,
             onRawPage = { page ->
-                // Cache writes happen only while this load is still the current one: a
-                // superseded scan (filter or drive/account changed meanwhile) must never write
-                // the old response into the now-current account's Realm.
-                if (isLoadCurrent()) {
+                // Store only while this load is still the newest request for its query: a
+                // superseded first page must not reset the captured account's gallery cache.
+                // The Realm itself is the captured account's own, so a racing account switch
+                // can never write into another account's database.
+                if (generation == loadGeneration) {
                     didFetchAnyPage = true
                     // Store every raw page unfiltered so the offline cache keeps covering the
                     // whole gallery, whatever the active filter is.
-                    FileController.storeGalleryDrive(page, isStoringFirstPage)
+                    FileController.storeGalleryDrive(page, isStoringFirstPage, customRealm = realm)
                     isStoringFirstPage = false
                 }
             },
             checkActive = checkActive,
         ) { cursor ->
-            val apiResponse = ApiRepository.getLastGallery(driveId = driveId, cursor = cursor)
+            val apiResponse = ApiRepository.getLastGallery(driveId = userDrive.driveId, cursor = cursor)
             if (apiResponse.isSuccess()) {
                 GalleryPage.Success(apiResponse.data.orEmpty(), apiResponse.cursor, apiResponse.hasMore)
             } else {
@@ -199,13 +241,13 @@ class GalleryViewModel : ViewModel() {
             }
         }
 
-        if (isFirstPage && didFetchAnyPage && isLoadCurrent()) FileController.removeOrphanFiles()
+        if (isFirstPage && didFetchAnyPage && generation == loadGeneration) FileController.removeOrphanFiles(realm)
 
         return when (outcome) {
-            is GalleryScanResult.Complete -> GalleryResult.Success(ArrayList(outcome.items), driveId, generation, isComplete = true)
+            is GalleryScanResult.Complete -> GalleryResult.Success(ArrayList(outcome.items), userDrive, generation, isComplete = true)
             is GalleryScanResult.Suspended -> GalleryResult.Success(
                 files = ArrayList(outcome.items),
-                driveId = driveId,
+                userDrive = userDrive,
                 loadGeneration = generation,
                 isComplete = false,
                 nextCursor = outcome.nextCursor,
@@ -213,19 +255,19 @@ class GalleryViewModel : ViewModel() {
             is GalleryScanResult.Unreachable -> when {
                 // Cache fallback only answers an initial load: a continuation scan that cannot
                 // reach the server must keep its cursor instead of replaying the whole cache.
-                isFirstPage -> emitCachedGallery(driveId, filter, generation)
+                isFirstPage -> emitCachedGallery(userDrive, filter, generation, realm)
                 // Nothing was scanned, so there are no matches to carry: an empty failure with
                 // the preserved start cursor lets the empty state offer a cursor-based retry.
                 else -> GalleryResult.PageFailure(
                     files = arrayListOf(),
-                    driveId = driveId,
+                    userDrive = userDrive,
                     loadGeneration = generation,
                     retryCursor = startCursor,
                 )
             }
             is GalleryScanResult.Interrupted -> GalleryResult.PageFailure(
                 files = ArrayList(outcome.items),
-                driveId = driveId,
+                userDrive = userDrive,
                 loadGeneration = generation,
                 retryCursor = outcome.retryCursor,
             )
