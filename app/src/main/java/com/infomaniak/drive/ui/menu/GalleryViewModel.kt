@@ -210,12 +210,14 @@ class GalleryViewModel : ViewModel() {
                 isComplete = false,
                 nextCursor = outcome.nextCursor,
             )
-            GalleryScanResult.Unreachable -> when {
+            is GalleryScanResult.Unreachable -> when {
                 // Cache fallback only answers an initial load: a continuation scan that cannot
                 // reach the server must keep its cursor instead of replaying the whole cache.
                 isFirstPage -> emitCachedGallery(driveId, filter, generation)
+                // Nothing was scanned, so there are no matches to carry: an empty failure with
+                // the preserved start cursor lets the empty state offer a cursor-based retry.
                 else -> GalleryResult.PageFailure(
-                    files = ArrayList(outcome.items),
+                    files = arrayListOf(),
                     driveId = driveId,
                     loadGeneration = generation,
                     retryCursor = startCursor,
