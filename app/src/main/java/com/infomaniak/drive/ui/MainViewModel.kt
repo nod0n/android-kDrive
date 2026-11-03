@@ -620,7 +620,7 @@ class MainViewModel(
      * owner of the deferred cleanup until the offline sync finishes it (issue #1902).
      */
     fun removeOfflineFolderRoot(file: File, userDrive: UserDrive = UserDrive()) = viewModelScope.launch(Dispatchers.IO) {
-        WorkManager.getInstance(getContext()).cancelUniqueWork(BulkDownloadWorker.uniqueWorkName(userDrive, file.id))
+        WorkManager.getInstance(getContext()).cancelUniqueWork(BulkDownloadWorker.walkWorkName(userDrive, file.id))
         OfflineFolderController.removeOfflineRoot(file.id, userDrive)
     }
 

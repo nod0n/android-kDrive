@@ -34,6 +34,12 @@ class SyncOfflineSelectBottomSheetDialog : SyncSelectBottomSheetDialog() {
         get() = AppSettings.onlyWifiSyncOffline
         set(value) {
             AppSettings.onlyWifiSyncOffline = value
+            // WorkManager constraints are captured at enqueue time (issue: round 4 #14):
+            // reconfigure existing offline folder chains so a Wi-Fi-only change cannot leave a
+            // mobile-data job running, nor an unmetered job blocked. Durable root intent and
+            // pending markers live in Realm; the offline sync re-enqueues them with the fresh
+            // constraints (its observers fire when the cancelled chains finish).
+            Utils.reconfigureOfflineFolderWork(requireContext())
         }
 
     override fun trackEvent(name: MatomoDrive.MatomoName) = trackSettingsEvent(name)

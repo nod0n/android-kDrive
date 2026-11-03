@@ -197,11 +197,15 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
         const val RECURSIVE = "recursive"
 
         /**
-         * Independently deduplicated and cancellable work identity per account, drive and root
-         * (issue #1902): two accounts sharing the same drive/folder never share a chain, so one
-         * account's KEEP cannot suppress the other's download and one account's removal cannot
-         * cancel the other's work.
+         * Independently deduplicated and cancellable work identities per account, drive and root
+         * (issue #1902), SEPARATE per mode (issue: round 4 #13): a recursive walk never suppresses
+         * or absorbs an explicit-pin batch and vice versa, and two accounts sharing a drive never
+         * share a chain.
          */
-        fun uniqueWorkName(userDrive: UserDrive, folderId: Int) = "${TAG}_${userDrive.userId}_${userDrive.driveId}_$folderId"
+        fun walkWorkName(userDrive: UserDrive, folderId: Int) =
+            "${TAG}_walk_${userDrive.userId}_${userDrive.driveId}_$folderId"
+
+        fun pinWorkName(userDrive: UserDrive, folderId: Int) =
+            "${TAG}_pin_${userDrive.userId}_${userDrive.driveId}_$folderId"
     }
 }

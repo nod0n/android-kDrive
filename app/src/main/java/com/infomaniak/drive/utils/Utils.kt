@@ -393,14 +393,24 @@ object Utils {
             .setExpeditedIfAvailable()
             .build()
 
-        // One independently deduplicated, cancellable work chain per root (issue #1902): a root
-        // that keeps failing can no longer block the other roots, repeated sync triggers do not
-        // append duplicate work, and removing a root cancels exactly its own chain.
-        workManager.enqueueUniqueWork(
-            BulkDownloadWorker.uniqueWorkName(userDrive, folderId),
-            ExistingWorkPolicy.KEEP,
-            downloadRequest,
-        )
+        // Recursive walks are KEEP-deduplicated (one pending walk per root, cancellable on
+        // removal); explicit-pin batches use their own identity and APPEND so consecutive
+        // selections drain instead of being silently dropped (issue: round 4 #13).
+        val (uniqueName, policy) = if (recursive) {
+            BulkDownloadWorker.walkWorkName(userDrive, folderId) to ExistingWorkPolicy.KEEP
+        } else {
+            BulkDownloadWorker.pinWorkName(userDrive, folderId) to ExistingWorkPolicy.APPEND_OR_REPLACE
+        }
+        workManager.enqueueUniqueWork(uniqueName, policy, downloadRequest)
+    }
+
+    /**
+     * Cancels all offline folder download chains so they are re-created with the current
+     * constraint settings (issue: round 4 #14). Durable root intent, coverage flags and pending
+     * markers live in Realm and are unaffected; the offline sync re-enqueues what is needed.
+     */
+    fun reconfigureOfflineFolderWork(context: Context) {
+        WorkManager.getInstance(context).cancelAllWorkByTag(BulkDownloadWorker::class.java.toString())
     }
 
     fun getInvalidFileNameCharacter(fileName: String): String? = DownloadManagerUtils.regexInvalidSystemChar.find(fileName)?.value

@@ -248,9 +248,12 @@ class DownloadOfflineFileManager(
                 notifyCompleted(file, offlineFile, context)
                 true
             }
-            // Nothing was replaced (target protected or intent gone): the transfer is done.
+            // Skipped outcomes leave the existing bytes and timestamps untouched (issue: round
+            // 4 #1): only the pending marker is cleared, since there is nothing valid left to
+            // download for this transfer.
             PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
-                fileDownloaded(context, file.id)
+                filesDownloaded += 1
+                clearPendingMarker(file.id)
                 true
             }
             PublicationOutcome.FAILED -> false
@@ -368,11 +371,19 @@ class DownloadOfflineFileManager(
             val sizeIsValidated = file.size == null || file.isIntactFile(staged)
             if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated) {
                 val outcome = publishStagedOfflineFile(file, offlineFile, staged)
-                if (outcome == PublicationOutcome.FAILED) {
-                    return@withContext ListenableWorker.Result.failure()
+                when (outcome) {
+                    PublicationOutcome.FAILED -> return@withContext ListenableWorker.Result.failure()
+                    // Completion (flag writes, timestamp, media scan) only runs for bytes this
+                    // transfer actually published; skipped outcomes leave the existing content
+                    // untouched (issue: round 4 #1).
+                    PublicationOutcome.PUBLISHED -> {
+                        onProgress(100, file.id)
+                        notifyCompleted(file, offlineFile, context)
+                    }
+                    PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
+                        clearPendingMarker(file.id)
+                    }
                 }
-                onProgress(100, file.id)
-                notifyCompleted(file, offlineFile, context)
                 ListenableWorker.Result.success()
             } else {
                 runCatching { staged.delete() }
@@ -382,6 +393,14 @@ class DownloadOfflineFileManager(
             runCatching { staged.delete() }
             throw it
         }
+    }
+
+    /**
+     * Clears only the download-pending marker, without touching bytes, timestamps or coverage
+     * flags (issue: round 4 #1).
+     */
+    private fun clearPendingMarker(fileId: Int) {
+        FileController.markFileAsOffline(fileId = fileId, isMarkedAsOffline = false, userDrive = userDrive)
     }
 
     private fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
