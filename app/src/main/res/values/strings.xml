@@ -465,6 +465,9 @@
     <string name="fileTypeFilterTitle">File type</string>
     <string name="filtersTitle">Filters</string>
     <string name="folderDescription">Private or shared folder</string>
+    <string name="galleryFilterEmptyMediaDescription">No media matches this filter. Refresh to check for more files, or select All.</string>
+    <string name="galleryMediaFilterAll">All</string>
+    <string name="galleryMediaFilterTitle">Media type</string>
     <string name="galleryTitle">Gallery</string>
     <string name="hintInputDirName">Folder name</string>
     <string name="hintInputFileName">File name</string>

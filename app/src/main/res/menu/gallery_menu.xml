@@ -24,4 +24,10 @@
         android:title="@string/sortTitle"
         app:showAsAction="always" />
 
+    <item
+        android:id="@+id/selectGalleryMediaFilter"
+        android:icon="@drawable/ic_category"
+        android:title="@string/galleryMediaFilterTitle"
+        app:showAsAction="always" />
+
 </menu>

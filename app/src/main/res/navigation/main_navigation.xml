@@ -1184,6 +1184,9 @@
         <action
             android:id="@+id/action_menuGalleryFragment_to_galleryPeriodBottomSheetDialog"
             app:destination="@id/galleryPeriodBottomSheetDialog" />
+        <action
+            android:id="@+id/action_menuGalleryFragment_to_galleryMediaFilterBottomSheetDialog"
+            app:destination="@id/galleryMediaFilterBottomSheetDialog" />
     </fragment>
 
     <dialog
@@ -1195,6 +1198,17 @@
             android:name="period"
             android:defaultValue="MONTH"
             app:argType="com.infomaniak.drive.ui.menu.GalleryPeriod" />
+    </dialog>
+
+    <dialog
+        android:id="@+id/galleryMediaFilterBottomSheetDialog"
+        android:name="com.infomaniak.drive.ui.menu.GalleryMediaFilterBottomSheetDialog"
+        android:label="GalleryMediaFilterBottomSheetDialog"
+        tools:layout="@layout/fragment_bottom_sheet_select">
+        <argument
+            android:name="filter"
+            android:defaultValue="ALL"
+            app:argType="com.infomaniak.drive.ui.menu.GalleryMediaFilter" />
     </dialog>
 
     <fragment

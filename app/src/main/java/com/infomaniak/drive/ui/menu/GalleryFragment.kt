@@ -157,6 +157,7 @@ class GalleryFragment : MultiSelectFragment(
 
         observeApiResultPagination()
         observePeriod()
+        observeMediaFilter()
 
         mainViewModel.deleteFilesFromGallery.observe(viewLifecycleOwner) { filesId ->
             filesId.forEach(galleryAdapter::deleteByFileId)
@@ -183,31 +184,60 @@ class GalleryFragment : MultiSelectFragment(
             dataAlreadyLoaded = false
         }
 
-        galleryViewModel.galleryApiResult.observe(viewLifecycleOwner) {
-            it?.let { (galleryFiles, isComplete) ->
-                galleryAdapter.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.PREVENT_WHEN_EMPTY
-                if (dataAlreadyLoaded) {
-                    // When the data is still available after the fragment is recreated, there's no need to reload it again.
-                    dataAlreadyLoaded = false
-                    return@observe
-                }
-                galleryAdapter.isComplete = isComplete
-                val galleryList = galleryAdapter.formatList(galleryFiles)
-                if (galleryFiles.isNotEmpty()) galleryAdapter.addAll(galleryList)
-                binding.noGalleryLayout.toggleVisibility(galleryAdapter.galleryList.isEmpty())
-            } ?: run {
-                galleryAdapter.isComplete = true
+        galleryViewModel.galleryApiResult.observe(viewLifecycleOwner) { result ->
+            galleryAdapter.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.PREVENT_WHEN_EMPTY
+            if (dataAlreadyLoaded) {
+                // When the data is still available after the fragment is recreated, there's no need to reload it again.
+                dataAlreadyLoaded = false
+                return@observe
+            }
 
-                binding.noGalleryLayout.toggleVisibility(
-                    noNetwork = !mainViewModel.hasNetwork,
-                    isVisible = galleryAdapter.galleryList.isEmpty(),
-                    showRefreshButton = true,
-                )
+            when (result) {
+                null -> {
+                    galleryAdapter.isComplete = true
+                    toggleNoGalleryLayout(isError = true)
+                }
+                is GalleryResult.PageFailure -> {
+                    galleryAdapter.isComplete = false
+                    addGalleryFiles(result.files)
+                    toggleNoGalleryLayout(isError = galleryAdapter.galleryList.isEmpty())
+                }
+                is GalleryResult.Success -> {
+                    galleryAdapter.isComplete = result.isComplete
+                    addGalleryFiles(result.files)
+                    toggleNoGalleryLayout(isError = false)
+                }
             }
 
             onDownloadFinished()
 
             isDownloadingGallery = false
+        }
+    }
+
+    private fun addGalleryFiles(files: ArrayList<File>) {
+        if (files.isNotEmpty()) galleryAdapter.addAll(galleryAdapter.formatList(files))
+    }
+
+    private fun toggleNoGalleryLayout(isError: Boolean) {
+        val isGalleryEmpty = galleryAdapter.galleryList.isEmpty()
+
+        if (isGalleryEmpty) {
+            // Be honest when a media filter yields nothing: the cache may simply not cover
+            // every media of the drive yet, and the server may still hold matching files.
+            binding.noGalleryLayout.description = when {
+                isError || galleryViewModel.mediaFilter.value == GalleryMediaFilter.ALL -> null
+                else -> R.string.galleryFilterEmptyMediaDescription
+            }
+        }
+
+        when {
+            isError -> binding.noGalleryLayout.toggleVisibility(
+                noNetwork = !mainViewModel.hasNetwork,
+                isVisible = isGalleryEmpty,
+                showRefreshButton = true,
+            )
+            else -> binding.noGalleryLayout.toggleVisibility(isVisible = isGalleryEmpty)
         }
     }
 
@@ -279,6 +309,27 @@ class GalleryFragment : MultiSelectFragment(
                 galleryViewModel.period.collect(galleryAdapter::updatePeriod)
             }
         }
+    }
+
+    private fun observeMediaFilter() {
+        var appliedFilter = galleryViewModel.mediaFilter.value
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                galleryViewModel.mediaFilter.collect { filter ->
+                    if (filter == appliedFilter) return@collect
+                    appliedFilter = filter
+                    onMediaFilterChanged()
+                }
+            }
+        }
+    }
+
+    private fun onMediaFilterChanged() {
+        // The previously selected files are no longer visible with the new filter.
+        if (multiSelectManager.isMultiSelectOn) closeMultiSelect()
+
+        galleryAdapter.clearGallery()
+        loadGallery(AccountUtils.currentDriveId, isRefresh = true)
     }
 
     fun onRefreshGallery() {
