@@ -306,13 +306,23 @@ class GalleryFragment : MultiSelectFragment(
         galleryAdapter.apply {
             if (isRefresh) clean()
 
-            showLoading()
-            isComplete = false
-            isDownloadingGallery = true
-
             val isNetworkAvailable = mainViewModel.hasNetwork
-            if (isRefresh) galleryViewModel.loadLastGallery(driveId, ignoreCloud = !isNetworkAvailable)
-            else if (isNetworkAvailable) galleryViewModel.loadMoreGallery(driveId, ignoreCloud = false)
+            val isRequestAccepted = if (isRefresh) {
+                galleryViewModel.loadLastGallery(driveId, ignoreCloud = !isNetworkAvailable)
+            } else if (isNetworkAvailable) {
+                galleryViewModel.loadMoreGallery(driveId, ignoreCloud = false)
+            } else {
+                false
+            }
+
+            // Only activate the loading UI for an accepted request: a refused continuation
+            // (one already running, or no cursor) must not leave placeholders plus a stuck
+            // loading flag that would block every further pagination request.
+            if (isRequestAccepted) {
+                showLoading()
+                isComplete = false
+                isDownloadingGallery = true
+            }
         }
     }
 
