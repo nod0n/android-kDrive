@@ -181,7 +181,7 @@ object OfflineFolderUtils {
             ?.children?.createSnapshot()?.map { it.id }?.toSet() ?: emptySet()
         val remoteIds = allPages.mapTo(mutableSetOf()) { it.id }
 
-        val last = lastResponse
+        val last = lastResponse ?: return false
         val completeResponse = CursorApiResponse<List<File>>(
             result = last.result,
             data = allPages,
@@ -329,7 +329,20 @@ object OfflineFolderUtils {
         while (queue.isNotEmpty()) {
             val subFolderId = queue.removeFirst()
             val subFolder = FileController.getFileById(realm, subFolderId) ?: continue
-            clearIfNotCoveredByOtherRoot(context, realm, subFolder, rootFolderId, userDrive, result, isFolder = true)
+            val subFolderCleared = clearIfNotCoveredByOtherRoot(
+                context,
+                realm,
+                subFolder,
+                rootFolderId,
+                userDrive,
+                result,
+                isFolder = true,
+            )
+            if (!subFolderCleared) {
+                // The subfolder is still covered (another root or a nested root record): its
+                // whole subtree stays covered.
+                continue
+            }
             realm.where(File::class.java)
                 .equalTo(File::parentId.name, subFolderId)
                 .findAll()
@@ -348,6 +361,10 @@ object OfflineFolderUtils {
         }
     }
 
+    /**
+     * Drops the file's (or folder row's) inherited coverage unless it is still covered by another
+     * root or is itself a remaining root. Returns true when the coverage was actually cleared.
+     */
     private fun clearIfNotCoveredByOtherRoot(
         context: Context,
         realm: Realm,
@@ -356,7 +373,7 @@ object OfflineFolderUtils {
         userDrive: UserDrive,
         result: OfflineFolderController.RemovalResult,
         isFolder: Boolean = false,
-    ) {
+    ): Boolean {
         // Recheck remaining roots before dropping a moved/deleted descendant: it may still be
         // covered by another root (e.g. an ancestor of the walked root or a nested one).
         val isCoveredByOtherRoot = OfflineFolderController.isInsideAnotherRoot(
@@ -364,7 +381,7 @@ object OfflineFolderUtils {
             file.id,
             excludedFolderId = rootFolderId,
         )
-        if (isCoveredByOtherRoot || OfflineFolderController.isOfflineRoot(file.id, customRealm = realm)) return
+        if (isCoveredByOtherRoot || OfflineFolderController.isOfflineRoot(file.id, customRealm = realm)) return false
 
         OfflineFolderController.clearFileCoverage(
             context = context,
@@ -374,6 +391,7 @@ object OfflineFolderUtils {
             result = result,
             isFolder = isFolder,
         )
+        return true
     }
 
     /**
