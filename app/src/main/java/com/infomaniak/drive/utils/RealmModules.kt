@@ -24,6 +24,7 @@ import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.FileActivity
 import com.infomaniak.drive.data.models.FileCategory
 import com.infomaniak.drive.data.models.MediaFolder
+import com.infomaniak.drive.data.models.OfflineRoot
 import com.infomaniak.drive.data.models.Rights
 import com.infomaniak.drive.data.models.ShareLink
 import com.infomaniak.drive.data.models.SyncSettings
@@ -59,7 +60,8 @@ object RealmModules {
         classes = [
             File::class, Rights::class, FileActivity::class, FileCategory::class,
             ShareLink::class, DropBox::class, FileVersion::class, FileConversion::class, FileExternalImport::class,
-            DropBoxCapabilities::class, ShareLinkCapabilities::class, DropBoxValidity::class, DropBoxSize::class
+            DropBoxCapabilities::class, ShareLinkCapabilities::class, DropBoxValidity::class, DropBoxSize::class,
+            OfflineRoot::class
         ]
     )
     class LocalFilesModule

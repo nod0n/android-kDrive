@@ -186,7 +186,7 @@ class FileInfoActionsView @JvmOverloads constructor(
         disabledSendCopy.isGone = canSendCopy
 
         val isOfflineToggleInteractable = !file.isMarkedAsOffline || file.isOffline
-        setOfflineControlsEnabled(isOfflineToggleInteractable && (hasNetwork || file.isOffline))
+        setOfflineControlsEnabled(isOfflineToggleInteractable && (hasNetwork || file.isOfflineFile(context)))
 
         editDocument.isEnabled = hasNetwork
         manageCategories.isEnabled = hasNetwork
@@ -236,7 +236,8 @@ class FileInfoActionsView @JvmOverloads constructor(
         if (currentFile.isFolder()) {
             sendCopyIcon.setImageResource(R.drawable.ic_add)
             sendCopyText.setText(R.string.buttonAdd)
-            availableOffline.isGone = true
+            // The offline row stays visible for folders: it marks/unmarks the folder as an
+            // offline root, recursively covering all its descendants (issue #1902).
             openWith.isGone = true
             setupColoredFolderVisibility(drive)
         }
@@ -358,12 +359,29 @@ class FileInfoActionsView @JvmOverloads constructor(
     }
 
     /**
+     * Mark/unmark [currentFile] (a folder) as an offline root (issue #1902). The durable intent is
+     * stored and a worker recursively downloads all descendants, now and on every future sync.
+     *
+     * @return true if the folder has been processed, false if its name contains forbidden characters
+     */
+    fun toggleFolderOffline(isChecked: Boolean): Boolean = with(currentFile) {
+        if (Utils.getInvalidFileNameCharacter(name) != null) return@with false
+
+        val userDrive = UserDrive(driveId = driveId)
+        if (isChecked) {
+            mainViewModel.addOfflineFolderRoot(this, userDrive)
+        } else {
+            mainViewModel.removeOfflineFolderRoot(this, userDrive)
+        }
+        return@with true
+    }
+
+    /**
      * Download [currentFile] to put it offline
      *
      * @return true if the file has been successfully downloaded, false if its name contains forbidden characters
      */
     fun downloadAsOfflineFile(): Boolean = with(currentFile) {
-
         if (Utils.getInvalidFileNameCharacter(name) != null) return@with false
 
         val cacheFile = getCacheFile(context)
@@ -516,7 +534,7 @@ class FileInfoActionsView @JvmOverloads constructor(
 
         val isPendingOffline = file.isMarkedAsOffline
         val isItemInteractable = !isPendingOffline || file.isOffline
-        val isItemAvailable = hasNetwork || file.isOffline
+        val isItemAvailable = hasNetwork || file.isOfflineFile(context)
         setOfflineControlsEnabled(isItemInteractable && isItemAvailable)
 
         val isOfflineFile = file.isOfflineFile(context)
@@ -639,6 +657,10 @@ class FileInfoActionsView @JvmOverloads constructor(
         @CallSuper
         fun availableOfflineSwitched(fileInfoActionsView: FileInfoActionsView, isChecked: Boolean): Boolean {
             currentFile?.apply {
+                if (isFolder()) {
+                    trackFileActionEvent(MatomoName.Offline, isChecked)
+                    return fileInfoActionsView.toggleFolderOffline(isChecked)
+                }
                 when {
                     isOffline && isChecked -> Unit
                     !isOffline && !isChecked -> Unit

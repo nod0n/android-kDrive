@@ -148,7 +148,7 @@ class PreviewPictureFragment : PreviewFragment() {
     }
 
     private fun buildPreviewRequest(): ImageRequest {
-        val offlineFile = if (file.isOffline) getOfflineFile() else null
+        val offlineFile = if (file.isOffline || file.isInOfflineFolder) getOfflineFile() else null
 
         return ImageRequest.Builder(requireContext())
             .data(offlineFile ?: ApiRoutes.getImagePreviewUrl(file))

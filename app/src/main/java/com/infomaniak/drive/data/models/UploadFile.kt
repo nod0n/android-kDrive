@@ -339,6 +339,22 @@ open class UploadFile(
             return customRealm?.let(block) ?: getRealmInstance().use(block)
         }
 
+        /**
+         * Whether an upload of [uri] is still pending (not yet uploaded, not deleted). Used by the
+         * offline folder root removal to keep the local copy backing an offline edit until it has
+         * been sent to the server.
+         */
+        fun hasPendingUpload(uri: String, customRealm: Realm? = null): Boolean {
+            val block: (Realm) -> Boolean = { realm ->
+                realm.uploadTable
+                    .equalTo(UploadFile::uri.name, uri)
+                    .isNull(UploadFile::uploadAt.name)
+                    .isNull(UploadFile::deletedAt.name)
+                    .count() > 0
+            }
+            return customRealm?.let(block) ?: getRealmInstance().use(block)
+        }
+
         fun deleteAll(uploadFiles: List<UploadFile>) {
             getRealmInstance().use {
                 it.executeTransaction { realm ->

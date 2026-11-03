@@ -353,12 +353,18 @@ object Utils {
             emit(FileResult(isSuccess = true))
         }
 
-    fun enqueueBulkDownloadWorker(context: Context, folderId: Int, userDrive: UserDrive = UserDrive()) {
+    fun enqueueBulkDownloadWorker(
+        context: Context,
+        folderId: Int,
+        userDrive: UserDrive = UserDrive(),
+        recursive: Boolean = false,
+    ) {
         val workManager = WorkManager.getInstance(context)
         val inputData = workDataOf(
             BulkDownloadWorker.FOLDER_ID to folderId,
             BaseDownloadWorker.USER_ID to userDrive.userId,
             BaseDownloadWorker.DRIVE_ID to userDrive.driveId,
+            BulkDownloadWorker.RECURSIVE to recursive,
         )
         val networkType = if (AppSettings.onlyWifiSyncOffline) NetworkType.UNMETERED else NetworkType.CONNECTED
         val constraints = Constraints.Builder()

@@ -22,6 +22,7 @@ import com.infomaniak.drive.data.models.DropBox
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.FileActivity
 import com.infomaniak.drive.data.models.FileCategory
+import com.infomaniak.drive.data.models.OfflineRoot
 import com.infomaniak.drive.data.models.Rights
 import com.infomaniak.drive.data.models.ShareLink
 import com.infomaniak.drive.data.models.file.FileConversion
@@ -384,6 +385,31 @@ class FileMigration : RealmMigration {
             schema[File::class.java.simpleName]?.removeField("isFromSearch")
             oldVersionTemp++
         }
+
+        // Migrated to version 12
+        // - Add new field `isInOfflineFolder` in File table (files covered by an offline folder, issue #1902)
+        // - Add new OfflineRoot table (durable offline folder roots, issue #1902)
+        // Existing explicit pins (`isOffline`) are left untouched: no lossy migration.
+        if (oldVersionTemp == 11L) {
+            schema[File::class.java.simpleName]?.apply {
+                addField(File::isInOfflineFolder.name, Boolean::class.java, FieldAttribute.REQUIRED)
+            }
+
+            schema.create(OfflineRoot::class.java.simpleName).apply {
+                addField(OfflineRoot::uid.name, String::class.java, FieldAttribute.REQUIRED)
+                addPrimaryKey(OfflineRoot::uid.name)
+                addField(OfflineRoot::folderId.name, Int::class.java, FieldAttribute.REQUIRED)
+                addField(OfflineRoot::driveId.name, Int::class.java, FieldAttribute.REQUIRED)
+                addField(OfflineRoot::userId.name, Int::class.java, FieldAttribute.REQUIRED)
+                addField(OfflineRoot::name.name, String::class.java, FieldAttribute.REQUIRED)
+                addField(OfflineRoot::path.name, String::class.java, FieldAttribute.REQUIRED)
+                addField(OfflineRoot::createdAt.name, Date::class.java, FieldAttribute.REQUIRED)
+                addField(OfflineRoot::lastSyncedAt.name, Date::class.java)
+                    .setNullable(OfflineRoot::lastSyncedAt.name, true)
+            }
+
+            oldVersionTemp++
+        }
     }
 
     override fun equals(other: Any?): Boolean {
@@ -411,7 +437,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 11L // Must be bumped when the schema changes
+        const val DB_VERSION = 12L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }

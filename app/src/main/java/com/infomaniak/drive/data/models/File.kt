@@ -136,6 +136,14 @@ open class File(
     var isFromUploads: Boolean = false,
     var isMarkedAsOffline: Boolean = false,
     var isOffline: Boolean = false,
+
+    /**
+     * True when this item is itself an offline folder root or is inside one (issue #1902).
+     * Its offline copy is managed by the folder coverage, as opposed to [isOffline] which is an
+     * explicit user pin on the file itself. Both can be true at the same time (a pinned file
+     * inside an offline folder).
+     */
+    var isInOfflineFolder: Boolean = false,
     var responseAt: Long = 0,
     var versionCode: Int = 0,
     var lastActionAt: Long = 0,
@@ -272,7 +280,7 @@ open class File(
     }
 
     fun getStoredFile(context: Context, userDrive: UserDrive = UserDrive()): IOFile? {
-        return if (isOffline) getOfflineFile(context, userDrive.userId) else getCacheFile(context, userDrive)
+        return if (isOffline || isInOfflineFolder) getOfflineFile(context, userDrive.userId) else getCacheFile(context, userDrive)
     }
 
     fun canUseStoredFile(context: Context, userDrive: UserDrive = UserDrive()): Boolean {
@@ -280,7 +288,8 @@ open class File(
     }
 
     fun isOfflineFile(context: Context, userId: Int = AccountUtils.currentUserId, checkLocalFile: Boolean = true): Boolean {
-        return isOffline || (checkLocalFile && !isFolder() && getOfflineFile(context, userId)?.exists() == true)
+        return isOffline || isInOfflineFolder
+                || (checkLocalFile && !isFolder() && getOfflineFile(context, userId)?.exists() == true)
     }
 
     /**
@@ -317,7 +326,7 @@ open class File(
     }
 
     fun deleteCaches(context: Context) {
-        if (isOffline) getOfflineFile(context)?.apply { if (exists()) delete() }
+        if (isOffline || isInOfflineFolder) getOfflineFile(context)?.apply { if (exists()) delete() }
         else getCacheFile(context).apply { if (exists()) delete() }
     }
 
@@ -509,7 +518,7 @@ open class File(
             cacheFile = when {
                 isPublicShared -> getPublicShareCache(context)
                 isOnlyOfficePreview() -> getConvertedPdfCache(context, userDrive)
-                isOffline -> getOfflineFile(context, userDrive.userId)!!
+                isOffline || isInOfflineFolder -> getOfflineFile(context, userDrive.userId)!!
                 else -> getCacheFile(context, userDrive)
             }
 
@@ -538,7 +547,7 @@ open class File(
             val cloudUri = CloudStorageProvider.createShareFileUri(context, this, userDrive)!!
             val offlineFile = getOfflineFile(context, userDrive.userId)
 
-            return cloudUri to if (isOffline && offlineFile != null) {
+            return cloudUri to if ((isOffline || isInOfflineFolder) && offlineFile != null) {
                 // We use the uri with scheme file because Microsoft Office don't support modifications from a content uri
                 if (isOnlyOfficePreview()) {
                     offlineFile.toUri()

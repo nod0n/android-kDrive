@@ -34,7 +34,7 @@ import kotlinx.coroutines.withContext
 class PlaybackViewModel(application: Application) : AndroidViewModel(application) {
 
     val offlineFile: IOFile? by lazy {
-        if (currentFile?.isOffline == true) {
+        if (currentFile?.isOffline == true || currentFile?.isInOfflineFolder == true) {
             currentFile?.getOfflineFile(getApplication(), userDrive.userId)
         } else {
             null

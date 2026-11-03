@@ -262,6 +262,9 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun updateOfflineFilesIfNeeded(folder: File, files: List<File>) {
+        // Offline folder roots (issue #1902) manage their children's state themselves; this
+        // crash-recovery heuristic must not convert covered files into explicit pins.
+        if (folder.isInOfflineFolder) return
         if (folder.getOfflineFile(context)?.exists() == true && FileController.getFolderOfflineFilesCount(folder.id) == 0L) {
             checkOfflineFilesJob.cancel()
             checkOfflineFilesJob = Job()

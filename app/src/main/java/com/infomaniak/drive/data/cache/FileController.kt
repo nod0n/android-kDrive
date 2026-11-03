@@ -362,6 +362,7 @@ object FileController {
                 currentRealm.executeTransaction {
                     getFileById(currentRealm, fileId)?.let { file ->
                         file.isOffline = isOffline
+                        if (!isOffline) file.isInOfflineFolder = false
                     }
                 }
             }
@@ -873,8 +874,14 @@ object FileController {
         customRealm: Realm? = null
     ): RealmResults<File> {
         val block: (Realm) -> RealmResults<File> = { realm ->
+            // Explicit pins and files covered by an offline folder root (issue #1902) are both
+            // maintained by the offline sync.
             realm.where(File::class.java)
+                .beginGroup()
                 .equalTo(File::isOffline.name, true)
+                .or()
+                .equalTo(File::isInOfflineFolder.name, true)
+                .endGroup()
                 .notEqualTo(File::type.name, Type.DIRECTORY.value)
                 .findAll()?.let { files ->
                     if (order == null) files
@@ -993,6 +1000,7 @@ object FileController {
         cursor = oldFile.cursor
         isComplete = oldFile.isComplete
         isOffline = oldFile.isOffline
+        isInOfflineFolder = oldFile.isInOfflineFolder
         responseAt = oldFile.responseAt
         if (path.isEmpty() && oldFile.path.isNotEmpty()) path = oldFile.path
         if (oldFile.revisedAt > revisedAt) revisedAt = oldFile.revisedAt

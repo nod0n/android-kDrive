@@ -59,7 +59,7 @@ open class PreviewPlaybackFragment : PreviewFragment() {
     private val flagKeepScreenOn by lazy { WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON }
 
     private val offlineFile: IOFile? by lazy {
-        if (file.isOffline) {
+        if (file.isOffline || file.isInOfflineFolder) {
             file.getOfflineFile(requireContext(), previewSliderViewModel.userDrive.userId)
         } else {
             null

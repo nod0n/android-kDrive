@@ -54,8 +54,7 @@ abstract class BaseDownloadWorker(context: Context, workerParams: WorkerParamete
     override suspend fun doWork(): Result {
         return runCatching {
             SentryLog.i(workerTag(), "Work started")
-            val memoryLeftAfterDownload = (getAvailableStorageInBytes() - getSizeOfDownload()) / BYTES_TO_MB
-            val hasSpaceLeftAfterDownload = memoryLeftAfterDownload > MIN_SPACE_LEFT_AFTER_DOWNLOAD_MB
+            val hasSpaceLeftAfterDownload = hasEnoughSpaceLeftAfterDownload(getSizeOfDownload())
             if (hasSpaceLeftAfterDownload) {
                 downloadAction()
             } else {
@@ -73,7 +72,12 @@ abstract class BaseDownloadWorker(context: Context, workerParams: WorkerParamete
         }
     }
 
-    private fun getNotEnoughSpaceOutputData(): Data {
+    protected fun hasEnoughSpaceLeftAfterDownload(sizeOfDownload: Long): Boolean {
+        val memoryLeftAfterDownload = (getAvailableStorageInBytes() - sizeOfDownload) / BYTES_TO_MB
+        return memoryLeftAfterDownload > MIN_SPACE_LEFT_AFTER_DOWNLOAD_MB
+    }
+
+    protected fun getNotEnoughSpaceOutputData(): Data {
         return Data.Builder()
             .putBoolean(HAS_SPACE_LEFT_AFTER_DOWNLOAD_KEY, false)
             .build()

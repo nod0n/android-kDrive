@@ -76,6 +76,11 @@ object SyncOfflineUtils {
                         realm = realm,
                     )
                 }
+
+                // Reconcile the offline folder roots (issue #1902): resume interrupted walks and
+                // periodically refresh the coverage so remote additions/deletions are reflected.
+                ensureActive()
+                OfflineFolderUtils.enqueueStaleOfflineFolderSyncs(context, userDrive, realm)
             }
         }
     }

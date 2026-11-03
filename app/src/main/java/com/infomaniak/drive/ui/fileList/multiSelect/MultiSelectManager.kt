@@ -77,7 +77,7 @@ class MultiSelectManager {
             fileIds.add(file.id)
             if (!file.isFolder()) onlyFolders = false
             if (!file.isFavorite) onlyFavorite = false
-            if (!file.isOffline && !file.isFolder()) onlyOffline = false
+            if (!file.isOffline && !file.isInOfflineFolder && !file.isFolder()) onlyOffline = false
         }
         return MenuNavArgs(
             fileIds = fileIds.toIntArray(),

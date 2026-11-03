@@ -218,7 +218,12 @@ class DownloadOfflineFileManager(
     }
 
     private fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
-        FileController.updateOfflineStatus(file.id, true)
+        FileController.updateFile(file.id) { localFile ->
+            // A file covered by an offline folder (issue #1902) keeps its inherited state: it must
+            // not become an explicit pin, otherwise removing the folder could not clean it up
+            // without stripping separately pinned files.
+            localFile.isOffline = localFile.isOffline || !localFile.isInOfflineFolder
+        }
         offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
         if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
         fileDownloaded(context, file.id)

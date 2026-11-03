@@ -52,6 +52,7 @@ import com.infomaniak.drive.data.api.ErrorCode
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FolderFilesProvider
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.CreateFile
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.FileCategory
@@ -541,7 +542,7 @@ class MainViewModel(
             if (!file.isFolder()) {
                 val offlineFile = file.getOfflineFile(getApplication())
                 val cacheFile = file.getCacheFile(getApplication())
-                if (file.isOffline && offlineFile != null) {
+                if ((file.isOffline || file.isInOfflineFolder) && offlineFile != null) {
                     deleteFile(file, offlineFile, cacheFile)
                 }
             }
@@ -564,7 +565,7 @@ class MainViewModel(
     ) {
         // We need to call this method outside the UI thread
         viewModelScope.launch(Dispatchers.IO) {
-            FileController.updateOfflineStatus(file.id, isOffline = false)
+            FileController.updateIsOfflineForFiles(fileIds = listOf(file.id), isOffline = false)
         }
         deleteFile(file, offlineFile, cacheFile, userDrive, onFileRemovedFromOffline)
     }
@@ -591,6 +592,23 @@ class MainViewModel(
         syncOfflineFilesJob = viewModelScope.launch(Dispatchers.IO) {
             SyncOfflineUtils.startSyncOffline(getContext())
         }
+    }
+
+    /**
+     * Marks [file] (a folder) as an offline root (issue #1902): the durable intent is stored and
+     * a recursive walk downloads all its descendants, now and on every future sync.
+     */
+    fun addOfflineFolderRoot(file: File, userDrive: UserDrive = UserDrive()) = viewModelScope.launch(Dispatchers.IO) {
+        val rootAdded = OfflineFolderController.addOfflineRoot(file, userDrive)
+        if (rootAdded) Utils.enqueueBulkDownloadWorker(getContext(), file.id, userDrive, recursive = true)
+    }
+
+    /**
+     * Removes the offline root on [file]: covered files lose their offline copy (offline cache
+     * only), while explicit pins and files still covered by another root are kept.
+     */
+    fun removeOfflineFolderRoot(file: File, userDrive: UserDrive = UserDrive()) = viewModelScope.launch(Dispatchers.IO) {
+        OfflineFolderController.removeOfflineRoot(file.id, userDrive)
     }
 
     fun cancelSyncOfflineFiles() {

@@ -375,7 +375,7 @@ open class FileAdapter(
             menuButton.isGone = true
         } else {
             menuButton.isVisible = true
-            menuButton.isEnabled = file.isFolder() || !(offlineMode && !file.isOffline)
+            menuButton.isEnabled = file.isFolder() || !(offlineMode && !file.isOfflineFile(context, checkLocalFile = false))
             menuButton.setOnClickListener { onMenuClicked?.invoke(file) }
         }
     }
@@ -418,7 +418,9 @@ open class FileAdapter(
     private fun FileItemViewHolder.checkIfEnableFile(file: File) {
         when {
             uploadInProgress -> displayUploadStatus(file)
-            isSelectingFolder || offlineMode -> enableFile(file.isFolderPartOfTheMove() || (offlineMode && file.isOffline))
+            isSelectingFolder || offlineMode -> enableFile(
+                file.isFolderPartOfTheMove() || (offlineMode && file.isOfflineFile(context, checkLocalFile = false))
+            )
             else -> enableFile()
         }
     }
@@ -521,6 +523,8 @@ open class FileAdapter(
             return oldItem.name == newItem.name &&
                     oldItem.isFavorite == newItem.isFavorite &&
                     oldItem.isOffline == newItem.isOffline &&
+                    oldItem.isInOfflineFolder == newItem.isInOfflineFolder &&
+                    oldItem.isMarkedAsOffline == newItem.isMarkedAsOffline &&
                     oldItem.color == newItem.color &&
                     oldItem.lastModifiedAt == newItem.lastModifiedAt &&
                     oldItem.size == newItem.size &&
