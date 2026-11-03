@@ -161,11 +161,13 @@ class AppLockTransitions(
 
     /**
      * Runs [block] after every queued transition task has fully completed (persist included),
-     * while new requests are refused for the duration. Used to exclude settings-file deletion
-     * from queued or running security writers; failure of the maintenance work itself is the
-     * caller's to handle before declaring its lifecycle step complete.
+     * while new requests are refused for the duration. [block] suspends on the caller's
+     * coroutine — still inside the maintenance exclusion — so maintenance steps that are
+     * themselves suspending (repository clears, file deletion) remain ordered and excluded.
+     * Failure of the maintenance work itself is the caller's to handle before declaring its
+     * lifecycle step complete.
      */
-    suspend fun <T> runWithWriterQuiesced(block: () -> T): T {
+    suspend fun <T> runWithWriterQuiesced(block: suspend () -> T): T {
         admission.write { maintenanceActive = true }
         try {
             quiescenceSignal.await()

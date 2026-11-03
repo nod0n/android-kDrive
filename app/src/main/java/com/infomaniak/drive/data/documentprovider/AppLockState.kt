@@ -62,9 +62,10 @@ object AppLockState {
 
     /**
      * Runs [block] after all queued transition tasks have completed and with new requests
-     * refused; see [AppLockTransitions.runWithWriterQuiesced].
+     * refused; the block suspends on the caller's coroutine inside the exclusion; see
+     * [AppLockTransitions.runWithWriterQuiesced].
      */
-    suspend fun <T> runWithWriterQuiesced(block: () -> T): T = transitions.runWithWriterQuiesced(block)
+    suspend fun <T> runWithWriterQuiesced(block: suspend () -> T): T = transitions.runWithWriterQuiesced(block)
 
     /** Maintenance-only reset; see [AppLockTransitions.resetToDisabledInternal]. */
     fun resetToDisabledInternal(): Boolean = transitions.resetToDisabledInternal()
