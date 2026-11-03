@@ -45,6 +45,7 @@ import kotlin.concurrent.write
  */
 class AppLockTransitions(
     private val persist: (Boolean) -> Boolean,
+    private val publish: (Boolean) -> Unit = {},
     private val onTransition: () -> Unit = {},
     private val writer: Executor = defaultWriter(),
 ) {
@@ -172,6 +173,37 @@ class AppLockTransitions(
         } finally {
             admission.write { maintenanceActive = false }
         }
+    }
+
+    /**
+     * Maintenance-only security reset (Astra review R4-3): durably persists the disabled value
+     * outside the public request path — public requests are refused under maintenance, so no
+     * public write can interleave — publishing the matching cache on success and clearing the
+     * pending denial only on real success. Returns true only when the store write committed.
+     */
+    fun resetToDisabledInternal(): Boolean {
+        val persisted = persist(false)
+        admission.write {
+            policyGeneration += 1
+            if (persisted) pendingGeneration = null
+        }
+        cancelAdmittedWork()
+        onTransition()
+        return persisted
+    }
+
+    /**
+     * Maintenance-phase reconcile: clears any pending denial and publishes [durableEnabled] —
+     * the value future durable reads will actually present (an absent store reads as the
+     * default disabled value) — to in-memory readers, then notifies observers.
+     */
+    fun reconcileAfterMaintenance(durableEnabled: Boolean) {
+        admission.write {
+            policyGeneration += 1
+            pendingGeneration = null
+        }
+        publish(durableEnabled)
+        onTransition()
     }
 
     private companion object {

@@ -96,15 +96,32 @@ open class AppSettings(
             }
         }
 
-        fun resetAppSettings() {
-            // _appSecurityEnabled is deliberately not written here: it is only ever changed
-            // through AppLockState's ordered lifecycle (AccountUtils.resetApp requests the
-            // reset), so this asynchronous default write can neither race a queued security
-            // write nor resurrect a stale value after one.
-            updateAppSettings {
-                _currentDriveId = -1
-                _currentUserId = -1
-                _onlyWifiSyncOffline = false
+        /** Publishes an already-durable value to in-memory readers without writing the store. */
+        fun publishAppSecurityLock(enabled: Boolean) {
+            appSecurityLock = enabled
+        }
+
+        /**
+         * Synchronous reset of the non-security settings fields, run inside the logout
+         * maintenance section so no asynchronous writer can commit after (or race) it.
+         * Returns true only when the write committed.
+         */
+        fun resetAppSettings(): Boolean {
+            return try {
+                getRealmInstance().use { realm ->
+                    realm.executeTransaction { transactionRealm ->
+                        (getAppSettingsQuery(transactionRealm)
+                            ?: transactionRealm.copyToRealm(AppSettings())
+                        ).apply {
+                            _currentDriveId = -1
+                            _currentUserId = -1
+                            _onlyWifiSyncOffline = false
+                        }
+                    }
+                }
+                true
+            } catch (_: Exception) {
+                false
             }
         }
 

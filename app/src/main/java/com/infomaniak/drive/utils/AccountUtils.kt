@@ -274,31 +274,42 @@ object AccountUtils : CredentialManager(
 
     private suspend fun resetApp(context: Context) {
         if (getAllUsersCount() == 0) {
-            // Awaited ordered security reset: returns only once the request has been durably
-            // persisted (or has failed, reported below); queued security writes drain first and
-            // newer ones cannot overtake it.
-            val resetPersisted = AppLockState.requestAppLockAwait(enabled = false)
-            if (!resetPersisted) {
-                SentryLog.w("AccountUtils", "resetApp> app lock reset could not be persisted")
-            }
-
-            AppSettings.resetAppSettings()
-            UiSettings(context).removeUiSettings()
-            AppReviewSettingsRepository(context).clear()
-            AppUpdateSettingsRepository(context).clear()
-
-            if (isEnableAppSync()) {
-                Sentry.captureMessage(DISABLE_AUTO_SYNC)
-                disableAutoSync()
-            }
-
-            // Delete all app data with the transition writer quiesced: no queued or running
-            // security write can touch or recreate the settings store during deletion, and new
-            // requests are refused until the deletion is done.
+            // Single maintenance lifecycle reserved before the final reset (R4-3): from here on
+            // public requests are refused, every queued security writer drains to completion,
+            // and the settings reset, deletion and reconciliation happen inside the exclusion —
+            // so no request can commit an enable between the reset and the deletion.
             AppLockState.runWithWriterQuiesced {
-                with(context) {
-                    filesDir.deleteRecursively()
-                    cacheDir.deleteRecursively()
+                val settingsReset = AppSettings.resetAppSettings()
+                if (!settingsReset) {
+                    SentryLog.w("AccountUtils", "resetApp> settings reset could not be persisted")
+                }
+
+                UiSettings(context).removeUiSettings()
+                AppReviewSettingsRepository(context).clear()
+                AppUpdateSettingsRepository(context).clear()
+
+                if (isEnableAppSync()) {
+                    Sentry.captureMessage(DISABLE_AUTO_SYNC)
+                    disableAutoSync()
+                }
+
+                val lockResetPersisted = AppLockState.resetToDisabledInternal()
+                if (!lockResetPersisted) {
+                    SentryLog.w("AccountUtils", "resetApp> app lock reset could not be persisted")
+                }
+
+                val filesDeleted = with(context) { filesDir.deleteRecursively() }
+                val cacheDeleted = with(context) { cacheDir.deleteRecursively() }
+                if (!filesDeleted || !cacheDeleted) {
+                    SentryLog.w("AccountUtils", "resetApp> app data deletion incomplete")
+                }
+
+                // Reconcile cache and pending denial with the state future durable reads will
+                // actually present (an absent store reads as the default disabled value); an
+                // unreadable store keeps the fail-closed denial.
+                when (val durableEnabled = AppLockState.readDurableAppLockEnabled()) {
+                    null -> SentryLog.w("AccountUtils", "resetApp> settings store unreadable after deletion")
+                    else -> AppLockState.reconcileAfterMaintenance(durableEnabled = durableEnabled)
                 }
             }
             SentryLog.i("AccountUtils", "resetApp> all user data has been deleted")

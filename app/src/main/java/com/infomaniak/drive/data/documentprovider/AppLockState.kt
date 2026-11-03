@@ -40,6 +40,7 @@ object AppLockState {
 
     private val transitions = AppLockTransitions(
         persist = { enabled -> AppSettings.updateAppSecurityLock(enabled) },
+        publish = { enabled -> AppSettings.publishAppSecurityLock(enabled) },
         onTransition = { onTransition?.invoke() },
     )
 
@@ -61,21 +62,20 @@ object AppLockState {
         transitions.request(enabled, onResult)
 
     /**
-     * Requests a change of the app-lock setting and suspends until it has fully completed:
-     * returns true only when the requested value became the durable one (false on persist
-     * failure, supersession, or refusal while the writer is under maintenance).
-     */
-    suspend fun requestAppLockAwait(enabled: Boolean): Boolean {
-        val result = CompletableDeferred<Boolean>()
-        transitions.request(enabled) { persisted -> result.complete(persisted) }
-        return result.await()
-    }
-
-    /**
      * Runs [block] after all queued transition tasks have completed and with new requests
      * refused; see [AppLockTransitions.runWithWriterQuiesced].
      */
     suspend fun <T> runWithWriterQuiesced(block: () -> T): T = transitions.runWithWriterQuiesced(block)
+
+    /** Maintenance-only reset; see [AppLockTransitions.resetToDisabledInternal]. */
+    fun resetToDisabledInternal(): Boolean = transitions.resetToDisabledInternal()
+
+    /** Maintenance reconcile; see [AppLockTransitions.reconcileAfterMaintenance]. */
+    fun reconcileAfterMaintenance(durableEnabled: Boolean) = transitions.reconcileAfterMaintenance(durableEnabled)
+
+    /** Durable store value; null when the store cannot be read (maintenance reconciliation). */
+    fun readDurableAppLockEnabled(): Boolean? =
+        runCatching { AppSettings.getAppSettings()._appSecurityEnabled }.getOrNull()
 
     /** Shared transition boundary for final authorization/issuance (see [AppLockTransitions]). */
     fun <T> withAdmission(block: () -> T): T = transitions.withAdmission(block)
