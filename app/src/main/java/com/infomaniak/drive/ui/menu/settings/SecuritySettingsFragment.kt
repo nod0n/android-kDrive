@@ -24,11 +24,14 @@ import android.view.ViewGroup
 import androidx.core.view.isGone
 import androidx.core.view.isVisible
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.navigation.fragment.findNavController
 import com.infomaniak.core.applock.AppLockManager
 import com.infomaniak.core.fragmentnavigation.safelyNavigate
 import com.infomaniak.core.legacy.utils.safeBinding
+import com.infomaniak.core.ui.view.utils.SnackbarUtils.showSnackbar
 import com.infomaniak.drive.MatomoDrive.MatomoName
 import com.infomaniak.drive.MatomoDrive.trackSettingsEvent
 import com.infomaniak.drive.R
@@ -85,7 +88,34 @@ class SecuritySettingsFragment : Fragment() {
 
         updateContentProviderDescription()
 
+        // Live request state: the parent screen must update its labels/explanation and consume
+        // failure feedback even when the app-lock activity is gone (Astra review R4-4).
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                AppLockRequest.state.collect { uiState -> renderAppLockRequestState(uiState) }
+            }
+        }
+
         binding.root.enableEdgeToEdge()
+    }
+
+    private fun renderAppLockRequestState(uiState: AppLockRequest.UiState) = with(binding) {
+        when (uiState) {
+            is AppLockRequest.UiState.Pending -> Unit // labels keep showing the committed value
+
+            is AppLockRequest.UiState.Completed -> {
+                updateSecurityLabels()
+                if (!uiState.persisted) showSnackbar(R.string.appSecurityPersistError)
+                AppLockRequest.markDelivered()
+            }
+
+            is AppLockRequest.UiState.Idle -> updateSecurityLabels()
+        }
+    }
+
+    private fun updateSecurityLabels() = with(binding) {
+        appLock.endText = getString(if (AppSettings.appSecurityLock) R.string.allActivated else R.string.allDisabled)
+        updateContentProviderDescription()
     }
 
     /**

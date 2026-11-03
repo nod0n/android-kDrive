@@ -89,8 +89,9 @@ class AppSecuritySettingsActivity : AppCompatActivity() {
                 setSwitchCheckedSilently(AppSettings.appSecurityLock)
             }
             is AppLockRequest.UiState.Pending -> {
-                // Disable the whole interactive row: the card click would otherwise flip the
-                // switch while its change is still being persisted.
+                // Every instance shows the committed value while pending, not the requested one
+                // (Core's helper flips the checkbox before the request callback runs).
+                setSwitchCheckedSilently(AppSettings.appSecurityLock)
                 enableFaceId.isEnabled = false
                 enableFaceIdSwitch.isEnabled = false
             }
