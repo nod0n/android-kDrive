@@ -20,18 +20,28 @@ package com.infomaniak.drive.ui.menu
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.infomaniak.core.auth.TokenAuthenticator
+import com.infomaniak.core.auth.TokenInterceptor
+import com.infomaniak.core.network.networking.HttpClientConfig
+import com.infomaniak.core.network.networking.HttpUtils
+import com.infomaniak.drive.TokenInterceptorListenerProvider
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.AccountUtils
 import io.realm.Realm
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.lock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
 import kotlin.coroutines.coroutineContext
 
 /** Result of a gallery load, published on [GalleryViewModel.galleryApiResult]. */
@@ -96,6 +106,38 @@ class GalleryViewModel : ViewModel() {
     val galleryApiResult = MutableLiveData<GalleryResult>()
     val needToRestoreFiles get() = galleryApiResult.isInitialized
 
+    /**
+     * Resources shared by every load of the same captured account+drive: one mutation lock and
+     * one HTTP client whose authentication is bound to that exact user.
+     */
+    private class DriveResources(userDrive: UserDrive) {
+
+        /** Serializes gallery cache mutations (stores, refresh resets, orphan cleanup). */
+        val mutationLock = ReentrantLock()
+
+        val httpClient: OkHttpClient = OkHttpClient.Builder().apply {
+            val tokenInterceptorListener = TokenInterceptorListenerProvider.tokenInterceptorListenerByUserId(
+                refreshTokenError = {
+                    // A failed token refresh surfaces here as a page failure and reaches the
+                    // retry UI; account removal stays the global handler's responsibility.
+                },
+                userId = userDrive.userId,
+            )
+            addInterceptor(Interceptor { chain ->
+                chain.request().newBuilder().headers(HttpUtils.getHeaders()).build().let(chain::proceed)
+            })
+            addInterceptor(TokenInterceptor(tokenInterceptorListener))
+            authenticator(TokenAuthenticator(tokenInterceptorListener))
+            HttpClientConfig.addCommonInterceptors(this) // Needs to be added last
+        }.build()
+    }
+
+    private val driveResources = ConcurrentHashMap<UserDrive, DriveResources>()
+
+    private fun resourcesFor(userDrive: UserDrive): DriveResources {
+        return driveResources.getOrPut(userDrive) { DriveResources(userDrive) }
+    }
+
     fun setMediaFilter(filter: GalleryMediaFilter) {
         // Selecting the already-selected filter must not invalidate anything: the equal
         // StateFlow value would not re-emit, so the invalidated in-flight load would never be
@@ -110,21 +152,27 @@ class GalleryViewModel : ViewModel() {
         mediaFilter.value = filter
     }
 
-    fun loadLastGallery(driveId: Int, ignoreCloud: Boolean) {
+    /** Always accepted: an explicit (re)start of the gallery from page one. */
+    fun loadLastGallery(driveId: Int, ignoreCloud: Boolean): Boolean {
         lastGalleryFiles = arrayListOf()
         currentCursor = null
         loadGallery(driveId, ignoreCloud, isFirstPage = true)
+        return true
     }
 
-    fun loadMoreGallery(driveId: Int, ignoreCloud: Boolean) {
+    /**
+     * Attempts to start a continuation from the preserved cursor. Returns false — without any
+     * side effect — when refused: one is already running, or there is no cursor to resume from.
+     */
+    fun loadMoreGallery(driveId: Int, ignoreCloud: Boolean): Boolean {
         // One active continuation at a time: a repeat trigger (scroll or empty-state button)
         // while a load is running must neither cancel it nor restart from the still-published
         // cursor, which would fetch and cache the same raw pages again.
-        if (getGalleryJob?.isActive == true) return
+        if (getGalleryJob?.isActive == true) return false
 
-        currentCursor?.let {
-            loadGallery(driveId, ignoreCloud, isFirstPage = false, startCursor = it)
-        }
+        val startCursor = currentCursor ?: return false
+        loadGallery(driveId, ignoreCloud, isFirstPage = false, startCursor = startCursor)
+        return true
     }
 
     fun restoreGalleryFiles() {
@@ -156,40 +204,45 @@ class GalleryViewModel : ViewModel() {
         getGalleryJob?.cancel()
         val generation = ++loadGeneration
         val filter = mediaFilter.value
-        // Capture the exact account+drive this load belongs to: every cache operation runs
-        // against this identity's own Realm and every acceptance check compares against it,
-        // never against the live global account.
+        // Capture the exact account+drive this load belongs to: authentication, every cache
+        // operation and every acceptance check use this identity, never the live global one.
         val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = driveId)
-        getGalleryJob = viewModelScope.launch(Dispatchers.IO) {
+        val resources = resourcesFor(userDrive)
+        getGalleryJob = viewModelScope.launch(Dispatchers.Main) {
             val job = requireNotNull(coroutineContext[Job])
-            val realm = FileController.getRealmInstance(userDrive)
-            try {
-                val result = if (ignoreCloud) {
-                    emitCachedGallery(userDrive, filter, generation, realm)
-                } else {
-                    fetchGallery(userDrive, filter, isFirstPage, startCursor, generation, { job.ensureActive() }, realm)
-                }
 
-                // Apply on Main as one atomic step: re-check the load identity there (Main is
-                // where invalidation happens), then mutate the cursor and accumulator first and
-                // publish synchronously last. A replacement load started meanwhile can neither
-                // interleave between the check and the mutations nor observe a half-applied one.
-                withContext(Dispatchers.Main) {
-                    job.ensureActive()
-                    val isLoadCurrent = generation == loadGeneration &&
-                        userDrive.userId == AccountUtils.currentUserId &&
-                        userDrive.driveId == AccountUtils.currentDriveId
-                    if (isLoadCurrent) {
-                        currentCursor = when (result) {
-                            is GalleryResult.Success -> result.nextCursor
-                            is GalleryResult.PageFailure -> result.retryCursor
-                        }
-                        lastGalleryFiles.addAll(result.files)
-                        galleryApiResult.value = result
-                    }
+            // Resolve the account-bound client before any other work: its interceptor and
+            // authenticator fetch the captured user's own credentials on OkHttp's threads, so
+            // no suspension and no live-user lookup can happen inside the Realm block below.
+            val httpClient = resources.httpClient
+
+            // One non-suspending IO block owns the Realm for its whole lifetime. Realm
+            // instances are thread-confined and Dispatchers.IO does not preserve the physical
+            // thread across suspension (closing from another thread throws), so opening,
+            // fetching, storing and closing all run inside this single block, on one worker
+            // thread; the detached result is dispatched to Main afterwards.
+            val result = withContext(Dispatchers.IO) {
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    if (ignoreCloud) emitCachedGallery(userDrive, filter, generation, realm)
+                    else fetchGallery(userDrive, filter, isFirstPage, startCursor, generation, job, resources, httpClient, realm)
                 }
-            } finally {
-                realm.close()
+            }
+
+            // Apply on Main as one atomic step: re-check the load identity there (Main is where
+            // invalidation happens), then mutate the cursor and accumulator first and publish
+            // synchronously last. A replacement load started meanwhile can neither interleave
+            // between the check and the mutations nor observe a half-applied one.
+            job.ensureActive()
+            val isLoadCurrent = generation == loadGeneration &&
+                userDrive.userId == AccountUtils.currentUserId &&
+                userDrive.driveId == AccountUtils.currentDriveId
+            if (isLoadCurrent) {
+                currentCursor = when (result) {
+                    is GalleryResult.Success -> result.nextCursor
+                    is GalleryResult.PageFailure -> result.retryCursor
+                }
+                lastGalleryFiles.addAll(result.files)
+                galleryApiResult.value = result
             }
         }
     }
@@ -210,7 +263,9 @@ class GalleryViewModel : ViewModel() {
         isFirstPage: Boolean,
         startCursor: String?,
         generation: Long,
-        checkActive: () -> Unit,
+        job: Job,
+        resources: DriveResources,
+        httpClient: OkHttpClient,
         realm: Realm,
     ): GalleryResult {
         var isStoringFirstPage = isFirstPage
@@ -219,21 +274,28 @@ class GalleryViewModel : ViewModel() {
         val outcome = GalleryPageScanner<File>(predicate = { it.matchesMediaFilter(filter) }).scan(
             startCursor = startCursor,
             onRawPage = { page ->
-                // Store only while this load is still the newest request for its query: a
-                // superseded first page must not reset the captured account's gallery cache.
-                // The Realm itself is the captured account's own, so a racing account switch
-                // can never write into another account's database.
-                if (generation == loadGeneration) {
-                    didFetchAnyPage = true
-                    // Store every raw page unfiltered so the offline cache keeps covering the
-                    // whole gallery, whatever the active filter is.
-                    FileController.storeGalleryDrive(page, isStoringFirstPage, customRealm = realm)
-                    isStoringFirstPage = false
+                // Serialize cache mutations per captured account: the liveness check and the
+                // transaction form one boundary inside the same lock that every newer load's
+                // writes must acquire, so an obsolete load can never commit after a
+                // replacement refresh (a stale first page would otherwise reset it).
+                resources.mutationLock.lock {
+                    if (job.isActive && generation == loadGeneration) {
+                        didFetchAnyPage = true
+                        // Store every raw page unfiltered so the offline cache keeps covering
+                        // the whole gallery, whatever the active filter is.
+                        FileController.storeGalleryDrive(page, isStoringFirstPage, customRealm = realm)
+                        isStoringFirstPage = false
+                    }
                 }
             },
-            checkActive = checkActive,
+            checkActive = { job.ensureActive() },
         ) { cursor ->
-            val apiResponse = ApiRepository.getLastGallery(driveId = userDrive.driveId, cursor = cursor)
+            // Authentication is bound to the captured account for every single page.
+            val apiResponse = ApiRepository.getLastGallery(
+                driveId = userDrive.driveId,
+                cursor = cursor,
+                okHttpClient = httpClient,
+            )
             if (apiResponse.isSuccess()) {
                 GalleryPage.Success(apiResponse.data.orEmpty(), apiResponse.cursor, apiResponse.hasMore)
             } else {
@@ -241,7 +303,11 @@ class GalleryViewModel : ViewModel() {
             }
         }
 
-        if (isFirstPage && didFetchAnyPage && generation == loadGeneration) FileController.removeOrphanFiles(realm)
+        if (isFirstPage && didFetchAnyPage) {
+            resources.mutationLock.lock {
+                if (job.isActive && generation == loadGeneration) FileController.removeOrphanFiles(realm)
+            }
+        }
 
         return when (outcome) {
             is GalleryScanResult.Complete -> GalleryResult.Success(ArrayList(outcome.items), userDrive, generation, isComplete = true)
