@@ -18,61 +18,52 @@
 package com.infomaniak.drive.data.documentprovider
 
 import com.infomaniak.drive.data.models.AppSettings
-import java.util.concurrent.Executors
 
 /**
  * Storage-aware, thread-safe source of truth for the app-lock gate of [CloudStorageProvider].
  *
- * [AppSettings.appSecurityLock] is an in-memory cached value backed by an asynchronous store
- * write: its reads observe neither concurrent changes nor the durable store, and an enable could
- * be lost if the process died before the queued transaction committed. The provider gate therefore
- * consults this object instead:
+ * [AppSettings.appSecurityLock] is an in-memory published value (updated only after the durable
+ * commit) for UI readers; it must not be consulted by the gate. The gate goes through this
+ * object, which wires [AppLockTransitions] to the Realm-backed settings store:
  *  - every read consults the durable store and denies when the store cannot be read,
- *  - changes are serialized on a single writer thread and a transition denies access from the
- *    moment it is requested until it is durably committed (an enable denies while pending; a
- *    disable keeps denying until the store actually carries the disabled value),
- *  - transitions are announced through [onTransition] so pending provider work can be invalidated
- *    and observers notified.
- *
- * If persistence fails, the pending denial is kept until a later successful request: the gate
- * never opens on the strength of an uncommitted value.
+ *  - transitions are serialized, generation-tagged and deny access from request until durable
+ *    commit (see [AppLockTransitions]),
+ *  - transitions are announced through [onTransition] so pending provider work can be
+ *    invalidated and observers notified.
  */
 object AppLockState {
-
-    private val stateLock = Any()
-    private val writeExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "AppLockState-writer")
-    }
 
     /** One-shot hook invoked whenever the effective policy may have changed. */
     @Volatile
     var onTransition: (() -> Unit)? = null
 
-    /** Latest requested-but-not-yet-durable target value, if any. Guarded by [stateLock]. */
-    private var pendingTarget: Boolean? = null
+    private val transitions = AppLockTransitions(
+        persist = { enabled -> AppSettings.updateAppSecurityLock(enabled) },
+        onTransition = { onTransition?.invoke() },
+    )
 
     /** Authoritative app-lock state for the provider gate. */
-    fun isAppLockActive(): Boolean = Policy.isActive(
-        pendingTarget = synchronized(stateLock) { pendingTarget },
-        persistedValue = runCatching { AppSettings.getAppSettings()._appSecurityEnabled }.getOrNull(),
-    )
+    fun isAppLockActive(): Boolean {
+        if (transitions.isPending()) return true
+        return Policy.isActive(
+            pendingTarget = null,
+            persistedValue = runCatching { AppSettings.getAppSettings()._appSecurityEnabled }.getOrNull(),
+        )
+    }
 
     /**
      * Requests a change of the app-lock setting. External access is denied from this call until
-     * the new value is durably persisted (or, within this process, until a later request succeeds,
-     * if persistence fails).
+     * the new value is durably persisted (or, within this process, until a later request
+     * succeeds, if persistence fails). See [AppLockTransitions.request] for [onResult].
      */
-    fun requestAppLock(enabled: Boolean) {
-        synchronized(stateLock) { pendingTarget = enabled }
-        onTransition?.invoke()
-        writeExecutor.execute {
-            val persisted = AppSettings.updateAppSecurityLock(enabled)
-            if (persisted) {
-                synchronized(stateLock) { if (pendingTarget == enabled) pendingTarget = null }
-                onTransition?.invoke()
-            }
-        }
-    }
+    fun requestAppLock(enabled: Boolean, onResult: ((Boolean) -> Unit)? = null): Long =
+        transitions.request(enabled, onResult)
+
+    /** Shared transition boundary for final authorization/issuance (see [AppLockTransitions]). */
+    fun <T> withAdmission(block: () -> T): T = transitions.withAdmission(block)
+
+    /** Current policy generation, for tagging retained state such as cursors. */
+    fun policyGeneration(): Long = transitions.policyGeneration()
 
     /** Pure decision core, unit-testable without Android or Realm. */
     object Policy {

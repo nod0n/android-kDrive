@@ -35,6 +35,7 @@ import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.ErrorCode
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.documentprovider.AppLockState
 import com.infomaniak.drive.data.documentprovider.CloudStorageProvider
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.UiSettings
@@ -273,6 +274,10 @@ object AccountUtils : CredentialManager(
 
     private suspend fun resetApp(context: Context) {
         if (getAllUsersCount() == 0) {
+            // Ordered security reset: durable disabled value, published cache, provider
+            // notification. Queued older security writes are skipped by generation, so none of
+            // them can overwrite or resurrect state after the settings-file deletion below.
+            AppLockState.requestAppLock(enabled = false)
             AppSettings.resetAppSettings()
             UiSettings(context).removeUiSettings()
             AppReviewSettingsRepository(context).clear()

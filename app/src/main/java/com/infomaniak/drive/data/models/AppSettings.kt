@@ -97,7 +97,15 @@ open class AppSettings(
         }
 
         fun resetAppSettings() {
-            updateAppSettings { update(AppSettings()) }
+            // _appSecurityEnabled is deliberately not written here: it is only ever changed
+            // through AppLockState's ordered lifecycle (AccountUtils.resetApp requests the
+            // reset), so this asynchronous default write can neither race a queued security
+            // write nor resurrect a stale value after one.
+            updateAppSettings {
+                _currentDriveId = -1
+                _currentUserId = -1
+                _onlyWifiSyncOffline = false
+            }
         }
 
         /**
