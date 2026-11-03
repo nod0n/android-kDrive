@@ -53,7 +53,6 @@ import com.infomaniak.drive.data.api.UploadTask.Companion.ConflictOption
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FolderFilesProvider
-import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
@@ -100,21 +99,25 @@ class CloudStorageProvider : DocumentsProvider() {
         return isDisabled(ctx)
     }
 
-    /**
-     * App lock state, read from persisted app settings. Fails closed (treated as locked) if the
-     * state cannot be read: an unreadable store would break the rest of the provider anyway, and
-     * blocking is the safe direction.
-     */
-    private fun isAppLockActive(): Boolean = runCatching {
-        AppSettings.appSecurityLock
-    }.getOrDefault(true)
-
     private fun accessDecision(): ProviderAccessPolicy.Reason = ProviderAccessPolicy.evaluate(
-        appLockEnabled = isAppLockActive(),
+        appLockEnabled = AppLockState.isAppLockActive(),
         providerDisabledByUser = isProviderDisabled(),
     )
 
     private fun isExternalAccessBlocked(): Boolean = accessDecision() != ProviderAccessPolicy.Reason.ALLOWED
+
+    /**
+     * Revalidates the policy right before access is granted. Used at Binder entry points and
+     * again before descriptor issuance, cursor page publication and mutation dispatch, so work
+     * that crossed an app-lock transition (slow downloads, queued pages) cannot complete with
+     * newly granted access.
+     */
+    private fun ensureExternalAccessAllowed() {
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision))
+        }
+    }
 
     private fun blockedReasonMessage(decision: ProviderAccessPolicy.Reason): String = when (decision) {
         ProviderAccessPolicy.Reason.BLOCKED_BY_APP_LOCK ->
@@ -156,10 +159,12 @@ class CloudStorageProvider : DocumentsProvider() {
         SentryLog.d(TAG, "queryRoots")
         val cursor = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
 
+        val isAccessBlocked = isExternalAccessBlocked()
         AccountUtils.getAllUsersSync().forEach { user ->
-            cursor.addRoot(user.id.toString(), user.id.toString(), user.email)
+            // While external access is blocked, do not disclose account identities via root summaries.
+            cursor.addRoot(user.id.toString(), user.id.toString(), if (isAccessBlocked) "" else user.email)
 
-            if (!isExternalAccessBlocked()) {
+            if (!isAccessBlocked) {
                 cloudScope.launch {
                     context?.let {
                         val okHttpClient = AccountUtils.getHttpClient(user.id)
@@ -229,6 +234,8 @@ class CloudStorageProvider : DocumentsProvider() {
         val decision = accessDecision()
         if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
             cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to blockedReasonMessage(decision))
+            // Install the notification URI so observers re-query once access is restored.
+            context?.let { cursor.setNotificationUri(it.contentResolver, DocumentCursor.createUri(it, parentDocumentId)) }
             return cursor
         }
 
@@ -323,6 +330,10 @@ class CloudStorageProvider : DocumentsProvider() {
     }
 
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+        // Relationship metadata is protected like any other content: deny before parsing IDs or
+        // touching the cache when external access is blocked.
+        ensureExternalAccessAllowed()
+
         // Roots and other virtual containers must only match documents that are actually
         // inside their subtree; otherwise SAF relationship checks can be bypassed.
         val parentDocumentType = computeDocumentType(parentDocumentId)
@@ -363,6 +374,8 @@ class CloudStorageProvider : DocumentsProvider() {
         uri: Uri,
         isSharedWithMeFolder: Boolean = false,
     ): (files: ArrayList<File>) -> Unit = { files ->
+        // A queued page must not be appended if the lock was enabled while it was being fetched.
+        if (isExternalAccessBlocked()) job.cancel()
         job.ensureActive()
         files.forEach { file ->
             val sharedWithMePath = StringBuilder(SHARED_WITHME_FOLDER_ID.toString())
@@ -381,10 +394,7 @@ class CloudStorageProvider : DocumentsProvider() {
         signal: CancellationSignal?
     ): ParcelFileDescriptor? = withLaxStrictMode {
         SentryLog.d(TAG, "openDocument(), id=$documentId, mode=$mode, signalIsCancelled: ${signal?.isCanceled}")
-        val decision = accessDecision()
-        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
-            throw SecurityException(blockedReasonMessage(decision))
-        }
+        ensureExternalAccessAllowed()
         val context = context ?: return null
 
         fun getRemoteFile(localFile: File?, fileId: Int, driveId: Int): File? {
@@ -401,6 +411,9 @@ class CloudStorageProvider : DocumentsProvider() {
         val updatedFile = runCatching {
             getRemoteFile(localFile, fileId, userDrive.driveId)
         }.getOrNull() ?: localFile
+
+        // The fetch above can outlive an app-lock transition; revalidate before issuing a descriptor.
+        ensureExternalAccessAllowed()
 
         return updatedFile?.let {
             if (isWrite) {
@@ -423,6 +436,8 @@ class CloudStorageProvider : DocumentsProvider() {
         val decision = accessDecision()
         if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
             cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to blockedReasonMessage(decision))
+            // Install the notification URI so observers re-query once access is restored.
+            context?.let { cursor.setNotificationUri(it.contentResolver, DocumentCursor.createUri(it, "$rootId/search/$query")) }
             return cursor
         }
 
@@ -458,6 +473,8 @@ class CloudStorageProvider : DocumentsProvider() {
 
         runSuspendOnPlatformAdaptively(cursor.job) {
             FileController.cloudStorageSearch(userDrive, query, onResponse = { files ->
+                // A queued result page must not be appended after the lock was enabled.
+                if (isExternalAccessBlocked()) cursor.job.cancel()
                 cursor.job.ensureActive()
                 files.forEach { file ->
                     cursor.addFile(file, createFileDocumentId(parentDocumentId, file.id))
@@ -479,10 +496,7 @@ class CloudStorageProvider : DocumentsProvider() {
     ): AssetFileDescriptor = withLaxStrictMode {
         SentryLog.d(TAG, "openDocumentThumbnail(), id=$documentId, signalIsCancelled: ${signal?.isCanceled}")
 
-        val decision = accessDecision()
-        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
-            throw SecurityException(blockedReasonMessage(decision))
-        }
+        ensureExternalAccessAllowed()
 
         val fileId = getFileIdFromDocumentId(documentId)
         val userId = getUserId(documentId)
@@ -490,6 +504,9 @@ class CloudStorageProvider : DocumentsProvider() {
         return FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
 
             FileController.getFileProxyById(fileId, customRealm = realm)?.let { file ->
+
+                // Revalidate before creating the pipe: a fetch may have crossed a lock transition.
+                ensureExternalAccessAllowed()
 
                 generateThumbnail(fileId, file, userId, signal)?.let { parcel ->
                     AssetFileDescriptor(parcel, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
@@ -512,10 +529,7 @@ class CloudStorageProvider : DocumentsProvider() {
     ): AssetFileDescriptor = withLaxStrictMode {
         SentryLog.d(TAG, "openTypedDocument(), id=$documentId, mimeTypeFilter=$mimeTypeFilter")
 
-        val decision = accessDecision()
-        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
-            throw SecurityException(blockedReasonMessage(decision))
-        }
+        ensureExternalAccessAllowed()
 
         return super.openTypedDocument(documentId, mimeTypeFilter, opts, signal)
     }
@@ -564,10 +578,7 @@ class CloudStorageProvider : DocumentsProvider() {
     ): String = withLaxStrictMode {
         SentryLog.d(TAG, "createDocument(), parentId=$parentDocumentId, mimeType=$mimeType")
 
-        val decision = accessDecision()
-        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
-            throw SecurityException(blockedReasonMessage(decision))
-        }
+        ensureExternalAccessAllowed()
 
         return if (mimeType.equals(DocumentsContract.Document.MIME_TYPE_DIR, true)) {
             createNewFolder(parentDocumentId, displayName) // If we want to create a new folder
@@ -579,10 +590,7 @@ class CloudStorageProvider : DocumentsProvider() {
     override fun deleteDocument(documentId: String): Unit = withLaxStrictMode {
         SentryLog.d(TAG, "deleteDocument(), id=$documentId")
 
-        val decision = accessDecision()
-        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
-            throw SecurityException(blockedReasonMessage(decision))
-        }
+        ensureExternalAccessAllowed()
 
         val context = context ?: throw IllegalStateException("Delete document failed: missing Android Context")
 
@@ -590,6 +598,7 @@ class CloudStorageProvider : DocumentsProvider() {
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
                 // Delete
+                ensureExternalAccessAllowed()
                 val apiResponse = FileController.deleteFile(file, realm, context = context)
 
                 if (apiResponse.isSuccess()) {
@@ -613,15 +622,13 @@ class CloudStorageProvider : DocumentsProvider() {
     ): String? = withLaxStrictMode {
         SentryLog.d(TAG, "renameDocument(), id=$documentId")
 
-        val decision = accessDecision()
-        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
-            throw SecurityException(blockedReasonMessage(decision))
-        }
+        ensureExternalAccessAllowed()
 
         FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
                 // Rename
+                ensureExternalAccessAllowed()
                 val apiResponse = FileController.renameFile(file, displayName, realm)
 
                 if (apiResponse.isSuccess()) {
@@ -643,10 +650,7 @@ class CloudStorageProvider : DocumentsProvider() {
     ): String = withLaxStrictMode {
         SentryLog.d(TAG, "copyDocument(), sourceId=$sourceDocumentId, targetParentId=$targetParentDocumentId")
 
-        val decision = accessDecision()
-        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
-            throw SecurityException(blockedReasonMessage(decision))
-        }
+        ensureExternalAccessAllowed()
 
         return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
 
@@ -655,6 +659,7 @@ class CloudStorageProvider : DocumentsProvider() {
                 FileController.getFileProxyById(fileId, customRealm = realm) ?: throw IllegalStateException("File not found")
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
 
+            ensureExternalAccessAllowed()
             val apiResponse = ApiRepository.duplicateFile(file, targetParentFileId)
 
             if (apiResponse.isSuccess()) {
@@ -681,10 +686,7 @@ class CloudStorageProvider : DocumentsProvider() {
                     "targetParentId=$targetParentDocumentId"
         )
 
-        val decision = accessDecision()
-        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
-            throw SecurityException(blockedReasonMessage(decision))
-        }
+        ensureExternalAccessAllowed()
 
         return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
 
@@ -697,6 +699,7 @@ class CloudStorageProvider : DocumentsProvider() {
             val targetParentFile =
                 FileController.getFileProxyById(targetParentFileId, customRealm = realm) ?: throw fileNotFoundException
 
+            ensureExternalAccessAllowed()
             val apiResponse = ApiRepository.moveFile(file, targetParentFile)
 
             if (apiResponse.isSuccess()) {
@@ -718,6 +721,7 @@ class CloudStorageProvider : DocumentsProvider() {
         val userDrive = createUserDrive(parentDocumentId)
         val parentId = getFileIdFromDocumentId(parentDocumentId)
 
+        ensureExternalAccessAllowed()
         val apiResponse = runBlocking { FileController.createFolder(displayName, parentId, true, userDrive) }
         val file = apiResponse.data
 
@@ -754,6 +758,7 @@ class CloudStorageProvider : DocumentsProvider() {
             lastModifiedAt = newDate,
         )
 
+        ensureExternalAccessAllowed()
         val apiResponse = ApiController.callApiBlocking<ApiResponse<File>>(
             uploadUrl,
             ApiController.ApiMethod.POST,
@@ -785,6 +790,11 @@ class CloudStorageProvider : DocumentsProvider() {
         return ParcelFileDescriptor.open(tempFile, accessMode, handler) { exception: IOException? ->
             if (exception == null) {
                 cloudScope.launch {
+                    // A descriptor issued before lock-on must not trigger a new upload after it.
+                    if (isExternalAccessBlocked()) {
+                        SentryLog.i(TAG, "Skipping close-time upload of ${file.name}: external access is blocked")
+                        return@launch
+                    }
                     UploadFile(
                         uri = tempFile.toUri().toString(),
                         driveId = userDrive.driveId,
@@ -1063,6 +1073,27 @@ class CloudStorageProvider : DocumentsProvider() {
     private data class DriveDocument(val name: String, val id: Int)
 
     companion object {
+
+        init {
+            // React to app-lock transitions wherever they originate in this process.
+            AppLockState.onTransition = { onAppLockTransition() }
+        }
+
+        /**
+         * Invalidates listing/search state retained across calls (so stale or blocked cursors are
+         * never restored) and reannounces the roots, letting observers replace stale content.
+         */
+        internal fun onAppLockTransition() {
+            oldQueryChildCursor?.cancelJob()
+            oldSearchCursor?.cancelJob()
+            oldQueryChildCursor = null
+            oldQueryChildUri = null
+            oldSearchCursor = null
+            oldSearchUri = null
+            currentParentDocumentId = null
+            needRefresh = false
+            notifyProviderChanged()
+        }
 
         private val mutex = Mutex()
 
