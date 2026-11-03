@@ -197,8 +197,11 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
         const val RECURSIVE = "recursive"
 
         /**
-         * Independently deduplicated and cancellable work identity per root (issue #1902).
+         * Independently deduplicated and cancellable work identity per account, drive and root
+         * (issue #1902): two accounts sharing the same drive/folder never share a chain, so one
+         * account's KEEP cannot suppress the other's download and one account's removal cannot
+         * cancel the other's work.
          */
-        fun uniqueWorkName(folderId: Int) = "${TAG}_$folderId"
+        fun uniqueWorkName(userDrive: UserDrive, folderId: Int) = "${TAG}_${userDrive.userId}_${userDrive.driveId}_$folderId"
     }
 }

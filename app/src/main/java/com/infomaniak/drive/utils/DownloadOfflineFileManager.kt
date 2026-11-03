@@ -270,28 +270,30 @@ class DownloadOfflineFileManager(
     private fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
         var coverageInvalidated = false
 
-        // Validate inside the committing transaction (issue #1902): the state read must not be
-        // separated from the flag write, or a root removal in between would be undone. Root
-        // membership is re-established from the durable ancestry, not from the materialized
-        // boolean alone (a moved file can retain a stale inherited flag).
+        // All validation happens INSIDE the committing transaction (issue: round 3 #9): a read
+        // separated from the write lets a concurrent root removal be undone. Current explicit
+        // pin and durable root ancestry are re-derived here; a materialized inherited flag alone
+        // never authorizes retention.
         FileController.getRealmInstance(userDrive).use { realm ->
-            val liveFile = FileController.getFileById(realm, file.id)
-            val pinOrInherited = liveFile?.isOffline == true || liveFile?.isInOfflineFolder == true
-            val ancestorRootCovers = OfflineFolderController.isInsideAnotherRoot(realm, file.id)
+            realm.executeTransaction {
+                val liveFile = FileController.getFileById(realm, file.id)
+                val pinned = liveFile?.isOffline == true
+                val ancestorRootCovers = liveFile != null && OfflineFolderController.isInsideAnotherRoot(realm, file.id)
 
-            when {
-                isInheritedDownload && !pinOrInherited && !ancestorRootCovers -> {
-                    coverageInvalidated = true
-                }
-                isInheritedDownload && ancestorRootCovers -> realm.executeTransaction {
-                    if (liveFile != null && liveFile.isValid) liveFile.isInOfflineFolder = true
-                }
-                else -> realm.executeTransaction {
-                    if (liveFile != null && liveFile.isValid) {
-                        // A file covered by an offline folder keeps its inherited state: it must
-                        // not become an explicit pin, otherwise removing the folder could not
-                        // clean it up without stripping separately pinned files.
-                        liveFile.isOffline = liveFile.isOffline || !liveFile.isInOfflineFolder
+                when {
+                    isInheritedDownload && !pinned && !ancestorRootCovers -> {
+                        coverageInvalidated = true
+                    }
+                    isInheritedDownload && ancestorRootCovers -> {
+                        if (liveFile != null && liveFile.isValid) liveFile.isInOfflineFolder = true
+                    }
+                    else -> {
+                        if (liveFile != null && liveFile.isValid) {
+                            // A file covered by an offline folder keeps its inherited state: it
+                            // must not become an explicit pin, otherwise removing the folder
+                            // could not clean it up without stripping separately pinned files.
+                            liveFile.isOffline = liveFile.isOffline || !liveFile.isInOfflineFolder
+                        }
                     }
                 }
             }

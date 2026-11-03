@@ -389,7 +389,7 @@ object Utils {
         // that keeps failing can no longer block the other roots, repeated sync triggers do not
         // append duplicate work, and removing a root cancels exactly its own chain.
         workManager.enqueueUniqueWork(
-            BulkDownloadWorker.uniqueWorkName(folderId),
+            BulkDownloadWorker.uniqueWorkName(userDrive, folderId),
             ExistingWorkPolicy.KEEP,
             downloadRequest,
         )

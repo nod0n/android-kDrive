@@ -383,6 +383,12 @@ object OfflineFolderUtils {
 
         while (queue.isNotEmpty()) {
             val currentId = queue.removeFirst()
+            // Stop at every remaining active root encountered deeper in the subtree: its own
+            // record and walk establish (or disprove) its coverage independently (issue: round
+            // 3 #11).
+            if (currentId != rootFolderId && OfflineFolderController.hasActiveOfflineRoot(currentId, customRealm = realm)) {
+                continue
+            }
             val currentFolder = FileController.getFileById(realm, currentId) ?: continue
             OfflineFolderController.clearFileCoverage(
                 context = context,
@@ -431,7 +437,10 @@ object OfflineFolderUtils {
             .notEqualTo(File::isOffline.name, true)
             .findAll()
             .createSnapshot()
-            .filter { !OfflineFolderController.isInsideAnotherRoot(realm, it.id) }
+            // Include the item's own active root row: a top-level root is not an orphan, and a
+            // pending-removal root's subtree stays owned by its record until its cleanup
+            // completes (issue: round 3 #10).
+            .filter { !OfflineFolderController.isCoveredByRootIncludingSelf(it.id, customRealm = realm) }
 
         orphans.forEach { orphan ->
             OfflineFolderController.clearFileCoverage(
