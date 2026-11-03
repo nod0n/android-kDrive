@@ -100,11 +100,44 @@ open class AppSettings(
             updateAppSettings { update(AppSettings()) }
         }
 
+        /**
+         * In-memory publish of the last durably committed value, for UI readers. Not consulted by
+         * the DocumentsProvider gate, which reads the durable store through [AppLockState].
+         */
+        @Volatile
         var appSecurityLock: Boolean = getAppSettings()._appSecurityEnabled
-            set(value) {
-                field = value
-                updateAppSettings { _appSecurityEnabled = value }
+            private set
+
+        /**
+         * Durable update of the app security lock: the store is written synchronously and the
+         * cached value is published only afterwards, so readers never observe a change that is
+         * not yet durable. Returns true only when the write committed.
+         */
+        fun updateAppSecurityLock(enabled: Boolean): Boolean {
+            val persisted = persistAppSecurityLockSync(enabled)
+            if (persisted) appSecurityLock = enabled
+            return persisted
+        }
+
+        /**
+         * Synchronous write of [_appSecurityEnabled]. Unlike [updateAppSettings], failures are
+         * reported to the caller instead of dropped. Callers are expected to serialize writes
+         * (AppLockState uses a single writer thread).
+         */
+        private fun persistAppSecurityLockSync(enabled: Boolean): Boolean {
+            return try {
+                getRealmInstance().use { realm ->
+                    realm.executeTransaction { transactionRealm ->
+                        (getAppSettingsQuery(transactionRealm)
+                            ?: transactionRealm.copyToRealm(AppSettings())
+                        )._appSecurityEnabled = enabled
+                    }
+                }
+                true
+            } catch (_: Exception) {
+                false
             }
+        }
 
         var onlyWifiSyncOffline: Boolean = getAppSettings()._onlyWifiSyncOffline
             set(value) {
