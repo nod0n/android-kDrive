@@ -50,6 +50,7 @@ import com.infomaniak.drive.R
 import com.infomaniak.drive.data.api.ApiRoutes
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.documentprovider.CloudStorageProvider
 import com.infomaniak.drive.data.models.CancellableAction
 import com.infomaniak.drive.data.models.File
@@ -185,7 +186,9 @@ class FileInfoActionsView @JvmOverloads constructor(
         sendCopy.isEnabled = canSendCopy
         disabledSendCopy.isGone = canSendCopy
 
-        val isOfflineToggleInteractable = !file.isMarkedAsOffline || file.isOffline
+        // A pending folder root stays cancellable: its walk may be queued or downloading, and
+        // the user must always be able to unmark it (issue #1902).
+        val isOfflineToggleInteractable = !file.isMarkedAsOffline || file.isOffline || file.isFolderOfflineRoot()
         setOfflineControlsEnabled(isOfflineToggleInteractable && (hasNetwork || file.isOfflineFile(context)))
 
         editDocument.isEnabled = hasNetwork
@@ -459,6 +462,14 @@ class FileInfoActionsView @JvmOverloads constructor(
         availableOffline.alpha = if (isEnabled) ENABLED_ALPHA else DISABLED_ALPHA
     }
 
+    /**
+     * Whether [this] folder carries its own durable offline root record (issue #1902) — the
+     * actionable intent, as opposed to the derived coverage shown by [File.isOfflineFile].
+     */
+    private fun File.isFolderOfflineRoot(): Boolean {
+        return isFolder() && OfflineFolderController.isOfflineRoot(id, UserDrive(driveId = driveId))
+    }
+
     fun observeOfflineProgression(lifecycleOwner: LifecycleOwner, updateFile: ((fileId: Int) -> Unit)? = null) {
         observeDownloadOffline = mainViewModel.observeDownloadOffline(context.applicationContext)
         observeDownloadOffline?.observe(lifecycleOwner) { workInfoList ->
@@ -533,12 +544,18 @@ class FileInfoActionsView @JvmOverloads constructor(
         if (isOfflineProgress) fileView.progressLayout.setupFileProgress(file) else fileToShowFlow.tryEmit(file)
 
         val isPendingOffline = file.isMarkedAsOffline
-        val isItemInteractable = !isPendingOffline || file.isOffline
+        val isFolderRoot = file.isFolderOfflineRoot()
+        val isItemInteractable = !isPendingOffline || file.isOffline || isFolderRoot
         val isItemAvailable = hasNetwork || file.isOfflineFile(context)
         setOfflineControlsEnabled(isItemInteractable && isItemAvailable)
 
         val isOfflineFile = file.isOfflineFile(context)
-        if (isItemInteractable) availableOfflineSwitch.isChecked = isOfflineFile
+        if (isItemInteractable) {
+            // For folders the actionable switch is bound to the durable OfflineRoot record, not
+            // to the derived coverage: a nested root must be independently removable while its
+            // ancestor coverage keeps the folder row showing as offline (issue #1902).
+            availableOfflineSwitch.isChecked = if (file.isFolder()) isFolderRoot else isOfflineFile
+        }
 
         when {
             // We can have a currentProgress in [0,99] yet the file is not pending?

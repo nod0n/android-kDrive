@@ -18,6 +18,7 @@
 package com.infomaniak.drive.utils
 
 import android.content.Context
+import android.net.Uri
 import android.os.ParcelFileDescriptor
 import androidx.concurrent.futures.await
 import androidx.core.app.NotificationCompat
@@ -45,10 +46,12 @@ import com.infomaniak.drive.data.api.ProgressResponseBody
 import com.infomaniak.drive.data.api.UploadTask
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
+import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.data.services.BaseDownloadWorker
 import com.infomaniak.drive.data.services.BulkDownloadWorker
 import com.infomaniak.drive.data.services.DownloadWorker
+import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.NotificationUtils.downloadProgressNotification
 import kotlinx.coroutines.Dispatchers
@@ -65,7 +68,13 @@ class DownloadOfflineFileManager(
     private val userDrive: UserDrive,
     private val filesCount: Int,
     private val downloadWorker: BaseDownloadWorker,
-    private val notificationManagerCompat: NotificationManagerCompat
+    private val notificationManagerCompat: NotificationManagerCompat,
+    /**
+     * True when this manager downloads files on behalf of an offline folder walk (issue #1902):
+     * completion never manufactures an explicit pin, and a copy whose coverage disappeared
+     * while the download was in flight is dropped instead of being kept.
+     */
+    private val isInheritedDownload: Boolean = false,
 ) {
     private var lastDownloadedFile: IOFile? = null
     private var currentFile: File? = null
@@ -86,6 +95,19 @@ class DownloadOfflineFileManager(
         if (offlineFile == null) {
             SentryLog.e(TAG, "offline must not be null")
             return ListenableWorker.Result.failure()
+        }
+
+        // Protect offline edits (issue #1902): never replace the bytes backing a pending upload
+        // or a locally newer copy; the sync layer uploads them and a later walk re-evaluates.
+        if (UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())) {
+            return ListenableWorker.Result.success()
+        }
+        if (offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
+                offlineFileLastModifiedMillis = offlineFile.lastModified(),
+                remoteLastModifiedAtSeconds = file.lastModifiedAt,
+            )
+        ) {
+            return ListenableWorker.Result.success()
         }
 
         if (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) return ListenableWorker.Result.success()
@@ -142,8 +164,13 @@ class DownloadOfflineFileManager(
         fileId: Int,
         userDrive: UserDrive = UserDrive(),
     ): File {
+        // Always use the captured account's HTTP client: the walk may target another account/drive
+        // than the currently active one (issue #1902).
         val fileDetails = Dispatchers.IO {
-            ApiRepository.getFileDetails(File(id = fileId, driveId = userDrive.driveId))
+            ApiRepository.getFileDetails(
+                file = File(id = fileId, driveId = userDrive.driveId),
+                okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
+            )
         }
         val remoteFile = fileDetails.data
         val file = if (fileDetails.isSuccess() && remoteFile != null) {
@@ -218,14 +245,29 @@ class DownloadOfflineFileManager(
     }
 
     private fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
-        FileController.updateFile(file.id) { localFile ->
-            // A file covered by an offline folder (issue #1902) keeps its inherited state: it must
-            // not become an explicit pin, otherwise removing the folder could not clean it up
-            // without stripping separately pinned files.
-            localFile.isOffline = localFile.isOffline || !localFile.isInOfflineFolder
+        val liveFile = FileController.getFileByUidOrId(fileId = file.id, userDrive = userDrive)
+        val stillWanted = liveFile?.isOffline == true || liveFile?.isInOfflineFolder == true
+
+        if (isInheritedDownload && !stillWanted) {
+            // The coverage (or pin) was removed while this download was in flight: an inherited
+            // download must never manufacture an explicit pin, so the orphaned copy is dropped
+            // (offline cache only).
+            runCatching { if (offlineFile.exists()) offlineFile.delete() }
+            if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
+        } else {
+            FileController.updateFile(file.id, userDrive = userDrive) { localFile ->
+                if (isInheritedDownload) {
+                    localFile.isInOfflineFolder = true
+                } else {
+                    // A file covered by an offline folder keeps its inherited state: it must not
+                    // become an explicit pin, otherwise removing the folder could not clean it up
+                    // without stripping separately pinned files.
+                    localFile.isOffline = localFile.isOffline || !localFile.isInOfflineFolder
+                }
+            }
+            offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
+            if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
         }
-        offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
-        if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
         fileDownloaded(context, file.id)
     }
 
@@ -248,7 +290,7 @@ class DownloadOfflineFileManager(
     }
 
     private fun fileDownloaded(context: Context, fileId: Int) {
-        FileController.markFileAsOffline(fileId = fileId, isMarkedAsOffline = false)
+        FileController.markFileAsOffline(fileId = fileId, isMarkedAsOffline = false, userDrive = userDrive)
         lastUpdateProgressMillis = System.currentTimeMillis()
         filesDownloaded += 1
 

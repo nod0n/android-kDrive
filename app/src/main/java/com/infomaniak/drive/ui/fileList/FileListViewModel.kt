@@ -273,7 +273,9 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                 FileController.getRealmInstance().use {
                     it.executeTransaction { realm ->
                         files.filterNot { file -> file.isFolder() }.forEach { file ->
-                            if (!file.isOffline && file.getOfflineFile(context)?.exists() == true && isActive) {
+                            // Inherited coverage (issue #1902) is managed by the folder walk:
+                            // never convert covered files into explicit pins here.
+                            if (!file.isOffline && !file.isInOfflineFolder && file.getOfflineFile(context)?.exists() == true && isActive) {
                                 FileController.getFileProxyById(file.id, customRealm = realm)?.isOffline = true
                             }
                         }

@@ -253,23 +253,28 @@ object FileController {
             }
     }
 
-    fun markFilesAsOffline(customRealm: Realm? = null, filesId: List<Int>, isMarkedAsOffline: Boolean) {
+    fun markFilesAsOffline(
+        customRealm: Realm? = null,
+        filesId: List<Int>,
+        isMarkedAsOffline: Boolean,
+        userDrive: UserDrive? = null,
+    ) {
         val block: (Realm) -> Unit? = { realm ->
             realm.executeTransaction {
                 filesId.forEach { fileId -> markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline) }
             }
         }
 
-        customRealm?.let(block) ?: getRealmInstance().use(block)
+        customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
-    fun markFileAsOffline(customRealm: Realm? = null, fileId: Int, isMarkedAsOffline: Boolean) {
+    fun markFileAsOffline(customRealm: Realm? = null, fileId: Int, isMarkedAsOffline: Boolean, userDrive: UserDrive? = null) {
         val block: (Realm) -> Unit? = { realm ->
             realm.executeTransaction {
                 markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline)
             }
         }
-        customRealm?.let(block) ?: getRealmInstance().use(block)
+        customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
     //endregion
 
@@ -362,7 +367,11 @@ object FileController {
                 currentRealm.executeTransaction {
                     getFileById(currentRealm, fileId)?.let { file ->
                         file.isOffline = isOffline
-                        if (!isOffline) file.isInOfflineFolder = false
+                        // Removing the explicit pin must not strip coverage from a file that
+                        // another offline root still covers (issue #1902).
+                        if (!isOffline && !OfflineFolderController.isInsideAnotherRoot(currentRealm, fileId)) {
+                            file.isInOfflineFolder = false
+                        }
                     }
                 }
             }

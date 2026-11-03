@@ -30,7 +30,10 @@ import com.infomaniak.drive.utils.NotificationUtils.cancelNotification
 class DownloadWorker(context: Context, workerParams: WorkerParameters) : BaseDownloadWorker(context, workerParams) {
 
     private val fileId: Int by lazy { inputData.getInt(FILE_ID, 0) }
-    private val file: File? by lazy { FileController.getFileByUidOrId(fileId) }
+    private val file: File? by lazy {
+        // Resolve in the captured account/drive scope, not the currently active one.
+        FileController.getFileByUidOrId(fileId, userDrive)
+    }
     private val fileName: String by lazy { inputData.getString(FILE_NAME) ?: "" }
     private val userDrive: UserDrive by lazy {
         UserDrive(

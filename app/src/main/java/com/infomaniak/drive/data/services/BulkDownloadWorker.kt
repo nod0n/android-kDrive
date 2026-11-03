@@ -44,6 +44,7 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
      */
     private var files: List<File> = emptyList()
     private var walkCompleted = false
+    private var synchronizationSucceeded = false
 
     private val userDrive: UserDrive by lazy {
         UserDrive(
@@ -56,7 +57,8 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
             userDrive,
             filesCount = files.size,
             downloadWorker = this,
-            notificationManagerCompat
+            notificationManagerCompat = notificationManagerCompat,
+            isInheritedDownload = recursive,
         )
     }
 
@@ -77,31 +79,54 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                 userDrive = userDrive,
             )
             walkCompleted = walkResult.completed
-            if (!walkResult.rootExists) return Result.success()
+            if (!walkResult.rootExists) {
+                synchronizationSucceeded = true // the root was removed: nothing left to synchronize
+                return Result.success()
+            }
+            if (!walkResult.completed) {
+                // Listing failed: the root intent stays durable and the offline sync retries the
+                // walk; reporting success here would advance the completion marker wrongly.
+                return Result.retry()
+            }
 
             files = walkResult.fileIds.mapNotNull { FileController.getFileByUidOrId(it, userDrive) }
-
-            val sizeOfDownload = files.sumOf { it.size ?: 0L }
-            if (!hasEnoughSpaceLeftAfterDownload(sizeOfDownload)) {
-                SentryLog.i(
-                    TAG,
-                    "After the download of the folder, the device storage would have been below 500 MB so we cancel the download."
-                )
-                return Result.failure(getNotEnoughSpaceOutputData())
-            }
         } else {
             files = FileController.getFolderOfflineFilesId(folderId = folderId, sortType = UiSettings(applicationContext).sortType)
                 .mapNotNull { FileController.getFileByUidOrId(it, userDrive) }
         }
-        return downloadFiles()
+
+        // Perform the size check with the actual list in both branches: the base pre-check runs
+        // before the list is loaded and would otherwise always pass.
+        val sizeOfDownload = files.sumOf { it.size ?: 0L }
+        if (!hasEnoughSpaceLeftAfterDownload(sizeOfDownload)) {
+            SentryLog.i(
+                TAG,
+                "After the download of file(s), the device storage would have been below 500 MB so we cancel the download."
+            )
+            return Result.failure(getNotEnoughSpaceOutputData())
+        }
+
+        return downloadFiles().also { synchronizationSucceeded = it == Result.success() }
     }
 
     override fun onFinish() {
-        FileController.markFilesAsOffline(filesId = files.map { it.id }, isMarkedAsOffline = false)
+        FileController.markFilesAsOffline(
+            customRealm = null,
+            filesId = files.map { it.id },
+            isMarkedAsOffline = false,
+            userDrive = userDrive,
+        )
         if (recursive) {
             // The root folder itself carries the "walk in progress" marker.
-            FileController.markFilesAsOffline(filesId = listOf(folderId), isMarkedAsOffline = false)
-            if (walkCompleted) OfflineFolderController.updateLastSyncedAt(folderId, userDrive)
+            FileController.markFilesAsOffline(
+                customRealm = null,
+                filesId = listOf(folderId),
+                isMarkedAsOffline = false,
+                userDrive = userDrive,
+            )
+            if (walkCompleted && synchronizationSucceeded) {
+                OfflineFolderController.updateLastSyncedAt(folderId, userDrive)
+            }
         }
         clearLastDownloadedFile()
         notifyDownloadFinished()
@@ -123,19 +148,34 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
     }
 
     private suspend fun downloadFiles(): Result {
-        var result = Result.failure()
+        if (files.isEmpty()) {
+            // Completed walk with nothing to download: a successful synchronization.
+            applicationContext.cancelNotification(BULK_DOWNLOAD_ID)
+            return Result.success()
+        }
+
+        var allFilesSucceeded = true
 
         files.forEach { file ->
-            result = downloadOfflineFileManager.execute(applicationContext, file) { progress, downloadedFileId ->
+            // Validate effective coverage before starting each download: unmarking the root
+            // must not leave this batch converting the remaining files into explicit pins.
+            if (recursive && !OfflineFolderController.isOfflineRoot(folderId, userDrive)) {
+                SentryLog.i(TAG, "Offline root $folderId was removed mid-batch, stopping the remaining downloads")
+                allFilesSucceeded = false
+                return@forEach
+            }
+
+            val result = downloadOfflineFileManager.execute(applicationContext, file) { progress, downloadedFileId ->
                 setProgressAsync(workDataOf(PROGRESS to progress, FILE_ID to downloadedFileId))
             }
+            if (result != Result.success()) allFilesSucceeded = false
         }
 
-        if (result == Result.success()) {
+        if (allFilesSucceeded) {
             applicationContext.cancelNotification(BULK_DOWNLOAD_ID)
+            return Result.success()
         }
-
-        return result
+        return Result.failure()
     }
 
     companion object {

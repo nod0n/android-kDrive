@@ -542,7 +542,10 @@ class MainViewModel(
             if (!file.isFolder()) {
                 val offlineFile = file.getOfflineFile(getApplication())
                 val cacheFile = file.getCacheFile(getApplication())
-                if ((file.isOffline || file.isInOfflineFolder) && offlineFile != null) {
+                // A file still covered by an offline root keeps its inherited state and bytes
+                // (issue #1902); only its explicit pin, if any, is removed.
+                val stillCovered = OfflineFolderController.isFileCoveredByAnyRoot(file.id)
+                if ((file.isOffline || file.isInOfflineFolder) && offlineFile != null && !stillCovered) {
                     deleteFile(file, offlineFile, cacheFile)
                 }
             }
@@ -566,8 +569,14 @@ class MainViewModel(
         // We need to call this method outside the UI thread
         viewModelScope.launch(Dispatchers.IO) {
             FileController.updateIsOfflineForFiles(fileIds = listOf(file.id), isOffline = false)
+            // A file still covered by an offline root keeps its inherited state and bytes
+            // (issue #1902); only its explicit pin, if any, is removed.
+            if (!OfflineFolderController.isFileCoveredByAnyRoot(file.id, userDrive)) {
+                deleteFile(file, offlineFile, cacheFile, userDrive, onFileRemovedFromOffline)
+            } else {
+                onFileRemovedFromOffline?.invoke()
+            }
         }
-        deleteFile(file, offlineFile, cacheFile, userDrive, onFileRemovedFromOffline)
     }
 
     private fun deleteFile(
