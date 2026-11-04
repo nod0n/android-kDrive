@@ -380,11 +380,19 @@ object OfflineFolderController {
     }
 
     /**
+     * Plain identity of the row owning a destination path, built while the Realm is open
+     * (issue: round 7 #1): a managed object — even from createSnapshot(), which snapshots
+     * collection membership but not the objects — escapes a closed Realm as a detached
+     * failure waiting to happen.
+     */
+    internal class DestinationOwner(val id: Int, val lastModifiedAt: Long)
+
+    /**
      * Resolves the row that owns the existing bytes at [target], by derived offline path, among
      * candidates sharing the incoming file's parent and name (the incoming file's own row
      * included). Returns null when no row claims that path: the bytes' ownership is unknown and
-     * must be preserved, not replaced (issue: round 6 #3). The returned row is a detached
-     * snapshot and stays readable after the Realm session closes.
+     * must be preserved, not replaced (issue: round 6 #3). The returned owner is a plain DTO,
+     * safe to read after the Realm session closes (issue: round 7 #1).
      */
     internal fun destinationOwnerRow(
         realm: Realm,
@@ -392,7 +400,7 @@ object OfflineFolderController {
         userDrive: UserDrive,
         incoming: File,
         target: IOFile,
-    ): File? {
+    ): DestinationOwner? {
         val candidates = realm.where(File::class.java)
             .equalTo(File::parentId.name, incoming.parentId)
             .equalTo(File::name.name, incoming.name)
@@ -400,7 +408,9 @@ object OfflineFolderController {
             .createSnapshot()
         for (candidate in candidates) {
             val candidatePath = candidate.getOfflineFile(context, userDrive.userId)?.path ?: continue
-            if (candidatePath == target.path) return candidate
+            if (candidatePath == target.path) {
+                return DestinationOwner(id = candidate.id, lastModifiedAt = candidate.lastModifiedAt)
+            }
         }
         return null
     }
@@ -531,7 +541,31 @@ object OfflineFolderController {
             // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7).
             val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
             val locationChanged = newOffline == null || newOffline.path != oldOffline.path
-            if (!locationChanged) return@map remoteFile
+            if (!locationChanged) {
+                // Pre-existing bytes are judged against the OLD baseline BEFORE the incoming
+                // metadata replaces it (issue: round 7 #2): a freshly upserted row cannot
+                // establish the cleanliness of bytes it did not write. Baseline T1, unsent
+                // edit T2, incoming T3 (T1 < T2 < T3): committing T3 first would classify the
+                // T2 edit as clean and let publication or root removal destroy it. A pending
+                // or retained-unsent record already owns the copy; a dirty copy is snapshotted
+                // against the OLD baseline first, and a failed registration defers the whole
+                // commit so the edit is never replaced unowned.
+                val targetUri = Uri.fromFile(oldOffline).toString()
+                if (UploadFile.hasPendingUpload(uri = targetUri) ||
+                    UploadFile.hasRetainedUnsentUpload(uri = targetUri)
+                ) {
+                    return@map remoteFile
+                }
+                if (OfflineFolderPolicy.isLocallyModified(
+                        offlineFileLastModifiedMillis = oldOffline.lastModified(),
+                        remoteLastModifiedAtSeconds = oldRow.lastModifiedAt,
+                    )
+                ) {
+                    val registered = registerDirtySnapshot(context, oldRow, oldOffline, userDrive)
+                    if (!registered) return@map oldRow
+                }
+                return@map remoteFile
+            }
             if (reconcileMovedInheritedCopy(
                     context = context,
                     oldOfflineFile = oldOffline,

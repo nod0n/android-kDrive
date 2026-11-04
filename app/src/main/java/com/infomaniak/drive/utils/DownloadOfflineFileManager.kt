@@ -96,19 +96,22 @@ class DownloadOfflineFileManager(
         lastDownloadedFile = null
 
         // Fetch first WITHOUT committing metadata, so an inherited copy at the old location can
-        // be preserved (migrated or snapshotted) before the remote rename/move upsert would
-        // forget that location (issue: round 3 #7). If preservation is incomplete, the transfer
-        // aborts with the OLD metadata intact: nothing is stranded, and the offline sync retries
-        // (issue: round 4 #9).
+        // be preserved (migrated, or snapshotted against its OLD baseline) before the remote
+        // rename/move upsert would forget that location (issues: round 3 #7, round 7 #2). The
+        // shared upsert boundary covers both moved and unchanged paths; if preservation is
+        // incomplete, the transfer aborts with the OLD metadata intact: nothing is stranded,
+        // and the offline sync retries (issue: round 4 #9).
         val remoteFile = fetchRemoteFileDetails(context, file.id)
-        val oldLocationHandled = preserveOldInheritedCopyBeforeRemoteRefresh(context, file.id, remoteFile)
-        if (!oldLocationHandled) {
+        val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
+            OfflineFolderController.reconcileOwnedCopiesBeforeCommit(realm, listOf(remoteFile), userDrive).first()
+        }
+        if (commitFile !== remoteFile) {
             SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
             return ListenableWorker.Result.failure()
         }
 
         FileController.getRealmInstance(userDrive).use { realm ->
-            FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+            FileController.updateExistingFile(newFile = commitFile, realm = realm)
         }
 
         val file = remoteFile
@@ -158,35 +161,6 @@ class DownloadOfflineFileManager(
                 SentryLog.e(TAG, "An error has occurred", exception)
             }.getOrDefault(ListenableWorker.Result.failure())
         }
-    }
-
-    /**
-     * Preserves an inherited or pinned copy at its OLD location before the remote rename/move
-     * metadata is committed, through the same reconciliation the folder walk uses (issues:
-     * round 3 #7 and round 4 #9). Returns false when preservation is incomplete: the caller must
-     * NOT commit the new metadata and must retry later.
-     */
-    private fun preserveOldInheritedCopyBeforeRemoteRefresh(
-        context: Context,
-        fileId: Int,
-        remoteFile: File,
-    ): Boolean {
-        val oldRow = FileController.getFileByUidOrId(fileId, userDrive) ?: return true
-        if (oldRow.isFolder()) return true
-        val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() } ?: return true
-        val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
-        val locationChanged = newOffline == null || newOffline.path != oldOffline.path
-        if (!locationChanged) return true
-
-        return OfflineFolderController.reconcileMovedInheritedCopy(
-            context = context,
-            oldOfflineFile = oldOffline,
-            oldIdentityName = oldRow.name,
-            oldIdentityParentId = oldRow.parentId,
-            oldLastModifiedAt = oldRow.lastModifiedAt,
-            newIdentity = remoteFile,
-            userDrive = userDrive,
-        )
     }
 
     /**
