@@ -556,8 +556,15 @@ object FileController {
         try {
             val block: (Realm) -> Unit? = { currentRealm ->
                 getFileById(currentRealm, fileId)?.let { file ->
-                    currentRealm.executeTransaction {
-                        if (file.isValid) transaction(file)
+                    // Row-field writers share the per-file coordination (issue: round 10 #3):
+                    // the direct rename's identity write must serialize with a publication's
+                    // check-and-rename. Callers without an explicit scope fall back to the
+                    // default-scope key — their writes are non-identity fields (cursors,
+                    // colors); the rename and every graph writer pass their captured scope.
+                    synchronized(OfflineFileCoordination.lockFor(userDrive ?: UserDrive(), fileId)) {
+                        currentRealm.executeTransaction {
+                            if (file.isValid) transaction(file)
+                        }
                     }
                 }
             }
@@ -620,6 +627,24 @@ object FileController {
     ) {
         getFileById(realm, newFile.id)?.let { localFile ->
             insertOrUpdateFile(realm, newFile, localFile, userDrive)
+        }
+    }
+
+    /**
+     * Conditional metadata replacement (issue: round 10 #4): the incoming row commits only
+     * when the live row's SERVER generation is not newer than the incoming one — [File.revisedAt]
+     * is the server's revision sequence (every re-upload creates a new revision), unlike the
+     * file modification time, which a re-upload can legitimately move backwards. The check and
+     * the commit share the per-file coordination, so a delayed older response can no longer
+     * roll back a newer committed generation between the publication's supersession check and
+     * its rename. Returns false (nothing written) when the incoming row is stale.
+     */
+    fun updateExistingFileIfNotOlder(newFile: File, realm: Realm, userDrive: UserDrive): Boolean {
+        return synchronized(OfflineFileCoordination.lockFor(userDrive, newFile.id)) {
+            val live = getFileById(realm, newFile.id) ?: return@synchronized false
+            if (live.revisedAt > newFile.revisedAt) return@synchronized false
+            insertOrUpdateFile(realm, newFile, live, userDrive)
+            true
         }
     }
 
@@ -721,14 +746,23 @@ object FileController {
                 remoteFiles = files,
                 userDrive = userDrive ?: UserDrive(),
             )
-            currentRealm.executeTransaction { realm ->
-                val newMySharesFolder = if (replaceOldData) {
-                    realm.copyToRealmOrUpdate(folder)
-                } else {
-                    currentRealm.where(File::class.java).equalTo(File::id.name, folder.id).findFirst()
-                        ?: realm.copyToRealmOrUpdate(folder)
+            // Coordinated commit boundary BEFORE the transaction (issue: round 10 #3): the
+            // container folder and every committable child, ascending, share the publication
+            // lock set — a graph upsert cannot commit an identity/revision between the
+            // publisher's supersession check and its rename.
+            OfflineFileCoordination.withLocksFor(
+                userDrive ?: UserDrive(),
+                listOf(folder.id) + committableFiles.map { it.id },
+            ) {
+                currentRealm.executeTransaction { realm ->
+                    val newMySharesFolder = if (replaceOldData) {
+                        realm.copyToRealmOrUpdate(folder)
+                    } else {
+                        currentRealm.where(File::class.java).equalTo(File::id.name, folder.id).findFirst()
+                            ?: realm.copyToRealmOrUpdate(folder)
+                    }
+                    newMySharesFolder?.children?.addAll(realm, committableFiles)
                 }
-                newMySharesFolder?.children?.addAll(realm, committableFiles)
             }
         }
 
@@ -938,17 +972,20 @@ object FileController {
             // their OLD row. The request's captured scope flows through realm and
             // preservation (issue: round 8 #4).
             val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(it, files, userDrive)
-            it.executeTransaction { realm ->
-                val folder = realm.where(File::class.java).equalTo(File::id.name, RecentChanges.id).findFirst()
-                    ?: realm.copyToRealm(RecentChanges.file)
-                if (isFirstPage) {
-                    folder.children = RealmList()
-                }
-                committableFiles.forEach { file ->
-                    realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()?.let { realmFile ->
-                        file.keepOldLocalFilesData(realmFile)
+            // Coordinated commit boundary before the transaction (issue: round 10 #3).
+            OfflineFileCoordination.withLocksFor(userDrive, listOf(RecentChanges.id) + committableFiles.map { file -> file.id }) {
+                it.executeTransaction { realm ->
+                    val folder = realm.where(File::class.java).equalTo(File::id.name, RecentChanges.id).findFirst()
+                        ?: realm.copyToRealm(RecentChanges.file)
+                    if (isFirstPage) {
+                        folder.children = RealmList()
                     }
-                    folder.children.add(file)
+                    committableFiles.forEach { file ->
+                        realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()?.let { realmFile ->
+                            file.keepOldLocalFilesData(realmFile)
+                        }
+                        folder.children.add(file)
+                    }
                 }
             }
         }
@@ -969,17 +1006,23 @@ object FileController {
                     ).first()
                 }
             }
-            realm.beginTransaction()
-            fileActivities.forEach { fileActivity ->
-                fileActivity.userId = fileActivity.user?.id
-                fileActivity.file?.let { file ->
-                    realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
-                }?.let { localFile ->
-                    fileActivity.file?.keepOldLocalFilesData(localFile)
+            // Coordinated commit boundary before the transaction (issue: round 10 #3): the
+            // activity rows cascade their embedded file rows, so every affected file id joins
+            // the lock set.
+            val affectedFileIds = fileActivities.mapNotNull { fileActivity -> fileActivity.file?.id }
+            OfflineFileCoordination.withLocksFor(userDrive, affectedFileIds) {
+                realm.beginTransaction()
+                fileActivities.forEach { fileActivity ->
+                    fileActivity.userId = fileActivity.user?.id
+                    fileActivity.file?.let { file ->
+                        realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
+                    }?.let { localFile ->
+                        fileActivity.file?.keepOldLocalFilesData(localFile)
+                    }
+                    realm.insertOrUpdate(fileActivity)
                 }
-                realm.insertOrUpdate(fileActivity)
+                realm.commitTransaction()
             }
-            realm.commitTransaction()
         }
     }
 
@@ -993,11 +1036,14 @@ object FileController {
             // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6). The
             // request's captured scope flows through realm and preservation (issue: round 8 #4).
             val committableMedia = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(currentRealm, mediaList, userDrive)
-            currentRealm.executeTransaction { realm ->
-                val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
-                    ?: realm.copyToRealm(Gallery.file)
-                if (isFirstPage) galleryFolder.children = RealmList()
-                galleryFolder.children.addAll(realm, committableMedia)
+            // Coordinated commit boundary before the transaction (issue: round 10 #3).
+            OfflineFileCoordination.withLocksFor(userDrive, listOf(Gallery.id) + committableMedia.map { media -> media.id }) {
+                currentRealm.executeTransaction { realm ->
+                    val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
+                        ?: realm.copyToRealm(Gallery.file)
+                    if (isFirstPage) galleryFolder.children = RealmList()
+                    galleryFolder.children.addAll(realm, committableMedia)
+                }
             }
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
@@ -1117,20 +1163,28 @@ object FileController {
                 }
             }
         }
-        realm.executeTransaction {
-            // Restore same children data
-            keepSubFolderChildren(realm, localFolderProxy?.children, committableFiles)
-            // Save to realm
-            (localFolderProxy ?: newLocalFolderProxy)?.let { folderProxy ->
-                // Remove old children
-                if (isFirstPage) folderProxy.children.clear()
-                // Add children
-                folderProxy.children.addAll(committableFiles)
-                // Update folder properties
-                folderProxy.isComplete = isCompleteFolder
-                folderProxy.responseAt = apiResponse.responseAt
-                folderProxy.cursor = apiResponse.cursor
-                folderProxy.versionCode = BuildConfig.VERSION_CODE
+        // Coordinated commit boundary before the transaction (issue: round 10 #3): the folder
+        // row (its properties and children list are identity-adjacent state) and every
+        // committable child, ascending.
+        OfflineFileCoordination.withLocksFor(
+            userDrive,
+            listOfNotNull(localFolderProxy?.id, remoteFolder?.id) + committableFiles.map { file -> file.id },
+        ) {
+            realm.executeTransaction {
+                // Restore same children data
+                keepSubFolderChildren(realm, localFolderProxy?.children, committableFiles)
+                // Save to realm
+                (localFolderProxy ?: newLocalFolderProxy)?.let { folderProxy ->
+                    // Remove old children
+                    if (isFirstPage) folderProxy.children.clear()
+                    // Add children
+                    folderProxy.children.addAll(committableFiles)
+                    // Update folder properties
+                    folderProxy.isComplete = isCompleteFolder
+                    folderProxy.responseAt = apiResponse.responseAt
+                    folderProxy.cursor = apiResponse.cursor
+                    folderProxy.versionCode = BuildConfig.VERSION_CODE
+                }
             }
         }
     }
@@ -1223,8 +1277,12 @@ object FileController {
         getFileProxyById(remoteFile.id, customRealm = realm)?.let { localFile ->
             insertOrUpdateFile(realm, remoteFile, localFile, userDrive)
         } ?: also {
-            realm.executeTransaction {
-                realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
+            // Coordinated commit boundary (issue: round 10 #3): the child-add is an identity
+            // mutation of the new child and of the container's children list.
+            OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, remoteFile.id)) {
+                realm.executeTransaction {
+                    realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
+                }
             }
         }
     }

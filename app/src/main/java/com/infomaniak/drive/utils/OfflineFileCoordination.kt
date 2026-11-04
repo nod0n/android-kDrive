@@ -36,4 +36,21 @@ object OfflineFileCoordination {
 
     fun lockFor(userDrive: UserDrive, fileId: Int): Any =
         locks.getOrPut("${userDrive.userId}_${userDrive.driveId}_$fileId") { Any() }
+
+    /**
+     * Runs [block] while holding the per-file locks of ALL [fileIds], acquired in ASCENDING id
+     * order (issue: round 10 #3): graph upserts commit many rows in one transaction, and the
+     * coordinated commit boundary must precede it — a publisher could otherwise validate
+     * identity and then lose the race to a graph transaction that commits a different name,
+     * parent or revision while the publisher still holds its file lock. The ascending order
+     * matches the publisher's two-lock scheme and the cleanup's single-lock acquisitions, so
+     * no lock cycle is possible. Java monitors are reentrant: paths already holding a subset
+     * of these locks nest safely.
+     */
+    fun <T> withLocksFor(userDrive: UserDrive, fileIds: Collection<Int>, block: () -> T): T {
+        val orderedLocks = fileIds.distinct().sorted().map { lockFor(userDrive, it) }
+        fun acquire(index: Int): T =
+            if (index == orderedLocks.size) block() else synchronized(orderedLocks[index]) { acquire(index + 1) }
+        return acquire(0)
+    }
 }

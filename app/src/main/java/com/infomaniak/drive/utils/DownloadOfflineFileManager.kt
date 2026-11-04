@@ -122,8 +122,16 @@ class DownloadOfflineFileManager(
             return ListenableWorker.Result.failure()
         }
 
-        FileController.getRealmInstance(userDrive).use { realm ->
-            FileController.updateExistingFile(newFile = commitFile, realm = realm, userDrive = userDrive)
+        // Conditional replacement (issue: round 10 #4): a delayed response from an older
+        // fetch must not roll back a newer generation another worker already committed —
+        // otherwise this transfer's later publication compares against the rolled-back row,
+        // passes, and leaves bytes and metadata describing different revisions.
+        val committed = FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive)
+        }
+        if (!committed) {
+            SentryLog.i(TAG, "Deferring refresh of file ${file.id}: a newer generation was committed while the metadata response was in flight")
+            return ListenableWorker.Result.failure()
         }
 
         val file = remoteFile
@@ -582,17 +590,19 @@ class DownloadOfflineFileManager(
                 val live = FileController.getFileById(realm, file.id)
                 val pinned = live?.isOffline == true
                 val ancestryCovers = OfflineFolderController.isInsideActiveRoot(realm, file.id)
-                // Superseded rejection — FULL identity CAS (issues: round 8 #9, round 9 #7):
-                // the transfer is stale when the live row names a NEWER revision OR a
-                // different location identity (direct rename/move, or an ancestor-chain
-                // change that moved the resolved offline path). Publishing at the old
-                // location and completing against the new row would desync bytes and
-                // metadata even without a content-timestamp change. Identity/revision
-                // writers take the same per-file lock (FileController.insertOrUpdateFile),
-                // so a writer cannot commit between this check and the rename; the check
-                // and the publication form one compare-and-set.
+                // Superseded rejection — full identity/generation CAS (issues: round 8 #9,
+                // round 9 #7, round 10 #4): the transfer is stale when the live row holds a
+                // NEWER SERVER GENERATION ([File.revisedAt] — the modification time alone is
+                // not monotonic, a re-upload can move it backwards; the mtime comparison only
+                // covers legacy rows whose revisedAt was never populated), OR a different
+                // location identity (direct rename/move, or an ancestor-chain change that
+                // moved the resolved offline path). Publishing at the old location and
+                // completing against the new row would desync bytes and metadata. The check
+                // and the rename form one compare-and-set: identity/revision writers take the
+                // same per-file lock before their transactions (round 10 #3).
                 supersededGeneration = live != null && (
-                    live.lastModifiedAt > file.lastModifiedAt ||
+                    live.revisedAt > file.revisedAt ||
+                        (live.revisedAt == 0L && live.lastModifiedAt > file.lastModifiedAt) ||
                         live.parentId != file.parentId ||
                         live.name != file.name ||
                         run {
