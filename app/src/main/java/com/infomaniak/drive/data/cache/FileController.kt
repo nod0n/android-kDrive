@@ -289,7 +289,7 @@ object FileController {
             // coordination lock, taken BEFORE the Realm write (issue: round 7 #9).
             val lockedBlock: (Realm) -> Unit? = { realm ->
                 filesId.forEach { fileId ->
-                    synchronized(OfflineFileCoordination.lockFor(userDrive ?: UserDrive(), fileId)) {
+                    OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), fileId) {
                         realm.executeTransaction {
                             markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin)
                         }
@@ -345,7 +345,7 @@ object FileController {
                     val resolvedUserDrive = userDrive ?: UserDrive(driveId = file.driveId)
                     // Row removal is a mutation owner of the offline copy: preservation, cache
                     // deletion and row deletion are one coordinated section (issue: round 4 #4).
-                    synchronized(OfflineFileCoordination.lockFor(resolvedUserDrive, fileId)) {
+                    OfflineFileCoordination.withFileLock(resolvedUserDrive, fileId) {
                         // Required ancestry (issue: round 5 #10): a folder row whose descendants
                         // remain locally owned must survive — deleting it strands the preserved
                         // copies' metadata and breaks every parentId traversal (deferred
@@ -507,7 +507,7 @@ object FileController {
             fileIds.forEach { fileId ->
                 // Per-file pin/unpin writes serialize with destructive cleanup on the same
                 // coordination lock, taken BEFORE the Realm write (issue: round 6 #6).
-                synchronized(OfflineFileCoordination.lockFor(userDrive ?: UserDrive(), fileId)) {
+                OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), fileId) {
                     currentRealm.executeTransaction {
                         getFileById(currentRealm, fileId)?.let { file ->
                             file.isOffline = isOffline
@@ -561,7 +561,7 @@ object FileController {
                     // check-and-rename. Callers without an explicit scope fall back to the
                     // default-scope key — their writes are non-identity fields (cursors,
                     // colors); the rename and every graph writer pass their captured scope.
-                    synchronized(OfflineFileCoordination.lockFor(userDrive ?: UserDrive(), fileId)) {
+                    OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), fileId) {
                         currentRealm.executeTransaction {
                             if (file.isValid) transaction(file)
                         }
@@ -613,7 +613,7 @@ object FileController {
         // The pin write serializes on the same per-file coordination the destructive cleanup
         // holds, taken BEFORE the Realm write, so a cleanup cannot delete a copy whose pin
         // request is being written (issue: round 6 #6).
-        synchronized(OfflineFileCoordination.lockFor(userDrive ?: UserDrive(), fileId)) {
+        OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), fileId) {
             updateFile(fileId, userDrive = userDrive) { file ->
                 file.isOffline = isOffline
             }
@@ -640,9 +640,9 @@ object FileController {
      * its rename. Returns false (nothing written) when the incoming row is stale.
      */
     fun updateExistingFileIfNotOlder(newFile: File, realm: Realm, userDrive: UserDrive): Boolean {
-        return synchronized(OfflineFileCoordination.lockFor(userDrive, newFile.id)) {
-            val live = getFileById(realm, newFile.id) ?: return@synchronized false
-            if (live.revisedAt > newFile.revisedAt) return@synchronized false
+        return OfflineFileCoordination.withFileLock(userDrive, newFile.id) {
+            val live = getFileById(realm, newFile.id) ?: return@withFileLock false
+            if (live.revisedAt > newFile.revisedAt) return@withFileLock false
             insertOrUpdateFile(realm, newFile, live, userDrive)
             true
         }
@@ -659,9 +659,9 @@ object FileController {
         // (issue: round 9 #7): without it, a writer could commit a newer identity or baseline
         // between the publisher's supersession check and its rename — the publisher's
         // check-and-rename is only a CAS if every identity/revision writer takes the same
-        // lock. Java monitors are reentrant, so writers already holding the file's lock
+        // lock. Reentrant locks reenter, so writers already holding the file's lock
         // (upload registration, move reconciliation) nest safely.
-        synchronized(OfflineFileCoordination.lockFor(userDrive, newFile.id)) {
+        OfflineFileCoordination.withFileLock(userDrive, newFile.id) {
             realm.executeTransaction {
                 if (oldFile?.isUsable() == true) newFile.keepOldLocalFilesData(oldFile)
                 moreTransaction?.invoke()

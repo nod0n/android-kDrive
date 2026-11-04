@@ -537,30 +537,16 @@ class DownloadOfflineFileManager(
                     OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)
                 }
             }
-            val incomingLock = OfflineFileCoordination.lockFor(userDrive, file.id)
-            val ownerLock = preLockOwner?.id?.takeIf { it != file.id }?.let { OfflineFileCoordination.lockFor(userDrive, it) }
             val lockedOwnerId: Int? = preLockOwner?.id
 
-            when {
-                ownerLock == null -> synchronized(incomingLock) {
-                    publishLockedCore(
-                        userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
-                    ) { coroutineContext.ensureActive() }
-                }
-                file.id < (preLockOwner?.id ?: file.id) -> synchronized(incomingLock) {
-                    synchronized(ownerLock) {
-                        publishLockedCore(
-                            userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
-                        ) { coroutineContext.ensureActive() }
-                    }
-                }
-                else -> synchronized(ownerLock) {
-                    synchronized(incomingLock) {
-                        publishLockedCore(
-                            userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
-                        ) { coroutineContext.ensureActive() }
-                    }
-                }
+            // Both locks (incoming + established owner) in ONE ascending-id acquisition,
+            // constant stack (issues: round 11 #1, round 11 #12): the same ordered protocol as
+            // every graph commit and cleanup acquisition, so no lock cycle is possible, and
+            // the explicit-lock loop cannot overflow the stack the way nested monitors did.
+            OfflineFileCoordination.withLocksFor(userDrive, listOfNotNull(file.id, preLockOwner?.id)) {
+                publishLockedCore(
+                    userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
+                ) { coroutineContext.ensureActive() }
             }
         }
 

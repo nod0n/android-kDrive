@@ -19,6 +19,7 @@ package com.infomaniak.drive.utils
 
 import com.infomaniak.drive.data.models.UserDrive
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * Process-wide per-file mutation coordination for offline copies (issue: round 4 #4).
@@ -32,7 +33,11 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object OfflineFileCoordination {
 
-    private val locks = ConcurrentHashMap<String, Any>()
+    // Explicit locks, NOT monitors (issue: round 11 #12): acquisition is a plain [ReentrantLock.lock]
+    // call driven by constant-stack loops, so an arbitrarily large lock set cannot overflow the
+    // call stack the way nested monitor acquisition did, and interruption never abandons a held
+    // section.
+    private val locks = ConcurrentHashMap<String, ReentrantLock>()
 
     /**
      * Process-wide ROOT-INTENT monitor (issue: round 10 #5): root writers (add, remove,
@@ -44,8 +49,24 @@ object OfflineFileCoordination {
      */
     val rootIntentMonitor: Any = Any()
 
-    fun lockFor(userDrive: UserDrive, fileId: Int): Any =
-        locks.getOrPut("${userDrive.userId}_${userDrive.driveId}_$fileId") { Any() }
+    fun lockFor(userDrive: UserDrive, fileId: Int): ReentrantLock =
+        locks.getOrPut("${userDrive.userId}_${userDrive.driveId}_$fileId") { ReentrantLock() }
+
+    /**
+     * Runs [block] while holding the single per-file lock of [fileId] (issue: round 11 #12):
+     * explicit acquisition with unlock in `finally`, replacing monitor `synchronized` blocks so
+     * every coordination site shares one acquisition/release shape. Reentrant: paths already
+     * holding the lock (nested preservation, snapshot registration) nest safely.
+     */
+    inline fun <T> withFileLock(userDrive: UserDrive, fileId: Int, block: () -> T): T {
+        val lock = lockFor(userDrive, fileId)
+        lock.lock()
+        try {
+            return block()
+        } finally {
+            lock.unlock()
+        }
+    }
 
     /**
      * Runs [block] while holding the per-file locks of ALL [fileIds], acquired in ASCENDING id
@@ -54,13 +75,22 @@ object OfflineFileCoordination {
      * identity and then lose the race to a graph transaction that commits a different name,
      * parent or revision while the publisher still holds its file lock. The ascending order
      * matches the publisher's two-lock scheme and the cleanup's single-lock acquisitions, so
-     * no lock cycle is possible. Java monitors are reentrant: paths already holding a subset
-     * of these locks nest safely.
+     * no lock cycle is possible. Reentrant: paths already holding a subset of these locks nest
+     * safely.
+     *
+     * Constant-stack (issue: round 11 #12): the locks are acquired by an iterative loop — one
+     * frame regardless of lock count — and released in REVERSE order in `finally`, unlike the
+     * previous per-lock recursive acquisition whose stack depth grew with the folder size (the
+     * walk passes every pagination page of a listing to one graph commit, so the set is
+     * unbounded and reached [StackOverflowError] before committing).
      */
     fun <T> withLocksFor(userDrive: UserDrive, fileIds: Collection<Int>, block: () -> T): T {
         val orderedLocks = fileIds.distinct().sorted().map { lockFor(userDrive, it) }
-        fun acquire(index: Int): T =
-            if (index == orderedLocks.size) block() else synchronized(orderedLocks[index]) { acquire(index + 1) }
-        return acquire(0)
+        for (lock in orderedLocks) lock.lock()
+        try {
+            return block()
+        } finally {
+            for (index in orderedLocks.indices.reversed()) orderedLocks[index].unlock()
+        }
     }
 }

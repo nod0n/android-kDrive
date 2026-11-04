@@ -361,7 +361,7 @@ object SyncOfflineUtils {
         // Upload-source registration is a mutation owner of these bytes: it holds the shared
         // per-file coordination so a publication or cleanup cannot interleave (issue:
         // round 4 #4).
-        synchronized(OfflineFileCoordination.lockFor(userDrive, localFile.id)) {
+        OfflineFileCoordination.withFileLock(userDrive, localFile.id) {
             // Revision dedup under the file lock (issue: round 8 #7): the identity of a
             // registration is the captured owner + content revision + destination (name,
             // folder, drive, user, modification date) — NOT the uri, since each registration
