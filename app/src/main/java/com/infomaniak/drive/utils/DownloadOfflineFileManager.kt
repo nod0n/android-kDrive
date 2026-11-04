@@ -275,23 +275,54 @@ class DownloadOfflineFileManager(
         // #20) — a pre-lock check can be stale by the time the marker is consumed, and a
         // stale observation falls through to the ordinary paths instead of reporting
         // success while consuming a newer request's re-mark.
-        if (consumeEarlySuccessIntent(context, file) { _, liveOffline ->
-                // THE ORIGINAL MUST EXIST (issue: round 22 #8): a pending record after the
-                // original disappeared is not usable content for this row.
+        if (consumeEarlySuccessIntent(context, file) { live, liveOffline ->
+                // EXACT OWNERSHIP, NOT A URI RECORD (issue: round 23 #9): the pending
+                // branch previously required only existence — an old URI record after the
+                // bytes changed (or a partial edit copy) fulfilled the request. The exact
+                // upload-record identity (name/folder/mtime/hash/fileId) must match the
+                // CURRENT bytes.
                 liveOffline.exists() &&
-                    UploadFile.hasPendingUpload(uri = Uri.fromFile(liveOffline).toString())
+                    UploadFile.sha256OrNull(liveOffline)?.let { currentHash ->
+                        UploadFile.hasUploadRecordFor(
+                            fileName = live.name,
+                            remoteFolder = live.parentId,
+                            driveId = userDrive.driveId,
+                            userId = userDrive.userId,
+                            fileModifiedAt = java.util.Date(liveOffline.lastModified()),
+                            pendingOnly = true,
+                            contentHash = currentHash,
+                            originalFileId = live.id,
+                        )
+                    } == true
             }
         ) {
             return ListenableWorker.Result.success()
         }
         if (consumeEarlySuccessIntent(context, file) { live, liveOffline ->
-                liveOffline.exists() && OfflineFolderPolicy.isLocallyModified(
-                    offlineFileLastModifiedMillis = liveOffline.lastModified(),
-                    // The LIVE row's PUBLISHED byte baseline, not accepted server metadata
-                    // (issues: round 15 #6, round 22 #8) — re-derived from live state, and
-                    // retained old-clean bytes are not a local edit.
-                    remoteLastModifiedAtSeconds = live.effectivePublishedBaseline,
-                )
+                // COMPLETE CONTENT CLASSIFICATION (issue: round 23 #9): the edit branch
+                // previously accepted any newer mtime — certified published bytes at
+                // mtime 20 above a lagging Realm baseline 10 satisfied it after newer
+                // remote metadata was accepted, the refresh was skipped and its marker
+                // cleared. The edit must be POSITIVELY established: an ANCHORED baseline
+                // (the mtime comparison is meaningless against the fallback), no
+                // certifying record (a certified copy is the published generation
+                // regardless of mtime), and no positively foreign record on the path.
+                liveOffline.exists() &&
+                    (live.publishedCleanBaseline ?: 0L) > 0L &&
+                    run {
+                        val liveProof = readPublishedProvenance(context, liveOffline)
+                        val liveHash = UploadFile.sha256OrNull(liveOffline)
+                        liveProof?.positivelyForeignTo(live, userDrive) != true &&
+                            !(liveProof?.identifies(live, userDrive) == true &&
+                                liveProof.contentHash != null && liveHash != null &&
+                                liveProof.contentHash == liveHash) &&
+                            OfflineFolderPolicy.isLocallyModified(
+                                offlineFileLastModifiedMillis = liveOffline.lastModified(),
+                                // The LIVE row's PUBLISHED byte baseline, not accepted server
+                                // metadata (issues: round 15 #6, round 22 #8).
+                                remoteLastModifiedAtSeconds = live.effectivePublishedBaseline,
+                            )
+                    }
             }
         ) {
             return ListenableWorker.Result.success()
@@ -1907,18 +1938,21 @@ class DownloadOfflineFileManager(
                     // and the sweep resolves the file (issue: round 22 #3).
                     if (pendingRecoveryExcludes) return PublicationOutcome.SKIPPED_CONFLICT
                     // Usable protected content FOR THIS FILE vs a destination conflict
-                    // (issue: round 14 #13): the protection proves F's own usable content
-                    // only when the destination's owner row is F itself — its pending
-                    // upload, retained unsent edit, or a local modification against its own
-                    // baseline. Unknown ownership and a CHANGED owner are preservation
-                    // reasons for OTHER content, not proof that F has usable local content:
-                    // they defer as a conflict, with pending and root work retained.
-                    // POSITIVE ownership (issue: round 15 #11): the protected content must
-                    // belong to the INCOMING file — [lockedOwnerId] is the previously
-                    // discovered destination owner and can equally be another row's, which
-                    // would report foreign bytes as F's usable content.
+                    // (issues: round 14 #13, round 23 #6): the protection proves F's own
+                    // VERIFIED-USABLE content only when the destination's owner row is F
+                    // itself AND the content is positively owned — a pending or
+                    // retained-unsent upload whose exact record owns the bytes. PRESERVED
+                    // is not USABLE: an unproven (unknown/hashless-classified) or unreadable
+                    // retained target is preserved but must NOT fulfill the transfer — the
+                    // intent is RETAINED (the marker stays) and the outcome is a conflict,
+                    // so the dialog never reports 100 and the bulk counts the work
+                    // unresolved. Unknown ownership and a CHANGED owner are preservation
+                    // reasons for OTHER content: they defer as a conflict too.
                     val ownedByThisFile = liveOwner != null && liveOwner.id == file.id && liveOwner.id == lockedOwnerId
-                    return if (ownedByThisFile) {
+                    val protectedContentUsable = ownedByThisFile &&
+                        (UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
+                            UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(target).toString()))
+                    return if (ownedByThisFile && protectedContentUsable) {
                         // The transfer's own generation and intent were validated INSIDE this
                         // section (superseded/intent checks above) — clearing THIS transfer's
                         // pending marker here cannot erase a newer request's marker (issue:

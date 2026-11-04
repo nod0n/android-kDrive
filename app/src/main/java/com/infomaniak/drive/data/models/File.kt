@@ -369,10 +369,22 @@ open class File(
             contentHash = currentHash,
             originalFileId = id,
         )
-        if (UploadFile.hasPendingUpload(uri = protectedCopyUri) ||
-            UploadFile.hasRetainedUnsentUpload(uri = protectedCopyUri) ||
-            snapshotOwned
-        ) {
+        // EXACT OWNERSHIP BEFORE READABILITY (issue: round 23 #8): a URI record alone
+        // never establishes that the CURRENT bytes belong to the recorded revision —
+        // existence plus an old URI record no longer grants a readable status by itself.
+        // The durable SNAPSHOT ownership (validated with the current content hash above)
+        // and the exact upload-record identity (name/folder/mtime/hash/fileId) do.
+        val exactPendingOwnership = UploadFile.hasUploadRecordFor(
+            fileName = name,
+            remoteFolder = parentId,
+            driveId = userDrive.driveId,
+            userId = userDrive.userId,
+            fileModifiedAt = Date(offlineFile.lastModified()),
+            pendingOnly = true,
+            contentHash = currentHash,
+            originalFileId = id,
+        )
+        if (snapshotOwned || exactPendingOwnership) {
             return StoredOfflineCopyState.READABLE_UNVERIFIED
         }
         // IMMUTABLE BYTE IDENTITY (issues: round 20 #3, round 20 #12): a hash-ful record
@@ -390,6 +402,12 @@ open class File(
         if (provenance?.contentHash == null && offlineFile.length() <= 0L && (size ?: 0L) > 0L) {
             return StoredOfflineCopyState.ABSENT_OR_STALE
         }
+        // COMPLETENESS BEFORE EVERY READABLE RETURN (issue: round 23 #8): the known-
+        // truncation gate previously sat after the unknown/mismatching-version and
+        // timestamp early returns — a truncated hashless copy with an unknown version
+        // still returned readable. A KNOWN-truncated copy is ABSENT regardless of which
+        // later arm would have spoken; an unknown row size stays conservative-readable.
+        if (size != null && !isIntactFile(offlineFile)) return StoredOfflineCopyState.ABSENT_OR_STALE
         // OWN-GENERATION coherence (issue: round 18 #14): the copy's usability is judged
         // against the generation it was published under — never against current remote
         // metadata alone, which a backward-dated newer revision changes without the bytes
@@ -397,12 +415,6 @@ open class File(
         val ownGeneration = provenance?.lastModifiedAt ?: effectivePublishedBaseline
         if ((offlineFile.lastModified() / 1_000L) != ownGeneration) return StoredOfflineCopyState.ABSENT_OR_STALE
         if (provenance == null) {
-            // COMPLETENESS BEFORE READABILITY (issue: round 22 #7): a truncated legacy copy
-            // matching its recorded generation is INCOMPLETE — the same known-truncation
-            // rule as the certified path applies before any readable status, or the dialog
-            // reports 100% over truncated bytes. An unknown row size stays
-            // conservative-readable: it cannot prove truncation.
-            if (size != null && !isIntactFile(offlineFile)) return StoredOfflineCopyState.ABSENT_OR_STALE
             return StoredOfflineCopyState.READABLE_UNVERIFIED
         }
         // STRICT OWNER IDENTITY (issue: round 20 #11): CURRENTNESS requires the caller's
@@ -426,13 +438,9 @@ open class File(
         // classification follow from it). Such a copy keeps its historical
         // READABILITY_UNVERIFIED status; only a republished record carrying a content
         // hash can certify the generation.
-        if (provenance.contentHash == null) {
-            // COMPLETENESS BEFORE READABILITY (issue: round 22 #7): a hashless record
-            // proves nothing about content — a truncated copy under it is incomplete,
-            // never readable. Same known-truncation rule as above.
-            if (size != null && !isIntactFile(offlineFile)) return StoredOfflineCopyState.ABSENT_OR_STALE
-            return StoredOfflineCopyState.READABLE_UNVERIFIED
-        }
+        // LEGACY HASHLESS RECORDS NEVER CERTIFY CONTENT (issue: round 21 #3); the
+        // known-truncation gate above already ran (issue: round 23 #8).
+        if (provenance.contentHash == null) return StoredOfflineCopyState.READABLE_UNVERIFIED
         // CURRENTNESS still requires the copy to be INTACT against the row's accepted size
         // (issue: round 19 #13); KNOWN TRUNCATION IS NOT EVEN READABLE (issue: round 21
         // #12) — a copy whose length differs from the row's KNOWN accepted size is

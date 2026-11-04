@@ -203,9 +203,27 @@ class DownloadProgressViewModel : ViewModel() {
                                 // old generation's clean bytes as an edit against the
                                 // replacement baseline and manufacture an upload that can
                                 // restore old content over the newer generation.
+                                // EXACT OWNERSHIP ONLY (issue: round 23 #8): the superseded
+                                // branch's OR expression previously accepted pending/retained
+                                // URI records ALONE — existence plus an old URI record never
+                                // establishes that the current bytes are usable or belong to
+                                // the same retained revision. Completion requires the scoped
+                                // content-state proof, an exact upload-record identity
+                                // (name/folder/mtime/hash/fileId), or the durable snapshot
+                                // ownership validated with the current content hash.
                                 (liveRow.isOfflineAndProvenCurrent(context, outputFile, userDrive) ||
-                                    UploadFile.hasPendingUpload(uri = targetUri) ||
-                                    UploadFile.hasRetainedUnsentUpload(uri = targetUri) ||
+                                    (UploadFile.sha256OrNull(outputFile)?.let { currentHash ->
+                                        UploadFile.hasUploadRecordFor(
+                                            fileName = liveRow.name,
+                                            remoteFolder = liveRow.parentId,
+                                            driveId = userDrive.driveId,
+                                            userId = userDrive.userId,
+                                            fileModifiedAt = Date(outputFile.lastModified()),
+                                            pendingOnly = true,
+                                            contentHash = currentHash,
+                                            originalFileId = liveRow.id,
+                                        )
+                                    } == true) ||
                                     // Durable SNAPSHOT registrations own the original
                                     // revision under unique uris the uri queries cannot
                                     // see (issue: round 15 #7). A FAILED hash/read is
