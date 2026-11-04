@@ -887,31 +887,49 @@ object FolderFilesProvider {
             }.getOrNull()
             val details = probe?.data?.takeIf { it.id == fileId }
             return when {
-                details != null -> synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                    OfflineFileCoordination.withFileLock(userDrive, fileId) {
-                        val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                            realm = realm,
-                            remoteFiles = listOf(details),
-                            userDrive = userDrive,
-                            observedById = fileId.let { id ->
-                                preFetchObservation?.let { obs -> mapOf(id to obs) } ?: emptyMap()
-                            },
-                        ).first()
-                        if (committable !== details) {
-                            false
-                        } else {
-                            // ABSENCE-AWARE upsert (issue: round 21 #18): an authoritative
-                            // details answer for an UNCACHED row must make progress — the
-                            // must-exist updater returned false forever and blocked the
-                            // activity cursor; the upsert also reconciles the authoritative
-                            // membership (destination link + obsolete old backlink) in the
-                            // same coordinated operation.
-                            FileController.upsertFetchedFileIfNotOlder(
-                                newFile = committable,
+                details != null -> {
+                    // COMPLETE ASCENDING LOCK SET ONCE (issue: round 22 #14): the previous
+                    // withFileLock(file) pre-held the CHILD lock while the upsert then
+                    // requested lower-ID parent locks — a concrete lock-order deadlock
+                    // against any concurrent ascending acquirer (activity holds 100 wants
+                    // 50; Gallery holds 50 wants 100, monitor retained). The caller now
+                    // acquires the intent monitor and the COMPLETE set — the fetched row's
+                    // new parent, the observed previous parent and the row itself — in ONE
+                    // ascending acquisition, then runs the boundary and the coordinated
+                    // upsert body (which acquires nothing itself).
+                    val coordinatedIds = buildList {
+                        add(fileId)
+                        preFetchObservation?.parentId?.takeIf { it > 0 }?.let(::add)
+                        details.parentId.takeIf { it > 0 }?.let(::add)
+                    }.distinct()
+                    synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                        OfflineFileCoordination.withLocksFor(userDrive, coordinatedIds) {
+                            val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                                 realm = realm,
+                                remoteFiles = listOf(details),
                                 userDrive = userDrive,
-                                observed = preFetchObservation,
-                            )
+                                observedById = fileId.let { id ->
+                                    preFetchObservation?.let { obs -> mapOf(id to obs) } ?: emptyMap()
+                                },
+                            ).first()
+                            if (committable !== details) {
+                                false
+                            } else {
+                                // ABSENCE-AWARE upsert (issues: round 21 #18, round 22
+                                // #14/#15): an authoritative details answer for an UNCACHED
+                                // row must make progress; the upsert reconciles the
+                                // authoritative membership (destination link + obsolete old
+                                // backlink) and backfills an inserted ancestor's existing
+                                // children in the same coordinated operation. A missing
+                                // parent row DEFERS (the cursor stays) instead of consuming
+                                // an authoritative event for unusable ancestry.
+                                FileController.upsertFetchedFileIfNotOlderInCoordinatedSection(
+                                    newFile = committable,
+                                    realm = realm,
+                                    userDrive = userDrive,
+                                    observed = preFetchObservation,
+                                )
+                            }
                         }
                     }
                 }

@@ -1101,58 +1101,114 @@ object FileController {
     }
 
     /**
-     * ABSENCE-AWARE payloadless upsert with AUTHORITATIVE MEMBERSHIP REPAIR (issue: round
-     * 21 #18): a resolving fetch's authoritative answer must make progress for an UNCACHED
-     * row too — the must-exist updater returned false forever and blocked the activity
-     * cursor on an authoritative details answer. Absent → INSERT (the fetched row IS the
-     * authoritative current state); present → the same conditional update as
-     * [updateExistingFileIfNotOlder]. The row's OWN parentId is the authoritative resulting
-     * location either way: the destination link and the obsolete old backlink are
-     * reconciled in the SAME coordinated operation (the previous update bypassed both for
-     * a moved row). A container that does not exist yet leaves the link to the ancestry
-     * resolvers (which own the chain) instead of blocking the cursor on it.
+     * ABSENCE-AWARE payloadless upsert with AUTHORITATIVE MEMBERSHIP REPAIR (issues: round
+     * 21 #18, round 22 #14/#15): a resolving fetch's authoritative answer must make
+     * progress for an UNCACHED row too — the must-exist updater returned false forever and
+     * blocked the activity cursor on an authoritative details answer. Absent → INSERT
+     * (the fetched row IS the authoritative current state); present → the same conditional
+     * update as [updateExistingFileIfNotOlder]. The row's OWN parentId is the
+     * authoritative resulting location either way: the destination link and the obsolete
+     * old backlink are reconciled in the SAME coordinated operation, and EXISTING
+     * authoritative children are backfilled into an inserted ancestor's children list
+     * (bottom-up ancestry fetches previously inserted the child first and never linked it
+     * when the parent arrived).
+     *
+     * LOCK PROTOCOL (issue: round 22 #14): the intent monitor precedes the COMPLETE
+     * ascending lock set, acquired ONCE — this entry point never runs underneath an
+     * already-held lower-order lock (the previous payloadless caller pre-held the child
+     * lock and deadlocked against any concurrent ascending acquirer of the parent).
+     * Callers that already hold the monitor with the complete set use
+     * [upsertFetchedFileIfNotOlderInCoordinatedSection].
+     *
+     * RESOLVED-ANCESTRY ACCEPTANCE (issue: round 22 #15): an accepted operation whose
+     * parent row is absent creates a row with unusable ancestry and consumes the activity
+     * cursor — with [requireResolvedParent] the operation DEFERS instead (a later
+     * resolving pass retries after the ancestry resolvers materialize the chain). Gallery's
+     * bottom-up ancestor fetches pass false: their unresolved membership work is the
+     * child-backfill below, which links the row once its parent arrives.
      */
     fun upsertFetchedFileIfNotOlder(
         newFile: File,
         realm: Realm,
         userDrive: UserDrive,
         observed: File? = null,
+        requireResolvedParent: Boolean = true,
     ): Boolean {
-        // Lock-set derivation only (a row's id/parent identity is stable); the membership
-        // repair itself re-reads the transaction-fresh rows.
-        val previousParentId = getFileById(realm, newFile.id)?.parentId?.takeIf { it != newFile.parentId }
-        return OfflineFileCoordination.withLocksFor(
-            userDrive,
-            buildList {
-                add(newFile.id)
-                if (newFile.parentId > 0) add(newFile.parentId)
-                previousParentId?.let(::add)
-            }.distinct(),
-        ) {
-            var accepted = false
-            realm.executeTransaction {
-                val live = getFileById(realm, newFile.id)
-                // ABSENCE-AWARE acceptance (issue: round 21 #18): absence INSERTS.
-                if (live != null && isStaleReplacement(live, newFile, observed)) return@executeTransaction
-                if (live?.isUsable() == true) newFile.keepOldLocalFilesData(live)
-                it.insertOrUpdate(newFile)
-                // AUTHORITATIVE MEMBERSHIP (issue: round 21 #18), same coordinated
-                // operation: link the committed row under the container its own parentId
-                // names, and drop the obsolete backlink from the previous one.
-                val committed = getFileById(realm, newFile.id)
-                if (committed != null && newFile.parentId > 0) {
-                    val container = getFileById(realm, newFile.parentId)
-                    if (container != null && container.children.none { it.id == newFile.id }) {
-                        container.children.add(committed)
-                    }
-                    previousParentId?.let { previous ->
-                        getFileById(realm, previous)?.children?.removeAll { it.id == newFile.id }
-                    }
-                }
-                accepted = true
+        return synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withLocksFor(userDrive, coordinatedLockSet(newFile)) {
+                upsertFetchedFileIfNotOlderInCoordinatedSection(newFile, realm, userDrive, observed, requireResolvedParent)
             }
-            accepted
         }
+    }
+
+    /**
+     * The COMPLETE ascending lock set for a fetched-row upsert: the row itself, its
+     * resulting parent and its observed previous parent (lock-set derivation only — the
+     * membership repair re-reads transaction-fresh rows).
+     */
+    private fun coordinatedLockSet(newFile: File): List<Int> = buildList {
+        add(newFile.id)
+        if (newFile.parentId > 0) add(newFile.parentId)
+    }.distinct()
+
+    /**
+     * The transactional body of [upsertFetchedFileIfNotOlder] for a caller that ALREADY
+     * holds the intent monitor and the COMPLETE ascending lock set (the row, its resulting
+     * parent and its observed previous parent) — this body acquires NO locks itself:
+     * acquiring lower-ID parent locks under an already-held child lock is the concrete
+     * lock-order deadlock this split removes (issue: round 22 #14).
+     */
+    fun upsertFetchedFileIfNotOlderInCoordinatedSection(
+        newFile: File,
+        realm: Realm,
+        userDrive: UserDrive,
+        observed: File? = null,
+        requireResolvedParent: Boolean = true,
+    ): Boolean {
+        val previousParentId = getFileById(realm, newFile.id)?.parentId?.takeIf { it != newFile.parentId }
+        var accepted = false
+        realm.executeTransaction {
+            val live = getFileById(realm, newFile.id)
+            // ABSENCE-AWARE acceptance (issue: round 21 #18): absence INSERTS.
+            if (live != null && isStaleReplacement(live, newFile, observed)) return@executeTransaction
+            // RESOLVED-ANCESTRY ACCEPTANCE (issue: round 22 #15): a missing parent row
+            // defers the operation (the cursor stays) instead of consuming an
+            // authoritative event for a row whose ancestry cannot be used.
+            if (requireResolvedParent && newFile.parentId > 0 && getFileById(realm, newFile.parentId) == null) {
+                return@executeTransaction
+            }
+            if (live?.isUsable() == true) newFile.keepOldLocalFilesData(live)
+            it.insertOrUpdate(newFile)
+            // AUTHORITATIVE MEMBERSHIP (issue: round 21 #18), same coordinated operation:
+            // link the committed row under the container its own parentId names, and drop
+            // the obsolete backlink from the previous one.
+            val committed = getFileById(realm, newFile.id)
+            if (committed != null && newFile.parentId > 0) {
+                val container = getFileById(realm, newFile.parentId)
+                if (container != null && container.children.none { it.id == newFile.id }) {
+                    container.children.add(committed)
+                }
+                previousParentId?.let { previous ->
+                    getFileById(realm, previous)?.children?.removeAll { it.id == newFile.id }
+                }
+            }
+            // AUTHORITATIVE CHILD BACKFILL (issue: round 22 #15): an ancestor inserted
+            // AFTER its children (bottom-up ancestry fetches) reconciles the existing
+            // authoritative rows into its children list — children previously existed
+            // while the generated path stayed unavailable.
+            if (committed != null) {
+                it.where(File::class.java)
+                    .equalTo(File::parentId.name, newFile.id)
+                    .findAll()
+                    .forEach { child ->
+                        if (committed.children.none { linked -> linked.id == child.id }) {
+                            committed.children.add(child)
+                        }
+                    }
+            }
+            accepted = true
+        }
+        return accepted
     }
 
     /**
@@ -1806,19 +1862,43 @@ object FileController {
                         okHttpClient = okHttpClient,
                     )
                 }.getOrNull()?.data?.takeIf { it.id == missingAncestorId } ?: return@forEach
-                val committableAncestor = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                    currentRealm,
-                    listOf(ancestorDetails),
-                    userDrive,
-                ).first()
-                if (committableAncestor === ancestorDetails) {
-                    // ABSENCE-AWARE ANCESTOR INSERT (issue: round 21 #23): the fetched
-                    // MISSING ancestor previously entered the must-exist updater, whose
-                    // live-row requirement rejected it — ancestry progress stayed at zero
-                    // forever. The upsert INSERTS the absent ancestor (with its
-                    // authoritative membership reconciliation) and conditionally updates a
-                    // present one; the fair per-pass budget keeps growing each chain.
-                    upsertFetchedFileIfNotOlder(committableAncestor, currentRealm, userDrive)
+                // SAME CONTINUOUS PROTOCOL (issue: round 22 #14): the ancestor's commit
+                // runs under the intent monitor and the COMPLETE ascending lock set (the
+                // ancestor and its resulting parent) — the previous lockless upsert
+                // acquired ascending locks with no monitor and deadlocked against the
+                // payloadless activity section's pre-held child lock. HTTP stays outside
+                // every lock.
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withLocksFor(
+                        userDrive,
+                        buildList {
+                            add(missingAncestorId)
+                            ancestorDetails.parentId.takeIf { it > 0 }?.let(::add)
+                        }.distinct(),
+                    ) {
+                        val committableAncestor = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                            currentRealm,
+                            listOf(ancestorDetails),
+                            userDrive,
+                        ).first()
+                        if (committableAncestor === ancestorDetails) {
+                            // ABSENCE-AWARE ANCESTOR INSERT (issues: round 21 #23, round 22
+                            // #14/#15): the upsert INSERTS the absent ancestor (with its
+                            // authoritative membership reconciliation and the CHILD BACKFILL
+                            // that links already-inserted descendants), and conditionally
+                            // updates a present one. requireResolvedParent = false: a
+                            // bottom-up fetch inserts the bottom-most missing ancestor whose
+                            // own parent may still be missing — the unresolved membership
+                            // work is the child backfill, completed when the parent's pass
+                            // arrives.
+                            upsertFetchedFileIfNotOlderInCoordinatedSection(
+                                committableAncestor,
+                                currentRealm,
+                                userDrive,
+                                requireResolvedParent = false,
+                            )
+                        }
+                    }
                 }
             }
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
