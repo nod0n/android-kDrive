@@ -52,6 +52,7 @@ import com.infomaniak.drive.data.api.UploadTask.Companion.ConflictOption
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FolderFilesProvider
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
@@ -596,6 +597,7 @@ class CloudStorageProvider : DocumentsProvider() {
         return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
 
             val fileNotFoundException = IllegalStateException("File not found")
+            val userDrive = createUserDrive(sourceDocumentId)
 
             val fileId = getFileIdFromDocumentId(sourceDocumentId)
             val file = FileController.getFileProxyById(fileId, customRealm = realm) ?: throw fileNotFoundException
@@ -607,7 +609,51 @@ class CloudStorageProvider : DocumentsProvider() {
             val apiResponse = ApiRepository.moveFile(file, targetParentFile)
 
             if (apiResponse.isSuccess()) {
-                realm.executeTransaction { file.deleteFromRealm() }
+                // Move reconciliation BEFORE the row deletion (issue: round 7 #7): the owned
+                // copy at the old location is migrated, or its edit snapshotted under the
+                // POST-move identity — the previous direct row deletion orphaned the sole
+                // bytes of an edited inherited file with no old row left to recover the
+                // original path from.
+                val appContext = Realm.getApplicationContext()
+                val preserved: Boolean = when {
+                    appContext == null -> false
+                    file.isFolder() ->
+                        // Required ancestry (issues: round 5 #10, round 7 #7): a folder row
+                        // whose descendants remain locally owned survives the SAF move.
+                        !OfflineFolderController.hasLocallyOwnedDescendant(file.id, realm)
+                    else -> {
+                        val oldOffline = file.getOfflineFile(appContext, userDrive.userId)?.takeIf { it.exists() }
+                        if (oldOffline == null) {
+                            true // nothing owned at the old location
+                        } else {
+                            val destinationFile = targetParentFile
+                                .getOfflineFile(appContext, userDrive.userId)
+                                ?.let { parentDir -> IOFile(parentDir, file.name) }
+                            destinationFile != null && OfflineFolderController.reconcileMovedInheritedCopy(
+                                context = appContext,
+                                oldOfflineFile = oldOffline,
+                                oldIdentityName = file.name,
+                                oldIdentityParentId = file.parentId,
+                                oldLastModifiedAt = file.lastModifiedAt,
+                                newIdentity = File(id = file.id, driveId = userDrive.driveId).apply {
+                                    parentId = targetParentFile.id
+                                    name = file.name
+                                },
+                                userDrive = userDrive,
+                                newOfflineTarget = destinationFile,
+                            )
+                        }
+                    }
+                }
+
+                if (preserved) {
+                    realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                } else {
+                    // Preservation deferred (or ancestry still required): the OLD row and its
+                    // ancestry stay so the original path stays discoverable; the destination
+                    // listing recreates the new identity and a later pass reconciles.
+                    SentryLog.i(TAG, "Deferred SAF move of ${file.id}: its offline copy is not safely preserved yet")
+                }
 
                 // Refresh
                 scheduleRefresh(sourceParentDocumentId)
