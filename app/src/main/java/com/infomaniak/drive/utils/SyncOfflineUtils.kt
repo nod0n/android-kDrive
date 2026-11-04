@@ -405,11 +405,20 @@ object SyncOfflineUtils {
         OfflineFileCoordination.withFileLock(userDrive, localFile.id) {
             runCatching { realm.refresh() }
             val liveRow = FileController.getFileById(realm, localFile.id)
-            if (liveRow == null ||
+            if (liveRow == null) {
+                // The row is gone (removed by another flow): consume with NO side effect —
+                // a later action or listing owns the identity.
+                return true
+            }
+            // The ACTION path's fresh acceptance BEFORE the snapshot side effect (issue:
+            // round 14 #1): a stale action must not register available bytes under an
+            // obsolete identity — the anchor ([localFile], the state the action request was
+            // issued against) resolves ordering ties. The no-action sweep ([remoteFile] ==
+            // null) has no action identity to gate; it registers under the CURRENT row's
+            // identity, read fresh under this lock.
+            if (remoteFile != null &&
                 FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionLastActionAt, observed = localFile)
             ) {
-                // The action's target row is gone or the action is stale: consume with NO
-                // side effect — a later action or listing owns the identity.
                 return true
             }
             // Revision dedup under the file lock (issue: round 8 #7): the identity of a
@@ -419,8 +428,8 @@ object SyncOfflineUtils {
             // this gate every no-action sync re-registered the same pending revision as a
             // new full snapshot, and a cancelled revision was silently reactivated on the
             // next sync.
-            val registrationName = remoteFile?.name ?: localFile.name
-            val registrationFolder = remoteFile?.parentId ?: localFile.parentId
+            val registrationName = remoteFile?.name ?: liveRow.name
+            val registrationFolder = remoteFile?.parentId ?: liveRow.parentId
             if (UploadFile.hasUploadRecordFor(
                     fileName = registrationName,
                     remoteFolder = registrationFolder,
@@ -465,10 +474,11 @@ object SyncOfflineUtils {
                 fileModifiedAt = fileModifiedAt,
                 // The record carries the POST-COMMIT identity (issue: round 7 #5): when the
                 // same action renames/moves the file, uploading under the source name/parent
-                // would recreate the old location remotely.
-                fileName = remoteFile?.name ?: localFile.name,
+                // would recreate the old location remotely. The sweep path uses the FRESH
+                // row's identity (issue: round 14 #1), not the pre-pass map's snapshot.
+                fileName = remoteFile?.name ?: liveRow.name,
                 fileSize = ioFile.length(),
-                remoteFolder = remoteFile?.parentId ?: localFile.parentId,
+                remoteFolder = remoteFile?.parentId ?: liveRow.parentId,
                 type = UploadFile.Type.SYNC_OFFLINE.name,
                 userId = userDrive.userId,
             ).store()

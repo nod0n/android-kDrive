@@ -1946,11 +1946,11 @@ object FileController {
         // timestamps tying is the same-generation evidence; anything else retains UNKNOWN
         // status. Omitted version data is UNKNOWN, not a generation difference (issue: round
         // 13 #9) — a same-generation versionless listing keeps its populated version.
-        if ((version?.number ?: 0) == 0 && (oldFile.version?.number ?: 0) > 0 &&
+        val inheritedVersion = oldFile.version
+        if ((version?.number ?: 0) == 0 && inheritedVersion != null && inheritedVersion.number > 0 &&
             parentId == oldFile.parentId && name == oldFile.name &&
             updatedAt == oldFile.updatedAt && revisedAt == oldFile.revisedAt
         ) {
-            val inheritedVersion = oldFile.version
             // UNMANAGED copy (issue: round 14 #3): the managed embedded object belongs to the
             // caller's Realm — attaching it to a response object that escapes (folder loading
             // returns the original response objects and closes its Realm; gallery/recent
