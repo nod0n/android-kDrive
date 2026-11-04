@@ -190,7 +190,15 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                 setProgressAsync(workDataOf(PROGRESS to progress, FILE_ID to downloadedFileId))
             }
             if (result == Result.success()) {
-                completedFileIds.add(file.id)
+                if (downloadOfflineFileManager.lastTransferSuperseded) {
+                    // A superseded generation's replacement is still outstanding (issue: round
+                    // 9 #8): its pending marker belongs to the newer transfer, so it is
+                    // excluded from completion-marker clearing, and the batch must not report
+                    // the root synchronized while that replacement runs.
+                    allFilesSucceeded = false
+                } else {
+                    completedFileIds.add(file.id)
+                }
             } else {
                 allFilesSucceeded = false
             }

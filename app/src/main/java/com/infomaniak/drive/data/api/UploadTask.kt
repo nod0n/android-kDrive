@@ -39,6 +39,7 @@ import com.infomaniak.core.notifications.notifyCompat
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.data.api.ApiRepository.uploadEmptyFile
 import com.infomaniak.drive.data.api.ApiRoutes.uploadChunkUrl
+import com.infomaniak.drive.data.models.UploadCancellationSignal
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.drive.Drive.MaintenanceReason
 import com.infomaniak.drive.data.models.upload.UploadSession
@@ -118,16 +119,35 @@ class UploadTask(
         }
 
         try {
-            val httpClient = HttpClient(OkHttp) {
-                engine { preconfigured = uploadFile.okHttpClient }
+            // Stopped between the worker's pre-start check and this transfer (issue: round 9
+            // #9): the record's removal already handled ownership; nothing uploads.
+            if (UploadCancellationSignal.isCancelled(uploadFile.uri)) {
+                throw UploadCancellationSignal.UploadStoppedByUserException(uploadFile.uri)
             }
-            when {
-                uploadFile.fileSize == 0L -> uploadEmptyFile(uploadFile)
-                uploadFile.fileSize <= MIN_FILE_SIZE_FOR_CHUNKING -> uploadDirectly(httpClient)
-                else -> uploadInChunks(httpClient)
-            }
-            finishUpload(uploadFile.getUriObject())
+            // The exact-URI stop signal races the WHOLE execution (issue: round 9 #9): when
+            // it fires, the still-running HTTP coroutine — a direct upload, a chunk transfer
+            // or a session creation — is cancelled and ktor aborts the underlying request.
+            raceOf(
+                {
+                    val httpClient = HttpClient(OkHttp) {
+                        engine { preconfigured = uploadFile.okHttpClient }
+                    }
+                    when {
+                        uploadFile.fileSize == 0L -> uploadEmptyFile(uploadFile)
+                        uploadFile.fileSize <= MIN_FILE_SIZE_FOR_CHUNKING -> uploadDirectly(httpClient)
+                        else -> uploadInChunks(httpClient)
+                    }
+                    finishUpload(uploadFile.getUriObject())
+                    true
+                },
+                { UploadCancellationSignal.awaitCancellation(uploadFile.uri) }
+            )
             return true
+        } catch (exception: UploadCancellationSignal.UploadStoppedByUserException) {
+            // The executing transfer was aborted by the exact-URI stop signal (issue: round 9
+            // #9): the cancellation path already soft-deleted the record and its retained
+            // snapshot ownership stands — no completion marking, no cleanup deletion here.
+            throw exception
         } catch (exception: CancellationException) {
             throw exception
         } catch (exception: ValidationFailedException) {

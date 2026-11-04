@@ -47,6 +47,8 @@ import io.realm.annotations.PrimaryKey
 import io.realm.kotlin.oneOf
 import io.realm.kotlin.toFlow
 import io.sentry.Sentry
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -56,7 +58,49 @@ import java.util.Date
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 
-open class UploadFile(
+open /**
+ * Process-wide cancellation signal for an EXECUTING upload, keyed by the record's EXACT uri
+ * (issue: round 9 #9): a record stopped in the UI — token-less, so only its row was
+ * soft-deleted — publishes here, and the executing transfer observes the signal and aborts
+ * its HTTP call, including direct uploads and session creation. Retained snapshot bytes and
+ * ownership are untouched: the cancellation paths already soft-delete the record, and the
+ * aborted transfer never reaches a completion marking. The signal is cleared when the same
+ * uri is registered again ([UploadFile.store]), because that is a new user intent.
+ */
+object UploadCancellationSignal {
+    private val cancelledUris: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    fun cancel(uri: String) {
+        cancelledUris.add(uri)
+    }
+
+    fun isCancelled(uri: String): Boolean = cancelledUris.contains(uri)
+
+    fun clear(uri: String) {
+        cancelledUris.remove(uri)
+    }
+
+    /** Thrown into the racing upload by [awaitCancellation]; NOT a coroutine cancellation. */
+    class UploadStoppedByUserException(uri: String) :
+        IllegalStateException("Upload stopped by user for $uri")
+
+    /**
+     * Racer for the executing transfer: suspends until this exact uri's signal fires, then
+     * aborts the racing upload — the still-running HTTP coroutine is cancelled and ktor
+     * aborts the underlying request.
+     */
+    suspend fun awaitCancellation(uri: String): Nothing = coroutineScope {
+        while (!isCancelled(uri)) {
+            ensureActive()
+            delay(CHECK_INTERVAL_MILLIS)
+        }
+        throw UploadStoppedByUserException(uri)
+    }
+
+    private const val CHECK_INTERVAL_MILLIS = 200L
+}
+
+class UploadFile(
     @PrimaryKey var uri: String = "",
     var deletedAt: Date? = null,
     var driveId: Int = -1,
@@ -86,6 +130,10 @@ open class UploadFile(
         var realm: Realm? = null
         try {
             realm = customRealm ?: getRealmInstance()
+            // A (re-)registration is a NEW user intent for this exact uri: any stale stop
+            // signal from a previously cancelled record must not abort the new transfer
+            // (issue: round 9 #9).
+            UploadCancellationSignal.clear(uri)
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.insertOrUpdate(this)
                 coroutineContext.ensureActive()
@@ -163,6 +211,8 @@ open class UploadFile(
 
     private fun deleteIfExistsInternal(keepFile: Boolean = false, realm: Realm) {
         val uploadFileProxy = uploadFileByUriQuery(realm, uri).findFirst() ?: return
+        // The record's removal publishes the exact-URI stop signal (issue: round 9 #9).
+        UploadCancellationSignal.cancel(uri)
         // Cancel session if exists
         uploadFileProxy.uploadToken?.let { uploadToken ->
             val response = ApiRepository.cancelSession(uploadFileProxy.driveId, uploadToken, okHttpClient)
@@ -518,6 +568,10 @@ open class UploadFile(
         }
 
         private fun deleteFromRealm(realm: Realm, uploadFileUri: String) {
+            // ANY removal of the record publishes the exact-URI stop signal (issue: round 9
+            // #9): an executing transfer for this record aborts instead of completing an
+            // upload the user (or a bulk close) just cancelled.
+            UploadCancellationSignal.cancel(uploadFileUri)
             uploadFileByUriQuery(realm, uploadFileUri).findFirst()?.let { uploadFileRealm ->
                 // Don't delete definitively if it's a sync
                 if (uploadFileRealm.type == Type.SYNC.name) {

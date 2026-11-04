@@ -52,6 +52,7 @@ import com.infomaniak.drive.data.api.UploadTask
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.MediaFolder
 import com.infomaniak.drive.data.models.SyncSettings
+import com.infomaniak.drive.data.models.UploadCancellationSignal
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UploadFile.Companion.getRealmInstance
 import com.infomaniak.drive.data.services.UploadWorkerErrorHandling.runUploadCatching
@@ -316,6 +317,13 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             } else {
                 uploadSchemeContent(uri)
             }
+        } catch (exception: UploadCancellationSignal.UploadStoppedByUserException) {
+            // The exact-URI stop signal aborted this transfer (issue: round 9 #9): the record
+            // was already soft-deleted by the cancellation path and its retained snapshot
+            // ownership stands; this upload counts as failed and the worker continues with
+            // the remaining files.
+            SentryLog.i(TAG, "upload aborted by exact-URI cancellation signal: $uri")
+            false
         } catch (exception: CancellationException) {
             throw exception
         } catch (exception: AllowedFileSizeExceededException) {

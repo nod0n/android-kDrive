@@ -82,6 +82,17 @@ class DownloadOfflineFileManager(
     private var currentFile: File? = null
     private var filesDownloaded = 0
 
+    /**
+     * Whether the most recent [execute] transfer was rejected as superseded (issue: round 9
+     * #8): the bulk caller must exclude such a transfer from its completion-marker clearing
+     * AND from its batch's synchronized verdict, because a newer generation owns the file's
+     * pending state and its replacement is still outstanding. The manager's own result maps
+     * the outcome to success (the newer transfer's bytes win, nothing failed here), which is
+     * why this status must travel beside it.
+     */
+    var lastTransferSuperseded: Boolean = false
+        private set
+
     private var lastUpdateProgressMillis = System.currentTimeMillis()
 
     suspend fun execute(
@@ -94,6 +105,7 @@ class DownloadOfflineFileManager(
         // previous transfer's file must never be examined or deleted by this transfer's cleanup.
         currentFile = file
         lastDownloadedFile = null
+        lastTransferSuperseded = false
 
         // Fetch first WITHOUT committing metadata, so an inherited copy at the old location can
         // be preserved (migrated, or snapshotted against its OLD baseline) before the remote
@@ -369,6 +381,8 @@ class DownloadOfflineFileManager(
             val sizeIsValidated = file.size == null || file.isIntactFile(staged)
             if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated) {
                 val outcome = publishStagedOfflineFile(context, file, offlineFile, staged)
+                // Public superseded status for the bulk caller (issue: round 9 #8).
+                lastTransferSuperseded = outcome == PublicationOutcome.SKIPPED_SUPERSEDED
                 when (outcome) {
                     PublicationOutcome.FAILED -> return@withContext ListenableWorker.Result.failure()
                     // Completion (flag writes, timestamp, media scan) only runs for bytes this
