@@ -210,10 +210,14 @@ object ApiRepository : ApiRepositoryCore() {
         return callApiWithCursor(url, GET)
     }
 
-    fun getLastGallery(driveId: Int, cursor: String?): CursorApiResponse<ArrayList<File>> {
+    fun getLastGallery(
+        driveId: Int,
+        cursor: String?,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): CursorApiResponse<ArrayList<File>> {
         val types = "&types[]=${ExtensionType.IMAGE.value}&types[]=${ExtensionType.VIDEO.value}"
         val url = "${ApiRoutes.searchFiles(driveId, SortType.RECENT)}$types&${loadCursor(cursor)}"
-        return callApiWithCursor(url, GET)
+        return callApiWithCursor(url, GET, okHttpClient = okHttpClient)
     }
 
     fun getValidChunks(driveId: Int, uploadToken: String, okHttpClient: OkHttpClient): ApiResponse<ValidChunks> {
@@ -459,9 +463,13 @@ object ApiRepository : ApiRepositoryCore() {
         return callApi(ApiRoutes.fileCategory(driveId, categoryId), DELETE, mapOf("file_ids" to files.map { it.id }))
     }
 
-    fun getLastActivities(driveId: Int, cursor: String?): CursorApiResponse<ArrayList<FileActivity>> {
+    fun getLastActivities(
+        driveId: Int,
+        cursor: String?,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): CursorApiResponse<ArrayList<FileActivity>> {
         val url = ApiRoutes.getLastActivities(driveId) + "&${loadCursor(cursor)}"
-        return callApiWithCursor(url, GET)
+        return callApiWithCursor(url, GET, okHttpClient = okHttpClient)
     }
 
     fun forceFolderAccess(file: File): ApiResponse<Boolean> {

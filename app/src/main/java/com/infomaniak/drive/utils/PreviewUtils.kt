@@ -187,12 +187,14 @@ suspend fun downloadFile(
     isPublicShared: Boolean,
     userDrive: UserDrive = UserDrive(),
     coordinated: Boolean = false,
-) {
+): PublicationOutcome {
     // The destination is never deleted up front (issue: round 8 #2): the replacement is
     // staged and only published once complete — coordinated publication for an offline-owned
     // destination, an atomic staged rename for a plain cache destination. The previous
     // delete-then-stream destroyed an edited offline copy as soon as the download started
-    // and left partial bytes at the destination on a cancelled download.
+    // and left partial bytes at the destination on a cancelled download. The outcome is
+    // propagated to the caller (issue: round 9 #1): a skipped transfer never touches the
+    // retained destination, and an invalidated destination is not reported as downloaded.
     val baseDownloadUrl = ApiRoutes.getDownloadFileUrl(file)
     val downloadUrl = if (file.isOnlyOfficePreview()) {
         baseDownloadUrl.appendQueryParams(mapOf("as" to "pdf"))
@@ -233,7 +235,13 @@ suspend fun downloadFile(
         if (outcome == PublicationOutcome.FAILED) {
             throw Exception("Download error")
         }
-        onProgress(PROGRESS_COMPLETE)
+        if (outcome != PublicationOutcome.SKIPPED_INVALIDATED) {
+            // The destination holds valid content (freshly published, or a protected/
+            // superseded retained copy): the preview can show it. An invalidated intent is
+            // NOT reported as a completed download.
+            onProgress(PROGRESS_COMPLETE)
+        }
+        return outcome
     }
 }
 

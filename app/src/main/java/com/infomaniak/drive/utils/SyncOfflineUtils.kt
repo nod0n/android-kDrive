@@ -19,6 +19,7 @@ package com.infomaniak.drive.utils
 
 import android.content.Context
 import android.net.Uri
+import androidx.work.Operation
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.R
 import com.infomaniak.drive.data.api.ApiRepository
@@ -38,6 +39,7 @@ import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.SyncUtils.syncImmediately
 import io.realm.Realm
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
@@ -54,12 +56,31 @@ object SyncOfflineUtils {
 
     private val renameActions = setOf(FILE_RENAME, FILE_RENAME_ALIAS, FILE_MOVE_OUT)
 
+    /**
+     * A cursor advance whose enqueue persistence is still unconfirmed (issues: round 8 #12,
+     * round 9 #2): the sync awaits the WorkManager operation OUTSIDE the file Realm session —
+     * no managed object or Realm instance survives the suspension — then revalidates on a
+     * fresh Realm in the captured scope before advancing.
+     */
+    private class PendingCursorAdvance(
+        val fileId: Int,
+        val lastActionAt: Long,
+        val operation: Operation,
+    )
+
+    /** Outcome of the download branch: handled, deferred, or handled with a pending advance. */
+    private class DownloadActionOutcome(
+        val handled: Boolean,
+        val pendingOperation: Operation? = null,
+    )
+
     suspend fun startSyncOffline(context: Context) = coroutineScope {
         // Delete all offline storage files prior to APIv3. For more info, see deleteLegacyOfflineFolder kDoc
         deleteLegacyOfflineFolder(context)
         DriveInfosController.getDrives(AccountUtils.currentUserId).forEach { drive ->
             ensureActive()
             val userDrive = UserDrive(driveId = drive.id)
+            val pendingAdvances = mutableListOf<PendingCursorAdvance>()
 
             FileController.getRealmInstance(userDrive).use { realm ->
                 // INFO(offline): We can get remote files when the local files path is empty to prevent sync bug
@@ -75,6 +96,7 @@ object SyncOfflineUtils {
                         userDrive = userDrive,
                         localFilesMap = it.associateBy { file -> file.id },
                         realm = realm,
+                        pendingAdvances = pendingAdvances,
                     )
                 }
 
@@ -82,6 +104,33 @@ object SyncOfflineUtils {
                 // periodically refresh the coverage so remote additions/deletions are reflected.
                 ensureActive()
                 OfflineFolderUtils.enqueueStaleOfflineFolderSyncs(context, userDrive, realm)
+            }
+
+            // Enqueue persistence is awaited AFTER the Realm session closed (issue: round 9 #2):
+            // the await suspends and its continuation may resume on another IO thread, which a
+            // thread-confined Realm (or its managed objects) must never survive. Each cursor
+            // advance revalidates on a fresh Realm in the captured scope, so an action already
+            // consumed by a concurrent sync neither rewinds nor duplicates the cursor; a failed
+            // or cancelled await retains it.
+            pendingAdvances.forEach { pending ->
+                ensureActive()
+                val persisted = try {
+                    pending.operation.result.await()
+                    true
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (exception: Exception) {
+                    false
+                }
+                if (persisted) {
+                    FileController.getRealmInstance(userDrive).use { freshRealm ->
+                        freshRealm.executeTransaction {
+                            FileController.getFileById(freshRealm, pending.fileId)?.let { live ->
+                                if (live.lastActionAt < pending.lastActionAt) live.lastActionAt = pending.lastActionAt
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -99,12 +148,13 @@ object SyncOfflineUtils {
         }
     }
 
-    private suspend fun processChunk(
+    private fun processChunk(
         context: Context,
         coroutineScope: CoroutineScope,
         userDrive: UserDrive,
         localFilesMap: Map<Int, File>,
         realm: Realm,
+        pendingAdvances: MutableList<PendingCursorAdvance>,
     ) {
         if (localFilesMap.isNotEmpty()) {
             val fileActionsBody = localFilesMap.values.map { file ->
@@ -126,7 +176,7 @@ object SyncOfflineUtils {
             lastFilesActions?.forEach { fileAction ->
                 coroutineScope.ensureActive()
                 fileActionsIds.add(fileAction.fileId)
-                handleFileAction(context, fileAction, localFilesMap, userDrive, realm)
+                handleFileAction(context, fileAction, localFilesMap, userDrive, realm, pendingAdvances)
             }
 
             // Check if any of the files that don't have fileActions require synchronization.
@@ -162,12 +212,13 @@ object SyncOfflineUtils {
         }
     }
 
-    private suspend fun handleFileAction(
+    private fun handleFileAction(
         context: Context,
         fileAction: LastFileAction,
         localFilesMap: Map<Int, File>,
         userDrive: UserDrive,
         realm: Realm,
+        pendingAdvances: MutableList<PendingCursorAdvance>,
     ) {
         val localFile = localFilesMap[fileAction.fileId]
         val ioFile = localFile?.getOfflineFile(context, userDrive.userId) ?: return
@@ -193,20 +244,22 @@ object SyncOfflineUtils {
                     )
                 }
             }
-            else -> updateFile(context, ioFile, localFile, fileAction, userDrive, realm)
+            else -> updateFile(context, ioFile, localFile, fileAction, userDrive, realm, pendingAdvances)
         }
     }
 
-    private suspend fun updateFile(
+    private fun updateFile(
         context: Context,
         ioFile: IOFile,
         localFile: File,
         fileAction: LastFileAction,
         userDrive: UserDrive,
         realm: Realm,
+        pendingAdvances: MutableList<PendingCursorAdvance>,
     ): Boolean {
         val remoteFile = fileAction.file
         val ioFileLastModified = ioFile.lastModified()
+        var downloadOutcome = DownloadActionOutcome(handled = false)
         val handled = when {
             remoteFile == null -> {
                 SentryLog.e("SyncOffline", "Expect remote file instead of null file") { scope ->
@@ -216,8 +269,10 @@ object SyncOfflineUtils {
             }
             ioFileLastModified > remoteFile.revisedAtInMillis ->
                 uploadFile(context, localFile, remoteFile, ioFile, userDrive, realm)
-            ioFileLastModified < remoteFile.revisedAtInMillis ->
-                downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm)
+            ioFileLastModified < remoteFile.revisedAtInMillis -> {
+                downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm)
+                downloadOutcome.handled
+            }
             fileAction.lastAction in renameActions -> {
                 // Shared move handling (issue: round 5 #4): a rename/move is reconciled through
                 // the same protection-aware routine as the folder walk, under the captured
@@ -248,15 +303,26 @@ object SyncOfflineUtils {
             else -> true
         }
 
-        if (handled) {
-            FileController.updateFile(localFile.id, realm) { mutableFile ->
+        when {
+            !handled -> {
+                // The activity cursor is NOT advanced for deferred operations (issue: round 6 #11):
+                // the action stays pending, so a later sync re-processes it instead of the retry
+                // depending on another mechanism.
+                SentryLog.i("SyncOffline", "Deferring file action ${fileAction.lastAction} for ${localFile.id}")
+            }
+            downloadOutcome.pendingOperation != null -> {
+                // The cursor advance waits for the enqueue's WorkManager persistence OUTSIDE
+                // this Realm session (issues: round 8 #12, round 9 #2): only detached values
+                // (file id, action date, operation) cross the suspension.
+                pendingAdvances += PendingCursorAdvance(
+                    fileId = localFile.id,
+                    lastActionAt = fileAction.lastActionAt ?: 0,
+                    operation = downloadOutcome.pendingOperation,
+                )
+            }
+            else -> FileController.updateFile(localFile.id, realm) { mutableFile ->
                 mutableFile.lastActionAt = fileAction.lastActionAt ?: 0
             }
-        } else {
-            // The activity cursor is NOT advanced for deferred operations (issue: round 6 #11):
-            // the action stays pending, so a later sync re-processes it instead of the retry
-            // depending on another mechanism.
-            SentryLog.i("SyncOffline", "Deferring file action ${fileAction.lastAction} for ${localFile.id}")
         }
         return handled
     }
@@ -370,22 +436,22 @@ object SyncOfflineUtils {
     /**
      * Update the local file with the remote file
      */
-    private suspend fun downloadOfflineFile(
+    private fun downloadOfflineFile(
         context: Context,
         file: File,
         remoteFile: File,
         offlineFile: IOFile,
         userDrive: UserDrive,
         realm: Realm,
-    ): Boolean {
-        val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return false
+    ): DownloadActionOutcome {
+        val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return DownloadActionOutcome(handled = false)
         val pathChanged = offlineFile.path != remoteOfflineFile.path
 
         if (pathChanged) {
             // A pending download marker leaves this refresh to the queued worker, which runs
             // its own protection checks: moving or deleting the bytes here would race it. The
             // action stays pending for a later sync (issue: round 6 #11).
-            if (file.isMarkedAsOffline) return false
+            if (file.isMarkedAsOffline) return DownloadActionOutcome(handled = false)
             if (offlineFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
                     context = context,
                     oldOfflineFile = offlineFile,
@@ -398,7 +464,7 @@ object SyncOfflineUtils {
             ) {
                 // Preservation incomplete: keep the old bytes and metadata; a later sync
                 // retries the refresh (issues: round 5 #4, round 6 #11).
-                return false
+                return DownloadActionOutcome(handled = false)
             }
             // The old location no longer holds this file's content (migrated, snapshotted
             // under the new identity, deleted as uploaded, or never existed): drop its stale
@@ -420,22 +486,20 @@ object SyncOfflineUtils {
                 remoteFiles = listOf(remoteFile),
                 userDrive = userDrive,
             ).first()
-            if (commitFile !== remoteFile) return false
+            if (commitFile !== remoteFile) return DownloadActionOutcome(handled = false)
             FileController.updateExistingFile(newFile = remoteFile, realm = realm)
             // Preserve the download origin: a refresh of a file covered by an offline folder is
             // an inherited download, so its completion can never manufacture an explicit pin
-            // after an unmark (issue #1902). The enqueue's persistence is awaited before this
-            // action reports handled (issue: round 8 #12).
-            if (!Utils.downloadAsOfflineFileAwaitingEnqueue(
-                    context = context,
-                    file = remoteFile,
-                    userDrive = userDrive,
-                    isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
-                )
-            ) {
-                return false
-            }
-            return true
+            // after an unmark (issue #1902). The enqueue's Operation is returned UNAWAITED
+            // (issues: round 8 #12, round 9 #2): awaiting here would suspend inside the
+            // thread-confined Realm session; the caller awaits it after the session closed.
+            val operation = Utils.downloadAsOfflineFileOperation(
+                context = context,
+                file = remoteFile,
+                userDrive = userDrive,
+                isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+            )
+            return DownloadActionOutcome(handled = true, pendingOperation = operation)
         }
         if (file.isMarkedAsOffline && !remoteFile.isOfflineAndIntact(remoteOfflineFile)) {
             // A pending marker alone does not prove that any worker owns the refresh (issue:
@@ -443,20 +507,18 @@ object SyncOfflineUtils {
             // handled without durable work would advance the sync cursor past a missing or
             // stale pin. Idempotently enqueue the scoped refresh — the download chain is
             // serialized, so a worker that already owns the file simply completes first. The
-            // enqueue's persistence is awaited before handled is reported; an enqueue failure
-            // defers the action and retains the cursor (issue: round 8 #12).
-            if (!Utils.downloadAsOfflineFileAwaitingEnqueue(
-                    context = context,
-                    file = remoteFile,
-                    userDrive = userDrive,
-                    isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
-                )
-            ) {
-                return false
-            }
+            // Operation is returned unawaited for the same out-of-session await (round 9 #2);
+            // an enqueue that fails its persistence leaves the cursor retained.
+            val operation = Utils.downloadAsOfflineFileOperation(
+                context = context,
+                file = remoteFile,
+                userDrive = userDrive,
+                isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+            )
+            return DownloadActionOutcome(handled = true, pendingOperation = operation)
         }
         // The local state already matches the remote revision, or a queued worker durably owns
         // the refresh: nothing left to do for this action (issue: round 6 #11).
-        return true
+        return DownloadActionOutcome(handled = true)
     }
 }

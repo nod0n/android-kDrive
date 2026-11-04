@@ -537,7 +537,15 @@ open class File(
         }
 
         if (fileNeedDownload) {
-            if (isOffline || isInOfflineFolder) {
+            // Ownership/publication mode follows the SELECTED destination, not merely the
+            // original file's flags (issue: round 9 #5): a converted PDF cache or a
+            // public-share cache is not the owned offline copy — running it through the
+            // offline publication would find no owner for that path and permanently skip the
+            // refresh. Only an actual owned offline destination receives the offline
+            // preservation checks; every cache destination uses the plain staged rename.
+            val destinationIsOwnedOfflineCopy =
+                (isOffline || isInOfflineFolder) && !isPublicShared && !isOnlyOfficePreview()
+            if (destinationIsOwnedOfflineCopy) {
                 // An offline-owned path is replaced only through the shared preservation policy
                 // (issue: round 7 #3): size mismatch alone never deletes an inherited edit. A
                 // copy backing an upload (or whose snapshot failed) stays the preview source; a
@@ -556,9 +564,13 @@ open class File(
                 onProgress,
                 isPublicShared,
                 userDrive = userDrive,
-                coordinated = isOffline || isInOfflineFolder,
+                coordinated = destinationIsOwnedOfflineCopy,
             )
-            Dispatchers.IO { cacheFile.setLastModified(getLastModifiedInMilliSecond()) }
+            // NO unconditional timestamp write here (issue: round 9 #1): the publication
+            // timestamps the staged bytes before a successful rename, and a skipped transfer
+            // (an editor's newer revision, a superseded generation) must never touch the
+            // retained destination's timestamp — that write re-classified a protected edit as
+            // clean against the remote baseline.
         }
 
         return cacheFile

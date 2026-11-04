@@ -102,8 +102,15 @@ class DownloadProgressViewModel : ViewModel() {
                 throw java.io.IOException("Remote data could not be saved")
             }
         }
+        // A skipped transfer never modifies the retained destination, and the dialog does not
+        // report an invalidated intent (pin/root removed mid-download) or a failure as a
+        // completed download (issue: round 9 #1); a protected or superseded skip keeps the
+        // valid retained content and reports completion (issue: round 9 #1).
         downloadProgressLiveData.postValue(
-            if (outcome == PublicationOutcome.FAILED) null else PROGRESS_COMPLETE
+            when (outcome) {
+                PublicationOutcome.SKIPPED_INVALIDATED, PublicationOutcome.FAILED -> null
+                else -> PROGRESS_COMPLETE
+            }
         )
     }
 

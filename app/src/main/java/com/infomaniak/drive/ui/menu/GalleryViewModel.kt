@@ -25,6 +25,7 @@ import com.infomaniak.drive.data.api.CursorApiResponse
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IsComplete
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -94,10 +95,20 @@ class GalleryViewModel : ViewModel() {
     }
 
     private fun fetchApiGallery(driveId: Int, isFirstPage: Boolean, cursor: String?): Pair<ArrayList<File>, Boolean> {
-        val apiResponse = ApiRepository.getLastGallery(driveId = driveId, cursor = cursor)
+        // The COMPLETE scope — user AND drive — is captured BEFORE the call, and the request
+        // runs on its HTTP client (issue: round 9 #4): only the drive was captured before, so
+        // a response landing after an account switch was persisted into the new account's
+        // realm and its cleanup inspected the wrong filesystem. Gallery's write has no
+        // cancellation check that would prevent it.
+        val capturedUserDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = driveId)
+        val apiResponse = ApiRepository.getLastGallery(
+            driveId = driveId,
+            cursor = cursor,
+            okHttpClient = AccountUtils.getHttpClient(capturedUserDrive.userId),
+        )
         return if (apiResponse.isSuccess()) {
             currentCursor = apiResponse.cursor
-            emitApiGallery(apiResponse, isFirstPage, driveId)
+            emitApiGallery(apiResponse, isFirstPage, capturedUserDrive)
         } else {
             emitRealmGallery()
         }
@@ -106,20 +117,25 @@ class GalleryViewModel : ViewModel() {
     private fun emitApiGallery(
         apiResponse: CursorApiResponse<ArrayList<File>>,
         isFirstPage: Boolean,
-        driveId: Int,
+        capturedUserDrive: UserDrive,
     ): Pair<ArrayList<File>, Boolean> {
         val data = apiResponse.data
 
         val results = if (data.isNullOrEmpty()) {
             arrayListOf<File>() to true
         } else {
-            // The request's own drive scopes the persistence (issue: round 8 #4).
-            FileController.storeGalleryDrive(data, isFirstPage, UserDrive(driveId = driveId))
+            // The request's captured scope scopes the persistence (issue: round 9 #4).
+            FileController.storeGalleryDrive(data, isFirstPage, capturedUserDrive)
             val isComplete = !apiResponse.hasMore
             data to isComplete
         }
 
-        if (isFirstPage) FileController.removeOrphanFiles()
+        if (isFirstPage) {
+            // Associated cleanup in the captured scope (issue: round 9 #4).
+            FileController.getRealmInstance(capturedUserDrive).use { capturedRealm ->
+                FileController.removeOrphanFiles(capturedRealm)
+            }
+        }
         return results
     }
 

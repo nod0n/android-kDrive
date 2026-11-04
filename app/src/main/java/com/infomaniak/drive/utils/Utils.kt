@@ -335,28 +335,19 @@ object Utils {
     }
 
     /**
-     * Same enqueue as [downloadAsOfflineFile], but awaits WorkManager's persistence of the
-     * request before returning (issue: round 8 #12): the fire-and-forget enqueue discards the
-     * [Operation], so a caller that reports its action "handled" on enqueue alone can advance
-     * a durable cursor while the request is not persisted yet — a process death or enqueue
-     * failure in that window leaves the consumed action without durable work. A failed or
-     * cancelled await returns false so the caller reports the action deferred instead.
+     * Same enqueue as [downloadAsOfflineFile], returning the WorkManager [Operation] so a
+     * caller whose cursor commit must wait for persistence (issue: round 8 #12) can await it
+     * OUTSIDE any thread-confined Realm session (issue: round 9 #2): the awaiting variant was
+     * suspended while the sync's Realm and managed objects stayed live across the suspension,
+     * violating Realm thread affinity. The caller detaches the values it needs, closes its
+     * Realm, awaits the operation, then revalidates on a fresh Realm.
      */
-    suspend fun downloadAsOfflineFileAwaitingEnqueue(
+    fun downloadAsOfflineFileOperation(
         context: Context,
         file: File,
         userDrive: UserDrive = UserDrive(),
         isInheritedDownload: Boolean = false,
-    ): Boolean {
-        return try {
-            enqueueOfflineDownload(context, file, userDrive, isInheritedDownload).result.await()
-            true
-        } catch (cancellation: CancellationException) {
-            throw cancellation
-        } catch (exception: Exception) {
-            false
-        }
-    }
+    ): Operation = enqueueOfflineDownload(context, file, userDrive, isInheritedDownload)
 
     private fun enqueueOfflineDownload(
         context: Context,

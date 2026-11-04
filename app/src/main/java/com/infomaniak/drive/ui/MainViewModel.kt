@@ -336,8 +336,13 @@ class MainViewModel(
                     val folderProxy = FileController.getFileById(currentDriveRealm, newParent.id)
                         ?: if (isSharedWithMe) FileController.getRealmInstance(
                             UserDrive(userId = presentationScope.userId, sharedWithMe = true)
-                        ).use { sharesRealm -> FileController.getFileById(sharesRealm, newParent.id) }
-                        else null
+                        ).use { sharesRealm ->
+                            // DETACHED copy (issue: round 9 #3): the shares Realm closes here,
+                            // and preservation reads the destination's identity afterward —
+                            // a managed row would escape its closed Realm and fail the
+                            // reconciliation. The captured account scope stays explicit.
+                            FileController.getFileById(sharesRealm, newParent.id)?.let { sharesRealm.copyFromRealm(it, 0) }
+                        } else null
                     if (file.isFolder()) {
                         // Directory storage never goes through the single-file helper (issue:
                         // round 8 #6): a directory timestamp cannot establish that descendants

@@ -25,6 +25,7 @@ import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.FileActivity
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.AccountUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
@@ -90,9 +91,10 @@ class HomeViewModel : ViewModel() {
             val mergeAndCleanActivities = mergeAndCleanActivities(data)
             lastActivities.addAll(data)
             lastMergedActivities.addAll(mergeAndCleanActivities)
-            // The request's own drive scopes the persistence (issue: round 8 #4): a default
-            // active-account scope would inspect another account's filesystem after a switch.
-            FileController.storeFileActivities(data, UserDrive(driveId = driveId))
+            // The request's COMPLETE captured scope (captured before the call, issue: round 9
+            // #4) scopes the persistence: resolving the account after the response would
+            // store one account's activities into another account's realm.
+            FileController.storeFileActivities(data, capturedUserDrive)
 
             return LastActivityResult(
                 mergedActivities = mergeAndCleanActivities,
@@ -118,13 +120,25 @@ class HomeViewModel : ViewModel() {
 
         lastActivitiesTime = Date().time
 
-        val apiResponse = ApiRepository.getLastActivities(driveId, cursor)
+        // The COMPLETE scope — user AND drive — is captured BEFORE the call, and the request
+        // runs on its HTTP client (issue: round 9 #4): only the drive was captured before, so
+        // a response landing after an account switch was persisted into the new account's
+        // realm and its cleanup inspected the wrong filesystem.
+        val capturedUserDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = driveId)
+        val apiResponse = ApiRepository.getLastActivities(
+            driveId = driveId,
+            cursor = cursor,
+            okHttpClient = AccountUtils.getHttpClient(capturedUserDrive.userId),
+        )
         lastActivityJob?.ensureActive()
         val apiResponseData = apiResponse.data
         currentCursor = apiResponse.cursor
 
         if (apiResponse.isSuccess() && isFirstPage) {
-            FileController.removeOrphanAndActivityFiles()
+            // Associated cleanup in the captured scope (issue: round 9 #4).
+            FileController.getRealmInstance(capturedUserDrive).use { capturedRealm ->
+                FileController.removeOrphanAndActivityFiles(capturedRealm)
+            }
             lastActivities = arrayListOf()
             lastMergedActivities = arrayListOf()
         }
