@@ -254,6 +254,20 @@ open class UploadFile(
         // again after a process restart.
         UploadCancellationSignal.cancel(uri)
         val unsentOfflineEdit = uploadFileProxy.isSyncOffline() && uploadFileProxy.uploadAt == null
+        // DURABLE completion state (issue: round 18 #8): a COMPLETED offline-upload record
+        // (uploadAt set) is never removed while its provenance reconciliation is still
+        // deferred — the retry query's only handle on it — nor while its owned snapshot
+        // still exists (deleting the record first orphans the snapshot as unowned residue).
+        // The worker's cleanup honors that state by LEAVING the record intact; the retry
+        // pass concludes the reconciliation and disposes the snapshot idempotently.
+        val completedOfflinePendingConclusion = uploadFileProxy.isSyncOffline() &&
+            uploadFileProxy.uploadAt != null &&
+            (!uploadFileProxy.reconciliationDone || durableSnapshotFile(uploadFileProxy.uri)?.exists() == true)
+        if (completedOfflinePendingConclusion) {
+            // Skip the cancellation publish? No — the durable local stop above already ran;
+            // only the RECORD removal is deferred. A completed record blocks nothing.
+            return
+        }
         realm.executeTransaction {
             if (uploadFileProxy.isValid) {
                 if (keepFile || unsentOfflineEdit) uploadFileProxy.deletedAt = Date() else uploadFileProxy.deleteFromRealm()
@@ -536,33 +550,40 @@ open class UploadFile(
         }
 
         /**
-         * Durable retry pass (issue: round 17 #4): records whose upload completed but whose
-         * provenance reconciliation did NOT conclude — a crash between the completion write
-         * and the baseline advance, or a transiently contested source path — keep their
-         * snapshot and stay `reconciliationDone == false`. Each sync pass re-runs the
-         * reconciliation for them; a concluded verdict records the completion state and only
-         * then disposes the snapshot.
+         * Durable retry pass (issues: round 17 #4, round 18 #8): every completed offline
+         * upload record whose lifecycle has not durably concluded keeps its snapshot and is
+         * retried here each sync pass. A record with `reconciliationDone == false` re-runs the
+         * provenance reconciliation; a CONCLUDED record whose snapshot still exists — the
+         * crash window between the durable completion marker and the disposal — gets its
+         * snapshot disposed IDEMPOTENTLY. The record itself is retained in every case (it
+         * remains the revision's dedup and protection evidence until the ordinary sweeps
+         * remove it), so a deferred record is never orphaned by an eager cleanup.
          */
         fun retryUnreconciledOriginals() {
-            val deferredRecords = getRealmInstance().use { realm ->
+            val completedRecords = getRealmInstance().use { realm ->
                 realm.where(UploadFile::class.java)
                     .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
                     .isNotNull(UploadFile::uploadAt.name)
                     .isNull(UploadFile::deletedAt.name)
-                    .equalTo(UploadFile::reconciliationDone.name, false)
                     .findAll()?.map { realm.copyFromRealm(it, 0) }
             } ?: return
-            deferredRecords.forEach { record ->
-                if (reconcileOriginalCopyCleanBaseline(record)) {
+            completedRecords.forEach { record ->
+                var concluded = record.reconciliationDone
+                if (!concluded && reconcileOriginalCopyCleanBaseline(record)) {
                     getRealmInstance().use { realm ->
                         val managed = uploadFileByUriQuery(realm, record.uri).findFirst() ?: return@use
-                        if (managed.reconciliationDone) return@use
-                        realm.executeTransaction { managed.reconciliationDone = true }
+                        if (!managed.reconciliationDone) {
+                            realm.executeTransaction { managed.reconciliationDone = true }
+                        }
                     }
-                    if (isDurableOfflineSnapshot(record.uri)) {
-                        val path = Uri.parse(record.uri).path ?: return@forEach
-                        runCatching { IOFile(path).takeIf { it.exists() }?.delete() }
-                    }
+                    concluded = true
+                }
+                if (!concluded) return@forEach
+                // Idempotent disposal (issue: round 18 #8): a crash after the durable
+                // completion marker but before the snapshot delete leaves the bytes unowned —
+                // the retry pass re-runs the exact same ownership-verified disposal.
+                durableSnapshotFile(record.uri)?.let { snapshot ->
+                    runCatching { snapshot.takeIf { it.exists() }?.delete() }
                 }
             }
         }
@@ -792,6 +813,17 @@ open class UploadFile(
                 val path = uri.toUri().path ?: return@runCatching false
                 IOFile(path).canonicalFile.parentFile == snapshotsDir
             }.getOrDefault(false)
+        }
+
+        /**
+         * The verified durable snapshot FILE of [uri], or null when the uri is not an owned
+         * snapshot (issue: round 18 #8): shared by the completion disposal and the retry
+         * pass's idempotent disposal so both test the exact same ownership rule.
+         */
+        private fun durableSnapshotFile(uri: String): IOFile? {
+            if (!isDurableOfflineSnapshot(uri)) return null
+            val path = uri.toUri().path ?: return null
+            return IOFile(path)
         }
 
         /**
