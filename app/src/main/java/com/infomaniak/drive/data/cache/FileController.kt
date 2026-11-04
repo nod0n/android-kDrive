@@ -2140,6 +2140,7 @@ object FileController {
         isCompleteFolder: Boolean,
         userDrive: UserDrive,
         observedById: Map<Int, File> = emptyMap(),
+        checkCancelled: () -> Unit = {},
     ): ListingCommitOutcomes {
         val remoteFiles = apiResponse.data ?: return ListingCommitOutcomes(emptySet(), emptySet())
 
@@ -2214,6 +2215,14 @@ object FileController {
                 }
             try {
                 run {
+                    // EXECUTING-CALLER CHECK POST-LOCKS (issue: round 23 #19): the check
+                    // runs AFTER the complete combined coordination set is held — the
+                    // previous check ran only before the HTTP and in the provider's
+                    // pre-save position, so a listing cancelled while blocked on the
+                    // locks (or on the request) still committed its stale page. A
+                    // cancellation here releases everything through the finally below
+                    // and effects nothing.
+                    checkCancelled()
             // Shared upsert boundary, PARTITIONED by each candidate's actual drive (issue:
             // round 5 #5, round 23 #17): owned copies at renamed/moved locations are
             // preserved BEFORE any metadata replacement — ordinary listings included, not

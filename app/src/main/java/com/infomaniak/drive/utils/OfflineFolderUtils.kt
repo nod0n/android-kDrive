@@ -360,6 +360,7 @@ object OfflineFolderUtils {
             folderQueue = folderQueue,
             visitedFolderIds = visitedFolderIds,
             observedById = observedById,
+            checkCancelled = { coroutineContext.ensureActive() },
         )
 
         // Fully listed: children confirmed absent from this authoritative listing are reconciled
@@ -535,6 +536,7 @@ object OfflineFolderUtils {
         folderQueue: ArrayDeque<Int>,
         visitedFolderIds: MutableSet<Int>,
         observedById: Map<Int, File>,
+        checkCancelled: () -> Unit = {},
     ): FileController.ListingCommitOutcomes {
         val remoteFiles = apiResponse.data ?: return FileController.ListingCommitOutcomes(emptySet(), emptySet())
         val folderProxy = FileController.getFileById(realm, folderId)
@@ -549,6 +551,10 @@ object OfflineFolderUtils {
             isCompleteFolder = isCompleteFolder,
             userDrive = userDrive,
             observedById = observedById,
+            // THE WALK'S EXECUTING CONTEXT, POST-LOCKS (issue: round 23 #19): the
+            // coroutine context is captured in the suspend caller; the save re-checks it
+            // after the complete coordination set is held.
+            checkCancelled = checkCancelled,
         )
 
         val subFolderIds = mutableListOf<Int>()

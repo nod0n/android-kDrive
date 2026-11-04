@@ -222,6 +222,10 @@ object FolderFilesProvider {
             isCompleteFolder = !apiResponse.hasMore,
             userDrive = folderFilesProviderArgs.userDrive,
             observedById = sequenceObservations,
+            // THE INITIAL PAGE'S POST-LOCKS CHECK (issue: round 23 #19): the save checks
+            // the executing context again INSIDE saveRemoteFiles, after the complete
+            // coordination set is held, immediately before the boundary/transaction.
+            checkCancelled = checkCancelled,
         )
 
         when {
@@ -574,7 +578,10 @@ object FolderFilesProvider {
                     isFirstPage = folderFilesProviderArgs.isFirstPage,
                     isCompleteFolder = isCompleteFolder,
                     userDrive = userDrive,
-                    observedById = observedById
+                    observedById = observedById,
+                    // POST-LOCKS CHECK (issue: round 23 #19): the ordinary/SAF route's
+                    // executing-context callback reaches the save's coordinated section.
+                    checkCancelled = checkCancelled
                 )
                 // ORDINARY/SAF LISTING RESOLUTION (issue: round 21 #17): the shared route's
                 // budgeted resolver previously never ran for the ordinary and SAF paths —

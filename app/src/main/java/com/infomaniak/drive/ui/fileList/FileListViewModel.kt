@@ -137,7 +137,13 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                         order = order,
                         sourceRestrictionType = sourceRestrictionType,
                         userDrive = requestScope,
-                    )
+                    ),
+                    // THE EXECUTING JOB'S CALLBACK (issue: round 23 #19): the ordinary
+                    // listing previously omitted the cancellation callback entirely — the
+                    // provider's post-HTTP and post-locks checks ran an EMPTY default. The
+                    // liveData block's job rides getFilesJob, so every save re-checks the
+                    // executing job, including inside the coordinated commit section.
+                    checkCancelled = { getFilesJob.ensureActive() },
                 )
 
                 when {

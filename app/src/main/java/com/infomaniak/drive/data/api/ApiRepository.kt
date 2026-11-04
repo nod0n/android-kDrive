@@ -189,9 +189,16 @@ object ApiRepository : ApiRepositoryCore() {
         return callApiWithCursor(url, GET, okHttpClient = okHttpClient)
     }
 
-    fun getFilesLastActivities(driveId: Int, body: FileLastActivityBody): ApiResponse<List<LastFileAction>> {
+    fun getFilesLastActivities(
+        driveId: Int,
+        body: FileLastActivityBody,
+        // CAPTURED-SCOPE CLIENT (issue: round 23 #18): the sync's per-scope reconciliation
+        // passes the client captured for ITS userDrive; the default keeps the previous
+        // global authenticated client for any caller without a scope of its own.
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<List<LastFileAction>> {
         val url = "${ApiRoutes.getFilesLastActivities(driveId)}?with=file"
-        return callApi(url, POST, body)
+        return callApi(url, POST, body, okHttpClient = okHttpClient)
     }
 
     // For sync offline service

@@ -255,7 +255,15 @@ class CloudStorageProvider : DocumentsProvider() {
                         FolderFilesProvider.getCloudStorageFiles(
                             realm = realm,
                             folderId = Utils.ROOT_ID,
-                            userDrive = UserDrive(AccountUtils.currentUserId, AccountUtils.currentDriveId, sharedWithMe = true),
+                            // THE DOCUMENT'S OWN SCOPE (issue: round 23 #18): the shared
+                            // listing previously queried the CURRENTLY ACTIVE account
+                            // (AccountUtils globals) while the realm above was opened on
+                            // the document's parsed scope — the query and its cache
+                            // disagreed. The local userDrive IS the document's
+                            // (userId, driveId, sharedWithMe) derived from
+                            // parentDocumentId; an async SAF resolution must never fall
+                            // back to the mutable global account.
+                            userDrive = userDrive,
                             sortType = sortType,
                             transaction = cursor.addFiles(parentDocumentId, uri, isSharedWithMeFolder = true),
                             // The captured executing context (issue: round 22 #20): the

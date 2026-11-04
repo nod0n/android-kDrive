@@ -267,9 +267,19 @@ object SyncOfflineUtils {
                     fromDate = file.lastActionAt.takeIf { it > 0 } ?: file.updatedAt,
                 )
             }
+            // THE SYNC'S CAPTURED-SCOPE CLIENT (issue: round 23 #18): the activity request
+            // previously rode the GLOBAL authenticated client, so a scope's reconciliation
+            // queried the CURRENTLY ACTIVE account's drive. The same captured-client idiom
+            // as the details probe below scopes the request to userDrive; a client that
+            // cannot be built defers the chunk (the next sync pass retries), like the
+            // fail-closed recovery exclusion above.
+            val okHttpClient = runCatching {
+                runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+            }.getOrNull() ?: return
             val lastFilesActions = ApiRepository.getFilesLastActivities(
                 driveId = userDrive.driveId,
                 body = FileLastActivityBody(files = fileActionsBody),
+                okHttpClient = okHttpClient,
             ).data
 
             // When a local file changes without a corresponding fileAction, we need to synchronize it differently.
