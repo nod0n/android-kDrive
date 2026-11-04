@@ -580,15 +580,21 @@ class FileInfoActionsView @JvmOverloads constructor(
 
     fun observeOfflineProgression(lifecycleOwner: LifecycleOwner, updateFile: ((fileId: Int) -> Unit)? = null) {
         observeDownloadOffline = mainViewModel.observeDownloadOffline(context.applicationContext)
+        // The tag lookup carries the WORK'S CAPTURED ACCOUNT (issue: round 21 #15): the
+        // dialog's enqueue and this observation run in the same session, so one captured
+        // scope (never a per-comparison AccountUtils read) scopes the tag identically for
+        // both sides.
+        val workerScope = UserDrive(userId = AccountUtils.currentUserId, driveId = currentFile.driveId)
+        val workerTag = currentFile.getWorkerTag(workerScope)
         observeDownloadOffline?.observe(lifecycleOwner) { workInfoList ->
             if (workInfoList.isEmpty()) return@observe
 
             val workInfo = workInfoList.firstOrNull { it.state == WorkInfo.State.RUNNING }
-                ?: workInfoList.firstOrNull { workInfo -> workInfo.tags.any { it == currentFile.getWorkerTag() } }
+                ?: workInfoList.firstOrNull { workInfo -> workInfo.tags.any { it == workerTag } }
                 ?: return@observe
 
-            val tag = workInfo.tags.firstOrNull { it == currentFile.getWorkerTag() }
-            if (currentFile.getWorkerTag() != tag) return@observe
+            val tag = workInfo.tags.firstOrNull { it == workerTag }
+            if (workerTag != tag) return@observe
 
             val fileId: Int = currentFile.id
             val progress = workInfo.progress.getInt(BaseDownloadWorker.PROGRESS, 100)

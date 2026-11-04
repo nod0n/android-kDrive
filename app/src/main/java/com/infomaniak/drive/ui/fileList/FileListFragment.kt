@@ -686,7 +686,12 @@ open class FileListFragment : MultiSelectFragment(
             val progress = workInfo.progress.getInt(BaseDownloadWorker.PROGRESS, 100)
             binding.fileRecyclerView.post {
                 fileAdapter.updateFileProgressByFileId(fileId, progress) { _, file ->
-                    val tag = workInfo.tags.firstOrNull { it == file.getWorkerTag() }
+                    // The tag carries the WORK'S CAPTURED ACCOUNT (issue: round 21 #15):
+                    // the listing's scope scopes the lookup; a null listing scope cannot
+                    // compute the tag and matches nothing (conservative) instead of
+                    // matching another account's work.
+                    val scope = userDrive ?: return@updateFileProgressByFileId
+                    val tag = workInfo.tags.firstOrNull { it == file.getWorkerTag(scope) }
                     if (tag != null) {
                         file.currentProgress = Utils.INDETERMINATE_PROGRESS
                     }
@@ -876,12 +881,12 @@ open class FileListFragment : MultiSelectFragment(
 
             val sourceRestrictionType = if (ignoreCache) ONLY_FROM_REMOTE else UNRESTRICTED
 
-            // IMMUTABLE REQUEST SCOPE (issue: round 19 #18): the listing's UserDrive is
-            // captured ONCE at request time and carried through EVERY check in the result
-            // callback — the fragment's mutable `userDrive` re-read at callback time let
-            // an account/drive switch between the request and the result route the
-            // crash-recovery (and every other check) into another realm's scope.
-            val requestUserDrive = userDrive
+            // ACTUAL REQUEST SCOPE CARRIED WITH THE RESULT (issues: round 19 #18, round
+            // 21 #16): the request builds its effective scope from this fragment's
+            // nullable property — the result now carries that effective scope back, so
+            // the crash-recovery (and every other result-side check) uses the ORIGINATING
+            // request's account instead of re-deriving (or falling back to) the newly
+            // active one at callback time.
 
             getFolderFiles(sourceRestrictionType, isNewSort, onFinish = {
                 it?.let { result ->
@@ -907,7 +912,7 @@ open class FileListFragment : MultiSelectFragment(
                     fileAdapter.hideLoading()
                     refreshActivities()
                     result.parentFolder?.let { folder ->
-                        fileListViewModel.updateOfflineFilesIfNeeded(folder, result.files, requestUserDrive)
+                        fileListViewModel.updateOfflineFilesIfNeeded(folder, result.files, result.requestUserDrive)
                     }
 
                 } ?: run {
@@ -931,6 +936,12 @@ open class FileListFragment : MultiSelectFragment(
         val isFirstPage: Boolean,
         val isNewSort: Boolean,
         @StringRes val errorRes: Int? = null,
+        // The ACTUAL immutable request scope the listing ran under (issue: round 21 #16):
+        // the request constructs its effective scope from a nullable property — carrying
+        // the effective scope back with the result keeps every result-side check (crash
+        // recovery, coverage) on the ORIGINATING request's account instead of falling
+        // back to the newly active one.
+        val requestUserDrive: UserDrive? = null,
     )
 
     /**

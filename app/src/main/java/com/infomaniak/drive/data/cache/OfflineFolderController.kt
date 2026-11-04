@@ -1591,7 +1591,21 @@ object OfflineFolderController {
                         fileModifiedAt = fileModifiedAt,
                         contentHash = contentHash,
                         originalFileId = file.id,
-                    ) || UploadFile.hasLegacyCancelledUploadRecordFor(
+                    )
+                ) {
+                    // A duplicate registration adds nothing; the fresh snapshot copy is
+                    // redundant residue either way.
+                    runCatching { IOFile(snapshotUri.path ?: "").delete() }
+                    return@withFileLock originalStillRevision
+                }
+                // AMBIGUOUS LEGACY CANCELLATION DEFERS (issue: round 21 #4): an ID-LESS
+                // cancelled record matching content/destination blocks automatic
+                // re-registration but can NEVER establish that record's stable ownership
+                // of this file — returning the original's revalidation state here would
+                // authorize deleting the current original and its metadata on an
+                // ambiguous match. Registration stays blocked; the caller's preservation
+                // DEFERS and the current bytes and row are retained.
+                if (UploadFile.hasLegacyCancelledUploadRecordFor(
                         fileName = file.name,
                         remoteFolder = file.parentId,
                         driveId = userDrive.driveId,
@@ -1600,10 +1614,8 @@ object OfflineFolderController {
                         contentHash = contentHash,
                     )
                 ) {
-                    // A duplicate registration adds nothing; the fresh snapshot copy is
-                    // redundant residue either way.
                     runCatching { IOFile(snapshotUri.path ?: "").delete() }
-                    return@withFileLock originalStillRevision
+                    return@withFileLock false
                 }
                 UploadFile(
                     uri = snapshotUri.toString(),

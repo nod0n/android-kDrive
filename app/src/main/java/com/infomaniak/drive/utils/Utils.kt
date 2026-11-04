@@ -363,7 +363,9 @@ object Utils {
         // Cancellation belongs to EXPLICIT REPLACEMENT only (issue: round 19 #17): the
         // verification path never cancels — repeated verification calls must not keep
         // killing their own in-flight work for the file.
-        if (cancelPendingWork && file.isMarkedAsOffline) workManager.cancelAllWorkByTag(file.getWorkerTag())
+        // The tag carries the WORK'S CAPTURED scope (issue: round 21 #15) — the same
+        // scope the input data below binds, never the currently active account.
+        if (cancelPendingWork && file.isMarkedAsOffline) workManager.cancelAllWorkByTag(file.getWorkerTag(userDrive))
         val inputData = workDataOf(
             BaseDownloadWorker.FILE_ID to file.id,
             DownloadWorker.FILE_NAME to file.name,
@@ -377,7 +379,7 @@ object Utils {
             .setRequiresStorageNotLow(true)
             .build()
         val downloadRequest = OneTimeWorkRequestBuilder<DownloadWorker>()
-            .addTag(file.getWorkerTag())
+            .addTag(file.getWorkerTag(userDrive))
             .addTag(DownloadWorker.TAG)
             .setInputData(inputData)
             .setConstraints(constraints)

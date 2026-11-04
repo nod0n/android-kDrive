@@ -119,6 +119,13 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
         getFolderActivitiesJob.cancel()
         getFilesJob = Job()
 
+        // The request's EFFECTIVE scope is built ONCE and carried with the result (issue:
+        // round 21 #16): the previous per-call `userDrive ?: UserDrive()` constructed the
+        // scope inside the request while the fragment captured its (possibly null)
+        // property outside, so result-side checks could fall back to the newly active
+        // account.
+        val requestScope = userDrive ?: UserDrive()
+
         return liveData(Dispatchers.IO + getFilesJob) {
             tailrec suspend fun recursiveDownload(folderId: Int, isFirstPage: Boolean) {
                 getFilesJob.ensureActive()
@@ -129,7 +136,7 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                         isFirstPage = isFirstPage,
                         order = order,
                         sourceRestrictionType = sourceRestrictionType,
-                        userDrive = userDrive ?: UserDrive(),
+                        userDrive = requestScope,
                     )
                 )
 
@@ -139,14 +146,14 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                         emit(null)
                     }
                     folderFilesProviderResult.isComplete -> {
-                        emit(folderFilesProviderResult.toFolderFilesResult(isFirstPage, isNewSort))
+                        emit(folderFilesProviderResult.toFolderFilesResult(isFirstPage, isNewSort, requestScope))
                         val parentFolder = folderFilesProviderResult.folder.id
                         val files = folderFilesProviderResult.folderFiles.count()
                         SentryLog.i(TAG, "getFiles: Emit is complete parentFolder=$parentFolder filesCount=$files")
                     }
                     else -> {
                         if (isFirstPage) {
-                            emit(folderFilesProviderResult.toFolderFilesResult(isFirstPage = true, isNewSort))
+                            emit(folderFilesProviderResult.toFolderFilesResult(isFirstPage = true, isNewSort, requestScope))
                             val parentFolder = folderFilesProviderResult.folder.id
                             val files = folderFilesProviderResult.folderFiles.count()
                             SentryLog.i(TAG, "getFiles: Emit first page, parentFolder = $parentFolder, files = $files")
@@ -165,13 +172,15 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
 
     fun FolderFilesProvider.FolderFilesProviderResult.toFolderFilesResult(
         isFirstPage: Boolean,
-        isNewSort: Boolean
+        isNewSort: Boolean,
+        requestUserDrive: UserDrive,
     ): FolderFilesResult = FolderFilesResult(
         parentFolder = folder,
         files = folderFiles,
         isComplete = true,
         isFirstPage = isFirstPage,
         isNewSort = isNewSort,
+        requestUserDrive = requestUserDrive,
     )
 
     fun getFavoriteFiles(order: SortType, isNewSort: Boolean, userDrive: UserDrive): LiveData<FolderFilesResult?> {

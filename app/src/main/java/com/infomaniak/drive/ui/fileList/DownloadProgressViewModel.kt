@@ -33,6 +33,7 @@ import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.StoredOfflineCopyState
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.utils.IOFile
@@ -98,8 +99,14 @@ class DownloadProgressViewModel : ViewModel() {
                 return@launch
             }
             runCatching {
+                // The DIALOG's captured account client BEFORE the request (issue: round
+                // 21 #16): the publication below runs in the supplied UserDrive's scope —
+                // the previous default global client authenticated the request against the
+                // CURRENTLY ACTIVE account instead.
+                val okHttpClient = AccountUtils.getHttpClient(userDrive.userId)
                 val apiResponse = DownloadOfflineFileManager.downloadFileResponse(
                     fileUrl = ApiRoutes.downloadFile(file),
+                    okHttpClient = okHttpClient,
                     downloadInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor { progress ->
                         downloadProgressLiveData.postValue(progress)
                     }

@@ -539,11 +539,14 @@ open class File(
 
     fun hasVisibilities(vararg types: VisibilityType) = getVisibilityType() in types
 
-    // ACCOUNT-SCOPED (issue: round 20 #15): the tag the enqueue and the explicit
-    // cancellation both use must not collide across accounts on a shared drive's same-id
-    // file — both sides run in the current account's session, so the current account's
-    // id scopes the tag identically for both.
-    fun getWorkerTag() = "${id}_${driveId}_${AccountUtils.currentUserId}"
+    // ACCOUNT-SCOPED (issues: round 20 #15, round 21 #15): the tag MUST carry the WORK'S
+    // CAPTURED account, not the account that happens to be active when a tag is computed —
+    // a background request for account A enqueued after a switch to B carries A in its
+    // input data and unique name, and B's active id in an AccountUtils-derived tag would
+    // let B's explicit cancellation stop A's work and leave A's UI unable to find it. The
+    // captured scope is a REQUIRED parameter, so enqueue, cancellation and observation all
+    // pass the same scope statically.
+    fun getWorkerTag(userDrive: UserDrive): String = "${id}_${driveId}_${userDrive.userId}"
 
     fun getMimeType(): String = name.guessMimeType()
 
