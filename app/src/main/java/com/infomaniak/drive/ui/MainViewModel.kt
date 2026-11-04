@@ -781,9 +781,11 @@ class MainViewModel(
                     }
                 }
                 // Conditional deletion in the SAME section, after the flags committed (issue:
-                // round 16 #6): never a later, uncoordinated coroutine on captured paths.
+                // round 16 #6): never a later, uncoordinated coroutine on captured paths. The
+                // provenance sidecar dies with the bytes (issue: round 16 #12).
                 deleteOfflinePath?.let { path ->
                     mediaFile?.let { file -> file.deleteInMediaScan(context, userDrive) }
+                    DownloadOfflineFileManager.deletePublishedProvenance(IOFile(path))
                     runCatching { IOFile(path).takeIf { it.exists() }?.delete() }
                 }
                 deleteCachePath?.let { path ->

@@ -807,7 +807,11 @@ class CloudStorageProvider : DocumentsProvider() {
                         userId = userDrive.userId,
                     ).store()
                     context.syncImmediately(isAutomaticTrigger = false)
+                    // Direct cache writers invalidate the generation sidecar with the bytes
+                    // (issue: round 16 #12): stale provenance must never survive bytes it does
+                    // not describe.
                     cacheFile.delete() // Delete old cache
+                    DownloadOfflineFileManager.deletePublishedProvenance(cacheFile)
                 }
             } else {
                 exception.printStackTrace()
@@ -851,6 +855,11 @@ class CloudStorageProvider : DocumentsProvider() {
                     DownloadOfflineFileManager.saveRemoteData(TAG, response, cacheFile)
                 }
                 cacheFile.setLastModified(file.getLastModifiedInMilliSecond())
+                // Direct cache writer: the SAF route has no generation provenance for the
+                // bytes it just wrote (issue: round 16 #12) — invalidate any sidecar from a
+                // previous generation so promotion can never mistake these bytes for a
+                // proven generation.
+                DownloadOfflineFileManager.deletePublishedProvenance(cacheFile)
                 return ParcelFileDescriptor.open(cacheFile, accessMode)
             }
         } catch (exception: Exception) {
@@ -868,6 +877,9 @@ class CloudStorageProvider : DocumentsProvider() {
     ) {
         if (remoteDataHasBeenSaved) {
             cacheFile.setLastModified(file.getLastModifiedInMilliSecond())
+            // Direct cache writer provenance invalidation (issue: round 16 #12), as in
+            // [getDataFile].
+            DownloadOfflineFileManager.deletePublishedProvenance(cacheFile)
             cacheFile.inputStream().use { it.copyToCancellable(this) }
         } else {
             writePipe.closeWithError("Error occurred when download remote data")

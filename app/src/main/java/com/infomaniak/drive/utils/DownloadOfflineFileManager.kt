@@ -203,7 +203,7 @@ class DownloadOfflineFileManager(
         // an app-owned directory and published by an atomic rename, so a failed transfer never
         // destroys it (issue: round 3 #2/#4).
         if (cacheFile.exists()) cacheFile.delete()
-        deleteCacheProvenance(cacheFile)
+        deletePublishedProvenance(cacheFile)
 
         return if (currentFile?.rights?.canRead == false) {
             ListenableWorker.Result.failure()
@@ -267,65 +267,63 @@ class DownloadOfflineFileManager(
         cacheFile: IOFile,
         offlineFile: IOFile,
     ): Boolean = withContext(Dispatchers.IO) {
-        // EXACT current clean baseline (issue: round 14 #14): "not older" accepts cache bytes
-        // whose timestamp is NEWER than a legitimate backward-dated newer baseline — the old
-        // generation's bytes would then be relabeled as current by the publication's
-        // timestamp write, and every later intact check would accept them as the new
-        // generation. A cache copy not exactly at this transfer's baseline is rejected and
-        // the current content downloads instead.
-        if (!(cacheFile.exists() && file.isIntactFile(cacheFile) && (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt)) {
-            return@withContext false
-        }
-        // GENERATION PROVENANCE (issue: round 15 #9): exact mtime and size do not establish
-        // WHICH generation the cached bytes are — two same-sized revisions can share the
-        // preserved client mtime with different known server versions. The sidecar written
-        // at cache publication names the producing generation; promotion requires it to
-        // match this transfer's authoritative (details-sourced) version. Unavailable or
-        // mismatched provenance downloads the current revision.
-        val provenance = readCacheProvenance(cacheFile)
-        val transferVersion = file.version?.number ?: 0
-        if (transferVersion <= 0 || provenance == null || provenance.first != transferVersion) {
-            return@withContext false
-        }
+        // SHARED provenance validation (issue: round 16 #11) under the file's coordination
+        // (issue: round 16 #12): the validate-to-staging read and the copy are serialized
+        // with cache publications and the UI promotion for the same file, so the bytes and
+        // their provenance sidecar cannot change between validation and staging.
+        OfflineFileCoordination.withFileLock(userDrive, file.id) {
+            // EXACT current generation provenance (issues: round 14 #14, round 15 #9, round
+            // 16 #11): "not older" accepts cache bytes whose timestamp is NEWER than a
+            // legitimate backward-dated newer baseline; and exact mtime and size do not
+            // establish WHICH generation the cached bytes are — two same-sized revisions can
+            // share the preserved client mtime with different known server versions. The
+            // sidecar written at cache publication names the producing generation; promotion
+            // requires it to match this transfer's authoritative (details-sourced) version
+            // and baseline. Unavailable or mismatched provenance downloads the current
+            // revision.
+            if (!cacheBytesProvenCurrent(cacheFile, file)) {
+                return@withFileLock false
+            }
 
-        val staged = newStagedFile(context, file)
-        val published = runCatching {
-            cacheFile.copyTo(staged, overwrite = true)
-            publishStagedOfflineFile(context, file, offlineFile, staged)
-        }.onFailure { exception ->
-            SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
-        }.getOrDefault(PublicationOutcome.FAILED)
+            val staged = newStagedFile(context, file)
+            val published = runCatching {
+                cacheFile.copyTo(staged, overwrite = true)
+                publishStagedOfflineFile(context, file, offlineFile, staged)
+            }.onFailure { exception ->
+                SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
+            }.getOrDefault(PublicationOutcome.FAILED)
         // Cache promotion is a transfer path too: its superseded/conflict outcomes must reach
         // the bulk caller like the network branch's (issues: round 10 #7, round 14 #13), or
         // the batch clears pending work and reports the root synchronized.
         lastTransferSuperseded =
             published == PublicationOutcome.SKIPPED_SUPERSEDED || published == PublicationOutcome.SKIPPED_CONFLICT
 
-        runCatching { if (staged.exists()) staged.delete() }
-        when (published) {
-            // Completion (flag write, media scan, invalidation) already ran inside the per-file
-            // lock via onPublishedLocked (issue: round 5 #2).
-            PublicationOutcome.PUBLISHED -> true
-            // Skipped outcomes leave the existing bytes and timestamps untouched (issue: round
-            // 4 #1): only the pending marker is cleared, since there is nothing valid left to
-            // download for this transfer.
-            PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
-                filesDownloaded += 1
-                clearPendingMarker(file.id)
-                true
+            runCatching { if (staged.exists()) staged.delete() }
+            when (published) {
+                // Completion (flag write, media scan, invalidation) already ran inside the per-file
+                // lock via onPublishedLocked (issue: round 5 #2).
+                PublicationOutcome.PUBLISHED -> true
+                // Skipped outcomes leave the existing bytes and timestamps untouched (issue: round
+                // 4 #1): only the pending marker is cleared, since there is nothing valid left to
+                // download for this transfer.
+                PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
+                    filesDownloaded += 1
+                    clearPendingMarker(file.id)
+                    true
+                }
+                PublicationOutcome.SKIPPED_CONFLICT -> {
+                    // The destination holds protected content owned by another row (issue: round
+                    // 14 #13): deferred — the pending marker stays so the work and the root's
+                    // incompleteness are retained until the conflict resolves.
+                    true
+                }
+                PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                    // A newer generation owns the file's pending state and completion (issue:
+                    // round 8 #9): this transfer's skip clears no marker and runs no completion.
+                    true
+                }
+                PublicationOutcome.FAILED -> false
             }
-            PublicationOutcome.SKIPPED_CONFLICT -> {
-                // The destination holds protected content owned by another row (issue: round
-                // 14 #13): deferred — the pending marker stays so the work and the root's
-                // incompleteness are retained until the conflict resolves.
-                true
-            }
-            PublicationOutcome.SKIPPED_SUPERSEDED -> {
-                // A newer generation owns the file's pending state and completion (issue:
-                // round 8 #9): this transfer's skip clears no marker and runs no completion.
-                true
-            }
-            PublicationOutcome.FAILED -> false
         }
     }
 
@@ -391,6 +389,7 @@ class DownloadOfflineFileManager(
             // became a pending upload, for instance) is owned by someone else now.
             val isExactPublishedRevision = target.exists() && target.lastModified() / 1_000L == file.lastModifiedAt
             if (isExactPublishedRevision) {
+                deletePublishedProvenance(target)
                 runCatching { target.delete() }
                 if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
             }
@@ -562,33 +561,65 @@ class DownloadOfflineFileManager(
 
         internal enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_CONFLICT, SKIPPED_INVALIDATED, SKIPPED_SUPERSEDED, FAILED }
 
-        /** Sidecar suffix recording the content generation that produced cached bytes (issue: round 15 #9). */
+        /** Sidecar suffix recording the content generation that produced published bytes (issue: round 15 #9). */
         private const val CACHE_PROVENANCE_SUFFIX = ".offlinegen"
 
-        private fun cacheProvenanceFile(cacheFile: IOFile): IOFile =
-            IOFile(cacheFile.parentFile, cacheFile.name + CACHE_PROVENANCE_SUFFIX)
+        private fun cacheProvenanceFile(publishedFile: IOFile): IOFile =
+            IOFile(publishedFile.parentFile, publishedFile.name + CACHE_PROVENANCE_SUFFIX)
 
         /**
-         * Associates published CACHE bytes with the content generation that produced them
-         * (issue: round 15 #9): exact mtime and size cannot establish the generation — two
-         * same-sized revisions can share the preserved client mtime with different server
-         * versions. The sidecar names the producing version and baseline; cache promotion
-         * requires it to match the current authoritative version.
+         * Associates PUBLISHED bytes (cache or offline destination) with the content generation
+         * that produced them (issues: round 15 #9, round 16 #12/#13): exact mtime and size
+         * cannot establish the generation — two same-sized revisions can share the preserved
+         * client mtime with different server versions. The sidecar names the producing version
+         * and baseline; every promotion and intact decision requires it to match the
+         * authoritative version.
          */
-        private fun writeCacheProvenance(target: IOFile, file: File) {
-            runCatching {
-                cacheProvenanceFile(target).writeText("${file.version?.number ?: 0}|${file.lastModifiedAt}")
-            }
-        }
+        private fun writePublishedProvenance(target: IOFile, file: File): Boolean = runCatching {
+            cacheProvenanceFile(target).writeText("${file.version?.number ?: 0}|${file.lastModifiedAt}")
+        }.getOrDefault(false)
 
-        private fun readCacheProvenance(cacheFile: IOFile): Pair<Int, Long>? = runCatching {
-            val parts = cacheProvenanceFile(cacheFile).readText().trim().split("|")
+        internal fun readPublishedProvenance(publishedFile: IOFile): Pair<Int, Long>? = runCatching {
+            val parts = cacheProvenanceFile(publishedFile).readText().trim().split("|")
             require(parts.size == 2)
             Pair(parts[0].trim().toInt(), parts[1].trim().toLong())
         }.getOrNull()
 
-        private fun deleteCacheProvenance(cacheFile: IOFile) {
-            runCatching { cacheProvenanceFile(cacheFile).delete() }
+        internal fun deletePublishedProvenance(publishedFile: IOFile) {
+            runCatching { cacheProvenanceFile(publishedFile).delete() }
+        }
+
+        /**
+         * Moves the provenance sidecar of [source]'s published bytes onto [target] (issue:
+         * round 16 #12): a byte migration (move reconciliation) keeps its generation record,
+         * and no orphan is left at the source path. True when there was nothing to move or
+         * the move succeeded.
+         */
+        internal fun movePublishedProvenance(source: IOFile, target: IOFile): Boolean {
+            val provenance = readPublishedProvenance(source)
+            deletePublishedProvenance(source)
+            if (provenance == null) return true
+            return runCatching {
+                cacheProvenanceFile(target).writeText("${provenance.first}|${provenance.second}")
+            }.getOrDefault(false)
+        }
+
+        /**
+         * Whether [cacheFile]'s bytes are PROVEN to be the current content generation of [file]
+         * (issues: round 15 #9, round 16 #11): exact size, exact modification baseline, and the
+         * generation provenance sidecar matching the row's authoritative version and baseline.
+         * EVERY cache promotion — worker and UI alike — requires this; missing or mismatched
+         * provenance must enqueue a fresh download instead of publishing unknown-generation
+         * bytes under current metadata.
+         */
+        internal fun cacheBytesProvenCurrent(cacheFile: IOFile, file: File): Boolean {
+            if (!(cacheFile.exists() && file.isIntactFile(cacheFile) && (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt)) {
+                return false
+            }
+            val provenance = readPublishedProvenance(cacheFile)
+            val transferVersion = file.version?.number ?: 0
+            return transferVersion > 0 && provenance != null &&
+                provenance.first == transferVersion && provenance.second == file.lastModifiedAt
         }
 
         /**
@@ -802,7 +833,20 @@ class DownloadOfflineFileManager(
             staged.setLastModified(file.getLastModifiedInMilliSecond())
             // Final cancellation check immediately before the atomic replace (issue: round 7 #11).
             checkCancelled()
+            // The OLD provenance is invalidated BEFORE the bytes are replaced (issue: round
+            // 16 #12): a crash between the rename and the new sidecar write must never leave
+            // the new bytes carrying the previous generation's provenance.
+            deletePublishedProvenance(target)
             if (staged.renameTo(target)) {
+                // The published generation's provenance sidecar is written FAIL-CLOSED
+                // (issue: round 16 #12): bytes without provenance are never accepted as the
+                // current generation by the intact/promotion decisions (issue: round 16 #13),
+                // so a failed write must discard the publication rather than leave
+                // unproven bytes at the destination.
+                if (!writePublishedProvenance(target, file)) {
+                    runCatching { target.delete() }
+                    return PublicationOutcome.FAILED
+                }
                 // Record the PUBLISHED bytes' clean baseline separately from the accepted
                 // server metadata (issue: round 15 #6): edit detection judges the copy
                 // against the baseline its bytes were actually written under until a
@@ -839,18 +883,44 @@ class DownloadOfflineFileManager(
             offlineFile: IOFile,
             userDrive: UserDrive,
         ): PublicationOutcome {
-            val staged = newStagedFile(context, file)
-            val outcome = runCatching {
-                cacheFile.copyTo(staged, overwrite = true)
-                publishStagedOfflineFile(userDrive, isInheritedDownload = false, file, offlineFile, staged)
-            }.onFailure { exception ->
-                SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
-            }.getOrDefault(PublicationOutcome.FAILED)
+            // AUTHORITATIVE version resolution for ambiguous transfers (issue: round 16 #13):
+            // a presentation row's unknown version against an unknown live version left only
+            // the coarse baseline, and two same-second, same-size revisions passed as
+            // "current". The details route carries the version expansion; resolving the
+            // identity before publication turns the ambiguous comparison into a
+            // known-generation one (the stale-operation risk is re-checked against the live
+            // row under the publication locks anyway).
+            val authoritativeFile = if ((file.version?.number ?: 0) > 0) file else {
+                runCatching {
+                    ApiRepository.getFileDetails(File(id = file.id, driveId = userDrive.driveId)).data
+                }.getOrNull()?.takeIf { details -> details.id == file.id } ?: file
+            }
+            // SHARED provenance validation against the ACTUAL staged source (issue: round 16
+            // #11): every cache promotion — UI included — requires the generation sidecar to
+            // match the authoritative identity; missing or mismatched provenance fails here
+            // and the caller enqueues a fresh download.
+            if (!cacheBytesProvenCurrent(cacheFile, authoritativeFile)) {
+                SentryLog.i(TAG, "Cache promotion refused for ${offlineFile.path}: unproven generation")
+                return PublicationOutcome.FAILED
+            }
+            val staged = newStagedFile(context, authoritativeFile)
+            // The validate-to-stage read and the copy are serialized under the file's
+            // coordination (issue: round 16 #12): the cache bytes and their provenance
+            // sidecar cannot change between validation and staging, and concurrent
+            // publications to the same cache cannot interleave their sidecar writes.
+            val outcome = OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                runCatching {
+                    cacheFile.copyTo(staged, overwrite = true)
+                    publishStagedOfflineFile(userDrive, isInheritedDownload = false, authoritativeFile, offlineFile, staged)
+                }.onFailure { exception ->
+                    SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
+                }.getOrDefault(PublicationOutcome.FAILED)
+            }
 
             runCatching { if (staged.exists()) staged.delete() }
             if (outcome == PublicationOutcome.PUBLISHED) {
                 runCatching { if (cacheFile.exists()) cacheFile.delete() }
-                deleteCacheProvenance(cacheFile)
+                deletePublishedProvenance(cacheFile)
             }
             return outcome
         }
@@ -877,43 +947,61 @@ class DownloadOfflineFileManager(
             writeStaged: suspend (IOFile) -> Unit,
         ): PublicationOutcome {
             if (!coordinated) {
-                // Stage inside the destination directory: same volume, so the final replace is
-                // an atomic rename.
-                val staged = IOFile(target.parentFile, "${target.name}.${UUID.randomUUID()}.part")
+                // Plain cache publication is still SERIALIZED per file (issue: round 16 #12):
+                // the rename and the provenance sidecar write are one coordinated section, so
+                // two publications can no longer interleave into "R1 bytes carrying R2
+                // provenance". The sidecar travels WITH the staged bytes: it is written next
+                // to the staged file before the rename, the destination's old provenance is
+                // invalidated BEFORE the bytes are replaced, and a provenance rename failure
+                // FAILS CLOSED — the new bytes are discarded rather than left at the
+                // destination without (or with stale) provenance.
+                OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                    val staged = IOFile(target.parentFile, "${target.name}.${UUID.randomUUID()}.part")
+                    val stagedProvenance = IOFile(staged.parentFile, staged.name + CACHE_PROVENANCE_SUFFIX)
+                    val outcome = runCatching {
+                        writeStaged(staged)
+                        staged.setLastModified(file.getLastModifiedInMilliSecond())
+                        cacheProvenanceFile(staged).writeText("${file.version?.number ?: 0}|${file.lastModifiedAt}")
+                        deletePublishedProvenance(target)
+                        if (staged.renameTo(target)) {
+                            if (stagedProvenance.renameTo(cacheProvenanceFile(target))) {
+                                PublicationOutcome.PUBLISHED
+                            } else {
+                                // Fail closed: no unproven bytes at the destination.
+                                runCatching { target.delete() }
+                                SentryLog.e(TAG, "Failed to commit provenance for ${target.path}")
+                                PublicationOutcome.FAILED
+                            }
+                        } else {
+                            SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                            PublicationOutcome.FAILED
+                        }
+                    }.onFailure { exception ->
+                        SentryLog.e(TAG, "Staged cache publication failed for ${target.path}", exception)
+                    }.getOrDefault(PublicationOutcome.FAILED)
+                    runCatching {
+                        if (staged.exists()) staged.delete()
+                        if (stagedProvenance.exists()) stagedProvenance.delete()
+                    }
+                    outcome
+                }
+            } else {
+                val appContext = Realm.getApplicationContext()
+                if (appContext == null) {
+                    SentryLog.e(TAG, "No application context: refusing uncoordinated offline publication")
+                    return PublicationOutcome.FAILED
+                }
+                val staged = newStagedFile(appContext, file)
                 val outcome = runCatching {
                     writeStaged(staged)
-                    staged.setLastModified(file.getLastModifiedInMilliSecond())
-                    if (staged.renameTo(target)) {
-                        // The plain cache destination's bytes are now the published
-                        // generation: record the provenance (issue: round 15 #9).
-                        writeCacheProvenance(target, file)
-                        PublicationOutcome.PUBLISHED
-                    } else {
-                        SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
-                        PublicationOutcome.FAILED
-                    }
+                    publishStagedOfflineFile(userDrive, isInheritedDownload, file, target, staged)
                 }.onFailure { exception ->
-                    SentryLog.e(TAG, "Staged cache publication failed for ${target.path}", exception)
+                    SentryLog.e(TAG, "Staged offline publication failed for ${target.path}", exception)
                 }.getOrDefault(PublicationOutcome.FAILED)
+
                 runCatching { if (staged.exists()) staged.delete() }
-                return outcome
+                outcome
             }
-
-            val appContext = Realm.getApplicationContext()
-            if (appContext == null) {
-                SentryLog.e(TAG, "No application context: refusing uncoordinated offline publication")
-                return PublicationOutcome.FAILED
-            }
-            val staged = newStagedFile(appContext, file)
-            val outcome = runCatching {
-                writeStaged(staged)
-                publishStagedOfflineFile(userDrive, isInheritedDownload, file, target, staged)
-            }.onFailure { exception ->
-                SentryLog.e(TAG, "Staged offline publication failed for ${target.path}", exception)
-            }.getOrDefault(PublicationOutcome.FAILED)
-
-            runCatching { if (staged.exists()) staged.delete() }
-            return outcome
         }
 
         fun getFailedDownloadWorkerOffline(context: Context) = WorkManager.getInstance(context).getWorkInfosLiveData(

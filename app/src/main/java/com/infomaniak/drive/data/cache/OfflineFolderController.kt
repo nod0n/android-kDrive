@@ -24,6 +24,7 @@ import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.OfflineRoot
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
@@ -663,7 +664,17 @@ object OfflineFolderController {
                         } else {
                             runCatching {
                                 target.parentFile?.mkdirs()
-                                oldOfflineFile.renameTo(target)
+                                val renamed = oldOfflineFile.renameTo(target)
+                                if (renamed) {
+                                    // The published generation's provenance travels with the
+                                    // bytes (issue: round 16 #12/#13): a migrated copy keeps its
+                                    // sidecar, and no orphan is left at the old path to lend its
+                                    // generation to a later file there. Best effort: a failed
+                                    // sidecar move never fails the byte migration — the copy
+                                    // simply loses provenance and a later walk re-downloads it.
+                                    DownloadOfflineFileManager.movePublishedProvenance(oldOfflineFile, target)
+                                }
+                                renamed
                             }.getOrDefault(false)
                         }
                     }
@@ -1226,6 +1237,9 @@ object OfflineFolderController {
         userDrive: UserDrive,
         result: RemovalResult,
     ) {
+        // The published generation's provenance sidecar dies with the bytes (issue: round
+        // 16 #12): an orphaned sidecar must never lend its generation to later bytes.
+        DownloadOfflineFileManager.deletePublishedProvenance(offlineFile)
         runCatching { offlineFile.delete() }.onFailure { exception ->
             SentryLog.e(TAG, "Failed to delete offline file ${offlineFile.path}", exception)
         }.onSuccess {

@@ -39,6 +39,7 @@ import com.infomaniak.drive.data.models.file.FileExternalImport
 import com.infomaniak.drive.data.models.file.FileExternalImport.FileExternalImportStatus
 import com.infomaniak.drive.data.models.file.FileVersion
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.OfflineFileCoordination
@@ -312,8 +313,22 @@ open class File(
     fun isOfflineAndIntact(offlineFile: IOFile): Boolean {
         // Explicit pins and files covered by an offline folder (issue #1902) are both offline:
         // the existence, timestamp and size checks below are unchanged.
-        return (isOffline || isInOfflineFolder)
-                && ((offlineFile.lastModified() / 1_000L) == lastModifiedAt && isIntactFile(offlineFile))
+        if (!((isOffline || isInOfflineFolder)
+                    && ((offlineFile.lastModified() / 1_000L) == lastModifiedAt && isIntactFile(offlineFile)))
+        ) {
+            return false
+        }
+        // GENERATION PROVENANCE of the published bytes (issue: round 16 #13): coarse mtime and
+        // size cannot distinguish two same-second, same-size revisions — R1's published bytes
+        // passed this check after R2 (same mtime, same size) was accepted, so the walk queued
+        // nothing and completed with R1's content. The sidecar written at publication names
+        // the producing generation: a KNOWN row version must match it, and a missing sidecar
+        // (bytes published before provenance existed, or of unknown origin) is never proven
+        // current. Unproven copies are re-downloaded once; every publication records its
+        // generation, so provenance is restored on that pass.
+        val provenance = DownloadOfflineFileManager.readPublishedProvenance(offlineFile) ?: return false
+        val rowVersion = version?.number ?: 0
+        return rowVersion <= 0 || provenance.first == rowVersion
     }
 
     fun getConvertedPdfCache(context: Context, userDrive: UserDrive): IOFile {

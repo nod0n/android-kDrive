@@ -399,14 +399,14 @@ class FileInfoActionsView @JvmOverloads constructor(
         val cacheFile = getCacheFile(context, capturedUserDrive)
         val offlineFile = getOfflineFile(context, capturedUserDrive.userId)
 
-        // Promotion eligibility is an EXACT current clean baseline (issue: round 13 #11):
-        // "not older" passes retained cache bytes whose timestamp is newer than a
-        // backward-dated newer baseline — the stale generation would be published and
-        // pinned as clean. A copy not exactly at the row's baseline routes to the
-        // pending-download path below, which fetches the current identity.
-        if (cacheFile.exists() && path.isNotEmpty() &&
-            isIntactFile(cacheFile) && (cacheFile.lastModified() / 1_000L) == lastModifiedAt
-        ) {
+        // Promotion eligibility is the SHARED generation-provenance validation (issues: round
+        // 13 #11, round 16 #11): exact mtime and size alone accepted R1 cache bytes under R2
+        // metadata — publication then compared R2 with R2 and labeled R1 bytes clean/current.
+        // The worker's requirement now applies to the UI too: the sidecar written at cache
+        // publication must name this row's authoritative version and baseline; missing or
+        // mismatched provenance routes to the pending-download path below, which fetches the
+        // current identity.
+        if (path.isNotEmpty() && DownloadOfflineFileManager.cacheBytesProvenCurrent(cacheFile, this)) {
             offlineFile?.let { target ->
                 val file = this
                 // UI promotion routes through the same protected, coordinated publication as the
