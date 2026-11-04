@@ -678,23 +678,18 @@ class MainViewModel(
     }
 
     fun removeSelectedFilesFromOffline(files: List<File>, onSuccess: (() -> Unit)? = null) = liveData {
-        val filesId = files.map {
-            val file: File = it.freeze()
-            if (!file.isFolder()) {
-                val offlineFile = file.getOfflineFile(getApplication())
-                val cacheFile = file.getCacheFile(getApplication())
-                // A file still covered by an offline root keeps its inherited state and bytes
-                // (issue #1902); only its explicit pin, if any, is removed.
-                val stillCovered = OfflineFolderController.isFileCoveredByAnyRoot(file.id)
-                if ((file.isOffline || file.isInOfflineFolder) && offlineFile != null && !stillCovered) {
-                    deleteFile(file, offlineFile, cacheFile)
-                }
-            }
-            file.id
+        // The captured account scope of each file travels through its whole unpin (issue:
+        // round 16 #6): flags, coverage, preservation and deletion all key the same scope,
+        // never the account that happens to be active when a later step runs.
+        val capturedScopes = files.associate { file ->
+            file.id to UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId)
         }
+        val filesId = files.map { it.id }
 
         viewModelScope.launch(Dispatchers.IO) {
-            FileController.updateIsOfflineForFiles(fileIds = filesId, isOffline = false)
+            filesId.forEach { fileId ->
+                unpinAndConditionallyDeleteCopies(fileId, capturedScopes[fileId] ?: UserDrive())
+            }
             onSuccess?.invoke()
             emit(FileResult(isSuccess = true))
         }
@@ -709,31 +704,81 @@ class MainViewModel(
     ) {
         // We need to call this method outside the UI thread
         viewModelScope.launch(Dispatchers.IO) {
-            FileController.updateIsOfflineForFiles(fileIds = listOf(file.id), isOffline = false)
-            // A file still covered by an offline root keeps its inherited state and bytes
-            // (issue #1902); only its explicit pin, if any, is removed.
-            if (!OfflineFolderController.isFileCoveredByAnyRoot(file.id, userDrive)) {
-                deleteFile(file, offlineFile, cacheFile, userDrive, onFileRemovedFromOffline)
-            } else {
-                onFileRemovedFromOffline?.invoke()
-            }
+            // The captured [offlineFile]/[cacheFile] paths are NOT trusted for the deletion
+            // (issue: round 16 #6): the fresh row's current paths are resolved inside the
+            // coordinated section below.
+            unpinAndConditionallyDeleteCopies(
+                fileId = file.id,
+                userDrive = userDrive,
+                isFolder = file.isFolder(),
+            )
+            onFileRemovedFromOffline?.invoke()
         }
     }
 
-    private fun deleteFile(
-        file: File,
-        offlineFile: IOFile,
-        cacheFile: IOFile,
-        userDrive: UserDrive = UserDrive(),
-        onFileRemovedFromOffline: (() -> Unit)? = null,
+    /**
+     * ONE intent → file-lock → fresh-Realm section for an unpin (issue: round 16 #6): the
+     * flag write, the current coverage resolution, the ownership/preservation decision and
+     * the conditional byte deletion all read the FRESH row under the same root-intent and
+     * per-file coordination, in the captured account scope. The previous shape checked
+     * coverage in one coroutine and deleted the captured paths in a later, uncoordinated
+     * one — a root or pin committed in between (which could publish or receive an edit)
+     * had its newly owned copy deleted by the stale unpin, and an account switch could
+     * clear flags in one Realm while deleting paths from another's storage.
+     */
+    private fun unpinAndConditionallyDeleteCopies(
+        fileId: Int,
+        userDrive: UserDrive,
+        isFolder: Boolean = false,
     ) {
-        viewModelScope.launch {
-            if (file.isMedia()) file.deleteInMediaScan(getContext(), userDrive)
-            if (cacheFile.exists()) cacheFile.delete()
-            if (offlineFile.exists()) {
-                offlineFile.delete()
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, fileId) {
+                val context = getContext()
+                var deleteOfflinePath: String? = null
+                var deleteCachePath: String? = null
+                var mediaFile: File? = null
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    runCatching { realm.refresh() }
+                    realm.executeTransaction {
+                        val liveRow = FileController.getFileById(realm, fileId) ?: return@executeTransaction
+                        // The captured row's flags can be stale: the fresh row's flags and the
+                        // CURRENT coverage result decide (issue #1902).
+                        liveRow.isOffline = false
+                        liveRow.isInOfflineFolder = OfflineFolderController.isInsideActiveRoot(realm, fileId)
+                        // The pending download marker is part of the removed intent (issue:
+                        // round 5 #15): a stale marker cannot resurrect the pin.
+                        liveRow.isMarkedAsOffline = false
+                        if (!isFolder && !liveRow.isInOfflineFolder &&
+                            !OfflineFolderController.isFileCoveredByAnyRoot(fileId, userDrive, realm)
+                        ) {
+                            deleteCachePath = liveRow.getCacheFile(context, userDrive).path
+                            val offlineFile = liveRow.getOfflineFile(context, userDrive.userId)
+                            if (offlineFile != null && offlineFile.exists()) {
+                                // PRESERVATION before any deletion (issue #1902): a pending or
+                                // retained-unsent edit keeps its bytes; a dirty copy is snapshotted
+                                // first (a failed registration keeps the copy); an uploaded or
+                                // clean copy is replaceable.
+                                when (OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, offlineFile, userDrive)) {
+                                    OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL -> Unit
+                                    OfflineFolderController.OwnedCopyReplacementDecision.REPLACEABLE -> {
+                                        deleteOfflinePath = offlineFile.path
+                                        if (liveRow.isMedia()) mediaFile = realm.copyFromRealm(liveRow, 0)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Conditional deletion in the SAME section, after the flags committed (issue:
+                // round 16 #6): never a later, uncoordinated coroutine on captured paths.
+                deleteOfflinePath?.let { path ->
+                    mediaFile?.let { file -> file.deleteInMediaScan(context, userDrive) }
+                    runCatching { IOFile(path).takeIf { it.exists() }?.delete() }
+                }
+                deleteCachePath?.let { path ->
+                    runCatching { IOFile(path).takeIf { it.exists() }?.delete() }
+                }
             }
-            onFileRemovedFromOffline?.invoke()
         }
     }
 
