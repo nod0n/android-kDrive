@@ -624,8 +624,11 @@ object OfflineFolderController {
         realm: Realm,
         remoteFiles: List<File>,
         userDrive: UserDrive,
-        isStale: (live: File, incoming: File, observed: File?) -> Boolean = { live, incoming, _ ->
-            FileController.isStaleReplacement(live, incoming)
+        isStale: (live: File, incoming: File, observed: File?) -> Boolean = { live, incoming, observed ->
+            // The request-observed basis is FORWARDED (issue: round 14 #5): discarding it made
+            // the download manager's supplied observation unusable and re-broke tied renames
+            // it was supplied for.
+            FileController.isStaleReplacement(live, incoming, observed)
         },
         observedById: Map<Int, File> = emptyMap(),
     ): List<File> {

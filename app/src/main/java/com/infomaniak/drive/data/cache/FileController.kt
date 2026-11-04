@@ -736,7 +736,13 @@ object FileController {
         isSupersededGeneration(live, incoming) -> true
         live.updatedAt > incoming.updatedAt -> true
         isSameIdentity(live, incoming) -> false
-        // Identity tie: unchanged observation required, otherwise ambiguous → reject.
+        // Identity difference the incoming row demonstrates as STRICTLY NEWER: a legitimate
+        // rename/move committed after the live row's state — the observation requirement
+        // applies to actual ordering TIES only (issue: round 14 #5); rejecting these blocked
+        // ordinary listing/details progress forever.
+        live.updatedAt < incoming.updatedAt -> false
+        // Ordering tie with a differing identity: ambiguous — an unchanged request-time
+        // observation accepts it, otherwise reject (issue: round 13 #1).
         observed == null || !isSameObservation(live, observed) -> true
         else -> false
     }
@@ -762,10 +768,26 @@ object FileController {
      * timestamp (null or 0, legacy data) applies no cursor bound — the generation and
      * updatedAt gates remain the fallback both before preservation and at commit.
      */
-    internal fun isStaleForAuthoritativeAction(live: File, incoming: File, actionAt: Long?): Boolean =
-        isSupersededGeneration(live, incoming) ||
-            live.updatedAt > incoming.updatedAt ||
-            (actionAt != null && actionAt > 0 && live.lastActionAt >= actionAt)
+    internal fun isStaleForAuthoritativeAction(
+        live: File,
+        incoming: File,
+        actionAt: Long?,
+        observed: File? = null,
+    ): Boolean = when {
+        isSupersededGeneration(live, incoming) -> true
+        live.updatedAt > incoming.updatedAt -> true
+        // Identity difference the action demonstrates as STRICTLY NEWER: the move/rename the
+        // event carries applies (issue: round 14 #2/#5).
+        !isSameIdentity(live, incoming) && live.updatedAt < incoming.updatedAt -> false
+        // Identity difference at an ordering tie: ambiguous — a delayed event against a
+        // current row must NOT snapshot the row's edit under the event's identity; only an
+        // unchanged request anchor (the state the action request was issued against) resolves
+        // it (issues: round 13 #1, round 14 #2). An action response alone is not proof of
+        // ordering.
+        !isSameIdentity(live, incoming) -> observed == null || !isSameObservation(live, observed)
+        // Same identity: the activity-cursor bound (issue: round 13 #3/#10).
+        else -> actionAt != null && actionAt > 0 && live.lastActionAt >= actionAt
+    }
 
     /**
      * Conditional metadata replacement (issue: round 10 #4, refined round 11 #4/#5/#6): the
@@ -1661,10 +1683,13 @@ object FileController {
         // child of the container.
         val localFile = getFileProxyById(remoteFile.id, customRealm = realm)
         if (localFile != null) {
-            // Authoritative-change commit (activity event): generation-only gate (issue:
-            // round 11 #4) — an identity difference at equal revisions is the rename being
-            // applied, not a rollback. The commit can REPARENT a folder (issue: round 12
-            // #8), so the root-intent monitor precedes the file lock.
+            // Authoritative-change commit (activity event): the COMPLETE action predicate
+            // (issue: round 14 #2) — generation AND newer non-Sync metadata AND the nullable
+            // cursor bound gate BOTH branches, including DIRECTORY rows the shared boundary
+            // skips (a stale directory response must not restore obsolete ancestry). The
+            // commit can REPARENT a folder (issue: round 12 #8), so the root-intent monitor
+            // precedes the file lock. No request anchor exists for MQTT activities — an
+            // identity tie rejects.
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 insertOrUpdateFile(
                     realm,
@@ -1672,13 +1697,16 @@ object FileController {
                     localFile,
                     userDrive,
                     // Must exist — this branch already resolved the live row (issue: round 12 #2).
-                    acceptIf = { live -> live != null && !isSupersededGeneration(live, remoteFile) },
+                    acceptIf = { live -> live != null && !isStaleForAuthoritativeAction(live, remoteFile, actionAt) },
                 )
             }
         } else {
             // Coordinated commit boundary (issues: round 10 #3, round 11 #3/#7): the child-add
             // is an identity mutation of the new child and of the container's children list,
             // and it establishes ancestry — the root-intent monitor precedes the file locks.
+            // Parent-consistent membership (issue: round 14 #2): a stale activity naming a
+            // moved identity must not gain a wrong backlink here either.
+            if (remoteFile.parentId != folderId) return
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, remoteFile.id)) {
                     realm.executeTransaction {
