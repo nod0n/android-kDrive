@@ -589,6 +589,19 @@ object SyncOfflineUtils {
                                     downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                                     downloadOutcome.handled
                                 }
+                                // INCOMING GENERATION CLASSIFICATION (issue: round 20 #19): an
+                                // incoming payload with an UNKNOWN version but a changed size
+                                // or modification baseline (tied revisedAt) describes a
+                                // DIFFERENT generation than the live row — proving the OLD
+                                // row's bytes current never accepts or downloads the incoming
+                                // change, and unknown version is not proof of equality. The
+                                // scoped download branch resolves it authoritatively (its
+                                // publication CAS rejects a genuinely superseded payload).
+                                liveRow.size != remoteFile.size ||
+                                    liveRow.lastModifiedAt != remoteFile.lastModifiedAt -> {
+                                    downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
+                                    downloadOutcome.handled
+                                }
                                 freshIoFile != null &&
                                     liveRow.isOfflineAndProvenCurrent(context, freshIoFile, userDrive) -> true
                                 liveRow.isMarkedAsOffline -> {
