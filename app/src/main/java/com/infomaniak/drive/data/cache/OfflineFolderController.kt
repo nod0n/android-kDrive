@@ -407,6 +407,7 @@ object OfflineFolderController {
         oldLastModifiedAt: Long,
         newIdentity: File,
         userDrive: UserDrive,
+        newOfflineTarget: IOFile? = null,
     ): Boolean {
         // Copy ownership and mutation coordination (issue: round 4 #4): move reconciliation
         // competes with publication, cleanup and upload registration for the same bytes.
@@ -447,7 +448,10 @@ object OfflineFolderController {
                     if (registered) runCatching { oldOfflineFile.delete() }.isSuccess else false
                 }
                 else -> {
-                    val target = newIdentity.getOfflineFile(context, userDrive.userId)
+                    // An explicit target is used by callers whose new location cannot be
+                    // derived from [newIdentity]'s not-yet-committed metadata (UI move/rename
+                    // flows): it must be the exact path the row will resolve to after commit.
+                    val target = newOfflineTarget ?: newIdentity.getOfflineFile(context, userDrive.userId)
                     if (target == null) {
                         false
                     } else {

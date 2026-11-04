@@ -311,13 +311,22 @@ class MainViewModel(
         isSharedWithMe: Boolean = false,
         onSuccess: ((fileId: Int) -> Unit)? = null
     ) = liveData(Dispatchers.IO) {
+        // The viewed file's account scope is captured BEFORE the asynchronous request (issue:
+        // round 6 #2): deriving it after the move could mix accounts mid-operation.
+        val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId)
         val apiResponse = ApiRepository.moveFile(file, newParent)
         if (apiResponse.isSuccess()) {
+            // The local copy move must complete (or durably defer) before the metadata commit
+            // (issue: round 6 #2): committing first would strand inherited copies — including
+            // unsent edits — at the old, untracked path. The row realm stays the session's
+            // current-drive Realm (shared-with-me rows live here, as upstream); the captured
+            // [userDrive] scopes only the offline-path/preservation APIs.
+            var preserved = true
             FileController.getRealmInstance().use { currentDriveRealm ->
-                file.getStoredFile(getContext())?.let { ioFile ->
+                file.getStoredFile(getContext(), userDrive)?.let { ioFile ->
                     val folderProxy = FileController.getFileById(currentDriveRealm, newParent.id)
                     if (ioFile.exists() && folderProxy != null) {
-                        moveIfOfflineFileOrDelete(file, ioFile, folderProxy)
+                        preserved = moveIfOfflineFileOrDelete(file, ioFile, folderProxy, userDrive, currentDriveRealm)
                     }
                 }
 
@@ -337,15 +346,21 @@ class MainViewModel(
                     FileController.removeFile(
                         fileId = file.id,
                         customRealm = currentDriveRealm,
-                        userDrive = UserDrive(driveId = file.driveId),
+                        userDrive = userDrive,
                     )
                     FileController.getRealmInstance(UserDrive(sharedWithMe = true)).use { sharedRealm ->
                         FileController.updateFile(newParent.id, sharedRealm) { localFolder ->
                             runCatching { localFolder.children.add(file) }.onFailure(Sentry::captureException)
                         }
                     }
-                } else {
+                } else if (preserved) {
                     FileController.addChild(newParent.id, file.apply { parentId = newParent.id }, currentDriveRealm)
+                } else {
+                    // Preservation incomplete (pending upload, protected destination): the row
+                    // keeps its OLD identity and location; the offline sync and the shared
+                    // upsert boundary re-process the move until preservation succeeds
+                    // (issue: round 6 #2).
+                    SentryLog.i("MainViewModel", "Deferred local move of ${file.id}: its offline copy is not safely preserved yet")
                 }
             }
 
@@ -727,14 +742,36 @@ class MainViewModel(
         }
     }
 
-    private fun moveIfOfflineFileOrDelete(file: File, ioFile: IOFile, newParent: File) {
-        if (file.isOffline) {
-            val offlineFile = newParent.getOfflineFile(application) ?: return
-            val destinationFile = IOFile("$offlineFile/${file.name}")
-            ioFile.renameTo(destinationFile)
-        } else {
+    /**
+     * Moves [file]'s local copy to its new parent, coordinated through the shared preservation
+     * routine for BOTH ownership types (issue: round 6 #2): an inherited-only copy used to
+     * reach a bare delete here, losing pending edits. A plain cache copy remains deletable
+     * (it is re-downloadable). Returns false when preservation is incomplete: the caller must
+     * not commit the new metadata yet.
+     */
+    private fun moveIfOfflineFileOrDelete(
+        file: File,
+        ioFile: IOFile,
+        newParent: File,
+        userDrive: UserDrive,
+        realm: Realm,
+    ): Boolean {
+        if (!file.isOffline && !file.isInOfflineFolder) {
             ioFile.delete()
+            return true
         }
+        val offlineFile = newParent.getOfflineFile(application) ?: return false
+        val destinationFile = IOFile(offlineFile, file.name)
+        return OfflineFolderController.reconcileMovedInheritedCopy(
+            context = application,
+            oldOfflineFile = ioFile,
+            oldIdentityName = file.name,
+            oldIdentityParentId = file.parentId,
+            oldLastModifiedAt = file.lastModifiedAt,
+            newIdentity = file,
+            userDrive = userDrive,
+            newOfflineTarget = destinationFile,
+        )
     }
 
     private fun saveCurrentFolder() {
