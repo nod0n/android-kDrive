@@ -1656,74 +1656,67 @@ object FileController {
             // ancestry decision. The realm is refreshed first, and every media row's
             // COMPLETE destination ancestry is validated BEFORE the preservation boundary —
             // media-file reparenting included, not only directory payloads.
+            // OWNED-MOVE CLASSIFICATION (issue: round 19 #27) — a lock-free HINT read: a
+            // row whose destination chain is broken and which carries durable offline
+            // state requires ancestry; a NEW UNCACHED payload defers harmlessly. The
+            // committing section below revalidates everything under the full protocol.
+            runCatching { currentRealm.refresh() }
+            val ownedMovesRequiringAncestry = mediaList.filter { media ->
+                media.parentId > 0 && !destinationChainExists(currentRealm, media.parentId) &&
+                    getFileById(currentRealm, media.id)?.let { existing ->
+                        existing.isOffline || existing.isInOfflineFolder || existing.isMarkedAsOffline
+                    } == true
+            }
+            // EXPLICIT ANCESTRY RESOLUTION for owned-move payloads (issues: round 19 #27,
+            // round 17 #5 doctrine) — OUTSIDE the intent monitor and file locks: the
+            // blocking details fetch must never retain them while another coordinated
+            // writer waits. Each pass fetches the FIRST missing ancestor per payload
+            // (details routes carry the expansion) and commits it through the shared
+            // boundary (which takes its own locks), growing the chain toward the
+            // destination. The budget bounds the pass; an unresolved payload keeps its
+            // row (the re-link below) and retries on the next gallery refresh — never a
+            // silent discard.
+            var ancestryBudget = GALLERY_ANCESTRY_RESOLUTION_BUDGET
+            ownedMovesRequiringAncestry.forEach { media ->
+                if (ancestryBudget <= 0) return@forEach
+                val missingAncestorId = firstMissingAncestorId(currentRealm, media.parentId) ?: return@forEach
+                ancestryBudget--
+                val ancestorDetails = runCatching {
+                    ApiRepository.getFileDetails(
+                        file = File(id = missingAncestorId, driveId = userDrive.driveId),
+                        okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
+                    )
+                }.getOrNull()?.data?.takeIf { it.id == missingAncestorId } ?: return@forEach
+                val committableAncestor = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                    currentRealm,
+                    listOf(ancestorDetails),
+                    userDrive,
+                ).first()
+                if (committableAncestor === ancestorDetails) {
+                    updateExistingFileIfNotOlder(committableAncestor, currentRealm, userDrive)
+                }
+            }
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withLocksFor(userDrive, listOf(Gallery.id) + mediaList.map { media -> media.id }) {
                     runCatching { currentRealm.refresh() }
                     // DESTINATION ANCESTRY BEFORE PRESERVATION (issues: round 18 #24, round
                     // 19 #27): a row whose destination chain is broken is not committed
-                    // this pass — but the two reasons are DISTINGUISHED, never silently
-                    // discarded together:
-                    //  - a NEW UNCACHED payload (no local row, no owned state) defers
-                    //    harmlessly — it is re-downloadable, its existing identity cannot
-                    //    strand, and a later refresh or folder walk commits it;
-                    //  - an OWNED-MOVE payload (the row EXISTS with durable offline state)
-                    //    requires ancestry: its copy's location story must not strand, so
-                    //    its missing ancestors are RESOLVED through the explicit details
-                    //    progress path below, bounded per pass.
-                    val chainOkMedia = mutableListOf<File>()
-                    val ownedMovesRequiringAncestry = mutableListOf<File>()
-                    mediaList.forEach { media ->
-                        if (media.parentId <= 0 || destinationChainExists(currentRealm, media.parentId)) {
-                            chainOkMedia += media
-                        } else {
-                            val existing = getFileById(currentRealm, media.id)
-                            val ownedMove = existing != null && (existing.isOffline ||
-                                existing.isInOfflineFolder || existing.isMarkedAsOffline)
-                            if (ownedMove) ownedMovesRequiringAncestry += media
-                        }
-                    }
-                    // EXPLICIT ANCESTRY RESOLUTION for owned-move payloads (issue: round 19
-                    // #27): each pass fetches the FIRST missing ancestor per payload
-                    // (details routes carry the expansion) and commits it through the
-                    // shared boundary, growing the chain toward the destination. The
-                    // budget bounds the pass; an unresolved payload keeps its row (the
-                    // re-link below) and retries on the next gallery refresh — never a
-                    // silent discard.
-                    var ancestryBudget = GALLERY_ANCESTRY_RESOLUTION_BUDGET
-                    val resolvedOwnedMoves = ownedMovesRequiringAncestry.mapNotNull { media ->
-                        val missingAncestorId = firstMissingAncestorId(currentRealm, media.parentId)
-                        if (missingAncestorId == null || ancestryBudget <= 0) return@mapNotNull null
-                        ancestryBudget--
-                        val ancestorDetails = runCatching {
-                            ApiRepository.getFileDetails(
-                                file = File(id = missingAncestorId, driveId = userDrive.driveId),
-                                okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
-                            )
-                        }.getOrNull()?.data?.takeIf { it.id == missingAncestorId } ?: return@mapNotNull null
-                        val committableAncestor = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                            currentRealm,
-                            listOf(ancestorDetails),
-                            userDrive,
-                        ).first()
-                        if (committableAncestor !== ancestorDetails) return@mapNotNull null
-                        if (!updateExistingFileIfNotOlder(committableAncestor, currentRealm, userDrive)) {
-                            return@mapNotNull null
-                        }
-                        if (destinationChainExists(currentRealm, media.parentId)) media else null
+                    // this pass — its existing identity and gallery backlink survive in
+                    // the re-link below, and a later gallery refresh retries the payload
+                    // once the ancestor exists (the resolution above may have completed
+                    // the chain since the hint classification).
+                    val chainOkMedia = mediaList.filter { media ->
+                        media.parentId <= 0 || destinationChainExists(currentRealm, media.parentId)
                     }
                     // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6). The
                     // request's captured scope flows through realm and preservation (issue: round 8 #4).
-                    val committableMedia = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                        currentRealm,
-                        chainOkMedia + resolvedOwnedMoves,
-                        userDrive,
-                    )
+                    val committableMedia = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(currentRealm, chainOkMedia, userDrive)
                     currentRealm.executeTransaction { realm ->
                         val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
                             ?: realm.copyToRealm(Gallery.file)
                         if (isFirstPage) galleryFolder.children = RealmList()
                         galleryFolder.children.addAll(realm, committableMedia)
-                        val chainOkIds = (chainOkMedia + resolvedOwnedMoves).map { media -> media.id }.toSet()
+                        val chainOkIds = chainOkMedia.map { media -> media.id }.toSet()
                         mediaList.filter { media -> media.id !in chainOkIds }.forEach { deferred ->
                             // Harmless new-uncached payloads have no row to re-link; an
                             // unresolved owned move re-links its EXISTING row so its
