@@ -305,7 +305,14 @@ class DownloadOfflineFileManager(
                     null
                 } else {
                     val candidate = newStagedFile(context, file)
-                    if (runCatching { cacheFile.copyTo(candidate, overwrite = true) }.getOrDefault(false)) {
+                    // EXPLICIT Boolean success AFTER the actual copy (round-16 compile fix #2):
+                    // File.copyTo returns the destination File, so getOrDefault(false) against
+                    // it inferred a File/Boolean least-upper-bound instead of a condition.
+                    val copied = runCatching {
+                        cacheFile.copyTo(candidate, overwrite = true)
+                        true
+                    }.getOrDefault(false)
+                    if (copied) {
                         candidate
                     } else {
                         runCatching { if (candidate.exists()) candidate.delete() }
@@ -938,8 +945,13 @@ class DownloadOfflineFileManager(
             val staged = newStagedFile(context, authoritativeFile)
             val stagedOk = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withFileLock(userDrive, file.id) {
-                    cacheBytesProvenCurrent(cacheFile, authoritativeFile) &&
-                        runCatching { cacheFile.copyTo(staged, overwrite = true) }.getOrDefault(false)
+                    // EXPLICIT Boolean success AFTER the actual copy (round-16 compile fix
+                    // #2), as in moveCacheFileIfIntact: File.copyTo's File return must not
+                    // merge with the failure default into a non-Boolean condition.
+                    cacheBytesProvenCurrent(cacheFile, authoritativeFile) && runCatching {
+                        cacheFile.copyTo(staged, overwrite = true)
+                        true
+                    }.getOrDefault(false)
                 }
             }
             if (!stagedOk) {
