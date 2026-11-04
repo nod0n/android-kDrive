@@ -1529,7 +1529,24 @@ object OfflineFolderController {
     /** EXACT content identity of [file]'s bytes (issue: round 18 #7), or null when unreadable. */
     private fun contentHashOf(file: IOFile): String? = UploadFile.sha256OrNull(file)
 
-    internal fun registerDirtySnapshot(context: Context, file: File, offlineFile: IOFile, userDrive: UserDrive): Boolean {
+    internal fun registerDirtySnapshot(
+        context: Context,
+        file: File,
+        offlineFile: IOFile,
+        userDrive: UserDrive,
+        allowPendingRecoveryResolution: Boolean = false,
+    ): Boolean {
+        // PENDING-RECOVERY EXCLUSION (issue: round 22 #3): a file with an unresolved
+        // durable publication recovery is excluded from ALL snapshot registration — its
+        // bytes may be partial output of an interrupted restore, and snapshotting them
+        // would upload an unknown generation as an edit. ONLY the reconciliation sweep's
+        // explicit intervening-revision preservation passes true (it IS the resolution
+        // step).
+        if (!allowPendingRecoveryResolution &&
+            DownloadOfflineFileManager.pendingRecoveryFileIds(context, userDrive).contains(file.id)
+        ) {
+            return false
+        }
         // Upload-source registration competes with publication and cleanup for these bytes
         // (issue: round 4 #4).
         return OfflineFileCoordination.withFileLock(userDrive, file.id) {

@@ -246,12 +246,14 @@ object SyncOfflineUtils {
         pendingAdvances: MutableList<PendingCursorAdvance>,
     ) {
         if (localFilesMap.isNotEmpty()) {
-            // DURABLE PUBLICATION RECONCILIATION BEFORE EVERY EDIT SELECTION (issue: round
-            // 21 #10): interrupted publications (crash between the rename and the baseline
-            // commit, or a failed restore) are resolved from their durable recovery records
-            // BEFORE the activity and no-action paths select uploads — a stale baseline must
-            // never re-classify freshly published (or restored) bytes as an unsent edit.
+            // DURABLE PUBLICATION RECONCILIATION BEFORE EVERY EDIT SELECTION (issues: round
+            // 21 #10, round 22 #3): interrupted publications are resolved from their durable
+            // recovery records BEFORE the activity and no-action paths select uploads, and
+            // the still-PENDING file ids become a per-file durable exclusion — partial
+            // bytes from an interrupted restore are never classified as an edit,
+            // registered, or replaced; unrelated files progress independently.
             DownloadOfflineFileManager.reconcileInterruptedRecoveries(context)
+            val pendingRecoveryIds = DownloadOfflineFileManager.pendingRecoveryFileIds(context, userDrive)
             val fileActionsBody = localFilesMap.values.map { file ->
                 FileLastActivityBody.FileActionBody(
                     id = file.id,
@@ -271,11 +273,11 @@ object SyncOfflineUtils {
             lastFilesActions?.forEach { fileAction ->
                 coroutineScope.ensureActive()
                 fileActionsIds.add(fileAction.fileId)
-                handleFileAction(context, fileAction, localFilesMap, userDrive, realm, pendingAdvances)
+                handleFileAction(context, fileAction, localFilesMap, userDrive, realm, pendingAdvances, pendingRecoveryIds)
             }
 
             // Check if any of the files that don't have fileActions require synchronization.
-            handleFilesWithoutActions(context, localFilesMap, fileActionsIds, userDrive, realm, coroutineScope)
+            handleFilesWithoutActions(context, localFilesMap, fileActionsIds, userDrive, realm, coroutineScope, pendingRecoveryIds)
         }
     }
 
@@ -286,10 +288,14 @@ object SyncOfflineUtils {
         userDrive: UserDrive,
         realm: Realm,
         coroutineScope: CoroutineScope,
+        pendingRecoveryIds: Set<Int>,
     ) {
         for (file in localFilesMap.values) {
             coroutineScope.ensureActive()
             if (fileActionsIds.contains(file.id)) continue
+            // PENDING-RECOVERY EXCLUSION (issue: round 22 #3): unresolved recovery keeps
+            // the file out of edit classification entirely; the recovery sweep owns it.
+            if (file.id in pendingRecoveryIds) continue
             val ioFile = file.getOfflineFile(context, userDrive.userId) ?: continue
 
             migrateOfflineIfNeeded(context, file, ioFile, userDrive)
@@ -332,6 +338,7 @@ object SyncOfflineUtils {
         userDrive: UserDrive,
         realm: Realm,
         pendingAdvances: MutableList<PendingCursorAdvance>,
+        pendingRecoveryIds: Set<Int>,
     ) {
         val localFile = localFilesMap[fileAction.fileId]
         val ioFile = localFile?.getOfflineFile(context, userDrive.userId) ?: return
@@ -484,11 +491,18 @@ object SyncOfflineUtils {
             OfflineFileCoordination.withFileLock(userDrive, localFile.id) {
                 runCatching { realm.refresh() }
                 val liveRow = FileController.getFileById(realm, localFile.id)
-                // Stale-action consumption BEFORE any side effect, on the fresh row (issue:
-                // round 12 #5 kept): a row already at or past this action has processed it.
-                if (actionAt != null && actionAt > 0 && liveRow != null && liveRow.lastActionAt >= actionAt) {
-                    true
+                // PENDING-RECOVERY EXCLUSION (issue: round 22 #3): unresolved recovery
+                // defers the action (the cursor stays) — the file's bytes may be partial
+                // output of an interrupted restore and are never classified, registered or
+                // replaced until the recovery resolves.
+                if (localFile.id in pendingRecoveryIds) {
+                    false
                 } else {
+                    // Stale-action consumption BEFORE any side effect, on the fresh row (issue:
+                    // round 12 #5 kept): a row already at or past this action has processed it.
+                    if (actionAt != null && actionAt > 0 && liveRow != null && liveRow.lastActionAt >= actionAt) {
+                        true
+                    } else {
                     // OPERATION SELECTION from the CURRENT source (issue: round 16 #5): the
                     // pre-request path's timestamp could select upload while the fresh bytes
                     // at the live row's location are clean — F moved from P to Q, P was
@@ -672,6 +686,7 @@ object SyncOfflineUtils {
                             }
                         }
                     }
+                }
                 }
             }
         }
