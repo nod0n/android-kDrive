@@ -285,13 +285,12 @@ object SyncOfflineUtils {
                     }
                 }
             }
-            else -> updateFile(context, ioFile, localFile, fileAction, userDrive, realm, pendingAdvances)
+            else -> updateFile(context, localFile, fileAction, userDrive, realm, pendingAdvances)
         }
     }
 
     private fun updateFile(
         context: Context,
-        ioFile: IOFile,
         localFile: File,
         fileAction: LastFileAction,
         userDrive: UserDrive,
@@ -324,11 +323,19 @@ object SyncOfflineUtils {
                 if (actionAt != null && actionAt > 0 && liveRow != null && liveRow.lastActionAt >= actionAt) {
                     true
                 } else {
-                    val ioFileLastModified = ioFile.lastModified()
+                    // OPERATION SELECTION from the CURRENT source (issue: round 16 #5): the
+                    // pre-request path's timestamp could select upload while the fresh bytes
+                    // at the live row's location are clean — F moved from P to Q, P was
+                    // reused by another file with a newer local mtime, and the stale P
+                    // timestamp queued F's clean Q bytes as an edit over a newer remote
+                    // revision. The source resolved UNDER this lock, at the live row's
+                    // current location, decides upload vs download vs rename.
+                    val freshIoFile = liveRow?.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
+                    val freshSourceModifiedSeconds = (freshIoFile?.lastModified() ?: 0L) / 1_000L
                     when {
-                        ioFileLastModified > remoteFile.revisedAtInMillis ->
+                        freshSourceModifiedSeconds > remoteFile.revisedAt ->
                             uploadFile(context, localFile, remoteFile, userDrive, realm, actionAt)
-                        ioFileLastModified < remoteFile.revisedAtInMillis -> {
+                        freshSourceModifiedSeconds < remoteFile.revisedAt -> {
                             downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                             downloadOutcome.handled
                         }
@@ -470,6 +477,17 @@ object SyncOfflineUtils {
                 // Nothing owned at the current location: consume with no side effect.
                 return true
             }
+            // UPLOAD-NEED revalidation against the FRESH bytes (issue: round 16 #5): branch
+            // selection happened earlier against possibly stale timestamps — the bytes
+            // actually resolved here decide, on the same seconds precision as
+            // [OfflineFolderPolicy.isLocallyModified]. Bytes no longer NEWER than the target
+            // revision are not an unsent edit (the stale-selection trace: clean bytes at Q
+            // queued for upload over a newer remote F revision); consume with no side effect
+            // — a download or nothing owns the refresh now.
+            val freshModifiedSeconds = freshSource.lastModified() / 1_000L
+            val uploadStillNeeded = freshModifiedSeconds >
+                (remoteFile?.revisedAt ?: liveRow.revisedAt)
+            if (!uploadStillNeeded) return true
             val uri = Uri.fromFile(freshSource)
             val fileModifiedAt = Date(freshSource.lastModified())
             if (!UploadFile.canUpload(uri, fileModifiedAt)) {
