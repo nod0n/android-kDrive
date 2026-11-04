@@ -799,6 +799,12 @@ class CloudStorageProvider : DocumentsProvider() {
     private fun writeDataFile(context: Context, file: File, userDrive: UserDrive, accessMode: Int): ParcelFileDescriptor? {
         val tempFile = createTempFile(file.parentId, file.name)
         val cacheFile = file.getCacheFile(context, userDrive)
+        // CAPTURED PUBLICATION TOKEN AT EDIT INITIATION (issue: round 22 #21): the close
+        // callback's cache cleanup validates current self-certification, which a later
+        // writer's new self-certifying record under the SAME captured row metadata also
+        // satisfies — the edit's beginning captures the cache's EXACT token instead, and
+        // the cleanup requires that token and bytes still.
+        val capturedToken = DownloadOfflineFileManager.capturedCachePublicationToken(context, cacheFile)
         val handler = Handler(context.mainLooper)
 
         return ParcelFileDescriptor.open(tempFile, accessMode, handler) { exception: IOException? ->
@@ -830,7 +836,9 @@ class CloudStorageProvider : DocumentsProvider() {
                             // THIS row's accepted revision — mtime+size alone let an
                             // unproven or foreign-record cache be deleted under a
                             // generation it never carried.
-                            if (DownloadOfflineFileManager.cacheBytesProvenCurrent(context, cacheFile, file, userDrive)) {
+                            if (DownloadOfflineFileManager.cacheBytesProvenCurrent(context, cacheFile, file, userDrive) &&
+                                DownloadOfflineFileManager.capturedCacheTokenStillMatches(context, cacheFile, capturedToken)
+                            ) {
                                 DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
                                 runCatching { cacheFile.delete() }
                             }

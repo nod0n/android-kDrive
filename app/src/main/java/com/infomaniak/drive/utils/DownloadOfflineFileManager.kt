@@ -118,6 +118,14 @@ class DownloadOfflineFileManager(
         lastDownloadedFile = null
         lastTransferSuperseded = false
 
+        // CAPTURED CACHE PUBLICATION TOKEN (issue: round 22 #21): the pre-download cache
+        // cleanup validates the cache's CURRENT self-certification, but a later writer can
+        // replace the cache and create a NEW self-certifying record under the SAME captured
+        // row metadata — the cleanup would then delete that later publication. The cache's
+        // exact token is captured BEFORE any await point (the details HTTP below is the
+        // window); the deletion requires that exact token and bytes.
+        val capturedCacheToken = capturedCachePublicationToken(context, file.getCacheFile(context, userDrive))
+
         // Fetch first WITHOUT committing metadata, so an inherited copy at the old location can
         // be preserved (migrated, or snapshotted against its OLD baseline) before the remote
         // rename/move upsert would forget that location (issues: round 3 #7, round 7 #2). The
@@ -341,7 +349,13 @@ class DownloadOfflineFileManager(
                     // for an unproven cache. Only the cache's own provenance record
                     // certifying THESE bytes for THIS row's exact generation authorizes
                     // the deletion; a different or unproven cache is preserved.
-                    cacheBytesProvenCurrent(context, cacheFile, file, userDrive)
+                    cacheBytesProvenCurrent(context, cacheFile, file, userDrive) &&
+                    // THE EXACT CAPTURED TOKEN (issue: round 22 #21): the deletion requires
+                    // the cache to still carry THIS transfer's captured publication token and
+                    // the same bytes — a later writer's new self-certifying record (same
+                    // captured row metadata, different bytes) does not match and is
+                    // preserved.
+                    capturedCacheTokenStillMatches(context, cacheFile, capturedCacheToken)
                 ) {
                     deletePublishedProvenance(context, cacheFile)
                     runCatching { cacheFile.delete() }
@@ -1054,6 +1068,33 @@ class DownloadOfflineFileManager(
             deletePublishedProvenance(context, source)
             return true
         }
+
+        /**
+         * The EXACT cache publication token captured at staging or edit initiation (issue:
+         * round 22 #21): the record's content hash and version plus the bytes' own hash. A
+         * later writer can replace the cache and create a NEW self-certifying record under
+         * the SAME captured row metadata — cleanup that validates current self-certification
+         * alone would then delete that later publication.
+         */
+        data class CachePublicationToken(val contentHash: String?, val version: Int, val bytesHash: String?)
+
+        internal fun capturedCachePublicationToken(context: Context, cacheFile: IOFile): CachePublicationToken? =
+            if (cacheFile.exists()) {
+                val record = readPublishedProvenance(context, cacheFile)
+                CachePublicationToken(
+                    contentHash = record?.contentHash,
+                    version = record?.version ?: 0,
+                    bytesHash = UploadFile.sha256OrNull(cacheFile),
+                )
+            } else null
+
+        /** The deletion gate (issue: round 22 #21): only THAT exact token and bytes still. */
+        internal fun capturedCacheTokenStillMatches(
+            context: Context,
+            cacheFile: IOFile,
+            captured: CachePublicationToken?,
+        ): Boolean = captured != null && cacheFile.exists() &&
+            capturedCachePublicationToken(context, cacheFile) == captured
 
         /**
          * Whether [cacheFile]'s bytes are PROVEN to be the current content generation of [file]
