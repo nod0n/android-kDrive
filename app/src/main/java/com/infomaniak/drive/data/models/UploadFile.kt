@@ -573,11 +573,17 @@ open class UploadFile(
          * remove it), so a deferred record is never orphaned by an eager cleanup.
          */
         fun retryUnreconciledOriginals() {
+            // CONFIRMED-COMPLETED records are processed INDEPENDENTLY of cancellation
+            // status (issue: round 19 #6): cancellation and bulk deletion can soft-delete an
+            // already completed offline upload — including a transfer that finished after
+            // the cancellation set was captured — and the previous `deletedAt == null`
+            // filter excluded that record from reconciliation and snapshot disposal
+            // forever. Cancelled UNSENT snapshots (uploadAt == null) remain excluded:
+            // their retention IS the cancellation decision and they are never re-enqueued.
             val completedRecords = getRealmInstance().use { realm ->
                 realm.where(UploadFile::class.java)
                     .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
                     .isNotNull(UploadFile::uploadAt.name)
-                    .isNull(UploadFile::deletedAt.name)
                     .findAll()?.map { realm.copyFromRealm(it, 0) }
             } ?: return
             completedRecords.forEach { record ->
