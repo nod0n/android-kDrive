@@ -71,6 +71,7 @@ import com.infomaniak.drive.ui.fileList.ShareLinkViewModel
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.DrivePermissions
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.SingleOperation
@@ -435,38 +436,40 @@ class FileInfoActionsView @JvmOverloads constructor(
                             }
                             PublicationOutcome.SKIPPED_SUPERSEDED,
                             PublicationOutcome.SKIPPED_CONFLICT,
-                            -> {
-                                // The cached copy's generation was superseded before
-                                // publication, or the destination holds protected content
-                                // owned by another row (issue: round 14 #13): announcing
-                                // success would leave the pin over a destination that may
-                                // hold no usable bytes for the current identity. The user's
-                                // intent is still on (the same coordinated publication
-                                // verified it immediately before the skip), so the pin stays
-                                // and pending work is persisted: the pending-download marker
-                                // plus a refresh of the current identity through the offline
-                                // worker.
-                                file.isOffline = true
-                                CoroutineScope(Dispatchers.IO).launch {
-                                    FileController.markFilesAsOffline(
-                                        filesId = listOf(fileId),
-                                        isMarkedAsOffline = true,
-                                        userDrive = capturedUserDrive,
-                                        setExplicitPin = true,
-                                    )
-                                    Utils.downloadAsOfflineFile(context, file = file, userDrive = capturedUserDrive)
-                                }
-                            }
-                            // Invalidation (the intent disappeared mid-transfer) and failure
-                            // are never successes (issue: round 13 #13): the pin is rolled
-                            // back like the pre-existing failure path.
                             PublicationOutcome.SKIPPED_INVALIDATED,
                             PublicationOutcome.FAILED,
                             -> {
+                                // Every non-published outcome re-reads the CURRENT scoped
+                                // intent under coordination before acting (issue: round 14
+                                // #12): the publication's intent check is historical by the
+                                // time this callback runs. A completion callback must not
+                                // resurrect an unpin (no explicit-pin reassertion), and the
+                                // old unconditional rollback must not erase a newer pin
+                                // request — the fresh intent alone decides the pin's fate.
                                 CoroutineScope(Dispatchers.IO).launch {
-                                    FileController.updateOfflineStatus(fileId, isOffline = false, userDrive = capturedUserDrive)
+                                    val intentStands =
+                                        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                                            OfflineFileCoordination.withFileLock(capturedUserDrive, fileId) {
+                                                FileController.getRealmInstance(capturedUserDrive).use { realm ->
+                                                    runCatching { realm.refresh() }
+                                                    FileController.getFileById(realm, fileId)?.isOffline == true
+                                                }
+                                            }
+                                        }
+                                    if (intentStands) {
+                                        // The intent stands (ours or a newer request): retain
+                                        // it, persist the pending-download marker WITHOUT
+                                        // recreating an explicit request, and enqueue the
+                                        // refresh with this request's own (explicit) origin.
+                                        FileController.markFilesAsOffline(
+                                            filesId = listOf(fileId),
+                                            isMarkedAsOffline = true,
+                                            userDrive = capturedUserDrive,
+                                        )
+                                        Utils.downloadAsOfflineFile(context, file = file, userDrive = capturedUserDrive)
+                                    }
+                                    // else: the intent is gone (a newer unpin) — do nothing.
                                 }
-                                file.isOffline = false
                             }
                         }
                         refreshBottomSheetUi(currentFile)
