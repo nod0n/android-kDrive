@@ -936,6 +936,14 @@ object OfflineFolderController {
         if (exclusivePathOwner(realm, context, userDrive, offlineFile.path) != file.id) {
             return OwnedCopyReplacementDecision.DEFERRED_FOREIGN
         }
+        // FOREIGN CONFLICT IS DISTINCT END-TO-END (issue: round 20 #11): the protection
+        // classification folds foreign bytes into UNPROVEN_HISTORICAL, but the REPLACEMENT
+        // decision must never answer KEEP_LOCAL for them — KEEP_LOCAL certifies the bytes
+        // as this file's usable content, and the dialog would report 100% over another
+        // identity's bytes. The conflict defers like any foreign ownership.
+        if (file.storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.FOREIGN_CONFLICT) {
+            return OwnedCopyReplacementDecision.DEFERRED_FOREIGN
+        }
         return when (protectionStateOf(file, offlineFile, userDrive)) {
             CopyProtection.PENDING_UPLOAD -> OwnedCopyReplacementDecision.KEEP_LOCAL
             CopyProtection.DIRTY ->

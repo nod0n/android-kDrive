@@ -1196,7 +1196,7 @@ object FileController {
                     // explicit pin: only an old row that was itself pinned restores the pin
                     // intent.
                     val offlineFile = appContext?.let { oldFile.getOfflineFile(it, userDrive.userId) }
-                    if (offlineFile != null && oldFile.isOfflineAndReadable(appContext, offlineFile)) {
+                    if (offlineFile != null && oldFile.isOfflineAndReadable(appContext, offlineFile, userDrive)) {
                         files[index].isOffline = oldFile.isOffline
                         keepCaches.add(file.id)
                     }

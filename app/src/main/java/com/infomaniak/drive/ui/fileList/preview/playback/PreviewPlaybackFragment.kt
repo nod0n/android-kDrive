@@ -253,8 +253,8 @@ open class PreviewPlaybackFragment : PreviewFragment() {
         // READABLE retained copy (issue: round 17 #15): legacy pre-provenance bytes stay
         // available; an unverified generation is scheduled for verification, never treated
         // as current.
-        val readable = file.isOfflineAndReadable(requireContext(), it)
-        if (readable && file.storedOfflineCopyState(requireContext(), it) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+        val readable = file.isOfflineAndReadable(requireContext(), it, previewSliderViewModel.userDrive)
+        if (readable && file.storedOfflineCopyState(requireContext(), it, previewSliderViewModel.userDrive) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
             OfflineFolderController.scheduleOfflineVerification(
         fileId = file.id,
         userDrive = previewSliderViewModel.userDrive,

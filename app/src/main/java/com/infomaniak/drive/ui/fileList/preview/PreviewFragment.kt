@@ -120,8 +120,8 @@ open class PreviewFragment : Fragment() {
             ?.let {
                 // READABLE retained copy (issue: round 17 #15): availability without
                 // generation proof; unverified copies are scheduled for verification.
-                val readable = file.isOfflineAndReadable(requireContext(), it)
-                if (readable && file.storedOfflineCopyState(requireContext(), it) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+                val readable = file.isOfflineAndReadable(requireContext(), it, previewSliderViewModel.userDrive)
+                if (readable && file.storedOfflineCopyState(requireContext(), it, previewSliderViewModel.userDrive) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
                     OfflineFolderController.scheduleOfflineVerification(
         fileId = file.id,
         userDrive = previewSliderViewModel.userDrive,

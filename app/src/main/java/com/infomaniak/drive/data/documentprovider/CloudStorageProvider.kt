@@ -851,7 +851,7 @@ class CloudStorageProvider : DocumentsProvider() {
 
         try {
             // Get offline file if it's intact
-            if (offlineFile != null && file.isOfflineAndReadable(context, offlineFile)) {
+            if (offlineFile != null && file.isOfflineAndReadable(context, offlineFile, userDrive)) {
                 // READABLE retained copy (issue: round 17 #15): legacy pre-provenance bytes
                 // stay available; their generation is unverified — schedule verification so
                 // the walk/worker proves or refreshes them without blocking this read.

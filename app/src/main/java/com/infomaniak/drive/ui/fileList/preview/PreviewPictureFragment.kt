@@ -190,10 +190,10 @@ class PreviewPictureFragment : PreviewFragment() {
 
     private fun getOfflineFile(): IOFile? {
         return file.getOfflineFile(requireContext(), previewSliderViewModel.userDrive.userId)?.let {
-            if (file.isOfflineAndReadable(requireContext(), it)) {
+            if (file.isOfflineAndReadable(requireContext(), it, previewSliderViewModel.userDrive)) {
                 // READABLE retained copy (issue: round 17 #15): availability without
                 // generation proof; unverified copies are scheduled for verification.
-                if (file.storedOfflineCopyState(requireContext(), it) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+                if (file.storedOfflineCopyState(requireContext(), it, previewSliderViewModel.userDrive) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
                     OfflineFolderController.scheduleOfflineVerification(
         fileId = file.id,
         userDrive = previewSliderViewModel.userDrive,

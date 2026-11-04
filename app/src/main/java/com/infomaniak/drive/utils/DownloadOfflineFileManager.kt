@@ -1130,7 +1130,15 @@ class DownloadOfflineFileManager(
                 }
 
                 val targetProtected = UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
-                        UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(target).toString()) || when {
+                        UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(target).toString()) ||
+                        // REGISTRY OWNER CONFLICT (issue: round 20 #11): the destination's
+                        // provenance record POSITIVELY names a different owner — the bytes
+                        // are another identity's published content. Realm ownership and
+                        // mtime alone never authorize overwriting them; the publication
+                        // defers as a conflict until the registry conflict resolves.
+                        (appContext != null &&
+                            readPublishedProvenance(appContext, target)
+                                ?.positivelyForeignTo(file, userDrive) == true) || when {
                     // Without an application context the ownership cannot be established: preserve.
                     appContext == null -> true
                     // Unknown ownership (no row claims the path — e.g. new-file/path-reuse

@@ -102,8 +102,8 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         currentFile?.let { file ->
             // READABLE retained copy (issue: round 17 #15): availability without generation
             // proof; unverified copies are scheduled for verification.
-            val readable = file.isOfflineAndReadable(getApplication(), stored)
-            if (readable && file.storedOfflineCopyState(getApplication(), stored) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+            val readable = file.isOfflineAndReadable(getApplication(), stored, userDrive)
+            if (readable && file.storedOfflineCopyState(getApplication(), stored, userDrive) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
                 OfflineFolderController.scheduleOfflineVerification(
                     fileId = file.id,
                     // The model's CAPTURED scope (issue: round 18 #16): every other read of
