@@ -1340,18 +1340,30 @@ class DownloadOfflineFileManager(
                     // declared another file's older dirty copy unprotected and overwrote
                     // its sole edit, and accepted metadata alone must not reclassify
                     // retained old-clean bytes as an edit.
-                    else -> OfflineFolderPolicy.isLocallyModified(
-                        offlineFileLastModifiedMillis = target.lastModified(),
-                        remoteLastModifiedAtSeconds = liveOwner.effectivePublishedBaseline,
-                    ) ||
+                    else -> run {
                         // SAME-MTIME CONTENT DRIFT IS PROTECTED (issue: round 21 #2): the
                         // owner's own provenance record whose hash does NOT match the
                         // current bytes is a proven same-mtime edit (or unknown content) —
                         // the metadata-only mtime comparison alone previously let the
-                        // fresh publication overwrite it.
-                        (readPublishedProvenance(appContext, target)
-                            ?.takeIf { it.identifies(liveOwner, userDrive) }
-                            ?.let { it.contentHash != null && !it.certifiesBytes(target) } == true)
+                        // fresh publication overwrite it. FRESH EXACT OWNER ROW (round-21
+                        // build correction): the pre-lock ownership answer is a
+                        // DestinationOwner DTO — the drift check validates the record
+                        // against the owner's CURRENT row, re-read under this section's
+                        // locks, never a cast or guard-weakened substitution.
+                        val currentTargetHash = UploadFile.sha256OrNull(target)
+                        val driftProtected = currentTargetHash != null &&
+                            readPublishedProvenance(appContext, target)?.let { record ->
+                                record.contentHash != null && record.contentHash != currentTargetHash &&
+                                    FileController.getRealmInstance(userDrive).use { ownerRealm ->
+                                        runCatching { ownerRealm.refresh() }
+                                        FileController.getFileById(ownerRealm, liveOwner.id)
+                                    }?.let { ownerRow -> record.identifies(ownerRow, userDrive) } == true
+                            } == true
+                        OfflineFolderPolicy.isLocallyModified(
+                            offlineFileLastModifiedMillis = target.lastModified(),
+                            remoteLastModifiedAtSeconds = liveOwner.effectivePublishedBaseline,
+                        ) || driftProtected
+                    }
                 }
 
                 if (targetProtected) {

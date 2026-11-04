@@ -451,12 +451,13 @@ open class File(
      * a complete retained copy unreadable. The copy's generation is unverified and
      * verification is scheduled separately.
      */
-    fun isOfflineAndReadable(context: Context, offlineFile: IOFile, userDrive: UserDrive?): Boolean {
-        // CAPTURED ACCOUNT SCOPE IS REQUIRED (issue: round 20 #11): the caller's scope
-        // rides every readability decision — a null scope can never verify account
-        // ownership, so it never grants currentness and foreignness detection weakens to
-        // row/drive only. Every reader (previews, playback, SAF, worker) passes its
-        // captured scope.
+    fun isOfflineAndReadable(context: Context, offlineFile: IOFile, userDrive: UserDrive): Boolean {
+        // CAPTURED ACCOUNT SCOPE IS REQUIRED (issues: round 20 #11, round 21 build
+        // correction): the caller's scope rides every readability decision — a null scope
+        // can never verify account ownership, so it never grants currentness, and a null
+        // cannot even reach the scoped state decision anymore: the parameter is REQUIRED
+        // (static enforcement), and every reader (previews, playback, SAF, worker) passes
+        // its CAPTURED-FROM-ORIGIN scope.
         val state = storedOfflineCopyState(context, offlineFile, userDrive)
         // EXPLICIT readable states (issue: round 19 #12): a positively foreign copy is a
         // conflict — display and completion never serve another identity's bytes as this
