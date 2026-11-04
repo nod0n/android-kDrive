@@ -439,7 +439,10 @@ class FileInfoActionsView @JvmOverloads constructor(
                 userDrive = capturedUserDrive,
                 setExplicitPin = true,
             )
-            Utils.downloadAsOfflineFile(context, file = this)
+            // The enqueue uses the same captured scope as the preceding intent write (issue:
+            // round 8 #4): a default active-account scope would queue the download on
+            // whatever account is active when the request lands.
+            Utils.downloadAsOfflineFile(context, file = this, userDrive = capturedUserDrive)
             mainViewModel.updateOfflineFile.value = fileId
         }
         refreshBottomSheetUi(file = this)

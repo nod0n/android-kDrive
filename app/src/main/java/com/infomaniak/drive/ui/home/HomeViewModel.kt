@@ -24,6 +24,7 @@ import androidx.lifecycle.viewModelScope
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.FileActivity
+import com.infomaniak.drive.data.models.UserDrive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
@@ -89,7 +90,9 @@ class HomeViewModel : ViewModel() {
             val mergeAndCleanActivities = mergeAndCleanActivities(data)
             lastActivities.addAll(data)
             lastMergedActivities.addAll(mergeAndCleanActivities)
-            FileController.storeFileActivities(data)
+            // The request's own drive scopes the persistence (issue: round 8 #4): a default
+            // active-account scope would inspect another account's filesystem after a switch.
+            FileController.storeFileActivities(data, UserDrive(driveId = driveId))
 
             return LastActivityResult(
                 mergedActivities = mergeAndCleanActivities,

@@ -22,6 +22,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.ui.fileList.FileListFragment
 import com.infomaniak.drive.utils.AccountUtils
 import kotlinx.coroutines.Dispatchers
@@ -56,11 +57,15 @@ class RecentChangesViewModel : ViewModel() {
         isNewSort: Boolean = false,
     ): FileListFragment.FolderFilesResult? {
 
-        val apiResponse = ApiRepository.getLastModifiedFiles(AccountUtils.currentDriveId, cursor)
+        // The request's scope is captured BEFORE the call (issue: round 8 #4): the drive the
+        // listing was fetched for is the drive whose realm and filesystem the persistence
+        // must inspect, even if the active account changes before the response is stored.
+        val capturedUserDrive = UserDrive(driveId = AccountUtils.currentDriveId)
+        val apiResponse = ApiRepository.getLastModifiedFiles(capturedUserDrive.driveId, cursor)
         return if (apiResponse.isSuccess()) {
             apiResponse.data?.let { data ->
                 currentCursor = apiResponse.cursor
-                FileController.storeRecentChanges(data, isFirstPage)
+                FileController.storeRecentChanges(data, isFirstPage, capturedUserDrive)
                 FileListFragment.FolderFilesResult(
                     files = data,
                     isComplete = !apiResponse.hasMore,

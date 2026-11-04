@@ -24,6 +24,7 @@ import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.CursorApiResponse
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
+import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.IsComplete
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -96,7 +97,7 @@ class GalleryViewModel : ViewModel() {
         val apiResponse = ApiRepository.getLastGallery(driveId = driveId, cursor = cursor)
         return if (apiResponse.isSuccess()) {
             currentCursor = apiResponse.cursor
-            emitApiGallery(apiResponse, isFirstPage)
+            emitApiGallery(apiResponse, isFirstPage, driveId)
         } else {
             emitRealmGallery()
         }
@@ -105,13 +106,15 @@ class GalleryViewModel : ViewModel() {
     private fun emitApiGallery(
         apiResponse: CursorApiResponse<ArrayList<File>>,
         isFirstPage: Boolean,
+        driveId: Int,
     ): Pair<ArrayList<File>, Boolean> {
         val data = apiResponse.data
 
         val results = if (data.isNullOrEmpty()) {
             arrayListOf<File>() to true
         } else {
-            FileController.storeGalleryDrive(data, isFirstPage)
+            // The request's own drive scopes the persistence (issue: round 8 #4).
+            FileController.storeGalleryDrive(data, isFirstPage, UserDrive(driveId = driveId))
             val isComplete = !apiResponse.hasMore
             data to isComplete
         }
