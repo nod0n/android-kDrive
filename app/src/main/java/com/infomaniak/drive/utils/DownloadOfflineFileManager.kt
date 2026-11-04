@@ -55,6 +55,7 @@ import com.infomaniak.drive.data.services.DownloadWorker
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.NotificationUtils.downloadProgressNotification
+import io.realm.Realm
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.invoke
@@ -515,54 +516,118 @@ class DownloadOfflineFileManager(
             staged: IOFile,
             onPublishedLocked: (() -> Unit)? = null,
         ): PublicationOutcome = withContext(Dispatchers.IO) {
-            synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
-                coroutineContext.ensureActive()
+            // Destination ownership (issue: round 6 #3): the row owning the existing bytes at
+            // [target] is resolved BEFORE locking, then this publication holds BOTH the
+            // incoming file's and the owner's coordination locks in a stable ascending-id
+            // order, so the owner's mutators (cleanup, reconciliation, its own publications)
+            // are serialized with it and no lock ordering can deadlock.
+            val appContext = Realm.getApplicationContext()
+            val preLockOwner = appContext?.let { ctx ->
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)
+                }
+            }
+            val incomingLock = OfflineFileCoordination.lockFor(userDrive, file.id)
+            val ownerLock = preLockOwner?.id?.takeIf { it != file.id }?.let { OfflineFileCoordination.lockFor(userDrive, it) }
+            val lockedOwnerId: Int? = preLockOwner?.id
 
-                // Live intent: an inherited download requires a current pin or durable root
-                // ancestry (a materialized inherited flag alone never authorizes retention); a
-                // pin download accepts its own pending marker or explicit pin as the user's
-                // request.
-                val intentOk = FileController.getRealmInstance(userDrive).use { realm ->
-                    val live = FileController.getFileById(realm, file.id)
-                    val pinned = live?.isOffline == true
-                    val ancestryCovers = OfflineFolderController.isInsideActiveRoot(realm, file.id)
-                    if (isInheritedDownload) {
-                        pinned || ancestryCovers
-                    } else {
-                        pinned || live?.isMarkedAsOffline == true || ancestryCovers
+            when {
+                ownerLock == null -> synchronized(incomingLock) {
+                    publishLockedCore(userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId)
+                }
+                file.id < (preLockOwner?.id ?: file.id) -> synchronized(incomingLock) {
+                    synchronized(ownerLock) {
+                        publishLockedCore(userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId)
                     }
                 }
-
-                if (!intentOk) {
-                    runCatching { staged.delete() }
-                    return@withContext PublicationOutcome.SKIPPED_INVALIDATED
-                }
-
-                // The existing copy may have been edited or registered for upload during the
-                // transfer: those bytes always win over the freshly downloaded ones.
-                if (target.exists()) {
-                    val targetProtected = UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
-                            OfflineFolderPolicy.isLocallyModified(
-                                offlineFileLastModifiedMillis = target.lastModified(),
-                                remoteLastModifiedAtSeconds = file.lastModifiedAt,
-                            )
-                    if (targetProtected) {
-                        runCatching { staged.delete() }
-                        return@withContext PublicationOutcome.SKIPPED_PROTECTED
+                else -> synchronized(ownerLock) {
+                    synchronized(incomingLock) {
+                        publishLockedCore(userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId)
                     }
                 }
+            }
+        }
 
-                staged.setLastModified(file.getLastModifiedInMilliSecond())
-                if (staged.renameTo(target)) {
-                    // Run the owner's completion while the per-file lock is still held
-                    // (issue: round 5 #2).
-                    onPublishedLocked?.invoke()
-                    PublicationOutcome.PUBLISHED
+        /**
+         * Publication body, executed while the coordination locks of the incoming file (and of
+         * the established destination owner, if any) are held.
+         */
+        private fun publishLockedCore(
+            userDrive: UserDrive,
+            isInheritedDownload: Boolean,
+            file: File,
+            target: IOFile,
+            staged: IOFile,
+            onPublishedLocked: (() -> Unit)?,
+            lockedOwnerId: Int?,
+        ): PublicationOutcome {
+            // Live intent: an inherited download requires a current pin or durable root
+            // ancestry (a materialized inherited flag alone never authorizes retention); a
+            // pin download accepts its own pending marker or explicit pin as the user's
+            // request.
+            val intentOk = FileController.getRealmInstance(userDrive).use { realm ->
+                val live = FileController.getFileById(realm, file.id)
+                val pinned = live?.isOffline == true
+                val ancestryCovers = OfflineFolderController.isInsideActiveRoot(realm, file.id)
+                if (isInheritedDownload) {
+                    pinned || ancestryCovers
                 } else {
-                    SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
-                    runCatching { staged.delete() }
-                    PublicationOutcome.FAILED
+                    pinned || live?.isMarkedAsOffline == true || ancestryCovers
                 }
+            }
+
+            if (!intentOk) {
+                runCatching { staged.delete() }
+                return PublicationOutcome.SKIPPED_INVALIDATED
+            }
+
+            // The existing copy may have been edited, registered for upload, or re-owned by
+            // another row during the transfer: those bytes always win over the freshly
+            // downloaded ones (issue: round 6 #3).
+            if (target.exists()) {
+                val appContext = Realm.getApplicationContext()
+                val liveOwner = appContext?.let { ctx ->
+                    FileController.getRealmInstance(userDrive).use { realm ->
+                        OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)
+                    }
+                }
+
+                val targetProtected = UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
+                        UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(target).toString()) || when {
+                    // Without an application context the ownership cannot be established: preserve.
+                    appContext == null -> true
+                    // Unknown ownership (no row claims the path — e.g. new-file/path-reuse
+                    // residue): preserve, never overwrite.
+                    liveOwner == null -> true
+                    // The owner changed after the locks were taken: its mutators are not
+                    // serialized with this publication — defer and let the next attempt lock
+                    // the current owner correctly.
+                    liveOwner.id != lockedOwnerId -> true
+                    // Known owner: protect against ITS last clean revision, never the
+                    // incoming revision — the previous baseline declared another file's
+                    // older dirty copy unprotected and overwrote its sole edit.
+                    else -> OfflineFolderPolicy.isLocallyModified(
+                        offlineFileLastModifiedMillis = target.lastModified(),
+                        remoteLastModifiedAtSeconds = liveOwner.lastModifiedAt,
+                    )
+                }
+
+                if (targetProtected) {
+                    runCatching { staged.delete() }
+                    return PublicationOutcome.SKIPPED_PROTECTED
+                }
+            }
+
+            staged.setLastModified(file.getLastModifiedInMilliSecond())
+            if (staged.renameTo(target)) {
+                // Run the owner's completion while the per-file lock is still held
+                // (issue: round 5 #2).
+                onPublishedLocked?.invoke()
+                return PublicationOutcome.PUBLISHED
+            } else {
+                SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                runCatching { staged.delete() }
+                return PublicationOutcome.FAILED
             }
         }
 

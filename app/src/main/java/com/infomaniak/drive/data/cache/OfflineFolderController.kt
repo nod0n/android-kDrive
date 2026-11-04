@@ -380,6 +380,32 @@ object OfflineFolderController {
     }
 
     /**
+     * Resolves the row that owns the existing bytes at [target], by derived offline path, among
+     * candidates sharing the incoming file's parent and name (the incoming file's own row
+     * included). Returns null when no row claims that path: the bytes' ownership is unknown and
+     * must be preserved, not replaced (issue: round 6 #3). The returned row is a detached
+     * snapshot and stays readable after the Realm session closes.
+     */
+    internal fun destinationOwnerRow(
+        realm: Realm,
+        context: Context,
+        userDrive: UserDrive,
+        incoming: File,
+        target: IOFile,
+    ): File? {
+        val candidates = realm.where(File::class.java)
+            .equalTo(File::parentId.name, incoming.parentId)
+            .equalTo(File::name.name, incoming.name)
+            .findAll()
+            .createSnapshot()
+        for (candidate in candidates) {
+            val candidatePath = candidate.getOfflineFile(context, userDrive.userId)?.path ?: continue
+            if (candidatePath == target.path) return candidate
+        }
+        return null
+    }
+
+    /**
      * Reconciles an inherited or pinned copy at its OLD location with the NEW remote identity
      * after a rename/move, BEFORE the new metadata is committed (issue: round 4 #9):
      *  - a copy backing a pending upload keeps its bytes (the upload reads that exact path);
