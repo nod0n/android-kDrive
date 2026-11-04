@@ -490,19 +490,28 @@ open class UploadFile(
         /**
          * Cancels in-flight sessions for a folder, scoped by account and drive so one account's
          * cancellation cannot reach another account's snapshots in a shared folder (issue:
-         * round 5 #14).
+         * round 5 #14). The account/drive scope is REQUIRED: bulk session cancellation never
+         * runs without an explicit owner, and there is no current-account fallback for a
+         * missing one. Each record is cancelled against its OWN drive identity — the drive the
+         * session was actually created on — and its own captured-account client.
          */
-        fun cancelAllPendingFilesSessions(folderId: Int, userId: Int? = null, driveId: Int? = null) {
+        fun cancelAllPendingFilesSessions(folderId: Int, userId: Int, driveId: Int) {
             getRealmInstance().use { realm ->
                 realm.uploadTable
-                    .apply { folderId.let { equalTo(UploadFile::remoteFolder.name, folderId) } }
-                    .apply { userId?.let { equalTo(UploadFile::userId.name, it) } }
-                    .apply { driveId?.let { equalTo(UploadFile::driveId.name, it) } }
+                    .equalTo(UploadFile::remoteFolder.name, folderId)
+                    .equalTo(UploadFile::userId.name, userId)
+                    .equalTo(UploadFile::driveId.name, driveId)
                     .isNull(UploadFile::uploadAt.name)
                     .isNotNull(UploadFile::uploadToken.name)
-                    .findAll()?.onEach { uploadFileProxy ->
-                        with(uploadFileProxy) {
-                            ApiRepository.cancelSession(driveId, uploadToken!!, okHttpClient)
+                    .findAll()?.forEach { uploadFileProxy ->
+                        // Null-safe even though the query filters isNotNull: no unsafe
+                        // assertion on ownership-critical identity (round 5 compile fix).
+                        uploadFileProxy.uploadToken?.let { token ->
+                            ApiRepository.cancelSession(
+                                driveId = uploadFileProxy.driveId,
+                                uploadToken = token,
+                                okHttpClient = uploadFileProxy.okHttpClient,
+                            )
                         }
                     }
             }
