@@ -461,8 +461,13 @@ object FileController {
                     if (renameRequestStillCurrent(file.id, observedName, observedParentId, userDrive, realm)) {
                         val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm)
                         if (preserved) {
+                            // The SAME immutable observation is rechecked INSIDE the
+                            // committing transaction (issue: round 17 #9): a newer committed
+                            // identity aborts the write instead of rolling it back.
                             updateFile(file.id, realm, userDrive = userDrive) { localFile ->
-                                localFile.name = newName
+                                if (localFile.name == observedName && localFile.parentId == observedParentId) {
+                                    localFile.name = newName
+                                }
                             }
                         }
                     } else {
@@ -490,7 +495,11 @@ object FileController {
         userDrive: UserDrive?,
         customRealm: Realm?,
     ): Boolean {
-        val block: (Realm) -> Boolean = { realmInstance ->
+        val block: (Realm) -> Boolean = renameBlock@{ realmInstance ->
+            // REFRESH under the coordination the caller holds (issue: round 17 #9): the SAF
+            // caller supplies a Realm opened before the HTTP request — without a refresh its
+            // stale view passes the identity check while another rename/move has committed.
+            runCatching { realmInstance.refresh() }.onFailure { return@renameBlock false }
             val liveRow = getFileProxyById(fileId, customRealm = realmInstance)
             liveRow == null || (liveRow.name == observedName && liveRow.parentId == observedParentId)
         }
@@ -516,6 +525,9 @@ object FileController {
         // A lambda stored in a variable has no implicit label: the explicit [renameBlock]
         // label is what the early returns below target (round-6 compile fix).
         val block: (Realm) -> Boolean = renameBlock@{ realm ->
+            // Same refresh-before-source-resolution contract (issue: round 17 #9): a refresh
+            // failure STOPS the rename — preservation must never run on a stale Realm.
+            runCatching { realm.refresh() }.onFailure { return@renameBlock false }
             val liveRow = getFileProxyById(file.id, customRealm = realm) ?: return@renameBlock true
             if (liveRow.isFolder()) return@renameBlock true
             val oldOffline = liveRow.getOfflineFile(context, scope.userId)?.takeIf { it.exists() }
@@ -718,13 +730,27 @@ object FileController {
                         // row's local fields are preserved when accepting over it.
                         realm.executeTransaction {
                             val freshRow = getFileById(realm, actionFile.id)
-                            val accepted = when {
-                                freshRow == null -> actionFile.parentId == folderId
+                            // RESULTING-PARENT consistency is INDEPENDENT of freshness
+                            // (issue: round 17 #18): a payload naming another container must
+                            // never link into this one, however fresh it is; an accepted
+                            // move also removes the OBSOLETE backlink from the row's prior
+                            // container. Pseudocontainers keep their separate membership
+                            // rules (this branch runs for real folders only).
+                            val membershipOk = actionFile.parentId == folderId
+                            val accepted = membershipOk && when {
+                                freshRow == null -> true
                                 else -> !FileController.isStaleForAuthoritativeAction(freshRow, actionFile, actionAt, observed)
                             }
                             if (accepted) {
+                                val previousParentId = freshRow?.parentId
                                 if (freshRow != null) actionFile.keepOldLocalFilesData(freshRow)
                                 realmFolder.children.add(actionFile)
+                                if (freshRow != null && previousParentId != folderId && previousParentId != null) {
+                                    getFileById(realm, previousParentId)?.children
+                                        ?.removeAll { it.id == actionFile.id }
+                                }
+                            } else if (!membershipOk) {
+                                handled = false
                             } else {
                                 handled = false
                             }
@@ -1916,12 +1942,18 @@ object FileController {
                 OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, remoteFile.id)) {
                     realm.executeTransaction {
                         val freshRow = getFileById(realm, remoteFile.id)
-                        // No same-parent bypass (issue: round 16 #4): an existing row already
-                        // in this container still passes the COMPLETE freshness predicate —
-                        // a stale child payload must not overwrite its current identity.
-                        accepted = when {
-                            freshRow == null -> remoteFile.parentId == folderId
+                        // No same-parent bypass (issue: round 16 #4) AND resulting-parent
+                        // consistency independent of freshness (issue: round 17 #18): a
+                        // payload naming another container never links here; an accepted
+                        // move removes the obsolete backlink from its prior container.
+                        val membershipOk = remoteFile.parentId == folderId
+                        accepted = membershipOk && when {
+                            freshRow == null -> true
                             else -> !isStaleForAuthoritativeAction(freshRow, remoteFile, actionAt, observed)
+                        }
+                        if (accepted && freshRow != null && freshRow.parentId != folderId) {
+                            getFileById(realm, freshRow.parentId)?.children
+                                ?.removeAll { it.id == remoteFile.id }
                         }
                         if (accepted) {
                             if (freshRow != null) remoteFile.keepOldLocalFilesData(freshRow)

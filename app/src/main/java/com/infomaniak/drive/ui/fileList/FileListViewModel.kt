@@ -271,10 +271,12 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
             checkOfflineFilesJob.cancel()
             checkOfflineFilesJob = Job()
 
+            // The originating listing's account scope is captured BEFORE the coroutine is
+            // launched (issue: round 17 #19): reading the active account at execution time
+            // lets an account switch between capture and dispatch inspect and pin matching
+            // rows in another realm.
+            val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = folder.driveId)
             viewModelScope.launch(Dispatchers.IO + checkOfflineFilesJob) {
-                // The CAPTURED account scope keys the coordination and the Realm (issue: round
-                // 16 #19) — an account switch mid-recovery must not write another realm.
-                val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = folder.driveId)
                 files.filterNot { file -> file.isFolder() }.forEach { file ->
                     // ONE intent → file-lock → fresh-Realm transaction per candidate (issue:
                     // round 16 #19): the recovery used to be an uncoordinated pin writer
@@ -298,8 +300,26 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                                     if (OfflineFolderController.isInsideActiveRoot(realm, liveRow.id)) {
                                         return@executeTransaction
                                     }
-                                    if (liveRow.getOfflineFile(context, userDrive.userId)?.exists() == true) {
-                                        liveRow.isOffline = true
+                                    val original = liveRow.getOfflineFile(context, userDrive.userId)
+                                    if (original?.exists() == true) {
+                                        // NEVER infer pin intent from retained bytes (issue:
+                                        // round 17 #20): an unpin keeps a pending or
+                                        // retained-unsent original on disk by design —
+                                        // recovery must not resurrect the removed pin from
+                                        // file existence. Only bytes no upload record owns
+                                        // are treated as the durable intent a pin restores.
+                                        val originalUri = android.net.Uri.fromFile(original).toString()
+                                        val uploadOwned = UploadFile.hasPendingUpload(uri = originalUri) ||
+                                            UploadFile.hasRetainedUnsentUpload(uri = originalUri) ||
+                                            UploadFile.hasDurableOriginalRevisionOwnership(
+                                                fileName = liveRow.name,
+                                                remoteFolder = liveRow.parentId,
+                                                driveId = userDrive.driveId,
+                                                userId = userDrive.userId,
+                                                fileModifiedAt = java.util.Date(original.lastModified()),
+                                                fileSize = original.length(),
+                                            )
+                                        if (!uploadOwned) liveRow.isOffline = true
                                     }
                                 }
                             }

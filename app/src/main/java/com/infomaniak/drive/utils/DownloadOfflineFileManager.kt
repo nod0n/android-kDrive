@@ -134,22 +134,48 @@ class DownloadOfflineFileManager(
                         observedById = mapOf(remoteFile.id to file),
                     ).first()
                 }
+                // COMPLETE DESTINATION-CHAIN validation BEFORE any preservation side
+                // effect (issue: round 17 #8, superseding the round-16 #20 single-parent
+                // check that ran after the boundary): every ancestor of the incoming
+                // metadata's destination — not just the immediate parent, whose own ancestry
+                // could be missing — must currently exist, or the whole operation defers
+                // WITHOUT touching source bytes; otherwise preservation could migrate or
+                // snapshot/delete the old copy and only then discover the unusable
+                // destination, leaving the old metadata pointing at an emptied location.
+                // The same validation is re-applied to the boundary-committed identity
+                // before the metadata commit.
+                fun destinationChainExists(parentId: Int, realm: Realm): Boolean {
+                    var currentId: Int? = parentId
+                    val visited = mutableSetOf<Int>()
+                    while (currentId != null && currentId > 0) {
+                        if (!visited.add(currentId)) return false
+                        if (FileController.getFileById(realm, currentId) == null) return false
+                        currentId = FileController.getFileById(realm, currentId)?.parentId
+                    }
+                    return true
+                }
+                val prePreservationChainOk = remoteFile.parentId <= 0 ||
+                    FileController.getRealmInstance(userDrive).use { realm ->
+                        runCatching { realm.refresh() }
+                        destinationChainExists(remoteFile.parentId, realm)
+                    }
+                if (!prePreservationChainOk) {
+                    SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its destination chain is incomplete")
+                    return@withFileLock false
+                }
                 if (commitFile !== remoteFile) {
                     SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
                     return@withFileLock false
                 }
-                // CURRENT DESTINATION ANCESTRY VALIDATION before preservation and commit
-                // (issue: round 16 #20): a location-changing response is committed only when
-                // its destination parent still exists as a row — committing under a parent
-                // another flow just deleted would strand the row's ancestry under a ghost.
-                // The commit defers; a later listing or the ancestor chain rebuilds the
-                // destination first.
-                val destinationParentExists = commitFile.parentId <= 0 ||
+                // The SAME complete-chain validation holds THROUGH the commit (issue: round
+                // 17 #8): a chain broken during preservation defers without the metadata
+                // write.
+                val commitChainOk = commitFile.parentId <= 0 ||
                     FileController.getRealmInstance(userDrive).use { realm ->
-                        FileController.getFileById(realm, commitFile.parentId) != null
+                        destinationChainExists(commitFile.parentId, realm)
                     }
-                if (!destinationParentExists) {
-                    SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its destination parent ${commitFile.parentId} no longer exists")
+                if (!commitChainOk) {
+                    SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its destination chain broke during preservation")
                     return@withFileLock false
                 }
 
