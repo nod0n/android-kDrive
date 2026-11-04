@@ -92,6 +92,40 @@ object OfflineFolderUtils {
             // walk's to complete or clear.
             val intentGeneration = OfflineFolderController.rootIntentGeneration(rootFolderId)
 
+            // REQUEST-TIME SUBTREE TOKENS (issue: round 22 #11): the absent-subtree
+            // traversal collects its candidates from the CURRENT realm after HTTP — a
+            // descendant moved into the subtree after the request has no request-time
+            // observation and must never be cleared by an older response. Every row inside
+            // the walk root's tree as it stood BEFORE the first listing request (depth-one
+            // detached copies) is the candidate token set for every folder's cleanup in
+            // this walk. A deeper folder's own listing is younger than this capture, so
+            // its cleanup is CONSERVATIVE: rows that joined between the capture and that
+            // listing are deferred (the next walk re-captures), never over-cleared — a row
+            // that LEFT the subtree fails the expected-parent check instead. The map's
+            // parent links also reconstruct each subtree-cleanup boundary's REQUEST-TIME
+            // ancestor chain, pinning its RESOLVED LOCATION: an ancestor above a listed
+            // parent moving changes the boundary's resolved offline path without changing
+            // its parentId, and the old response is not the authority for the relocated
+            // location either.
+            val subtreeObservedById = run {
+                val map = HashMap<Int, File>()
+                val folderStack = ArrayDeque(listOf(rootFolderId))
+                val visitedFolders = mutableSetOf<Int>()
+                while (folderStack.isNotEmpty()) {
+                    val currentId = folderStack.removeFirst()
+                    if (!visitedFolders.add(currentId)) continue
+                    realm.where(File::class.java)
+                        .equalTo(File::parentId.name, currentId)
+                        .findAll()
+                        .createSnapshot()
+                        .forEach { row ->
+                            map.putIfAbsent(row.id, realm.copyFromRealm(row, 1))
+                            if (row.isFolder()) folderStack.addLast(row.id)
+                        }
+                }
+                map
+            }
+
             val fileIds = mutableListOf<Int>()
             val visitedFolderIds = mutableSetOf(rootFolderId)
             val folderQueue = ArrayDeque(listOf(rootFolderId))
@@ -124,6 +158,7 @@ object OfflineFolderUtils {
                     fileIds = fileIds,
                     folderQueue = folderQueue,
                     visitedFolderIds = visitedFolderIds,
+                    subtreeObservedById = subtreeObservedById,
                 )) {
                     FolderWalkOutcome.INCOMPLETE -> {
                         // The folder's membership is unknown: leave its coverage untouched,
@@ -183,6 +218,7 @@ object OfflineFolderUtils {
         fileIds: MutableList<Int>,
         folderQueue: ArrayDeque<Int>,
         visitedFolderIds: MutableSet<Int>,
+        subtreeObservedById: Map<Int, File>,
     ): FolderWalkOutcome {
         val allPages = mutableListOf<File>()
         var lastResponse: CursorApiResponse<List<File>>? = null
@@ -317,7 +353,9 @@ object OfflineFolderUtils {
         // root removed and revived (or a child whose membership was established by a newer
         // walk or move) while the response was in flight predates this stamp and is never
         // cleared by it.
-        cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds, requestGeneration, observedById)
+        cleanupConfirmedAbsentChildren(
+            context, realm, folderId, userDrive, remoteIds, requestGeneration, observedById, subtreeObservedById,
+        )
 
         // DEFERRALS keep the walk incomplete (issue: round 14 #8): an ambiguous identity tie
         // rejected for a missing observation is NOT a completed reconciliation — its retained
@@ -633,17 +671,56 @@ object OfflineFolderUtils {
         boundaryListedParentId: Int,
         traversalStartedGeneration: Long,
         boundaryObservation: File?,
+        subtreeObservedById: Map<Int, File>,
     ): (Realm, File) -> Boolean = { currentRealm, candidate ->
         val liveBoundary = FileController.getFileById(currentRealm, boundaryFolderId)
+        // RESOLVED-LOCATION AUTHORITY (issue: round 22 #11): the boundary's request-time
+        // ancestor chain — reconstructed from the pre-request subtree map's parent links —
+        // must be a prefix of its LIVE chain. An ancestor above the listed parent moving
+        // changes the boundary's resolved offline path WITHOUT changing its parentId (the
+        // listed-parent check alone cannot see it); the old response is not the authority
+        // for the relocated location. A live chain that comes up short (a missing ancestor
+        // row) also defers.
+        val requestAncestry = buildList {
+            var current: Int? = subtreeObservedById[boundaryFolderId]?.parentId
+            while (current != null && current > 0) {
+                add(current)
+                current = subtreeObservedById[current]?.parentId
+            }
+        }
+        val liveAncestry = if (liveBoundary == null) emptyList() else buildList {
+            var current: Int? = liveBoundary.parentId
+            val visited = mutableSetOf<Int>()
+            while (current != null && current > 0 && visited.add(current)) {
+                add(current)
+                current = FileController.getFileById(currentRealm, current)?.parentId
+            }
+        }
+        val boundaryLocationHolds = liveAncestry.size >= requestAncestry.size &&
+            requestAncestry.withIndex().all { (index, ancestorId) -> liveAncestry[index] == ancestorId }
         val boundaryHolds = liveBoundary != null &&
             liveBoundary.parentId == boundaryListedParentId &&
+            boundaryLocationHolds &&
             // The boundary's PRE-REQUEST OBSERVATION is carried into every queued
             // descendant's destructive predicate and compared INSIDE this committing
-            // transaction (issue: round 21 #21): a boundary restored or re-created since
-            // the request (same listed parent, newer identity) is a newer generation this
-            // response is not the authority for — the listed-parent check alone let its
-            // CURRENT descendants be cleared by the old traversal.
+            // transaction (issues: round 21 #21, round 22 #11): a boundary restored or
+            // re-created since the request (same listed parent, newer identity) is a newer
+            // generation this response is not the authority for — the listed-parent check
+            // alone let its CURRENT descendants be cleared by the old traversal. The
+            // observation comparison covers the publication identity too (the materialized
+            // published baseline is part of the observation).
             (boundaryObservation == null || FileController.isSameObservation(liveBoundary, boundaryObservation))
+        // CANDIDATE REQUEST-TIME TOKEN (issue: round 22 #11): the traversal's candidates
+        // are collected from the CURRENT realm after HTTP — a descendant moved INTO the
+        // subtree after the request has no request-time observation and is never cleared
+        // by this older response (fresh authority reconciles it); a descendant that moved
+        // WITHIN the subtree fails the expected-parent match (its request-time parent
+        // differs from its current one); a newer generation (publication, restore) fails
+        // the full observation comparison.
+        val requestObservation = subtreeObservedById[candidate.id]
+        val candidateTokenHolds = requestObservation != null &&
+            requestObservation.parentId == candidate.parentId &&
+            FileController.isSameObservation(candidate, requestObservation)
         var reachesBoundary = candidate.id == boundaryFolderId
         var currentId: Int? = FileController.getFileById(currentRealm, candidate.id)?.parentId
         val visited = mutableSetOf(candidate.id)
@@ -659,7 +736,7 @@ object OfflineFolderUtils {
             }
             currentId = FileController.getFileById(currentRealm, currentId)?.parentId
         }
-        boundaryHolds && reachesBoundary &&
+        boundaryHolds && candidateTokenHolds && reachesBoundary &&
             // FRESH ownership checks that do not depend on the generation (issue: round 14
             // #9): the boundary's own record and the candidate's own record (the
             // boundary-self case bypasses the chain walk entirely) are re-read INSIDE this
@@ -678,6 +755,7 @@ object OfflineFolderUtils {
         remoteFileIds: Set<Int>,
         requestGeneration: Long,
         observedById: Map<Int, File>,
+        subtreeObservedById: Map<Int, File>,
     ) {
         val result = OfflineFolderController.RemovalResult()
         // REQUEST-TIME freshness horizon (issues: round 11 #8, round 12 #9, round 18 #25):
@@ -726,6 +804,7 @@ object OfflineFolderUtils {
                     result,
                     traversalStartedGeneration,
                     boundaryObservation = observedChild,
+                    subtreeObservedById = subtreeObservedById,
                 )
             } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
                     isOffline = child.isOffline,
@@ -774,6 +853,7 @@ object OfflineFolderUtils {
         result: OfflineFolderController.RemovalResult,
         traversalStartedGeneration: Long,
         boundaryObservation: File?,
+        subtreeObservedById: Map<Int, File>,
     ) {
         val visited = mutableSetOf(rootFolderId)
         // folderId to the parent the traversal reached it from — the only parent relationship
@@ -808,6 +888,7 @@ object OfflineFolderUtils {
                     listedParentId,
                     traversalStartedGeneration,
                     boundaryObservation,
+                    subtreeObservedById,
                 ),
             )
             // The subtree's original listing authority dies with the folder's rejection
@@ -843,6 +924,7 @@ object OfflineFolderUtils {
                                 listedParentId,
                                 traversalStartedGeneration,
                                 boundaryObservation,
+                                subtreeObservedById,
                             ),
                         )
                     }
