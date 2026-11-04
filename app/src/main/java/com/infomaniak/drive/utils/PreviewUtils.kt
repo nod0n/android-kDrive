@@ -183,8 +183,14 @@ suspend fun downloadFile(
     shouldBePdf: Boolean,
     onProgress: (progress: Int) -> Unit,
     isPublicShared: Boolean,
+    userDrive: UserDrive = UserDrive(),
+    coordinated: Boolean = false,
 ) {
-    Dispatchers.IO { if (externalOutputFile.exists()) externalOutputFile.delete() }
+    // The destination is never deleted up front (issue: round 8 #2): the replacement is
+    // staged and only published once complete — coordinated publication for an offline-owned
+    // destination, an atomic staged rename for a plain cache destination. The previous
+    // delete-then-stream destroyed an edited offline copy as soon as the download started
+    // and left partial bytes at the destination on a cancelled download.
     val baseDownloadUrl = ApiRoutes.getDownloadFileUrl(file)
     val downloadUrl = if (file.isOnlyOfficePreview()) {
         baseDownloadUrl.appendQueryParams(mapOf("as" to "pdf"))
@@ -215,7 +221,16 @@ suspend fun downloadFile(
             throw UnsupportedOperationException("File not supported")
         }
 
-        createTempFile(it, externalOutputFile)
+        val outcome = DownloadOfflineFileManager.publishDownloadedCopy(
+            file = file,
+            target = externalOutputFile,
+            userDrive = userDrive,
+            isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+            coordinated = coordinated,
+        ) { staged -> createTempFile(it, staged) }
+        if (outcome == DownloadOfflineFileManager.PublicationOutcome.FAILED) {
+            throw Exception("Download error")
+        }
         onProgress(PROGRESS_COMPLETE)
     }
 }

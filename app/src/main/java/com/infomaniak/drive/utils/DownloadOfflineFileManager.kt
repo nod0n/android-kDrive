@@ -647,6 +647,64 @@ class DownloadOfflineFileManager(
             return outcome != PublicationOutcome.FAILED
         }
 
+        /**
+         * Coordinated final replacement for UI-driven re-downloads (preview, download dialog)
+         * (issue: round 8 #2): the response body is written to unique staging storage and only
+         * the final replacement of the destination goes through publication. For an
+         * offline-owned destination the shared coordinated publication re-runs ownership,
+         * revision, intent and cancellation checks under the per-file locks — a preflight check
+         * made before the request started (or the snapshot it took) can never authorize
+         * deleting a revision an editor saved to the path in the meantime. A plain cache
+         * destination has no ownership to protect, but the staged copy still makes the
+         * replacement an atomic rename, so a cancelled or failed download can no longer leave
+         * partial bytes — or delete existing bytes — at the destination. The destination is
+         * never touched before the staged copy is complete.
+         */
+        internal suspend fun publishDownloadedCopy(
+            file: File,
+            target: IOFile,
+            userDrive: UserDrive,
+            isInheritedDownload: Boolean,
+            coordinated: Boolean,
+            writeStaged: (IOFile) -> Unit,
+        ): PublicationOutcome {
+            if (!coordinated) {
+                // Stage inside the destination directory: same volume, so the final replace is
+                // an atomic rename.
+                val staged = IOFile(target.parentFile, "${target.name}.${UUID.randomUUID()}.part")
+                val outcome = runCatching {
+                    writeStaged(staged)
+                    staged.setLastModified(file.getLastModifiedInMilliSecond())
+                    if (staged.renameTo(target)) {
+                        PublicationOutcome.PUBLISHED
+                    } else {
+                        SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                        PublicationOutcome.FAILED
+                    }
+                }.onFailure { exception ->
+                    SentryLog.e(TAG, "Staged cache publication failed for ${target.path}", exception)
+                }.getOrDefault(PublicationOutcome.FAILED)
+                runCatching { if (staged.exists()) staged.delete() }
+                return outcome
+            }
+
+            val appContext = Realm.getApplicationContext()
+            if (appContext == null) {
+                SentryLog.e(TAG, "No application context: refusing uncoordinated offline publication")
+                return PublicationOutcome.FAILED
+            }
+            val staged = newStagedFile(appContext, file)
+            val outcome = runCatching {
+                writeStaged(staged)
+                publishStagedOfflineFile(userDrive, isInheritedDownload, file, target, staged)
+            }.onFailure { exception ->
+                SentryLog.e(TAG, "Staged offline publication failed for ${target.path}", exception)
+            }.getOrDefault(PublicationOutcome.FAILED)
+
+            runCatching { if (staged.exists()) staged.delete() }
+            return outcome
+        }
+
         fun getFailedDownloadWorkerOffline(context: Context) = WorkManager.getInstance(context).getWorkInfosLiveData(
             WorkQuery.Builder
                 .fromTags(arrayListOf(BulkDownloadWorker::class.java.toString(), DownloadWorker.TAG))

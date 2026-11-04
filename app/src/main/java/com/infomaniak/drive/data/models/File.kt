@@ -549,7 +549,15 @@ open class File(
                 }
             }
             navigateToDownloadDialog?.invoke()
-            downloadFile(cacheFile, file = this, shouldBePdf, onProgress, isPublicShared)
+            downloadFile(
+                cacheFile,
+                file = this,
+                shouldBePdf,
+                onProgress,
+                isPublicShared,
+                userDrive = userDrive,
+                coordinated = isOffline || isInOfflineFolder,
+            )
             Dispatchers.IO { cacheFile.setLastModified(getLastModifiedInMilliSecond()) }
         }
 

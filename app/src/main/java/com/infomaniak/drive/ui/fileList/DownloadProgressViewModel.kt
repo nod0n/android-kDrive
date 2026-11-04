@@ -70,7 +70,7 @@ class DownloadProgressViewModel : ViewModel() {
                 )
 
                 if (apiResponse.isSuccessful) {
-                    saveData(file, outputFile, apiResponse)
+                    saveData(file, outputFile, apiResponse, userDrive)
                 } else {
                     downloadProgressLiveData.postValue(null)
                 }
@@ -83,12 +83,27 @@ class DownloadProgressViewModel : ViewModel() {
         }
     }
 
-    private suspend fun saveData(file: File, outputFile: IOFile, response: Response) {
-        if (outputFile.exists()) outputFile.delete()
-        if (DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
-            downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
+    private suspend fun saveData(file: File, outputFile: IOFile, response: Response, userDrive: UserDrive) {
+        // The final replacement goes through the coordinated staged publication (issue:
+        // round 8 #2): the preflight check above ran before the request, so it cannot
+        // authorize deleting a revision saved to the offline path in the meantime — the
+        // publication re-checks ownership, revision, intent and cancellation under the
+        // per-file locks. An offline-owned destination never holds partial or deleted bytes
+        // while the download runs.
+        val outcome = DownloadOfflineFileManager.publishDownloadedCopy(
+            file = file,
+            target = outputFile,
+            userDrive = userDrive,
+            isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+            coordinated = file.isOffline || file.isInOfflineFolder,
+        ) { staged ->
+            if (!DownloadOfflineFileManager.saveRemoteData(TAG, response, staged)) {
+                throw java.io.IOException("Remote data could not be saved")
+            }
         }
-        outputFile.setLastModified(file.getLastModifiedInMilliSecond())
+        downloadProgressLiveData.postValue(
+            if (outcome == DownloadOfflineFileManager.PublicationOutcome.FAILED) null else PROGRESS_COMPLETE
+        )
     }
 
     companion object {
