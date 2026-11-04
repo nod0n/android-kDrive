@@ -237,6 +237,11 @@ class DownloadOfflineFileManager(
                 clearPendingMarker(file.id)
                 true
             }
+            PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                // A newer generation owns the file's pending state and completion (issue:
+                // round 8 #9): this transfer's skip clears no marker and runs no completion.
+                true
+            }
             PublicationOutcome.FAILED -> false
         }
     }
@@ -684,7 +689,7 @@ class DownloadOfflineFileManager(
             userDrive: UserDrive,
             isInheritedDownload: Boolean,
             coordinated: Boolean,
-            writeStaged: (IOFile) -> Unit,
+            writeStaged: suspend (IOFile) -> Unit,
         ): PublicationOutcome {
             if (!coordinated) {
                 // Stage inside the destination directory: same volume, so the final replace is

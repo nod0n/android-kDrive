@@ -30,6 +30,7 @@ import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.utils.IOFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -102,7 +103,7 @@ class DownloadProgressViewModel : ViewModel() {
             }
         }
         downloadProgressLiveData.postValue(
-            if (outcome == DownloadOfflineFileManager.PublicationOutcome.FAILED) null else PROGRESS_COMPLETE
+            if (outcome == PublicationOutcome.FAILED) null else PROGRESS_COMPLETE
         )
     }
 

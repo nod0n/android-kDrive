@@ -42,6 +42,8 @@ import com.infomaniak.drive.data.api.ApiRoutes
 import com.infomaniak.drive.data.api.ApiRoutes.appendQueryParams
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.ui.SaveExternalFilesActivity
 import com.infomaniak.drive.ui.SaveExternalFilesActivityArgs
 import com.infomaniak.drive.ui.fileList.DownloadProgressViewModel.Companion.PROGRESS_COMPLETE
@@ -228,7 +230,7 @@ suspend fun downloadFile(
             isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
             coordinated = coordinated,
         ) { staged -> createTempFile(it, staged) }
-        if (outcome == DownloadOfflineFileManager.PublicationOutcome.FAILED) {
+        if (outcome == PublicationOutcome.FAILED) {
             throw Exception("Download error")
         }
         onProgress(PROGRESS_COMPLETE)
