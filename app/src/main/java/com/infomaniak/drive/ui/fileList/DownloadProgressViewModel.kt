@@ -68,7 +68,11 @@ class DownloadProgressViewModel : ViewModel() {
                     return@launch
                 }
                 StoredOfflineCopyState.READABLE_UNVERIFIED -> {
-                    OfflineFolderController.scheduleOfflineVerification(fileId = file.id, userDrive = userDrive)
+                    OfflineFolderController.scheduleOfflineVerification(
+                        fileId = file.id,
+                        userDrive = userDrive,
+                        observedGeneration = outputFile.lastModified() / 1_000L,
+                    )
                     downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
                     return@launch
                 }

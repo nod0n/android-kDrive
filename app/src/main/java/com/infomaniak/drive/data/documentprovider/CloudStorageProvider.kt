@@ -856,6 +856,7 @@ class CloudStorageProvider : DocumentsProvider() {
                     OfflineFolderController.scheduleOfflineVerification(
                         fileId = file.id,
                         userDrive = UserDrive(userId = userDrive.userId, driveId = userDrive.driveId),
+                        observedGeneration = offlineFile.lastModified() / 1_000L,
                     )
                 }
                 return ParcelFileDescriptor.open(offlineFile, accessMode)

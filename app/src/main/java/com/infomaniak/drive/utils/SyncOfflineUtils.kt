@@ -39,6 +39,7 @@ import com.infomaniak.drive.data.models.file.LastFileAction
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.SyncUtils.syncImmediately
+import com.infomaniak.drive.utils.Utils
 import io.realm.Realm
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -82,6 +83,17 @@ object SyncOfflineUtils {
         // provenance reconciliation did not conclude keep their snapshot owned; each pass
         // re-runs the reconciliation and disposes only concluded snapshots.
         UploadFile.retryUnreconciledOriginals()
+        DriveInfosController.getDrives(AccountUtils.currentUserId).forEach { drive ->
+            ensureActive()
+            val userDrive = UserDrive(driveId = drive.id)
+            // Durable verification re-drive (issue: round 18 #17): an explicit pin outside
+            // any walked root whose verification enqueue failed keeps its pending marker as
+            // retry evidence — each pass re-enqueues the scoped verification work for
+            // markers whose copy is still not proven current. The marker clears on the
+            // verification's publication (and proven-current copies never match), so the
+            // re-drive is bounded. Scoped per drive — never the re-derived active account.
+            redriveUnverifiedPins(context, userDrive)
+        }
         DriveInfosController.getDrives(AccountUtils.currentUserId).forEach { drive ->
             ensureActive()
             val userDrive = UserDrive(driveId = drive.id)
@@ -150,6 +162,48 @@ object SyncOfflineUtils {
                 }
             }
         }
+    }
+
+    /**
+     * Durable verification re-drive for explicit pins (issue: round 18 #17): a pending
+     * verification marker on an explicitly pinned row is RETRY EVIDENCE that its scoped
+     * verification work is not (yet) durably enqueued or completed — an unchanged legacy
+     * pin outside any walked root otherwise stays unverified indefinitely. Each pass
+     * re-enqueues the scoped download worker for every such marker whose retained copy is
+     * still not proven current; the marker clears on the verification's publication (and
+     * proven-current copies never match), so the re-drive is bounded by unfinished work.
+     * The row's scope is the record's own account/drive — never the active account.
+     */
+    private fun redriveUnverifiedPins(context: Context, userDrive: UserDrive) {
+        runCatching {
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(File::class.java)
+                    .equalTo(File::isOffline.name, true)
+                    .equalTo(File::isMarkedAsOffline.name, true)
+                    .notEqualTo(File::type.name, File.Type.DIRECTORY.value)
+                    .findAll()
+                    .map { realm.copyFromRealm(it, 0) }
+            }
+        }.onFailure { exception ->
+            SentryLog.e("SyncOffline", "Failed to collect unverified pins for re-drive", exception)
+        }.getOrDefault(emptyList())
+            .forEach { pinnedRow ->
+                ensureActive()
+                val offlineFile = pinnedRow.getOfflineFile(context, userDrive.userId) ?: return@forEach
+                if (offlineFile.exists() && pinnedRow.isOfflineAndProvenCurrent(context, offlineFile, userDrive)) {
+                    return@forEach
+                }
+                runCatching {
+                    Utils.downloadAsOfflineFileOperation(
+                        context = context,
+                        file = pinnedRow,
+                        userDrive = userDrive,
+                        isInheritedDownload = false,
+                    )
+                }.onFailure { exception ->
+                    SentryLog.e("SyncOffline", "Failed to re-drive verification work for ${pinnedRow.id}", exception)
+                }
+            }
     }
 
     /**

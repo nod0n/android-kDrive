@@ -31,6 +31,7 @@ import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.OfflineFolderPolicy
 import com.infomaniak.drive.utils.SyncUtils.syncImmediately
+import com.infomaniak.drive.utils.Utils
 import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
 import java.util.Date
@@ -1260,22 +1261,68 @@ object OfflineFolderController {
     internal enum class CopyProtection { NONE, PENDING_UPLOAD, UPLOADED, DIRTY }
 
     /**
-     * Schedules generation VERIFICATION for a readable-but-unproven offline copy (issue:
-     * round 17 #15): legacy pre-provenance bytes stay readable, and the pending-download
-     * marker drives the walk/worker verification, so a legacy copy is neither blocked behind
-     * its missing provenance nor silently treated as current. Coordinated like every intent
-     * write, idempotent; the verification's publication records the generation and clears
-     * the marker.
+     * Schedules generation VERIFICATION for a readable-but-unproven offline copy (issues:
+     * round 17 #15, round 18 #15/#17): the pending-download marker drives the walk/worker
+     * verification, so a legacy copy is neither blocked behind its missing provenance nor
+     * silently treated as current. Coordinated like every intent write, idempotent.
+     *
+     * CONDITIONAL (issue: round 18 #15): the marker is written only when the CURRENT row
+     * still carries the durable intent that authorizes retention — an explicit pin, or
+     * inherited coverage by a still-active root matching the inherited flag — and only for
+     * the generation the caller observed; a row that has since advanced to newer work is
+     * not marked for the old request. Verification never CREATES offline authorization:
+     * the delayed call of a preview whose copy was unpinned meanwhile (or whose root was
+     * removed) is a no-op and cannot resurrect the removed intent.
+     *
+     * DURABLE ENQUEUE (issue: round 18 #17): after the conditional commit the scoped
+     * verification/download work is enqueued — a marker alone guarantees no worker when an
+     * explicit pin sits outside any walked root, so an unchanged legacy pin stayed
+     * unverified indefinitely while the dialog reported completion. A failed enqueue keeps
+     * the marker as its durable retry evidence (the sync's re-drive re-enqueues from it).
      */
-    fun scheduleOfflineVerification(fileId: Int, userDrive: UserDrive) {
+    fun scheduleOfflineVerification(fileId: Int, userDrive: UserDrive, observedGeneration: Long? = null) {
+        val appContext = Realm.getApplicationContext()
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, fileId) {
-                FileController.getRealmInstance(userDrive).use { realm ->
+                val detachedRow = FileController.getRealmInstance(userDrive).use { realm ->
                     runCatching { realm.refresh() }
+                    var marked = false
                     realm.executeTransaction {
                         val liveRow = FileController.getFileById(realm, fileId) ?: return@executeTransaction
-                        if (liveRow.isMarkedAsOffline) return@executeTransaction
+                        if (liveRow.isMarkedAsOffline) {
+                            marked = true
+                            return@executeTransaction
+                        }
+                        // CURRENT durable intent only (issue: round 18 #15).
+                        val hasDurableIntent = liveRow.isOffline ||
+                            (liveRow.isInOfflineFolder && isInsideActiveRoot(realm, fileId))
+                        if (!hasDurableIntent) return@executeTransaction
+                        // OBSERVED generation (issue: round 18 #15): a caller that observed a
+                        // copy's generation requests verification FOR THAT GENERATION.
+                        if (observedGeneration != null && observedGeneration > 0 &&
+                            liveRow.lastModifiedAt > observedGeneration
+                        ) return@executeTransaction
                         liveRow.isMarkedAsOffline = true
+                        marked = true
+                    }
+                    if (marked) FileController.getFileById(realm, fileId)?.let { realm.copyFromRealm(it, 0) } else null
+                }
+                if (detachedRow != null && appContext != null) {
+                    runCatching {
+                        Utils.downloadAsOfflineFileOperation(
+                            context = appContext,
+                            file = detachedRow,
+                            userDrive = userDrive,
+                            // Follows the CURRENT authorization: a covered non-pinned row
+                            // must never manufacture a pin through the verification work.
+                            isInheritedDownload = !detachedRow.isOffline,
+                        )
+                    }.onFailure { exception ->
+                        SentryLog.e(
+                            TAG,
+                            "Failed to enqueue verification work for $fileId; marker retained as retry evidence",
+                            exception,
+                        )
                     }
                 }
             }

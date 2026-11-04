@@ -318,39 +318,51 @@ open class File(
     }
 
     /**
-     * State of the retained offline copy of this row (issues: round 17 #13/#14/#15) — three
-     * DISTINCT answers, never conflated:
+     * State of the retained offline copy of this row (issues: round 17 #13/#14/#15, round 18
+     * #13/#14) — the ONE fresh, scoped content-state decision used by every entry and
+     * completion path. Three DISTINCT answers, never conflated:
      *  - [StoredOfflineCopyState.PROVEN_CURRENT]: the bytes are PROVEN to be the accepted
-     *    remote generation — coarse baseline AND the published generation's recorded
-     *    provenance (complete baseline plus accepted revisedAt/updatedAt identity, and a
-     *    known version when the row carries one) all match.
+     *    remote generation — the record names this owner at this location and its COMPLETE
+     *    generation identity (a KNOWN row version matching the record's, modification
+     *    baseline, accepted revisedAt/updatedAt) matches the row's accepted metadata. An
+     *    UNKNOWN row version is never currentness: a versionless R2 listing with R1's
+     *    coarse identity must not accept R1's record as proof of R2 — the copy stays
+     *    readable and the authoritative version-bearing request resolves it (issue: round
+     *    18 #13).
      *  - [StoredOfflineCopyState.READABLE_UNVERIFIED]: a complete copy exists and stays
-     *    READABLE (legacy pre-provenance bytes, or a coarse match whose generation cannot
-     *    be proven) — access is preserved, but it is never proof of current content;
-     *    verification is scheduled instead.
-     *  - [StoredOfflineCopyState.ABSENT_OR_STALE]: nothing usable at the path.
+     *    READABLE — judged against the generation IT was published under (its own
+     *    provenance record's baseline, or the row's effective published baseline for legacy
+     *    copies), so a retained, complete R1 copy remains available to reads after a newer
+     *    backward-dated R2 changes the accepted metadata (issue: round 18 #14). It is never
+     *    proof of current content; verification is scheduled instead.
+     *  - [StoredOfflineCopyState.ABSENT_OR_STALE]: nothing usable at the path — missing,
+     *    truncated, or bytes whose own generation does not cohere.
      */
     fun storedOfflineCopyState(context: Context, offlineFile: IOFile, userDrive: UserDrive? = null): StoredOfflineCopyState {
         if (!(isOffline || isInOfflineFolder)) return StoredOfflineCopyState.ABSENT_OR_STALE
-        if (!((offlineFile.lastModified() / 1_000L) == lastModifiedAt && isIntactFile(offlineFile))) {
-            return StoredOfflineCopyState.ABSENT_OR_STALE
-        }
-        // GENERATION PROVENANCE of the published bytes (issues: round 16 #13, round 17 #13):
-        // coarse mtime and size cannot distinguish two same-second, same-size revisions, and
-        // an UNKNOWN row version is not equality with an arbitrary published generation — the
-        // record's COMPLETE baseline (version, modification time) AND its accepted revision
-        // identity (revisedAt, updatedAt) must match the row's accepted metadata.
+        if (!(offlineFile.exists() && isIntactFile(offlineFile))) return StoredOfflineCopyState.ABSENT_OR_STALE
+        // OWN-GENERATION coherence (issue: round 18 #14): the copy's usability is judged
+        // against the generation it was published under — never against current remote
+        // metadata alone, which a backward-dated newer revision changes without the bytes
+        // becoming unusable.
         val provenance = DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile)
-            ?: return StoredOfflineCopyState.READABLE_UNVERIFIED
+        val ownGeneration = provenance?.lastModifiedAt ?: effectivePublishedBaseline
+        if ((offlineFile.lastModified() / 1_000L) != ownGeneration) return StoredOfflineCopyState.ABSENT_OR_STALE
+        if (provenance == null) return StoredOfflineCopyState.READABLE_UNVERIFIED
         // OWNER identity (issue: round 18 #12): a record inherited across a path reuse by
         // another row (or, when the caller's account scope is known, published by another
         // account on a shared drive) is not provenance for these bytes.
         if (!provenance.identifies(this, userDrive)) return StoredOfflineCopyState.READABLE_UNVERIFIED
-        if (provenance.lastModifiedAt != lastModifiedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
         val rowVersion = version?.number ?: 0
-        if (rowVersion > 0 && provenance.version != rowVersion) return StoredOfflineCopyState.READABLE_UNVERIFIED
-        if (revisedAt > 0 && provenance.revisedAt > 0 && provenance.revisedAt != revisedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
-        if (provenance.updatedAt > 0 && provenance.updatedAt != updatedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        // UNKNOWN GENERATION IS NEVER PROOF (issue: round 18 #13).
+        if (rowVersion <= 0) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (provenance.version != rowVersion) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        // A record that cannot name the row's KNOWN revision identity does not prove
+        // currentness (issue: round 18 #13) — missing/nonpositive recorded fields no longer
+        // bypass the comparisons.
+        if (revisedAt > 0 && provenance.revisedAt != revisedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (updatedAt > 0 && provenance.updatedAt != updatedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (provenance.lastModifiedAt != lastModifiedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
         return StoredOfflineCopyState.PROVEN_CURRENT
     }
 
@@ -363,14 +375,16 @@ open class File(
         storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.PROVEN_CURRENT
 
     /**
-     * Whether a complete, readable offline copy exists WITHOUT proving its generation —
-     * access decisions (previews, playback, SAF reads) use this so legacy pre-provenance
-     * bytes stay available immediately after upgrade (issue: round 17 #15); the copy's
-     * generation is unverified and verification is scheduled separately.
+     * Whether a usable, readable offline copy exists WITHOUT proving its generation — the
+     * SAME fresh content-state decision (issue: round 18 #14), so access decisions
+     * (previews, playback, SAF reads) keep a retained, complete copy available against its
+     * OWN published generation: legacy pre-provenance bytes stay available immediately
+     * after upgrade (issue: round 17 #15), and a newer metadata change alone never renders
+     * a complete retained copy unreadable. The copy's generation is unverified and
+     * verification is scheduled separately.
      */
     fun isOfflineAndReadable(context: Context, offlineFile: IOFile): Boolean =
-        (isOffline || isInOfflineFolder) &&
-            ((offlineFile.lastModified() / 1_000L) == lastModifiedAt && isIntactFile(offlineFile))
+        storedOfflineCopyState(context, offlineFile) != StoredOfflineCopyState.ABSENT_OR_STALE
 
     fun getConvertedPdfCache(context: Context, userDrive: UserDrive): IOFile {
         val folder = IOFile(context.cacheDir, "converted_pdf/${userDrive.userId}/${userDrive.driveId}")
@@ -613,7 +627,30 @@ open class File(
                 else -> getCacheFile(context, userDrive)
             }
 
-            fileNeedDownload = if (isOnlyOfficePreview()) isObsolete(cacheFile) else isObsoleteOrNotIntact(cacheFile)
+            fileNeedDownload = when {
+                isOnlyOfficePreview() -> isObsolete(cacheFile)
+                // UNIFIED fresh content-state decision at the conversion entry (issue: round
+                // 18 #14): the previous isObsoleteOrNotIntact heuristic accepted same-size
+                // old bytes whose mtime satisfied a newer BACKWARD-DATED revision (R1 at
+                // 100 vs revision at 90), bypassing the provenance model entirely; and a
+                // newer metadata change alone no longer forces a re-download of a complete
+                // retained copy, which stays readable against its own generation.
+                isOffline || isInOfflineFolder -> when (storedOfflineCopyState(context, cacheFile, userDrive)) {
+                    StoredOfflineCopyState.PROVEN_CURRENT -> false
+                    StoredOfflineCopyState.READABLE_UNVERIFIED -> {
+                        // Usable retained copy: serve it now; its generation is verified
+                        // separately (issues: round 18 #14/#15).
+                        OfflineFolderController.scheduleOfflineVerification(
+                            fileId = id,
+                            userDrive = userDrive,
+                            observedGeneration = cacheFile.lastModified() / 1_000L,
+                        )
+                        false
+                    }
+                    StoredOfflineCopyState.ABSENT_OR_STALE -> true
+                }
+                else -> isObsoleteOrNotIntact(cacheFile)
+            }
         }
 
         if (fileNeedDownload) {

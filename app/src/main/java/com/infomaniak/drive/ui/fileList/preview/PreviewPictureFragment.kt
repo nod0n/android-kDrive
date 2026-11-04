@@ -197,6 +197,7 @@ class PreviewPictureFragment : PreviewFragment() {
                     OfflineFolderController.scheduleOfflineVerification(
         fileId = file.id,
         userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId),
+        observedGeneration = it.lastModified() / 1_000L,
     )
                 }
                 it

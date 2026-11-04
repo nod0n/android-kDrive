@@ -107,6 +107,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
                 OfflineFolderController.scheduleOfflineVerification(
                     fileId = file.id,
                     userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId),
+                    observedGeneration = stored.lastModified() / 1_000L,
                 )
             }
             readable
