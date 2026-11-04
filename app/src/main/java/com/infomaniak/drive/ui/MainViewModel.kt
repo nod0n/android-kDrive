@@ -426,6 +426,10 @@ class MainViewModel(
                             },
                             currentDriveRealm,
                             userDrive,
+                            // This add also COMMITS the post-move identity (issue: round 14
+                            // #11): the row still holds the source parent, so the fresh-row
+                            // container check must not apply.
+                            revalidateExistingRow = false,
                         )
                     } else {
                         // Preservation incomplete (pending upload, protected destination): the row

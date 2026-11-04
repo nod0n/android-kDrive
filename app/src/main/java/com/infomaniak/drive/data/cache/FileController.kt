@@ -92,13 +92,16 @@ object FileController {
     fun getParentFileProxy(fileId: Int, userDrive: UserDrive? = null, realm: Realm? = null): File? {
         val block: (Realm) -> File? = { currentRealm ->
             getFileById(currentRealm, fileId)?.let { file ->
-                // The AUTHORITATIVE parent relationship resolves the proxy (issue: round 13
-                // #12): the backlink matching parentId wins, a missing backlink is resolved
-                // BY ID from the known parent, and the first-positive backlink is only the
-                // legacy fallback for rows without a real parent id.
+                // The AUTHORITATIVE parent relationship resolves the proxy (issues: round 13
+                // #12, round 14 #11): the backlink matching parentId wins, a missing backlink
+                // resolves BY ID from the KNOWN parent — every positive id, ROOT included —
+                // and when that parent is absent the resolution returns UNAVAILABLE rather
+                // than trusting a stale extra backlink. The first-positive backlink is the
+                // legacy fallback ONLY for rows without a known parent id (virtual
+                // ancestry).
                 file.localParent?.firstOrNull { it.id == file.parentId && it.id > 0 }
-                    ?: file.parentId.takeIf { it > ROOT_ID }?.let { getFileById(currentRealm, it) }
-                    ?: file.localParent?.firstOrNull { it.id > 0 }
+                    ?: file.parentId.takeIf { it > 0 }?.let { getFileById(currentRealm, it) }
+                    ?: file.localParent?.firstOrNull { it.id > 0 }?.takeIf { file.parentId <= 0 }
             }
         }
 
@@ -174,10 +177,11 @@ object FileController {
         val parents = file.localParent?.createSnapshot()
         val folder = parents?.firstOrNull { it.id == file.parentId && it.id > 0 }
             // A known authoritative parent with NO matching backlink DEFERS the derivation
-            // (issue: round 13 #12): falling back to an inconsistent real-folder backlink
-            // would derive the abandoned location's path. Rows without a real parent id
-            // (virtual containers) keep the legacy first-positive fallback.
-            ?: parents?.firstOrNull { it.id > 0 }?.takeIf { file.parentId <= ROOT_ID }
+            // (issues: round 13 #12, round 14 #11): falling back to an inconsistent
+            // real-folder backlink would derive the abandoned location's path. ROOT_ID is a
+            // REAL parent id and defers like any other; rows without a known parent id
+            // (parentId <= 0, virtual containers) keep the legacy first-positive fallback.
+            ?: parents?.firstOrNull { it.id > 0 }?.takeIf { file.parentId <= 0 }
         return when {
             folder == null -> ""
             folder.id == ROOT_ID -> recPath.insert(0, "/${file.name}").toString()
@@ -884,7 +888,13 @@ object FileController {
         }
     }
 
-    fun addChild(localFolderId: Int, newFile: File, realm: Realm, userDrive: UserDrive? = null) {
+    fun addChild(
+        localFolderId: Int,
+        newFile: File,
+        realm: Realm,
+        userDrive: UserDrive? = null,
+        revalidateExistingRow: Boolean = true,
+    ) {
         // Authoritative-parent membership (issue: round 13 #12): a real-folder child addition
         // links a row only when the row's own parent relationship names THIS folder — the
         // linking caller's basis can be stale (the child may have moved while an ancestor
@@ -902,7 +912,22 @@ object FileController {
                     userDrive ?: UserDrive(),
                     listOf(localFolderId, newFile.id),
                 ) {
-                    realm.executeTransaction { runCatching { localFolder.children.add(newFile) } }
+                    realm.executeTransaction {
+                        // TRANSACTION-FRESH membership (issue: round 14 #11): re-read the
+                        // committed row under the locks. EXISTING-ROW LINKING (the chain
+                        // resolvers) requires the committed row to still name this container
+                        // — its basis can predate another writer's move. An add that also
+                        // COMMITS the child's post-move identity (the UI move) passes
+                        // [revalidateExistingRow] = false: the passed object IS the intended
+                        // new identity and the row still holds the source parent.
+                        val freshChild = getFileById(realm, newFile.id)
+                        val links = when {
+                            freshChild == null -> true
+                            !revalidateExistingRow -> true
+                            else -> freshChild.parentId == localFolderId
+                        }
+                        if (links) runCatching { localFolder.children.add(newFile) }
+                    }
                 }
             }
         }
@@ -1069,6 +1094,15 @@ object FileController {
                 ?: return
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withLocksFor(userDrive, listOf(parentResponse.id, remoteFile.id)) {
+                    // Validate the COMPLETE graph operation BEFORE child preservation (issue:
+                    // round 14 #6): when the parent's fresh live row would REJECT the cascade
+                    // (a newer committed parent), preserving the child's bytes toward A's
+                    // location would strand them — the newer parent's own flow owns the child.
+                    runCatching { realm.refresh() }
+                    val parentOldRow = getFileById(realm, parentResponse.id)
+                    if (parentOldRow != null && isStaleReplacement(parentOldRow, parentResponse)) {
+                        return@withLocksFor
+                    }
                     // Shared upsert boundary (issue: round 6 #4): the details cascade can also
                     // replace the file's identity; preserve the owned copy at the old location,
                     // inside the same coordination as the commit.
@@ -1088,31 +1122,42 @@ object FileController {
                         if (preservedFile.parentId == parentResponse.id) RealmList(preservedFile) else RealmList()
                     // The parent upsert CASCADES the embedded child row (issues: round 11 #3,
                     // round 13 #4): the PARENT's acceptance is also checked against the
-                    // transaction-fresh row (another writer can commit its newer location while
-                    // this HTTP response was in flight) with its local fields preserved, and
-                    // the cascaded child's acceptance is re-checked inside the committing
-                    // transaction.
-                    val parentOldRow = getFileById(realm, parentResponse.id)
+                    // transaction-fresh row with its local fields preserved, and the accepted
+                    // child is EXPLICITLY merged below (issue: round 14 #6) — the local-field
+                    // preservation replaces this list with the parent's existing children and
+                    // must not silently discard the cascade's child.
                     insertOrUpdateFile(
                         realm,
                         parentResponse,
                         parentOldRow,
                         userDrive = userDrive,
                         // Absence inserts — the cascade legitimately creates the missing
-                        // ancestor (issue: round 13 #4).
+                        // ancestor (issue: round 13 #4). Unreachable-false under the held
+                        // locks (the prospective gate above passed on the same row), kept as
+                        // the conditional-commit contract.
                         acceptIf = { live -> live == null || !isStaleReplacement(live, parentResponse) },
                         moreTransaction = {
                             val liveChild = getFileById(realm, preservedFile.id)
-                            if (liveChild != null && isStaleReplacement(liveChild, preservedFile)) {
-                                // Membership re-derived from the LIVE row: substitute only
-                                // when it still hangs from this parent; otherwise the cascade
-                                // carries no link for it at all.
-                                if (liveChild.parentId == parentResponse.id) {
-                                    val index = parentResponse.children.indexOfFirst { child -> child.id == preservedFile.id }
-                                    if (index >= 0) parentResponse.children[index] = liveChild
-                                } else {
+                            val index = parentResponse.children.indexOfFirst { child -> child.id == preservedFile.id }
+                            when {
+                                // The child row does not exist yet: add the accepted cascade
+                                // child back when its authoritative parent is this container.
+                                liveChild == null ->
+                                    if (preservedFile.parentId == parentResponse.id && index < 0) {
+                                        parentResponse.children.add(preservedFile)
+                                    }
+                                // Membership re-derived from the LIVE row: a row that moved
+                                // away carries no link in this cascade at all.
+                                liveChild.parentId != parentResponse.id ->
                                     parentResponse.children.removeAll { it.id == preservedFile.id }
-                                }
+                                // Existing member: substitute the live row when the cascade's
+                                // identity is stale against it.
+                                index >= 0 ->
+                                    if (isStaleReplacement(liveChild, preservedFile)) {
+                                        parentResponse.children[index] = liveChild
+                                    }
+                                // Present row, absent from the (replaced) list: link it.
+                                else -> parentResponse.children.add(liveChild)
                             }
                         },
                     )
@@ -1812,7 +1857,7 @@ object FileController {
         okHttpClient: OkHttpClient,
     ) {
         if (parentId == 0) return
-        if (tryLinkToExistingParent(realm, parentId, childId)) return
+        if (tryLinkToExistingParent(realm, parentId, childId, userDrive)) return
 
         val remoteParent = saveRemoteFileAncestorToDb(realm, parentId, childId, driveId, userDrive, okHttpClient) ?: return
         resolveAndLinkFileAncestorsChain(realm, remoteParent.parentId, parentId, driveId, userDrive, okHttpClient)
@@ -1842,19 +1887,21 @@ object FileController {
                 acceptIf = { live -> live == null || !isStaleReplacement(live, remoteParent) },
             )
         }
-        linkChildToParent(realm, parentId = parentId, childId = childId)
+        linkChildToParent(realm, parentId = parentId, childId = childId, userDrive = userDrive)
         return remoteParent
     }
 
-    private fun tryLinkToExistingParent(realm: Realm, parentId: Int, childId: Int): Boolean {
+    private fun tryLinkToExistingParent(realm: Realm, parentId: Int, childId: Int, userDrive: UserDrive): Boolean {
         return hasFile(realm, parentId).also { _ ->
-            linkChildToParent(realm = realm, parentId = parentId, childId = childId)
+            linkChildToParent(realm = realm, parentId = parentId, childId = childId, userDrive = userDrive)
         }
     }
 
-    private fun linkChildToParent(realm: Realm, parentId: Int, childId: Int) {
+    private fun linkChildToParent(realm: Realm, parentId: Int, childId: Int, userDrive: UserDrive) {
         getFileById(realm, childId)?.let { childProxy ->
-            addChild(localFolderId = parentId, newFile = childProxy, realm = realm)
+            // The CAPTURED scope keys the locks (issue: round 14 #11): a scope-less default
+            // would key another account's lock namespace after an account switch.
+            addChild(localFolderId = parentId, newFile = childProxy, realm = realm, userDrive = userDrive)
         }
     }
 
