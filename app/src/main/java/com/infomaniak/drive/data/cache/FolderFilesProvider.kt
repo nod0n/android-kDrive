@@ -569,27 +569,56 @@ object FolderFilesProvider {
         userDrive: UserDrive,
         observed: File?,
     ): Boolean {
-        val liveRow = FileController.getFileById(realm, fileId)
-        if (liveRow == null) return true // nothing left to remove: consume
-        // [FileAction] carries no timestamp: the cursor bound of
-        // [FileController.isStaleForAuthoritativeAction] applies nothing here; the generation,
-        // updatedAt and observation gates carry the authority.
-        val stale = when {
-            actionFile != null -> FileController.isStaleForAuthoritativeAction(liveRow, actionFile, null, observed)
-            else -> true
-        }
-        if (stale) return false
-
-        FileController.getParentFile(fileId = fileId, realm = realm)?.let { localFolder ->
-            if (localFolder.id != currentFolder.id) return@let
-
-            if (actionType == FileActivityType.FILE_MOVE_OUT) {
-                FileController.updateFile(localFolder.id, realm) { it.children.remove(actionFile) }
-            } else {
-                FileController.removeFile(fileId, customRealm = realm, recursive = false, userDrive = userDrive)
+        // [FileAction] carries no timestamp: a payload-less destructive activity has NO
+        // deletion authority (issue: round 16 #15).
+        if (actionFile == null) return false
+        // ONE coordinated operation (issue: round 17 #12): intent monitor → ordered locks
+        // (container + file) → fresh Realm; the COMPLETE action predicate re-applies against
+        // the FRESH row INSIDE the section (a restore or newer generation committed since the
+        // pre-gate read defers the deletion), preservation runs before any byte or row
+        // deletion, and a directory's descendant-ownership revalidates INSIDE the deleting
+        // transaction.
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withLocksFor(userDrive, listOf(currentFolder.id, fileId)) {
+                runCatching { realm.refresh() }
+                val liveRow = FileController.getFileById(realm, fileId) ?: return@withLocksFor true
+                if (FileController.isStaleForAuthoritativeAction(liveRow, actionFile, null, observed)) {
+                    return@withLocksFor false
+                }
+                val parentRow = FileController.getFileById(realm, currentFolder.id)
+                if (parentRow == null) return@withLocksFor false
+                when (actionType) {
+                    FileActivityType.FILE_MOVE_OUT -> {
+                        realm.executeTransaction { parentRow.children.removeAll { it.id == fileId } }
+                        true
+                    }
+                    else -> {
+                        val context = Realm.getApplicationContext() ?: return@withLocksFor false
+                        if (liveRow.isFolder()) {
+                            // Required ancestry revalidated INSIDE the deleting transaction
+                            // (issue: round 17 #12): coverage or pin writers can establish
+                            // required descendants up to the last moment.
+                            var deletable = false
+                            realm.executeTransaction {
+                                deletable = !OfflineFolderController.hasLocallyOwnedDescendant(liveRow.id, realm)
+                                if (deletable) liveRow.deleteFromRealm()
+                            }
+                            deletable
+                        } else {
+                            when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(liveRow, userDrive)) {
+                                OfflineFolderController.PreservationOutcome.CONTENT_SAFE -> {
+                                    runCatching { liveRow.deleteCaches(context, userDrive.userId) }
+                                    realm.executeTransaction { if (liveRow.isValid) liveRow.deleteFromRealm() }
+                                    true
+                                }
+                                // Preservation pending: row, bytes and cursor retained.
+                                OfflineFolderController.PreservationOutcome.PRESERVED -> false
+                            }
+                        }
+                    }
+                }
             }
         }
-        return true
     }
 
     private fun FileAction.upsertAction(
@@ -600,8 +629,12 @@ object FolderFilesProvider {
         observed: File?,
     ): Boolean {
         if (actionFile == null) {
-            FileController.removeFile(fileId, customRealm = realm, recursive = false, userDrive = userDrive)
-            return true
+            // CONSISTENT safe resolution (issue: round 17 #11): a missing payload for an
+            // update/unknown activity has NO deletion authority — the row and the cursor are
+            // retained, never removed by an absent payload. The authoritative resolution is
+            // the retained cursor's next activities pass and the periodic folder walk, both
+            // of which this deferral keeps reachable.
+            return false
         } else {
             if (actionFile.isImporting()) MqttClientWrapper.start(actionFile.externalImport?.id)
             return FileController.upsertActionFile(realm, currentFolder.id, actionFile, userDrive, observed = observed)

@@ -239,6 +239,29 @@ object SyncOfflineUtils {
 
         when (fileAction.lastAction) {
             FileActivityType.FILE_DELETE, FileActivityType.FILE_TRASH -> {
+                // AUTHORITATIVE RESOLVING FETCH for payloadless destructive actions
+                // (issue: round 17 #10), OUTSIDE the coordination: current remote existence —
+                // not timestamp heuristics alone — decides. A live remote row proves the
+                // trash stale (consume, advance the cursor, delete nothing); a verified
+                // missing object grants deletion authority; any other answer defers with
+                // the copy and cursor retained.
+                if (fileAction.file == null) {
+                    val actionAt0 = fileAction.lastActionAt
+                    if (actionAt0 == null || actionAt0 <= 0) return
+                    val probe = runCatching {
+                        ApiRepository.getFileDetails(File(id = fileAction.fileId, driveId = userDrive.driveId))
+                    }.getOrNull()
+                    when {
+                        probe == null || !probe.isSuccess() -> return
+                        probe.data != null -> {
+                            FileController.updateFile(fileAction.fileId, realm, userDrive = userDrive) { mutableFile ->
+                                if (actionAt0 > mutableFile.lastActionAt) mutableFile.lastActionAt = actionAt0
+                            }
+                            return
+                        }
+                        // verified object_not_found: fall through to the coordinated deletion
+                    }
+                }
                 // Deletion joins the per-action freshness protocol (issue: round 15 #3):
                 // intent monitor → file lock → fresh Realm BEFORE any byte or coverage side
                 // effect — an old trash response arriving after a restore, a move under
@@ -268,6 +291,12 @@ object SyncOfflineUtils {
                             else ->
                                 actionAt == null || actionAt <= 0 ||
                                     freshRow.lastActionAt >= actionAt ||
+                                    // A destructive timestamp OLDER than the CURRENT row's
+                                    // non-Sync metadata never authorizes deletion (issue:
+                                    // round 17 #10): a listing can restore F (updatedAt 300)
+                                    // while an old payloadless trash (210) is in flight —
+                                    // the observation-uniformity check alone passes it.
+                                    freshRow.updatedAt >= actionAt ||
                                     localFile == null ||
                                     freshRow.parentId != localFile.parentId ||
                                     freshRow.name != localFile.name ||
