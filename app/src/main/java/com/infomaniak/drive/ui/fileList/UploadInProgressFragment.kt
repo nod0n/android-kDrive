@@ -58,7 +58,8 @@ class UploadInProgressFragment : FileListFragment() {
     override val noItemsIcon = R.drawable.ic_upload
     override val noItemsTitle = R.string.uploadInProgressNoFile
 
-    private var pendingUploadFiles = mutableListOf<UploadFile>()
+    /** The upload records actually displayed, as detached copies safe to read off the main thread. */
+    private var displayedUploadRecords = mutableListOf<UploadFile>()
     private var cancellationConfirmationDialog: AlertDialog? = null
     private val cancellationProgressDialog by lazy {
         Utils.createProgressDialog(requireContext(), R.string.allCancellationInProgress)
@@ -136,7 +137,7 @@ class UploadInProgressFragment : FileListFragment() {
 
     private fun setupOnStopUploadButtonClicked() {
         fileAdapter.onStopUploadButtonClicked = { fileName ->
-            pendingUploadFiles.find { it.fileName == fileName }?.let { syncFile ->
+            displayedUploadRecords.find { it.fileName == fileName }?.let { syncFile ->
                 val title = getString(R.string.uploadInProgressCancelFileUploadTitle, syncFile.fileName)
 
                 cancellationConfirmationDialog = createCancellationConfirmationDialog(requireContext(), title) {
@@ -201,17 +202,30 @@ class UploadInProgressFragment : FileListFragment() {
             var needPopBackStack = false
             uploadFile?.let {
                 it.uploadToken?.let { token ->
-                    ApiRepository.cancelSession(AccountUtils.currentDriveId, token, it.okHttpClient)
+                    // The session belongs to the displayed record's own drive (issue:
+                    // round 6 #9): the current drive would cancel the wrong session when the
+                    // view shows shared-drive uploads.
+                    ApiRepository.cancelSession(it.driveId, token, it.okHttpClient)
                 }
                 UploadFile.deleteAll(listOf(it))
             }
             folderId?.let {
-                // Scope bulk cancellation/removal to the viewed account and drive (issue: round 5 #14).
-                val userId = AccountUtils.currentUserId
-                val driveId = AccountUtils.currentDriveId
-                UploadFile.cancelAllPendingFilesSessions(folderId = it, userId = userId, driveId = driveId)
-                if (isPendingFolders()) UploadFile.deleteAll(null, userId = userId, driveId = driveId)
-                else UploadFile.deleteAll(folderId = it, userId = userId, driveId = driveId)
+                // Cancel/remove by the DISPLAYED uploads' actual ownership (issue: round 6 #9):
+                // the pending list includes shared-drive uploads whose owner differs from the
+                // current drive, so one fixed current-account scope would cancel and remove
+                // nothing for them.
+                displayedUploadRecords.toList()
+                    .groupBy { uploadRecord -> uploadRecord.userId to uploadRecord.driveId }
+                    .forEach { (scope, _) ->
+                        val (recordUserId, recordDriveId) = scope
+                        UploadFile.cancelAllPendingFilesSessions(
+                            folderId = it,
+                            userId = recordUserId,
+                            driveId = recordDriveId,
+                        )
+                        if (isPendingFolders()) UploadFile.deleteAll(null, userId = recordUserId, driveId = recordDriveId)
+                        else UploadFile.deleteAll(folderId = it, userId = recordUserId, driveId = recordDriveId)
+                    }
 
                 fileRecyclerView?.post { fileAdapter.setFiles(listOf()) }
 
@@ -264,6 +278,9 @@ class UploadInProgressFragment : FileListFragment() {
 
         private fun downloadPendingFolders() {
             UploadFile.getAllPendingFolders(uploadInProgressViewModel.realmUpload)?.let { pendingFolders ->
+                // Detached copies of the displayed records: their ownership scopes the
+                // bulk cancellation (issue: round 6 #9).
+                displayedUploadRecords = uploadInProgressViewModel.realmUpload.copyFromRealm(pendingFolders, 0)
                 if (pendingFolders.count() == 1) navigateToFirstFolder(pendingFolders) else showPendingFolders()
             } ?: binding.noFilesLayout.toggleVisibility(true)
         }
@@ -304,7 +321,7 @@ class UploadInProgressFragment : FileListFragment() {
             swipeRefreshLayout.isRefreshing = true
             uploadInProgressViewModel.getPendingFiles(folderId).observe(viewLifecycleOwner) {
                 it?.let { (files, uploadFiles) ->
-                    pendingUploadFiles = uploadFiles
+                    displayedUploadRecords = uploadFiles
 
                     toolbar.menu.findItem(R.id.restartItem).isVisible = true
                     toolbar.menu.findItem(R.id.closeItem).isVisible = true
