@@ -528,10 +528,15 @@ object FolderFilesProvider {
                 // We used to have this condition, but it doesn't exist on the ios side, according to commit it was an api fix.
                 // returnResponse[fileId]?.createdAt?.time == createdAt.time
                 if (returnResponse[fileId] == null) {
-                    removeAction(realm, currentFolder, actionFile, userDrive)
-                    returnResponse[fileId] = this
+                    // A DEFERRED destructive action is not recorded as handled (issue: round
+                    // 16 #15/#17): its unresolved work must stay visible to the retained
+                    // cursor and to later duplicates.
+                    val handled = removeAction(realm, currentFolder, actionFile, userDrive, observedChildren[fileId])
+                    if (handled) returnResponse[fileId] = this
+                    handled
+                } else {
+                    true
                 }
-                true
             }
             else -> {
                 if (actionType == null) {
@@ -549,7 +554,37 @@ object FolderFilesProvider {
         }
     }
 
-    private fun FileAction.removeAction(realm: Realm, currentFolder: File, actionFile: File?, userDrive: UserDrive) {
+    /**
+     * Destructive folder-activity removal with complete request authority (issue: round 16
+     * #15): the removal applies only against the FRESH live row — a payload-bearing action
+     * through the complete action predicate (the request observation resolves ties), a
+     * payload-less action only when a timestamp exists, the row still matches the request
+     * observation's identity, and no newer non-Sync metadata committed over it. A legacy
+     * action without any timestamp has no deletion authority at all. Returns false when
+     * deferred: the copy and the unresolved cursor are retained.
+     */
+    private fun FileAction.removeAction(
+        realm: Realm,
+        currentFolder: File,
+        actionFile: File?,
+        userDrive: UserDrive,
+        observed: File?,
+    ): Boolean {
+        val liveRow = FileController.getFileById(realm, fileId)
+        if (liveRow == null) return true // nothing left to remove: consume
+        val actionAt = createdAt?.time
+        val stale = when {
+            actionFile != null -> FileController.isStaleForAuthoritativeAction(liveRow, actionFile, actionAt, observed)
+            else ->
+                actionAt == null || actionAt <= 0 ||
+                    liveRow.lastActionAt >= actionAt / 1_000L ||
+                    observed == null ||
+                    liveRow.parentId != observed.parentId ||
+                    liveRow.name != observed.name ||
+                    liveRow.updatedAt > observed.updatedAt
+        }
+        if (stale) return false
+
         FileController.getParentFile(fileId = fileId, realm = realm)?.let { localFolder ->
             if (localFolder.id != currentFolder.id) return@let
 
@@ -559,6 +594,7 @@ object FolderFilesProvider {
                 FileController.removeFile(fileId, customRealm = realm, recursive = false, userDrive = userDrive)
             }
         }
+        return true
     }
 
     private fun FileAction.upsertAction(

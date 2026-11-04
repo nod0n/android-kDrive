@@ -245,22 +245,34 @@ object SyncOfflineUtils {
                 // another active root, or a redownload must not delete the current clean
                 // copy and coverage. When the action carries a file row, the complete
                 // action predicate gates it (the detached [localFile] is the request
-                // anchor); a legacy payload-less action applies the cursor bound alone, and
-                // ambiguous authority defers (nothing is cleared).
+                // anchor). PAYLOAD-LESS authority (issue: round 16 #15): the cursor bound
+                // alone let a delayed trash delete a copy that a newer listing had
+                // restored, moved or redownloaded (updatedAt advanced without the cursor) —
+                // the destructive action now also requires the fresh row to still match the
+                // request observation's identity and to hold no newer non-Sync metadata,
+                // and a legacy action with NO timestamp has no ordering authority at all:
+                // it defers, retaining the copy and the unresolved cursor.
                 synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withFileLock(userDrive, fileAction.fileId) {
                         runCatching { realm.refresh() }
                         val freshRow = FileController.getFileById(realm, fileAction.fileId)
                             ?: return@withFileLock
                         val actionAt = fileAction.lastActionAt
-                        val stale =
-                            (fileAction.file != null && FileController.isStaleForAuthoritativeAction(
+                        val stale = when {
+                            fileAction.file != null -> FileController.isStaleForAuthoritativeAction(
                                 freshRow,
                                 fileAction.file,
                                 actionAt,
                                 observed = localFile,
-                            )) ||
-                                (actionAt != null && actionAt > 0 && freshRow.lastActionAt >= actionAt)
+                            )
+                            else ->
+                                actionAt == null || actionAt <= 0 ||
+                                    freshRow.lastActionAt >= actionAt ||
+                                    localFile == null ||
+                                    freshRow.parentId != localFile.parentId ||
+                                    freshRow.name != localFile.name ||
+                                    freshRow.updatedAt > localFile.updatedAt
+                        }
                         if (stale) return@withFileLock
                         val freshIoFile = freshRow.getOfflineFile(context, userDrive.userId)
                         if (freshRow.isOffline) {
