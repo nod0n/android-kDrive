@@ -108,20 +108,20 @@ class GalleryViewModel : ViewModel() {
     val needToRestoreFiles get() = galleryApiResult.isInitialized
 
     /**
-     * Resources shared by every load of the same captured account+drive: one mutation lock and
-     * one HTTP client whose authentication is bound to that exact user.
+     * Resources shared by every load of the same captured account+drive within this ViewModel:
+     * one HTTP client whose authentication is bound to that exact user, forwarding invalid
+     * sessions to the established recovery handler. The cache mutation lock, by contrast, is
+     * process-wide and keyed by the actual Realm file identity, so it is shared across
+     * ViewModel replacements (see [mutationLocks]).
      */
     private class DriveResources(userDrive: UserDrive) {
 
-        /** Serializes gallery cache mutations (stores, refresh resets, orphan cleanup). */
-        val mutationLock = ReentrantLock()
-
         val httpClient: OkHttpClient = OkHttpClient.Builder().apply {
             val tokenInterceptorListener = TokenInterceptorListenerProvider.tokenInterceptorListenerByUserId(
-                refreshTokenError = {
-                    // A failed token refresh surfaces here as a page failure and reaches the
-                    // retry UI; account removal stays the global handler's responsibility.
-                },
+                // Forward the captured User to the established recovery handler
+                // (AccountUtils.onRefreshTokenError, set by MainApplication): an invalid
+                // session for this account must notify and remove it like every other screen.
+                refreshTokenError = { user -> AccountUtils.onRefreshTokenError?.invoke(user) },
                 userId = userDrive.userId,
             )
             addInterceptor(Interceptor { chain ->
@@ -228,8 +228,13 @@ class GalleryViewModel : ViewModel() {
             // thread; the detached result is dispatched to Main afterwards.
             val result = withContext(Dispatchers.IO) {
                 FileController.getRealmInstance(userDrive).use { realm ->
+                    // The mutation boundary is keyed by the actual Realm file identity and is
+                    // process-wide: every gallery ViewModel instance mutating this same
+                    // database shares this exact lock, so a replacement screen's refresh can
+                    // never interleave with an obsolete load's commit.
+                    val mutationLock = mutationLocks.getOrPut(realm.configuration.realmFileName) { ReentrantLock() }
                     if (ignoreCloud) emitCachedGallery(userDrive, filter, generation, realm)
-                    else fetchGallery(userDrive, filter, isFirstPage, startCursor, generation, job, resources, httpClient, realm)
+                    else fetchGallery(userDrive, filter, isFirstPage, startCursor, generation, job, httpClient, mutationLock, realm)
                 }
             }
 
@@ -269,8 +274,8 @@ class GalleryViewModel : ViewModel() {
         startCursor: String?,
         generation: Long,
         job: Job,
-        resources: DriveResources,
         httpClient: OkHttpClient,
+        mutationLock: ReentrantLock,
         realm: Realm,
     ): GalleryResult {
         var isStoringFirstPage = isFirstPage
@@ -279,11 +284,12 @@ class GalleryViewModel : ViewModel() {
         val outcome = GalleryPageScanner<File>(predicate = { it.matchesMediaFilter(filter) }).scan(
             startCursor = startCursor,
             onRawPage = { page ->
-                // Serialize cache mutations per captured account: the liveness check and the
-                // transaction form one boundary inside the same lock that every newer load's
-                // writes must acquire, so an obsolete load can never commit after a
-                // replacement refresh (a stale first page would otherwise reset it).
-                resources.mutationLock.withLock {
+                // Serialize cache mutations on the shared Realm-identity boundary: the
+                // liveness check and the transaction form one section inside the same lock
+                // every newer load's writes (from this or a replacement ViewModel) must
+                // acquire, so an obsolete load can never commit after a replacement refresh
+                // (a stale first page would otherwise reset it).
+                mutationLock.withLock {
                     if (job.isActive && generation == loadGeneration) {
                         didFetchAnyPage = true
                         // Store every raw page unfiltered so the offline cache keeps covering
@@ -309,7 +315,7 @@ class GalleryViewModel : ViewModel() {
         }
 
         if (isFirstPage && didFetchAnyPage) {
-            resources.mutationLock.withLock {
+            mutationLock.withLock {
                 if (job.isActive && generation == loadGeneration) FileController.removeOrphanFiles(realm)
             }
         }
@@ -348,5 +354,16 @@ class GalleryViewModel : ViewModel() {
     override fun onCleared() {
         getGalleryJob?.cancel()
         super.onCleared()
+    }
+
+    companion object {
+        /**
+         * Process-wide gallery cache mutation boundaries, keyed by the actual Realm file
+         * identity (`realm.configuration.realmFileName`): they must outlive any single
+         * ViewModel so a replacement gallery screen's refresh cannot interleave with an
+         * obsolete load's commit. The in-boundary liveness check (job active + generation)
+         * stays per load.
+         */
+        private val mutationLocks = ConcurrentHashMap<String, ReentrantLock>()
     }
 }
