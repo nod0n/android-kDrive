@@ -296,7 +296,15 @@ class DownloadOfflineFileManager(
             OfflineFileCoordination.withFileLock(userDrive, file.id) {
                 if (cacheFile.exists() &&
                     (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt &&
-                    file.isIntactFile(cacheFile)
+                    file.isIntactFile(cacheFile) &&
+                    // EXACT CAPTURED PUBLICATION IDENTITY (issue: round 21 #24): coarse
+                    // size/mtime alone cannot distinguish this transfer's cache from a
+                    // DIFFERENT generation a concurrent writer published with the same
+                    // size/mtime — and this cleanup also runs when promotion was REJECTED
+                    // for an unproven cache. Only the cache's own provenance record
+                    // certifying THESE bytes for THIS row's exact generation authorizes
+                    // the deletion; a different or unproven cache is preserved.
+                    cacheBytesProvenCurrent(context, cacheFile, file, userDrive)
                 ) {
                     deletePublishedProvenance(context, cacheFile)
                     runCatching { cacheFile.delete() }
@@ -1589,7 +1597,14 @@ class DownloadOfflineFileManager(
                         // replace the cache between the check and the deletion.
                         if (cacheFile.exists() &&
                             (cacheFile.lastModified() / 1_000L) == authoritativeFile.lastModifiedAt &&
-                            authoritativeFile.isIntactFile(cacheFile)
+                            authoritativeFile.isIntactFile(cacheFile) &&
+                            // EXACT CAPTURED PUBLICATION IDENTITY (issue: round 21 #24):
+                            // the promotion's cleanup runs under the publication's locks —
+                            // a concurrent writer can have published a DIFFERENT generation
+                            // with the same size/mtime over the cache source; only the
+                            // cache's own provenance record certifying THESE bytes for THIS
+                            // exact generation authorizes the deletion.
+                            cacheBytesProvenCurrent(context, cacheFile, authoritativeFile, userDrive)
                         ) {
                             deletePublishedProvenance(context, cacheFile)
                             runCatching { cacheFile.delete() }

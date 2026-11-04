@@ -373,15 +373,26 @@ object FileController {
         customRealm: Realm? = null,
         recursive: Boolean = true,
         userDrive: UserDrive? = null,
+        originFolderId: Int? = null,
     ) {
         val block: (Realm) -> Unit? = { realm ->
             // Child recursion runs BEFORE this row's coordination (no nested lock
             // acquisition): each child re-runs the full protocol under its own section,
             // and the captured account flows through the recursion (issue: round 5 #6).
+            // Every descendant carries the ORIGINAL removal boundary (issue: round 21 #5):
+            // the top call's own id — so each recursive section can revalidate that its
+            // row is still inside the subtree this removal was authorized for.
             if (recursive) {
                 getFileById(realm, fileId)?.children?.createSnapshot()?.forEach {
                     if (!keepFiles.contains(it.id)) {
-                        removeFile(it.id, keepFileCaches, keepFiles, realm, userDrive = userDrive)
+                        removeFile(
+                            it.id,
+                            keepFileCaches,
+                            keepFiles,
+                            realm,
+                            userDrive = userDrive,
+                            originFolderId = originFolderId ?: fileId,
+                        )
                     }
                 }
             }
@@ -403,6 +414,16 @@ object FileController {
                         // stays and a later pass retries.
                         runCatching { realm.refresh() }.onFailure { return@withFileLock }
                         val file = getFileById(realm, fileId) ?: return@withFileLock
+                        // ORIGINAL REMOVAL AUTHORITY (issue: round 21 #5): a recursive call
+                        // is authorized by the ORIGINAL boundary's removal only while the
+                        // row is still INSIDE that boundary's subtree — a child that moved
+                        // out between its collection and its coordination (its recursive
+                        // call waited on the locks) is no longer this removal's to delete:
+                        // its current copy and row are another location's content now.
+                        // Fresh path ownership alone never establishes deletion authority.
+                        if (originFolderId != null && !ancestryReachesBoundary(realm, file.parentId, originFolderId)) {
+                            return@withFileLock
+                        }
                         val resolvedUserDrive = userDrive ?: UserDrive(driveId = file.driveId)
                         // Required ancestry (issue: round 5 #10): a folder row whose descendants
                         // remain locally owned must survive — deleting it strands the preserved
@@ -465,6 +486,22 @@ object FileController {
             Unit
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
+    }
+
+    /**
+     * Whether the live ancestry from [fromParentId] still reaches [boundaryId] (issue: round
+     * 21 #5): the original removal authority covers only rows still inside its subtree.
+     * Bounded walk over the live parent chain; a missing ancestor or the root ends it.
+     */
+    private fun ancestryReachesBoundary(realm: Realm, fromParentId: Int, boundaryId: Int): Boolean {
+        var currentId: Int? = fromParentId
+        var hops = 0
+        while (currentId != null && currentId > 0 && hops < 64) {
+            if (currentId == boundaryId) return true
+            currentId = getFileById(realm, currentId)?.parentId
+            hops++
+        }
+        return false
     }
 
     fun renameFile(
@@ -742,7 +779,19 @@ object FileController {
             val destinationContainerId = if (membershipOk) null else actionFile.parentId
             // A mismatched payload whose destination row is absent has no container to link
             // into: defer WITHOUT side effects — no preservation runs (issue: round 18 #9).
-            if (!membershipOk && getFileById(realm, destinationContainerId ?: 0) == null) {
+            // COMPLETE FRESH DESTINATION ANCESTRY BEFORE PRESERVATION (issue: round 21 #6):
+            // the container row's EXISTENCE is not a complete chain — anchoring, snapshot
+            // and relocation must never run for a destination whose ancestry is missing
+            // locally (an unchanged-path dirty snapshot previously registered before the
+            // ancestry rejection); this deferral is side-effect-free and the resolving pass
+            // repairs the chain.
+            val destinationReady = if (membershipOk) {
+                destinationChainExists(realm, folderId)
+            } else {
+                getFileById(realm, destinationContainerId ?: 0) != null &&
+                    destinationChainExists(realm, destinationContainerId ?: 0)
+            }
+            if (!destinationReady) {
                 handled = false
             } else OfflineFileCoordination.withLocksFor(
                 userDrive,

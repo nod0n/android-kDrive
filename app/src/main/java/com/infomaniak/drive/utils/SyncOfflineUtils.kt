@@ -530,13 +530,21 @@ object SyncOfflineUtils {
                             when {
                                 liveRow == null -> true
                                 FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionAt, observed = localFile) -> true
+                                // COMPLETE FRESH DESTINATION ANCESTRY BEFORE ANY
+                                // PRESERVATION EFFECT (issue: round 21 #6): the direct
+                                // rename path previously called the move helper with NO
+                                // destination-chain check — bytes could relocate beneath
+                                // missing local ancestors. A missing chain defers the action
+                                // side-effect-free (the resolving pass repairs the ancestry).
+                                !FileController.destinationChainExists(realm, remoteFile.parentId) -> false
                                 // FRESH source (issue: round 15 #2): the bytes live at the
                                 // live row's current path — the pre-pass ioFile can be stale
                                 // or reused by another file.
                                 liveRow.getOfflineFile(context, userDrive.userId)?.let { freshSource ->
                                     freshSource.exists() && run {
                                         // Historical provenance anchored BEFORE the relocation
-                                        // (issue: round 17 #3).
+                                        // (issue: round 17 #3) — only after the destination
+                                        // chain was validated complete.
                                         OfflineFolderController.anchorHistoricalBaseline(context, realm, liveRow, freshSource, userDrive)
                                         !OfflineFolderController.reconcileMovedInheritedCopy(
                                         context = context,
