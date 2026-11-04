@@ -598,34 +598,38 @@ object FileController {
     }
 
     fun upsertActionFile(realm: Realm, folderId: Int, actionFile: File, userDrive: UserDrive, actionAt: Long? = null) {
-        // Shared upsert boundary (issue: round 5 #5): an activity refresh can carry a
-        // rename/move; the owned copy at the old location is preserved before the metadata
-        // replacement, and a deferred reconciliation keeps the OLD row authoritative.
-        // Authoritative-change flow (the activity event IS the change): the action gate —
-        // newer generations AND newer non-Sync metadata reject the activity, and its
-        // nullable timestamp bounds the row's activity cursor (issue: round 13 #3).
-        val preservedActionFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-            realm = realm,
-            remoteFiles = listOf(actionFile),
-            userDrive = userDrive,
-            isStale = { live, incoming, _ ->
-                FileController.isStaleForAuthoritativeAction(live, incoming, actionAt)
-            },
-        ).first()
-        realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
-            if (!realmFolder.children.contains(preservedActionFile)) {
-                // Coordinated child-add (issue: round 11 #3): the add mutates the new child's
-                // graph identity (it gains its parent) and the container's children list, so
-                // both locks precede the transaction — under the root-intent monitor, since
-                // the add establishes ancestry that coverage resolution walks (issue: round
-                // 11 #7). Order: intent monitor → file locks → transaction.
-                synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                    OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, preservedActionFile.id)) {
+        // ONE caller-level coordinated operation (issue: round 13 #2): the intent monitor
+        // precedes the ordered lock set, and the shared boundary's validation/preservation
+        // runs INSIDE it — reentrant — immediately before the commit, with no lock release
+        // between them. Authoritative-change flow (the activity event IS the change): the
+        // action gate — newer generations AND newer non-Sync metadata reject the activity,
+        // and its nullable timestamp bounds the row's activity cursor (issue: round 13 #3).
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, actionFile.id)) {
+                val preservedActionFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                    realm = realm,
+                    remoteFiles = listOf(actionFile),
+                    userDrive = userDrive,
+                    isStale = { live, incoming, _ ->
+                        FileController.isStaleForAuthoritativeAction(live, incoming, actionAt)
+                    },
+                ).first()
+                realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
+                    if (!realmFolder.children.contains(preservedActionFile) &&
+                        // Parent-consistent membership (issue: round 13 #12): a
+                        // boundary-substituted MANAGED row whose authoritative parent is NOT
+                        // this container must not gain a wrong backlink here either; a fresh
+                        // unmanaged action row keeps the upstream add semantics.
+                        (!preservedActionFile.isManaged || preservedActionFile.parentId == folderId)
+                    ) {
+                        // Coordinated child-add (issues: round 11 #3, round 12 #12): the add
+                        // mutates the new child's graph identity and the container's children
+                        // list; the locks are already held by this section.
                         realm.executeTransaction { realmFolder.children.add(preservedActionFile) }
+                    } else if (realmFolder.children.contains(preservedActionFile)) {
+                        updateFileFromActivity(realm, preservedActionFile, realmFolder.id, userDrive, actionAt)
                     }
                 }
-            } else {
-                updateFileFromActivity(realm, preservedActionFile, realmFolder.id, userDrive, actionAt)
             }
         }
     }
@@ -1008,35 +1012,49 @@ object FileController {
 
     fun getFileDetails(fileId: Int, userDrive: UserDrive = UserDrive()): File? {
         fun getRemoteParentDetails(remoteFile: File, userDrive: UserDrive, realm: Realm) {
-            // Shared upsert boundary (issue: round 6 #4): the details cascade can also replace
-            // the file's identity; preserve the owned copy at the old location first.
-            val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                realm = realm,
-                remoteFiles = listOf(remoteFile),
-                userDrive = userDrive,
-            ).first()
-            ApiRepository.getFileDetails(File(id = remoteFile.parentId, driveId = userDrive.driveId)).data?.let {
-                it.children = RealmList(preservedFile)
-                // The parent upsert CASCADES the embedded child row (issues: round 11 #3,
-                // round 12 #4): both affected identities are locked before the transaction —
-                // under the root-intent monitor, since the parent row's commit can re-parent
-                // a folder — and the CASCaded child's acceptance is re-checked inside the
-                // committing transaction, after the second HTTP response's wait.
-                synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                    OfflineFileCoordination.withLocksFor(userDrive, listOf(it.id, preservedFile.id)) {
-                        insertOrUpdateFile(
-                            realm,
-                            it,
-                            userDrive = userDrive,
-                            moreTransaction = {
-                                val liveChild = getFileById(realm, preservedFile.id)
-                                if (liveChild != null && isStaleReplacement(liveChild, preservedFile)) {
-                                    val index = it.children.indexOfFirst { child -> child.id == preservedFile.id }
-                                    if (index >= 0) it.children[index] = liveChild
-                                }
-                            },
-                        )
-                    }
+            // HTTP FIRST (issue: round 13 #2): the parent response is fetched BEFORE any
+            // preservation, so validation, preservation and the commit run in ONE coordinated
+            // operation — the old order preserved the child's copy, released the lock, waited
+            // for the second HTTP response, then committed, leaving a window where a newer
+            // response could commit and strand the migrated bytes or an upload targeting
+            // them. The intent monitor precedes the ordered lock set (issue: round 13 #5):
+            // the parent row's commit can re-parent a folder.
+            val parentResponse = ApiRepository.getFileDetails(File(id = remoteFile.parentId, driveId = userDrive.driveId)).data
+                ?: return
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withLocksFor(userDrive, listOf(parentResponse.id, remoteFile.id)) {
+                    // Shared upsert boundary (issue: round 6 #4): the details cascade can also
+                    // replace the file's identity; preserve the owned copy at the old location,
+                    // inside the same coordination as the commit.
+                    val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                        realm = realm,
+                        remoteFiles = listOf(remoteFile),
+                        userDrive = userDrive,
+                    ).first()
+                    parentResponse.children = RealmList(preservedFile)
+                    // The parent upsert CASCADES the embedded child row (issues: round 11 #3,
+                    // round 13 #4): the PARENT's acceptance is also checked against the
+                    // transaction-fresh row (another writer can commit its newer location while
+                    // this HTTP response was in flight) with its local fields preserved, and
+                    // the cascaded child's acceptance is re-checked inside the committing
+                    // transaction.
+                    val parentOldRow = getFileById(realm, parentResponse.id)
+                    insertOrUpdateFile(
+                        realm,
+                        parentResponse,
+                        parentOldRow,
+                        userDrive = userDrive,
+                        // Absence inserts — the cascade legitimately creates the missing
+                        // ancestor (issue: round 13 #4).
+                        acceptIf = { live -> live == null || !isStaleReplacement(live, parentResponse) },
+                        moreTransaction = {
+                            val liveChild = getFileById(realm, preservedFile.id)
+                            if (liveChild != null && isStaleReplacement(liveChild, preservedFile)) {
+                                val index = parentResponse.children.indexOfFirst { child -> child.id == preservedFile.id }
+                                if (index >= 0) parentResponse.children[index] = liveChild
+                            }
+                        },
+                    )
                 }
             }
         }
@@ -1049,23 +1067,32 @@ object FileController {
                     if (localParentProxy == null) {
                         getRemoteParentDetails(remoteFile, userDrive, realm)
                     } else {
-                        // Shared upsert boundary (issue: round 6 #4): details responses carry
-                        // name/path metadata that would replace the old identity without
-                        // preserving the owned copy at its old location.
-                        val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                            realm = realm,
-                            remoteFiles = listOf(remoteFile),
-                            userDrive = userDrive,
-                        ).first()
-                        insertOrUpdateFile(
-                            realm,
-                            preservedFile,
-                            getFileProxyById(fileId, customRealm = realm),
-                            userDrive,
-                            // Must exist — the details refresh has nothing to refresh otherwise
-                            // (issue: round 12 #2).
-                            acceptIf = { live -> live != null && !isStaleReplacement(live, preservedFile) },
-                        )
+                        // ONE caller-level coordinated operation (issue: round 13 #2): the
+                        // HTTP response is already fetched; the intent monitor precedes the
+                        // file lock (issue: round 13 #5 — the commit can reparent a
+                        // directory), and validation, preservation and the conditional commit
+                        // run before the lock is released.
+                        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                            OfflineFileCoordination.withFileLock(userDrive, fileId) {
+                                // Shared upsert boundary (issue: round 6 #4): details responses carry
+                                // name/path metadata that would replace the old identity without
+                                // preserving the owned copy at its old location.
+                                val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                                    realm = realm,
+                                    remoteFiles = listOf(remoteFile),
+                                    userDrive = userDrive,
+                                ).first()
+                                insertOrUpdateFile(
+                                    realm,
+                                    preservedFile,
+                                    getFileProxyById(fileId, customRealm = realm),
+                                    userDrive,
+                                    // Must exist — the details refresh has nothing to refresh
+                                    // otherwise (issue: round 12 #2).
+                                    acceptIf = { live -> live != null && !isStaleReplacement(live, preservedFile) },
+                                )
+                            }
+                        }
                     }
                 }
                 remoteFile
@@ -1608,32 +1635,47 @@ object FileController {
         okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
     ) = Dispatchers.IO {
         getRealmInstance(userDrive).use { realm ->
-            // Shared upsert boundary (issue: round 6 #4): preserve the owned copy at the old
-            // location before the metadata replacement; a deferred reconciliation commits the
-            // OLD row instead of the new identity.
-            val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                realm = realm,
-                remoteFiles = listOf(remoteFile),
-                userDrive = userDrive,
-            ).first()
-            val localFile = getFileById(realm, preservedFile.id)
-            // Conditional UPSERT (issue: round 12 #2): absence INSERTS (playback and deep-link
-            // flows call this after a cache miss), while a stale response against an existing
-            // newer row is rejected.
-            val committed = insertOrUpdateFile(
-                realm,
-                preservedFile,
-                localFile,
-                userDrive,
-                acceptIf = { live -> live == null || !isStaleReplacement(live, preservedFile) },
-            )
+            // ONE caller-level coordinated operation (issue: round 13 #2): the HTTP response
+            // is already fetched by the caller; the shared boundary's validation/preservation
+            // and the conditional commit run inside ONE per-file section — the old order
+            // released the boundary's lock before acquiring the commit's, leaving a window
+            // where a newer response could strand migrated bytes or an upload targeting
+            // them. The ancestor linking runs AFTER the section (it fetches further HTTP
+            // responses and takes other rows' locks — holding this file's lock across those
+            // acquisitions could cycle against ascending multi-lock commits).
+            var linkedParentId = 0
+            var linkedChildId = 0
+            val committed = OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
+                // Shared upsert boundary (issue: round 6 #4): preserve the owned copy at the old
+                // location before the metadata replacement; a deferred reconciliation commits the
+                // OLD row instead of the new identity.
+                val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                    realm = realm,
+                    remoteFiles = listOf(remoteFile),
+                    userDrive = userDrive,
+                ).first()
+                val localFile = getFileById(realm, preservedFile.id)
+                // Conditional UPSERT (issue: round 12 #2): absence INSERTS (playback and
+                // deep-link flows call this after a cache miss), while a stale response
+                // against an existing newer row is rejected.
+                val accepted = insertOrUpdateFile(
+                    realm,
+                    preservedFile,
+                    localFile,
+                    userDrive,
+                    acceptIf = { live -> live == null || !isStaleReplacement(live, preservedFile) },
+                )
+                linkedParentId = preservedFile.parentId
+                linkedChildId = preservedFile.id
+                accepted
+            }
             // Propagate rejection (issue: round 12 #2): a rejected response left the newer
             // live row authoritative — continuing the ancestor linking would attach the LIVE
             // row under the STALE response's parent, corrupting the graph with the loser's
             // ancestry.
             if (committed) {
                 val driveId = userDrive.driveId
-                resolveAndLinkFileAncestorsChain(realm, preservedFile.parentId, preservedFile.id, driveId, userDrive, okHttpClient)
+                resolveAndLinkFileAncestorsChain(realm, linkedParentId, linkedChildId, driveId, userDrive, okHttpClient)
             }
         }
     }
