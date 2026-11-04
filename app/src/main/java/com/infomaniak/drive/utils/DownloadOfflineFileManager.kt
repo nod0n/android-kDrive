@@ -1236,19 +1236,45 @@ class DownloadOfflineFileManager(
             // leave the retained bytes carrying their generation's provenance.
             val oldRecordFile = provenanceFileFor(provenanceContext, target)
             val oldRecordText = if (oldRecordFile.exists()) runCatching { oldRecordFile.readText() }.getOrNull() else null
+            // RECOVERABLE OLD BYTES (issue: round 20 #10): the atomic rename REPLACES the
+            // old bytes — a post-rename failure (the target-provenance move failing)
+            // previously deleted the NEW bytes, leaving the destination EMPTY with the old
+            // bytes gone. The old bytes are backed up in the app-owned staging directory
+            // until the operation commits; every post-rename failure restores them with
+            // their retained proof.
+            val recoveryFile = if (target.exists()) newStagedFile(provenanceContext, file) else null
+            val recoveryOk = recoveryFile == null || runCatching {
+                target.copyTo(recoveryFile, overwrite = true) && recoveryFile.exists()
+            }.getOrDefault(false)
+            if (!recoveryOk) {
+                runCatching { recoveryFile?.delete() }
+                runCatching { staged.delete() }
+                return PublicationOutcome.FAILED
+            }
             // The OLD provenance is invalidated BEFORE the bytes are replaced (issue: round
             // 16 #12): a crash between the rename and the new sidecar write must never leave
             // the new bytes carrying the previous generation's provenance.
             deletePublishedProvenance(provenanceContext, target)
             if (staged.renameTo(target)) {
                 // The staged record travels onto the target with the rename (issue: round 18
-                // #2): provenance and bytes are published together — a failed move FAILS
-                // CLOSED and discards the newly published bytes rather than leaving
-                // unproven bytes at the destination.
+                // #2): provenance and bytes are published together — a failed move now
+                // RESTORES the recoverable old bytes and their proof (issue: round 20 #10)
+                // instead of deleting the new bytes with the old ones already gone.
                 if (!movePublishedProvenance(provenanceContext, staged, target)) {
-                    runCatching { target.delete() }
+                    if (recoveryFile != null) {
+                        runCatching { recoveryFile.copyTo(target, overwrite = true) }
+                        if (oldRecordText != null) {
+                            runCatching { provenanceFileFor(provenanceContext, target).writeText(oldRecordText) }
+                        }
+                    }
+                    if (recoveryFile == null || !target.exists()) {
+                        // Nothing recoverable existed before (fresh publication): fail closed.
+                        runCatching { target.delete() }
+                    }
+                    runCatching { recoveryFile?.delete() }
                     return PublicationOutcome.FAILED
                 }
+                runCatching { recoveryFile?.delete() }
                 // Record the PUBLISHED bytes' clean baseline separately from the accepted
                 // server metadata (issue: round 15 #6): edit detection judges the copy
                 // against the baseline its bytes were actually written under until a
@@ -1279,6 +1305,7 @@ class DownloadOfflineFileManager(
                 if (oldRecordText != null) {
                     runCatching { provenanceFileFor(provenanceContext, target).writeText(oldRecordText) }
                 }
+                runCatching { recoveryFile?.delete() }
                 SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
@@ -1410,28 +1437,55 @@ class DownloadOfflineFileManager(
                         // atomicity of the replacement covers the PROOF as well as the bytes.
                         val oldRecordFile = provenanceFileFor(context, target)
                         val oldRecordText = if (oldRecordFile.exists()) runCatching { oldRecordFile.readText() }.getOrNull() else null
-                        deletePublishedProvenance(context, target)
-                        when {
-                            staged.renameTo(target) && movePublishedProvenance(context, staged, target) ->
-                                PublicationOutcome.PUBLISHED
-                            // A FAILED RENAME NEVER DELETES THE OLD TARGET (issue: round 19
-                            // #11): the rename touched nothing — the retained bytes stay, and
-                            // their proof is rolled back with them. The staged file's
-                            // presence distinguishes this from a rename that succeeded and
-                            // then failed its proof move.
-                            staged.exists() -> {
-                                if (oldRecordText != null) {
-                                    runCatching { provenanceFileFor(context, target).writeText(oldRecordText) }
+                        // RECOVERABLE OLD BYTES (issue: round 20 #10), as in the coordinated
+                        // publication: the rename replaces the old bytes — a post-rename
+                        // proof-move failure restores them with their retained proof.
+                        val recoveryFile = if (target.exists()) newStagedFile(context, file) else null
+                        val recoveryOk = recoveryFile == null || runCatching {
+                            target.copyTo(recoveryFile, overwrite = true) && recoveryFile.exists()
+                        }.getOrDefault(false)
+                        if (!recoveryOk) {
+                            runCatching { recoveryFile?.delete() }
+                            runCatching { staged.delete() }
+                            PublicationOutcome.FAILED
+                        } else runCatching@{
+                            deletePublishedProvenance(context, target)
+                            when {
+                                staged.renameTo(target) && movePublishedProvenance(context, staged, target) -> {
+                                    runCatching { recoveryFile?.delete() }
+                                    PublicationOutcome.PUBLISHED
                                 }
-                                SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
-                                PublicationOutcome.FAILED
-                            }
-                            else -> {
-                                // Fail closed: the rename replaced the old bytes and the
-                                // proof move failed — the NEW unproven bytes are discarded.
-                                runCatching { target.delete() }
-                                SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
-                                PublicationOutcome.FAILED
+                                // A FAILED RENAME NEVER DELETES THE OLD TARGET (issue: round 19
+                                // #11): the rename touched nothing — the retained bytes stay, and
+                                // their proof is rolled back with them. The staged file's
+                                // presence distinguishes this from a rename that succeeded and
+                                // then failed its proof move.
+                                staged.exists() -> {
+                                    if (oldRecordText != null) {
+                                        runCatching { provenanceFileFor(context, target).writeText(oldRecordText) }
+                                    }
+                                    runCatching { recoveryFile?.delete() }
+                                    SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                                    PublicationOutcome.FAILED
+                                }
+                                else -> {
+                                    // The rename replaced the old bytes and the proof move
+                                    // failed — RESTORE the recoverable old bytes and their
+                                    // proof (issue: round 20 #10); with nothing recoverable
+                                    // (fresh publication) fail closed.
+                                    if (recoveryFile != null) {
+                                        runCatching { recoveryFile.copyTo(target, overwrite = true) }
+                                        if (oldRecordText != null) {
+                                            runCatching { provenanceFileFor(context, target).writeText(oldRecordText) }
+                                        }
+                                    }
+                                    if (recoveryFile == null || !target.exists()) {
+                                        runCatching { target.delete() }
+                                    }
+                                    runCatching { recoveryFile?.delete() }
+                                    SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                                    PublicationOutcome.FAILED
+                                }
                             }
                         }
                     }

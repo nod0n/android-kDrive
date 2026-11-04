@@ -289,6 +289,15 @@ object SyncOfflineUtils {
             if (UploadFile.hasPendingUpload(uri = Uri.fromFile(ioFile).toString()) ||
                 UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(ioFile).toString())
             ) continue
+            // CRASH-RECOVERABLE PUBLICATION (issue: round 20 #10): a crash after
+            // bytes+provenance publication but before the clean-baseline commit must not
+            // classify the freshly published copy as a local edit against the OLD baseline
+            // (which would upload it over a later remote revision). The provenance
+            // record's immutable byte identity IS the durable publication evidence.
+            val publishedProof = DownloadOfflineFileManager.readPublishedProvenance(context, ioFile)
+            if (publishedProof != null && publishedProof.identifies(file, userDrive) &&
+                publishedProof.certifiesBytes(ioFile)
+            ) continue
             if (ioFile.lastModified() / 1_000L > file.effectivePublishedBaseline) {
                 uploadFile(
                     context = context,
