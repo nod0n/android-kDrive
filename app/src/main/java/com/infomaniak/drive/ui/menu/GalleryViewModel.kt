@@ -29,6 +29,7 @@ import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IsComplete
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -72,6 +73,10 @@ class GalleryViewModel : ViewModel() {
         getGalleryJob?.cancel()
         getGalleryJob = viewModelScope.launch(Dispatchers.IO) {
             val result = getLastGallery(driveId, ignoreCloud, isFirstPage, cursor)
+            // Publish only from the EXECUTING coroutine's own cancellation state (issue:
+            // round 10 #2): a stale superseded run that was cancelled mid-flight does not
+            // publish over a newer one.
+            ensureActive()
             galleryApiResult.postValue(result)
             lastGalleryFiles.addAll(result.first)
         }
@@ -83,9 +88,10 @@ class GalleryViewModel : ViewModel() {
         isFirstPage: Boolean,
         cursor: String?,
     ): Pair<ArrayList<File>, IsComplete> {
-        getGalleryJob?.cancel()
-        getGalleryJob = Job()
-
+        // NO inner self-cancel (issue: round 10 #2): cancelling here killed the OUTER launch
+        // that owns this call — its suspending client lookup (a cancellable Room read) then
+        // never completed — and the replacement dummy Job gave the executing coroutine no
+        // cancellation state at all. loadLastGallery exclusively owns the launched job.
         return if (ignoreCloud) emitRealmGallery() else fetchApiGallery(driveId, isFirstPage, cursor)
     }
 

@@ -38,6 +38,7 @@ import com.infomaniak.drive.data.models.file.FileExternalImport
 import com.infomaniak.drive.data.models.file.FileExternalImport.FileExternalImportStatus
 import com.infomaniak.drive.data.models.file.FileVersion
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.RealmListParceler.FileCategoryRealmListParceler
 import com.infomaniak.drive.utils.RealmListParceler.FileRealmListParceler
@@ -557,7 +558,7 @@ open class File(
                 }
             }
             navigateToDownloadDialog?.invoke()
-            downloadFile(
+            val outcome = downloadFile(
                 cacheFile,
                 file = this,
                 shouldBePdf,
@@ -566,6 +567,23 @@ open class File(
                 userDrive = userDrive,
                 coordinated = destinationIsOwnedOfflineCopy,
             )
+            // Exhaustive outcome handling in the public caller (issue: round 10 #8): a skip
+            // is never silently reported as a fresh download of a valid destination.
+            when (outcome) {
+                PublicationOutcome.PUBLISHED, PublicationOutcome.SKIPPED_PROTECTED -> Unit
+                PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                    // A concurrent rename/move can have left the retained path missing:
+                    // validate the scoped destination before naming it, or fail the preview.
+                    if (!cacheFile.exists()) {
+                        throw java.io.IOException("Superseded preview left no usable destination for $name")
+                    }
+                }
+                PublicationOutcome.SKIPPED_INVALIDATED ->
+                    // The offline intent or destination disappeared mid-download (root
+                    // removal): error/deferred — never a success naming a possibly deleted file.
+                    throw java.io.IOException("Preview download invalidated: the offline intent for $name disappeared")
+                PublicationOutcome.FAILED -> throw java.io.IOException("Preview download failed for $name")
+            }
             // NO unconditional timestamp write here (issue: round 9 #1): the publication
             // timestamps the staged bytes before a successful rename, and a skipped transfer
             // (an editor's newer revision, a superseded generation) must never touch the

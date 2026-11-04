@@ -243,6 +243,10 @@ class DownloadOfflineFileManager(
         }.onFailure { exception ->
             SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
         }.getOrDefault(PublicationOutcome.FAILED)
+        // Cache promotion is a transfer path too: its superseded outcome must reach the bulk
+        // caller like the network branch's (issue: round 10 #7), or the batch clears a newer
+        // generation's pending marker and reports the root synchronized.
+        lastTransferSuperseded = published == PublicationOutcome.SKIPPED_SUPERSEDED
 
         runCatching { if (staged.exists()) staged.delete() }
         when (published) {
@@ -854,7 +858,13 @@ class DownloadOfflineFileManager(
                         val lastUpdate = getMostRecentLastUpdate?.invoke() ?: 0L
                         if (currentSystemTimeMillis - lastUpdate > MAX_INTERVAL_BETWEEN_PROGRESS_UPDATE_MS) {
                             onLastUpdateChange?.invoke(currentSystemTimeMillis)
-                            val progress = (bytesRead.toFloat() / contentLength.toFloat() * 100F).toInt()
+                            // Transport progress never reaches 100 (issue: round 10 #9): the
+                            // raw body read completes while publication may still be waiting
+                            // for a lock, failing, or returning invalidated — dialogs treat
+                            // 100 as completion and schedule their callbacks on it. 100 is
+                            // reserved for confirmed usable-destination completion, emitted
+                            // by each flow only after its publication outcome succeeds.
+                            val progress = ((bytesRead.toFloat() / contentLength.toFloat() * 100F).toInt()).coerceAtMost(99)
                             onProgress.invoke(progress)
                         }
                     }
