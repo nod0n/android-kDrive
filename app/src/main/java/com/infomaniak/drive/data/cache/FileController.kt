@@ -695,7 +695,29 @@ object FileController {
         // the request-observed anchor resolves ordering ties (issue: round 15 #10).
         var handled = true
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
-            OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, actionFile.id)) {
+            // COMPLETE RESULTING MEMBERSHIP DECIDED BEFORE PRESERVATION (issue: round 18
+            // #9): the payload's own parentId is the authoritative resulting location, and
+            // the decision runs FIRST — with the destination's lock taken into the same
+            // ascending set — so preservation never moves or snapshots bytes for a payload
+            // the membership decision then rejects. The previous order preserved FIRST and
+            // checked `actionFile.parentId == folderId` inside the adding transaction: a
+            // fresh F payload whose resulting parent was Q moved F's bytes to Q, then the
+            // membership check rejected the insertion and the old metadata stayed at its
+            // prior location.
+            val membershipOk = actionFile.parentId == folderId
+            val destinationContainerId = if (membershipOk) null else actionFile.parentId
+            // A mismatched payload whose destination row is absent has no container to link
+            // into: defer WITHOUT side effects — no preservation runs (issue: round 18 #9).
+            if (!membershipOk && getFileById(realm, destinationContainerId ?: 0) == null) {
+                handled = false
+            } else OfflineFileCoordination.withLocksFor(
+                userDrive,
+                buildList {
+                    add(folderId)
+                    add(actionFile.id)
+                    destinationContainerId?.let(::add)
+                },
+            ) {
                 val preservedActionFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                     realm = realm,
                     remoteFiles = listOf(actionFile),
@@ -710,7 +732,42 @@ object FileController {
                 // payload must not be inserted past a rejected/substituted boundary — the
                 // original payload describes the revision the boundary refused to apply.
                 if (preservedActionFile !== actionFile) handled = false
-                if (handled) realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
+                if (handled && !membershipOk) {
+                    // ACCEPTED MOVE OUT (issue: round 18 #9): the payload is authoritative
+                    // for F's resulting location — ONE transaction commits the payload's
+                    // destination metadata, links it into the named container and removes
+                    // the OBSOLETE backlink from this container (and any other prior one),
+                    // under the same ascending locks. The previous existing-row branch
+                    // (updateFileFromActivity) updated such a row without removing this
+                    // container's obsolete backlink.
+                    val destinationRow = getFileById(realm, destinationContainerId ?: return@withLocksFor)
+                    if (destinationRow == null) {
+                        handled = false
+                    } else {
+                        realm.executeTransaction {
+                            val freshRow = getFileById(realm, actionFile.id)
+                            val accepted = when {
+                                freshRow == null -> true
+                                else -> !FileController.isStaleForAuthoritativeAction(freshRow, actionFile, actionAt, observed)
+                            }
+                            if (accepted) {
+                                val previousParentId = freshRow?.parentId
+                                if (freshRow != null) actionFile.keepOldLocalFilesData(freshRow)
+                                if (destinationRow.children.none { it.id == actionFile.id }) {
+                                    destinationRow.children.add(actionFile)
+                                }
+                                if (freshRow != null && previousParentId != null && previousParentId != destinationRow.id) {
+                                    getFileById(realm, previousParentId)?.children
+                                        ?.removeAll { it.id == actionFile.id }
+                                }
+                                getFileById(realm, folderId)?.children
+                                    ?.removeAll { it.id == actionFile.id }
+                            } else {
+                                handled = false
+                            }
+                        }
+                    }
+                } else if (handled) realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
                     if (!realmFolder.children.contains(preservedActionFile) &&
                         // Parent-consistent membership (issue: round 13 #12): a
                         // boundary-substituted MANAGED row whose authoritative parent is NOT
@@ -720,26 +777,14 @@ object FileController {
                     ) {
                         // Coordinated child-add (issues: round 11 #3, round 12 #12): the add
                         // mutates the new child's graph identity and the container's children
-                        // list; the locks are already held by this section. BOTH commit
-                        // branches apply the complete fresh action predicate and membership
-                        // INSIDE the adding transaction (issues: round 15 #4, round 16 #4) —
-                        // the shared boundary returns directory rows before its predicate, so
-                        // an unmanaged delayed D-at-A payload must not overwrite D's current
-                        // parent or restore obsolete ancestry, and an existing row in THIS
-                        // parent is NOT exempt from the freshness predicate: a stale child
-                        // update must be rejected like any other (no same-parent bypass). The
-                        // predicate itself authorizes a strictly-newer move-in; the current
-                        // row's local fields are preserved when accepting over it.
+                        // list; the locks are already held by this section. The complete
+                        // fresh action predicate applies INSIDE the adding transaction
+                        // (issues: round 15 #4, round 16 #4) — the resulting membership was
+                        // decided BEFORE preservation (issue: round 18 #9), so the rejected
+                        // branch can no longer strand preserved bytes.
                         realm.executeTransaction {
                             val freshRow = getFileById(realm, actionFile.id)
-                            // RESULTING-PARENT consistency is INDEPENDENT of freshness
-                            // (issue: round 17 #18): a payload naming another container must
-                            // never link into this one, however fresh it is; an accepted
-                            // move also removes the OBSOLETE backlink from the row's prior
-                            // container. Pseudocontainers keep their separate membership
-                            // rules (this branch runs for real folders only).
-                            val membershipOk = actionFile.parentId == folderId
-                            val accepted = membershipOk && when {
+                            val accepted = when {
                                 freshRow == null -> true
                                 else -> !FileController.isStaleForAuthoritativeAction(freshRow, actionFile, actionAt, observed)
                             }
@@ -751,8 +796,6 @@ object FileController {
                                     getFileById(realm, previousParentId)?.children
                                         ?.removeAll { it.id == actionFile.id }
                                 }
-                            } else if (!membershipOk) {
-                                handled = false
                             } else {
                                 handled = false
                             }
