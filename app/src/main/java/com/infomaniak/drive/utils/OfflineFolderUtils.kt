@@ -28,6 +28,7 @@ import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -369,15 +370,38 @@ object OfflineFolderUtils {
             if (!OfflineFolderController.hasActiveOfflineRoot(rootFolderId, customRealm = realm)) {
                 return@executeTransaction
             }
+            // COMPLETE-ANCESTRY revalidation per candidate, INSIDE this later monitored
+            // transaction (issue: round 16 #18): the metadata commit and the coverage
+            // materialization are separate sections, and SAF can move or delete the
+            // intermediate directory D in between (its newly listed child C was not yet
+            // marked owned). Root existence alone is insufficient — a candidate whose CURRENT
+            // durable ancestry no longer reaches this root (or an independent active root)
+            // is not marked: its rows are the orphan sweep's or a later listing's to judge.
+            fun reachesRootOrIndependentRoot(candidateId: Int): Boolean {
+                var currentId: Int? = candidateId
+                val visited = mutableSetOf(candidateId)
+                while (currentId != null && currentId != ROOT_ID) {
+                    if (currentId != rootFolderId &&
+                        OfflineFolderController.hasActiveOfflineRoot(currentId, customRealm = realm)
+                    ) {
+                        return true
+                    }
+                    if (currentId == rootFolderId) return true
+                    val row = FileController.getFileById(realm, currentId) ?: return false
+                    currentId = row.parentId.takeIf { visited.add(it) }
+                }
+                return false
+            }
             // Materialize coverage on descendant folders too, so browsing a downloaded
             // subfolder cannot trigger the offline recovery heuristic (issue #1902).
             subFolderIds.forEach { subFolderId ->
                 realm.where(File::class.java).equalTo(File::id.name, subFolderId).findFirst()?.let { subFolder ->
-                    subFolder.isInOfflineFolder = true
+                    if (reachesRootOrIndependentRoot(subFolderId)) subFolder.isInOfflineFolder = true
                 }
             }
             coveredFiles.forEach { (localFile, needsDownload) ->
                 if (!localFile.isValid) return@forEach
+                if (!reachesRootOrIndependentRoot(localFile.id)) return@forEach
                 localFile.isInOfflineFolder = true
                 if (needsDownload) {
                     localFile.isMarkedAsOffline = true

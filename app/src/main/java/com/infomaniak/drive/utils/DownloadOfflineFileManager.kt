@@ -114,37 +114,54 @@ class DownloadOfflineFileManager(
         // incomplete, the transfer aborts with the OLD metadata intact: nothing is stranded,
         // and the offline sync retries (issue: round 4 #9).
         val remoteFile = fetchRemoteFileDetails(context, file.id)
-        // ONE coordinated operation (issue: round 11 #2): the file's coordination lock spans
-        // the stale-response validation, the preservation side effects and the metadata
-        // commit, so no identity writer can interleave between them — a response rejected as
-        // stale leaves NO filesystem or upload-queue side effect, and an accepted one cannot
-        // be superseded between its validation and its commit. The per-file acquisitions
-        // inside the boundary and the commit reenter this lock.
-        val committed = OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
-            val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
-                // The transfer's basis [file] is the request-observed state (issue: round 13
-                // #1): a tied-timestamp identity change is accepted only while the live row
-                // still matches it.
-                OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                    realm = realm,
-                    remoteFiles = listOf(remoteFile),
-                    userDrive = userDrive,
-                    observedById = mapOf(remoteFile.id to file),
-                ).first()
-            }
-            if (commitFile !== remoteFile) {
-                SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
-                return@withFileLock false
-            }
+        // ONE coordinated operation (issue: round 11 #2): the ROOT-INTENT monitor precedes the
+        // file lock (issue: round 16 #20) — the details response can CHANGE THE LOCATION
+        // (parentId), a commit that reparents rows and alters the ancestry coverage
+        // resolution walks; holding only the file lock let this reparenting interleave with
+        // SAF's ancestry decisions (delete D after finding no owned descendants, then this
+        // phase commits F under the deleted D). Order: intent monitor → file lock →
+        // Realm/FS mutation — never the monitor from inside an already-held file lock.
+        val committed = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
+                val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
+                    // The transfer's basis [file] is the request-observed state (issue: round 13
+                    // #1): a tied-timestamp identity change is accepted only while the live row
+                    // still matches it.
+                    OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                        realm = realm,
+                        remoteFiles = listOf(remoteFile),
+                        userDrive = userDrive,
+                        observedById = mapOf(remoteFile.id to file),
+                    ).first()
+                }
+                if (commitFile !== remoteFile) {
+                    SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
+                    return@withFileLock false
+                }
+                // CURRENT DESTINATION ANCESTRY VALIDATION before preservation and commit
+                // (issue: round 16 #20): a location-changing response is committed only when
+                // its destination parent still exists as a row — committing under a parent
+                // another flow just deleted would strand the row's ancestry under a ghost.
+                // The commit defers; a later listing or the ancestor chain rebuilds the
+                // destination first.
+                val destinationParentExists = commitFile.parentId <= 0 ||
+                    FileController.getRealmInstance(userDrive).use { realm ->
+                        FileController.getFileById(realm, commitFile.parentId) != null
+                    }
+                if (!destinationParentExists) {
+                    SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its destination parent ${commitFile.parentId} no longer exists")
+                    return@withFileLock false
+                }
 
-            // Conditional replacement (issue: round 10 #4): a delayed response from an older
-            // fetch must not roll back a newer generation another worker already committed —
-            // otherwise this transfer's later publication compares against the rolled-back row,
-            // passes, and leaves bytes and metadata describing different revisions. The
-            // acceptance decision reads the live row INSIDE the committing transaction
-            // (issue: round 11 #5) against the request-observed basis (issue: round 13 #1).
-            FileController.getRealmInstance(userDrive).use { realm ->
-                FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive, observed = file)
+                // Conditional replacement (issue: round 10 #4): a delayed response from an older
+                // fetch must not roll back a newer generation another worker already committed —
+                // otherwise this transfer's later publication compares against the rolled-back row,
+                // passes, and leaves bytes and metadata describing different revisions. The
+                // acceptance decision reads the live row INSIDE the committing transaction
+                // (issue: round 11 #5) against the request-observed basis (issue: round 13 #1).
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive, observed = file)
+                }
             }
         }
         if (!committed) {

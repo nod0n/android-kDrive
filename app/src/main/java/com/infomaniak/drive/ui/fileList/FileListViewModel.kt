@@ -39,11 +39,13 @@ import com.infomaniak.drive.data.models.File.Type
 import com.infomaniak.drive.data.models.FileCount
 import com.infomaniak.drive.data.models.MqttNotification
 import com.infomaniak.drive.data.models.UploadFile
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.data.models.file.SpecialFolder.Favorites
 import com.infomaniak.drive.ui.fileList.FileListFragment.FolderFilesResult
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.FileId
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.Position
 import com.infomaniak.drive.utils.Utils
 import io.realm.Realm
@@ -270,13 +272,36 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
             checkOfflineFilesJob = Job()
 
             viewModelScope.launch(Dispatchers.IO + checkOfflineFilesJob) {
-                FileController.getRealmInstance().use {
-                    it.executeTransaction { realm ->
-                        files.filterNot { file -> file.isFolder() }.forEach { file ->
-                            // Inherited coverage (issue #1902) is managed by the folder walk:
-                            // never convert covered files into explicit pins here.
-                            if (!file.isOffline && !file.isInOfflineFolder && file.getOfflineFile(context)?.exists() == true && isActive) {
-                                FileController.getFileProxyById(file.id, customRealm = realm)?.isOffline = true
+                // The CAPTURED account scope keys the coordination and the Realm (issue: round
+                // 16 #19) — an account switch mid-recovery must not write another realm.
+                val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = folder.driveId)
+                files.filterNot { file -> file.isFolder() }.forEach { file ->
+                    // ONE intent → file-lock → fresh-Realm transaction per candidate (issue:
+                    // round 16 #19): the recovery used to be an uncoordinated pin writer
+                    // deciding from STALE captured flags — a root walk that materialized
+                    // inherited coverage (or a SAF ancestry decision) after the capture was
+                    // overwritten with an explicit pin, so removing the root wrongly retained
+                    // the file. The decision now reads the FRESH row and the CURRENT root
+                    // ancestry inside the transaction; stale flags never create a pin.
+                    synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                        OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                            FileController.getRealmInstance(userDrive).use { realm ->
+                                runCatching { realm.refresh() }
+                                realm.executeTransaction {
+                                    if (!isActive) return@executeTransaction
+                                    val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
+                                    if (liveRow.isOffline || liveRow.isInOfflineFolder || liveRow.isMarkedAsOffline) {
+                                        return@executeTransaction
+                                    }
+                                    // Current durable ancestry, not the captured flags: any
+                                    // active root covering the row owns its state.
+                                    if (OfflineFolderController.isInsideActiveRoot(realm, liveRow.id)) {
+                                        return@executeTransaction
+                                    }
+                                    if (liveRow.getOfflineFile(context, userDrive.userId)?.exists() == true) {
+                                        liveRow.isOffline = true
+                                    }
+                                }
                             }
                         }
                     }
