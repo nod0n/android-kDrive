@@ -58,7 +58,7 @@ import java.util.Date
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 
-open /**
+/**
  * Process-wide cancellation signal for an EXECUTING upload, keyed by the record's EXACT uri
  * (issue: round 9 #9): a record stopped in the UI — token-less, so only its row was
  * soft-deleted — publishes here, and the executing transfer observes the signal and aborts
@@ -100,7 +100,7 @@ object UploadCancellationSignal {
     private const val CHECK_INTERVAL_MILLIS = 200L
 }
 
-class UploadFile(
+open class UploadFile(
     @PrimaryKey var uri: String = "",
     var deletedAt: Date? = null,
     var driveId: Int = -1,
