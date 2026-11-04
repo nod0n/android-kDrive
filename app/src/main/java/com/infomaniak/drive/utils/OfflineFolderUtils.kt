@@ -61,6 +61,13 @@ object OfflineFolderUtils {
         val rootExists: Boolean,
         val completed: Boolean,
         val fileIds: List<Int>,
+        /**
+         * The root-intent generation captured BEFORE the walk's first request (issue: round
+         * 18 #20/#25): the batch's root completion compares against it, so a root removed
+         * and revived — or a newer walk started — while this one ran is never completed by
+         * this older batch.
+         */
+        val intentGeneration: Long = 0L,
     )
 
     suspend fun walkAndMarkOfflineFolder(
@@ -77,6 +84,13 @@ object OfflineFolderUtils {
             if (!OfflineFolderController.hasActiveOfflineRoot(rootFolderId, customRealm = realm)) {
                 return@withContext WalkResult(rootExists = false, completed = false, fileIds = emptyList())
             }
+
+            // REQUEST-TIME AUTHORITY (issues: round 18 #20/#25): the root's intent
+            // generation is captured BEFORE any listing request — the walk's completion (and
+            // its destructive absent-child cleanup) compare against THIS stamp, so changes
+            // that happen while the walk is in flight are newer work's business, not this
+            // walk's to complete or clear.
+            val intentGeneration = OfflineFolderController.rootIntentGeneration(rootFolderId)
 
             val fileIds = mutableListOf<Int>()
             val visitedFolderIds = mutableSetOf(rootFolderId)
@@ -134,7 +148,7 @@ object OfflineFolderUtils {
                 sweepOrphanInheritedCoverage(context, realm, userDrive)
             }
 
-            WalkResult(rootExists = true, completed = completed, fileIds = fileIds)
+            WalkResult(rootExists = true, completed = completed, fileIds = fileIds, intentGeneration = intentGeneration)
         }
     }
 

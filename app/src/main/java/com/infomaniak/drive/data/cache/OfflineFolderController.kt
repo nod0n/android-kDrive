@@ -67,7 +67,14 @@ object OfflineFolderController {
     /** The generation stamp a cleanup traversal takes BEFORE its collection checks. */
     internal fun currentRootIntentGeneration(): Long = rootIntentGenerationClock.get()
 
-    private fun rootIntentChangedSince(folderId: Int, sinceGeneration: Long): Boolean =
+    /**
+     * The per-root intent generation at OBSERVATION time (issue: round 18 #20): a walk
+     * captures it BEFORE its first request so its completion can be compared against it —
+     * an old batch must not complete newly revived intent.
+     */
+    internal fun rootIntentGeneration(folderId: Int): Long = rootIntentGenerations[folderId] ?: 0L
+
+    internal fun rootIntentChangedSince(folderId: Int, sinceGeneration: Long): Boolean =
         (rootIntentGenerations[folderId] ?: 0L) > sinceGeneration
 
     data class RemovalResult(

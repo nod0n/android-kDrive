@@ -524,7 +524,31 @@ object SyncOfflineUtils {
                                     )
                             }
                         }
-                        else -> true
+                        else -> {
+                            // DOWNLOAD NEED from ACCEPTED IDENTITY vs PUBLISHED BYTES
+                            // (issue: round 18 #19): the previous fall-through consumed any
+                            // non-rename action whose metadata did not strictly advance the
+                            // remote revision — a listing that already accepted R2's
+                            // metadata (same revisedAt, or a same-second version advance)
+                            // while the published bytes were still R1 reached `else -> true`
+                            // and advanced the cursor WITHOUT downloading; an explicit pin
+                            // outside any walked root had no folder walk to repair it. The
+                            // action is consumed only when the row's accepted generation is
+                            // actually PROVEN in the published bytes (the same strictness as
+                            // the copy-state decision: version + full provenance identity),
+                            // or pending durable work owns the refresh; otherwise the scoped
+                            // download branch runs for the accepted revision.
+                            when {
+                                liveRow == null -> true
+                                freshIoFile != null &&
+                                    liveRow.isOfflineAndProvenCurrent(context, freshIoFile, userDrive) -> true
+                                liveRow.isMarkedAsOffline -> true
+                                else -> {
+                                    downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
+                                    downloadOutcome.handled
+                                }
+                            }
+                        }
                     }
                 }
             }

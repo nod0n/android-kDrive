@@ -47,10 +47,11 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
     private var synchronizationSucceeded = false
 
     /**
-     * Files whose download completed successfully: only their pending markers may be cleared at
-     * the end, unfinished work keeps its evidence for the offline sync (issue #1902).
+     * The walk's result, retained for [onFinish]'s root completion (issue: round 18 #20):
+     * the root marker and lastSyncedAt advance only when the root's intent generation is
+     * unchanged since the walk captured it BEFORE its first request.
      */
-    private val completedFileIds = mutableListOf<Int>()
+    private var walkResult: OfflineFolderUtils.WalkResult? = null
 
     private val userDrive: UserDrive by lazy {
         UserDrive(
@@ -79,13 +80,14 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
 
     override suspend fun downloadAction(): Result {
         if (recursive) {
-            val walkResult = OfflineFolderUtils.walkAndMarkOfflineFolder(
+            val result = OfflineFolderUtils.walkAndMarkOfflineFolder(
                 context = applicationContext,
                 rootFolderId = folderId,
                 userDrive = userDrive,
             )
-            walkCompleted = walkResult.completed
-            if (!walkResult.rootExists) {
+            walkResult = result
+            walkCompleted = result.completed
+            if (!result.rootExists) {
                 synchronizationSucceeded = true // the root was removed: nothing left to synchronize
                 return Result.success()
             }
@@ -95,7 +97,7 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
             // incomplete (a failed folder listing or deferred moves); the root outcome stays
             // incomplete below, so the remaining folders and moves are retried without
             // advancing lastSyncedAt.
-            files = walkResult.fileIds.mapNotNull { FileController.getFileByUidOrId(it, userDrive) }
+            files = result.fileIds.mapNotNull { FileController.getFileByUidOrId(it, userDrive) }
         } else {
             files = FileController.getFolderOfflineFilesId(
                 folderId = folderId,
@@ -128,17 +130,26 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
     }
 
     override fun onFinish() {
-        FileController.markFilesAsOffline(
-            customRealm = null,
-            filesId = completedFileIds,
-            isMarkedAsOffline = false,
-            userDrive = userDrive,
-        )
+        // FILE-MARKER clearing is NOT repeated here (issue: round 18 #20): the batch-end
+        // unconditional clear erased markers belonging to NEWER work — F can finish early,
+        // a newer request re-marks F pending while the batch processes another file, and
+        // the old batch then cleared that marker without any generation comparison. Each
+        // transfer consumes its OWN marker at completion (the manager's paths clear
+        // conditionally on the row still being at the generation the transfer refreshed
+        // against); a superseded transfer's marker belongs to the newer transfer and is
+        // excluded upstream.
         if (recursive) {
             // The root folder itself carries the "walk in progress" marker; it is only cleared
             // for a successful synchronization so unfinished work keeps its pending state
             // (issue #1902). An explicit removal clears it through the pending-removal path.
-            if (synchronizationSucceeded) {
+            // ROOT COMPLETION MATCHES THE PROCESSED INTENT GENERATION (issue: round 18
+            // #20): the walk captured the root's generation BEFORE its first request — a
+            // root removed and revived (or a newer walk started) while this batch ran is
+            // never completed by it: the marker stays pending and lastSyncedAt does not
+            // advance.
+            if (synchronizationSucceeded &&
+                !OfflineFolderController.rootIntentChangedSince(folderId, walkResult?.intentGeneration ?: 0L)
+            ) {
                 FileController.markFilesAsOffline(
                     customRealm = null,
                     filesId = listOf(folderId),
@@ -146,6 +157,8 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                     userDrive = userDrive,
                 )
                 if (walkCompleted) OfflineFolderController.updateLastSyncedAt(folderId, userDrive)
+            } else if (synchronizationSucceeded) {
+                SentryLog.i(TAG, "Root $folderId intent changed during the walk; completion deferred to the newer walk")
             }
         }
         clearLastDownloadedFile()
@@ -193,12 +206,13 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                 if (downloadOfflineFileManager.lastTransferSuperseded) {
                     // A superseded generation's replacement is still outstanding (issue: round
                     // 9 #8): its pending marker belongs to the newer transfer, so it is
-                    // excluded from completion-marker clearing, and the batch must not report
-                    // the root synchronized while that replacement runs.
+                    // excluded from completion, and the batch must not report the root
+                    // synchronized while that replacement runs.
                     allFilesSucceeded = false
-                } else {
-                    completedFileIds.add(file.id)
                 }
+                // Ordinary success (including a protected-copy skip whose own marker the
+                // publication cleared under the locks — issue: round 18 #20): the transfer
+                // consumed its own marker; the batch records nothing.
             } else {
                 allFilesSucceeded = false
             }

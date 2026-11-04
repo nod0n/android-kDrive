@@ -220,7 +220,11 @@ class DownloadOfflineFileManager(
         }
         // Protect offline edits (issue #1902): never replace the bytes backing a pending upload
         // or a locally newer copy; the sync layer uploads them and a later walk re-evaluates.
+        // Each early-success path consumes its OWN pending marker immediately and
+        // conditionally (issue: round 18 #20) — the marker belongs to the generation this
+        // transfer refreshed against, and a newer request's re-mark must survive.
         if (UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())) {
+            clearPendingMarkerIfCurrent(file)
             return ListenableWorker.Result.success()
         }
         if (offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
@@ -230,15 +234,20 @@ class DownloadOfflineFileManager(
                 remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
             )
         ) {
+            clearPendingMarkerIfCurrent(file)
             return ListenableWorker.Result.success()
         }
 
-        if (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) return ListenableWorker.Result.success()
+        if (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) {
+            clearPendingMarkerIfCurrent(file)
+            return ListenableWorker.Result.success()
+        }
 
         if (file.isOfflineAndProvenCurrent(context, offlineFile)) {
             // We can have this case for example when we try to put a lot of files at once in offline mode
             // and for some reason, the worker is cancelled after a long time, the worker is restarted
             filesDownloaded += 1
+            clearPendingMarkerIfCurrent(file)
             return ListenableWorker.Result.success()
         }
 
@@ -570,6 +579,29 @@ class DownloadOfflineFileManager(
      */
     private fun clearPendingMarker(fileId: Int) {
         FileController.markFileAsOffline(fileId = fileId, isMarkedAsOffline = false, userDrive = userDrive)
+    }
+
+    /**
+     * Consumes THIS transfer's pending-download marker CONDITIONALLY (issue: round 18 #20):
+     * the marker is cleared only when the live row is still at the generation this transfer
+     * refreshed against — a newer request (a re-pin, or a newer server generation's pending
+     * state) has re-marked the row and owns the marker now. Runs under the intent monitor
+     * and the file lock. The batch-end unconditional clearing this replaces erased newer
+     * work's markers without any generation comparison.
+     */
+    private fun clearPendingMarkerIfCurrent(file: File) {
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    runCatching { realm.refresh() }
+                    val live = FileController.getFileById(realm, file.id) ?: return@withFileLock
+                    if (FileController.isSupersededGeneration(live, file) || live.updatedAt > file.updatedAt) return@withFileLock
+                    if (live.isMarkedAsOffline) {
+                        FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false, userDrive = userDrive)
+                    }
+                }
+            }
+        }
     }
 
     private fun makeSureFileExists(offlineFile: java.io.File): Unit? {
