@@ -334,7 +334,10 @@ object OfflineFolderUtils {
             val hasIntactOfflineCopy = offlineFile != null && localFile.isOfflineAndIntact(offlineFile)
             val isLocallyModified = offlineFile != null && offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
-                remoteLastModifiedAtSeconds = localFile.lastModifiedAt,
+                // Edit detection judges against the PUBLISHED byte baseline, not accepted
+                // server metadata (issue: round 15 #6) — retained old-clean bytes after a
+                // backward-dated newer generation commits are not a local edit.
+                remoteLastModifiedAtSeconds = localFile.publishedCleanBaseline ?: localFile.lastModifiedAt,
             )
             localFile to OfflineFolderPolicy.needsDownload(
                 hasIntactOfflineCopy = hasIntactOfflineCopy,

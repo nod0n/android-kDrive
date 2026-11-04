@@ -90,6 +90,16 @@ open class File(
     var addedAt: Long = 0,
     @SerializedName("last_modified_at")
     var lastModifiedAt: Long = 0,
+    /**
+     * LOCAL byte-provenance, never a server field: the modification baseline the bytes at
+     * this row's offline path were actually PUBLISHED under (issue: round 15 #6). Edit
+     * detection judges the copy against this baseline — not against [lastModifiedAt], which
+     * accepted server metadata advances — so retained old-clean bytes are not reclassified
+     * as a local edit after a backward-dated newer generation commits. Null (legacy rows)
+     * falls back to [lastModifiedAt]. Preserved across metadata updates, advanced only by a
+     * successful publication of new bytes.
+     */
+    var publishedCleanBaseline: Long? = null,
     @SerializedName("deleted_by")
     var deletedBy: Int = 0,
     @SerializedName("deleted_at")

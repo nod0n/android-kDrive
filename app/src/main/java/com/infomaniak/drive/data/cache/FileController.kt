@@ -2003,6 +2003,10 @@ object FileController {
         isComplete = oldFile.isComplete
         isOffline = oldFile.isOffline
         isInOfflineFolder = oldFile.isInOfflineFolder
+        // LOCAL byte-provenance travels with the row (issue: round 15 #6): the baseline
+        // describes the bytes at the row's path, which metadata acceptance does not replace
+        // — only a successful publication advances it.
+        publishedCleanBaseline = oldFile.publishedCleanBaseline
         responseAt = oldFile.responseAt
         if (path.isEmpty() && oldFile.path.isNotEmpty()) path = oldFile.path
         // Merge a version ONLY when the same content generation is PROVEN (issue: round 14

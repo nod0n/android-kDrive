@@ -420,6 +420,19 @@ class FileMigration : RealmMigration {
 
             oldVersionTemp++
         }
+
+        // Migrated to version 14
+        // - Add new nullable field `publishedCleanBaseline` in File table (the LOCAL clean
+        //   baseline the bytes at the row's offline path were published under, kept separate
+        //   from accepted server metadata so retained old-clean bytes are not reclassified as
+        //   a local edit after a backward-dated newer generation commits, issue: round 15 #6)
+        if (oldVersionTemp == 13L) {
+            schema[File::class.java.simpleName]?.apply {
+                addField(File::publishedCleanBaseline.name, Long::class.java)
+            }
+
+            oldVersionTemp++
+        }
     }
 
     override fun equals(other: Any?): Boolean {
@@ -447,7 +460,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 13L // Must be bumped when the schema changes
+        const val DB_VERSION = 14L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }

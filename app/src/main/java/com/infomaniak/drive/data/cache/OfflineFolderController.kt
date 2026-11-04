@@ -1056,7 +1056,10 @@ object OfflineFolderController {
             ) -> CopyProtection.UPLOADED
             OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
-                remoteLastModifiedAtSeconds = file.lastModifiedAt,
+                // The PUBLISHED byte baseline, not accepted server metadata (issue: round
+                // 15 #6) — retained old-clean bytes after a backward-dated newer
+                // generation commits are not a local edit.
+                remoteLastModifiedAtSeconds = file.publishedCleanBaseline ?: file.lastModifiedAt,
             ) -> CopyProtection.DIRTY
             else -> CopyProtection.NONE
         }

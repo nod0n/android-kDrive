@@ -168,7 +168,9 @@ class DownloadOfflineFileManager(
         }
         if (offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
-                remoteLastModifiedAtSeconds = file.lastModifiedAt,
+                // The PUBLISHED byte baseline, not accepted server metadata (issue: round
+                // 15 #6) — retained old-clean bytes are not a local edit.
+                remoteLastModifiedAtSeconds = file.publishedCleanBaseline ?: file.lastModifiedAt,
             )
         ) {
             return ListenableWorker.Result.success()
@@ -189,6 +191,7 @@ class DownloadOfflineFileManager(
         // an app-owned directory and published by an atomic rename, so a failed transfer never
         // destroys it (issue: round 3 #2/#4).
         if (cacheFile.exists()) cacheFile.delete()
+        deleteCacheProvenance(cacheFile)
 
         return if (currentFile?.rights?.canRead == false) {
             ListenableWorker.Result.failure()
@@ -259,6 +262,17 @@ class DownloadOfflineFileManager(
         // generation. A cache copy not exactly at this transfer's baseline is rejected and
         // the current content downloads instead.
         if (!(cacheFile.exists() && file.isIntactFile(cacheFile) && (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt)) {
+            return@withContext false
+        }
+        // GENERATION PROVENANCE (issue: round 15 #9): exact mtime and size do not establish
+        // WHICH generation the cached bytes are — two same-sized revisions can share the
+        // preserved client mtime with different known server versions. The sidecar written
+        // at cache publication names the producing generation; promotion requires it to
+        // match this transfer's authoritative (details-sourced) version. Unavailable or
+        // mismatched provenance downloads the current revision.
+        val provenance = readCacheProvenance(cacheFile)
+        val transferVersion = file.version?.number ?: 0
+        if (transferVersion <= 0 || provenance == null || provenance.first != transferVersion) {
             return@withContext false
         }
 
@@ -536,6 +550,35 @@ class DownloadOfflineFileManager(
 
         internal enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_CONFLICT, SKIPPED_INVALIDATED, SKIPPED_SUPERSEDED, FAILED }
 
+        /** Sidecar suffix recording the content generation that produced cached bytes (issue: round 15 #9). */
+        private const val CACHE_PROVENANCE_SUFFIX = ".offlinegen"
+
+        private fun cacheProvenanceFile(cacheFile: IOFile): IOFile =
+            IOFile(cacheFile.parentFile, cacheFile.name + CACHE_PROVENANCE_SUFFIX)
+
+        /**
+         * Associates published CACHE bytes with the content generation that produced them
+         * (issue: round 15 #9): exact mtime and size cannot establish the generation — two
+         * same-sized revisions can share the preserved client mtime with different server
+         * versions. The sidecar names the producing version and baseline; cache promotion
+         * requires it to match the current authoritative version.
+         */
+        private fun writeCacheProvenance(target: IOFile, file: File) {
+            runCatching {
+                cacheProvenanceFile(target).writeText("${file.version?.number ?: 0}|${file.lastModifiedAt}")
+            }
+        }
+
+        private fun readCacheProvenance(cacheFile: IOFile): Pair<Int, Long>? = runCatching {
+            val parts = cacheProvenanceFile(cacheFile).readText().trim().split("|")
+            require(parts.size == 2)
+            Pair(parts[0].trim().toInt(), parts[1].trim().toLong())
+        }.getOrNull()
+
+        private fun deleteCacheProvenance(cacheFile: IOFile) {
+            runCatching { cacheProvenanceFile(cacheFile).delete() }
+        }
+
         /**
          * App-owned staging directory on the SAME volume as the offline storage (so publication
          * is an atomic rename), but OUTSIDE it: remote file paths can never resolve here, so no
@@ -711,12 +754,14 @@ class DownloadOfflineFileManager(
                     // serialized with this publication — defer and let the next attempt lock
                     // the current owner correctly.
                     liveOwner.id != lockedOwnerId -> true
-                    // Known owner: protect against ITS last clean revision, never the
-                    // incoming revision — the previous baseline declared another file's
-                    // older dirty copy unprotected and overwrote its sole edit.
+                    // Known owner: protect against ITS PUBLISHED byte baseline (issue:
+                    // round 15 #6), never the incoming revision — the previous baseline
+                    // declared another file's older dirty copy unprotected and overwrote
+                    // its sole edit, and accepted metadata alone must not reclassify
+                    // retained old-clean bytes as an edit.
                     else -> OfflineFolderPolicy.isLocallyModified(
                         offlineFileLastModifiedMillis = target.lastModified(),
-                        remoteLastModifiedAtSeconds = liveOwner.lastModifiedAt,
+                        remoteLastModifiedAtSeconds = liveOwner.publishedCleanBaseline ?: liveOwner.lastModifiedAt,
                     )
                 }
 
@@ -742,6 +787,16 @@ class DownloadOfflineFileManager(
             // Final cancellation check immediately before the atomic replace (issue: round 7 #11).
             checkCancelled()
             if (staged.renameTo(target)) {
+                // Record the PUBLISHED bytes' clean baseline separately from the accepted
+                // server metadata (issue: round 15 #6): edit detection judges the copy
+                // against the baseline its bytes were actually written under until a
+                // successful replacement advances it — metadata acceptance alone must not
+                // reclassify retained old-clean bytes as a local edit.
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    realm.executeTransaction {
+                        FileController.getFileById(realm, file.id)?.publishedCleanBaseline = file.lastModifiedAt
+                    }
+                }
                 // Run the owner's completion while the per-file lock is still held
                 // (issue: round 5 #2).
                 onPublishedLocked?.invoke()
@@ -779,6 +834,7 @@ class DownloadOfflineFileManager(
             runCatching { if (staged.exists()) staged.delete() }
             if (outcome == PublicationOutcome.PUBLISHED) {
                 runCatching { if (cacheFile.exists()) cacheFile.delete() }
+                deleteCacheProvenance(cacheFile)
             }
             return outcome
         }
@@ -812,6 +868,9 @@ class DownloadOfflineFileManager(
                     writeStaged(staged)
                     staged.setLastModified(file.getLastModifiedInMilliSecond())
                     if (staged.renameTo(target)) {
+                        // The plain cache destination's bytes are now the published
+                        // generation: record the provenance (issue: round 15 #9).
+                        writeCacheProvenance(target, file)
                         PublicationOutcome.PUBLISHED
                     } else {
                         SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
