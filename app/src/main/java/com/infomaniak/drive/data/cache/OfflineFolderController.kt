@@ -761,16 +761,23 @@ object OfflineFolderController {
                 // touched) and a later pass retries once the duplicate resolves.
                 val pathOwnerId = exclusivePathOwner(realm, context, userDrive, oldOffline.path)
                 if (pathOwnerId != oldRow.id) return@withFileLock oldRow
-                // Historical baseline ANCHOR (issue: round 16 #2): a row whose bytes were
-                // published before the baseline field existed carries null. While those bytes
-                // still verify against the row's CURRENT metadata (the metadata they were
-                // published under, absent any replacement), that metadata IS their provable
-                // baseline — persist it NOW, before this replacement can change the metadata,
-                // or a later pass would compare the bytes against the REPLACEMENT's
-                // modification time and reclassify the old-clean copy as a local edit. An
-                // unprovable historical copy keeps null and is snapshotted below like an
-                // edit — preservation, not classification against replacement metadata.
-                if (oldRow.publishedCleanBaseline == null &&
+                // Historical baseline ANCHOR (issues: round 16 #2, round 18 #6): a row whose
+                // bytes were published before the baseline field existed carries UNSET (null
+                // — and, consistently, a non-positive repaired value). While those bytes
+                // still verify against the row's CURRENT metadata with SUFFICIENT BYTE
+                // PROVENANCE (intact size, and a modification time not newer than that
+                // metadata), that metadata IS their provable baseline — persist it NOW,
+                // before this replacement can change the metadata, or a later pass would
+                // compare the bytes against the REPLACEMENT's modification time and
+                // reclassify the old-clean copy as a local edit (the migrated zero-baseline
+                // trace: clean bytes at 100, replacement metadata at 90 — without the anchor
+                // the fallback becomes 90 and the old bytes upload over the newer revision).
+                // An unprovable historical copy keeps unset — never anchored from mtime alone
+                // — and stays preserved: the replacement flow's protection and the upload
+                // completion's exact-revision reconciliation prevent old bytes from destroying
+                // newer content, and a genuine edit still snapshots below.
+                if ((oldRow.publishedCleanBaseline ?: 0L) <= 0L &&
+                    oldRow.isIntactFile(oldOffline) &&
                     !OfflineFolderPolicy.isLocallyModified(
                         offlineFileLastModifiedMillis = oldOffline.lastModified(),
                         remoteLastModifiedAtSeconds = oldRow.lastModifiedAt,
@@ -1311,13 +1318,21 @@ object OfflineFolderController {
 
     /**
      * Establishes a historical row's byte provenance BEFORE any relocation or metadata
-     * change (issue: round 17 #3): bytes that still verify against the row's current
-     * metadata have that metadata persisted as their baseline; an unprovable historical
-     * copy keeps null and is treated conservatively (edited) downstream.
+     * change (issues: round 17 #3, round 18 #6): bytes that still verify against the row's
+     * current metadata WITH sufficient byte provenance — intact size, modification time not
+     * newer than that metadata — have that metadata persisted as their baseline. UNSET is
+     * consistent everywhere: null AND a non-positive repaired value (a legacy zero is not
+     * provenance and must anchor exactly like a never-written baseline). An unprovable
+     * historical copy keeps unset — it is never anchored from an mtime comparison alone,
+     * and it is not automatically labeled and uploaded as a local edit: the replacement
+     * flow's protection and the upload completion's exact-revision reconciliation gate the
+     * destructive paths while the copy stays preserved.
      */
     internal fun anchorHistoricalBaseline(realm: Realm, row: File, bytes: IOFile) {
-        if (row.publishedCleanBaseline != null) return
-        if (!OfflineFolderPolicy.isLocallyModified(bytes.lastModified(), row.lastModifiedAt)) {
+        if ((row.publishedCleanBaseline ?: 0L) > 0L) return
+        if (row.isIntactFile(bytes) &&
+            !OfflineFolderPolicy.isLocallyModified(bytes.lastModified(), row.lastModifiedAt)
+        ) {
             runCatching { realm.executeTransaction { row.publishedCleanBaseline = row.lastModifiedAt } }
         }
     }

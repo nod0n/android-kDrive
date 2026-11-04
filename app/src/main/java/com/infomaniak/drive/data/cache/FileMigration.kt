@@ -453,6 +453,20 @@ class FileMigration : RealmMigration {
                     setRequired(File::publishedCleanBaseline.name, false)
                 }
             }
+            // SENTINEL ZERO NORMALIZATION (issue: round 18 #6): the required-long default 0
+            // is NOT publication provenance. Left in the nullable column, a zero would make
+            // the historical-anchor writers (keyed on non-null) skip a row that never had a
+            // baseline: a replacement could then reclassify the row's old clean bytes as a
+            // local edit against the FALLBACK (the replacement's own metadata) and upload
+            // them over the newer revision. The repair writes the one consistent unset
+            // value — null — which every reader, writer and consumer already treats as
+            // unset. A database already at version 15 (developer builds only) keeps any
+            // residual zero, but the anchor writers key on the SAME non-positive-unset
+            // predicate, so the behavior is identical either way.
+            realm.where(File::class.java.simpleName)
+                .equalTo(File::publishedCleanBaseline.name, 0L)
+                .findAll()
+                .onEach { row -> row.setNull(File::publishedCleanBaseline.name) }
 
             oldVersionTemp++
         }
