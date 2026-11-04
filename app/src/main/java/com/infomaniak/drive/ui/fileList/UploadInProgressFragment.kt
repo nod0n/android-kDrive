@@ -136,13 +136,16 @@ class UploadInProgressFragment : FileListFragment() {
     }
 
     private fun setupOnStopUploadButtonClicked() {
-        fileAdapter.onStopUploadButtonClicked = { fileName ->
-            displayedUploadRecords.find { it.fileName == fileName }?.let { syncFile ->
+        fileAdapter.onStopUploadButtonClicked = { displayedFile ->
+            // Exact record identity (issue: round 7 #14): the displayed item's path IS the
+            // upload record's URI, so durable snapshot revisions that share a filename are
+            // cancelled and removed individually instead of always the first match.
+            displayedUploadRecords.find { it.uri == displayedFile.path }?.let { syncFile ->
                 val title = getString(R.string.uploadInProgressCancelFileUploadTitle, syncFile.fileName)
 
                 cancellationConfirmationDialog = createCancellationConfirmationDialog(requireContext(), title) {
                     closeItemClicked(uploadFile = syncFile)
-                    fileAdapter.deleteByFileName(fileName)
+                    fileAdapter.deleteByFileId(displayedFile.id)
                 }.also(AlertDialog::show)
             }
         }
@@ -210,21 +213,27 @@ class UploadInProgressFragment : FileListFragment() {
                 UploadFile.deleteAll(listOf(it))
             }
             folderId?.let {
-                // Cancel/remove by the DISPLAYED uploads' actual ownership (issue: round 6 #9):
-                // the pending list includes shared-drive uploads whose owner differs from the
-                // current drive, so one fixed current-account scope would cancel and remove
-                // nothing for them.
+                // Cancel/remove the SAME captured set, grouped by each record's actual owner,
+                // drive and folder (issue: round 7 #13): the folders view's sentinel (-1)
+                // never reaches a server-folder filter, and removal no longer sweeps a whole
+                // drive beyond the folders actually displayed. The folders view shows one
+                // representative per pending folder, so each (owner, drive, folder) group
+                // scopes the session cancellation and the fresh per-folder removal that
+                // captures that folder's records when cancellation starts.
                 displayedUploadRecords.toList()
-                    .groupBy { uploadRecord -> uploadRecord.userId to uploadRecord.driveId }
-                    .forEach { (scope, _) ->
-                        val (recordUserId, recordDriveId) = scope
+                    .map { uploadRecord -> Triple(uploadRecord.userId, uploadRecord.driveId, uploadRecord.remoteFolder) }
+                    .toSet()
+                    .forEach { (recordUserId, recordDriveId, recordFolder) ->
                         UploadFile.cancelAllPendingFilesSessions(
-                            folderId = it,
+                            folderId = recordFolder,
                             userId = recordUserId,
                             driveId = recordDriveId,
                         )
-                        if (isPendingFolders()) UploadFile.deleteAll(null, userId = recordUserId, driveId = recordDriveId)
-                        else UploadFile.deleteAll(folderId = it, userId = recordUserId, driveId = recordDriveId)
+                        UploadFile.deleteAll(
+                            folderId = recordFolder,
+                            userId = recordUserId,
+                            driveId = recordDriveId,
+                        )
                     }
 
                 fileRecyclerView?.post { fileAdapter.setFiles(listOf()) }

@@ -72,7 +72,7 @@ open class FileAdapter(
     var onEmptyList: (() -> Unit)? = null
     var onFileClicked: ((file: File) -> Unit)? = null
     var onMenuClicked: ((selectedFile: File) -> Unit)? = null
-    var onStopUploadButtonClicked: ((fileName: String) -> Unit)? = null
+    var onStopUploadButtonClicked: ((file: File) -> Unit)? = null
 
     var isSelectingFolder = false
     var navigationRestrictions = FolderNavigationRestrictions()
@@ -357,7 +357,7 @@ open class FileAdapter(
 
     private fun FileItemViewHolder.displayStopUploadButton(file: File) {
         stopUploadButton?.apply {
-            setOnClickListener { onStopUploadButtonClicked?.invoke(file.name) }
+            setOnClickListener { onStopUploadButtonClicked?.invoke(file) }
             isVisible = true
         }
     }
