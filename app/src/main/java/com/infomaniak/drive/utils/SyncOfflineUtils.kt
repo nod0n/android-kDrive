@@ -316,9 +316,12 @@ object SyncOfflineUtils {
                 uri = snapshotUri.toString(),
                 driveId = userDrive.driveId,
                 fileModifiedAt = fileModifiedAt,
-                fileName = localFile.name,
+                // The record carries the POST-COMMIT identity (issue: round 7 #5): when the
+                // same action renames/moves the file, uploading under the source name/parent
+                // would recreate the old location remotely.
+                fileName = remoteFile?.name ?: localFile.name,
                 fileSize = ioFile.length(),
-                remoteFolder = localFile.parentId,
+                remoteFolder = remoteFile?.parentId ?: localFile.parentId,
                 type = UploadFile.Type.SYNC_OFFLINE.name,
                 userId = userDrive.userId,
             ).store()

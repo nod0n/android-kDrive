@@ -414,10 +414,13 @@ abstract class MultiSelectFragment(private val matomoCategory: MatomoCategory) :
     ) {
         if (folderId != null) {
             notificationPermission.checkNotificationPermission(requestPermission = true)
+            // The selection's account scope is captured at dispatch (issue: round 7 #8).
+            val capturedScope = UserDrive()
             mediator.addSource(
                 mainViewModel.addSelectionToOffline(
                     filesId = selectedFiles.map { selectedFile -> selectedFile.id },
                     folderId = folderId,
+                    userDrive = capturedScope,
                     onSuccess = { onIndividualActionSuccess(type) }
                 ),
                 mainViewModel.updateMultiSelectMediator(mediator),

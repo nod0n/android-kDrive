@@ -311,18 +311,22 @@ class MainViewModel(
         isSharedWithMe: Boolean = false,
         onSuccess: ((fileId: Int) -> Unit)? = null
     ) = liveData(Dispatchers.IO) {
-        // The viewed file's account scope is captured BEFORE the asynchronous request (issue:
-        // round 6 #2): deriving it after the move could mix accounts mid-operation.
+        // The viewed file's account scope AND the presentation scope are captured BEFORE the
+        // asynchronous request (issues: round 6 #2, round 7 #8): deriving either after the
+        // move could mix accounts mid-operation. Every Realm, filesystem and enqueue
+        // operation below uses these captured scopes, never the active account re-resolved
+        // after the request.
         val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId)
+        val presentationScope = UserDrive()
         val apiResponse = ApiRepository.moveFile(file, newParent)
         if (apiResponse.isSuccess()) {
             // The local copy move must complete (or durably defer) before the metadata commit
             // (issue: round 6 #2): committing first would strand inherited copies — including
             // unsent edits — at the old, untracked path. The row realm stays the session's
             // current-drive Realm (shared-with-me rows live here, as upstream); the captured
-            // [userDrive] scopes only the offline-path/preservation APIs.
+            // scopes key the offline-path/preservation APIs and the shares realm.
             var preserved = true
-            FileController.getRealmInstance().use { currentDriveRealm ->
+            FileController.getRealmInstance(presentationScope).use { currentDriveRealm ->
                 file.getStoredFile(getContext(), userDrive)?.let { ioFile ->
                     val folderProxy = FileController.getFileById(currentDriveRealm, newParent.id)
                     if (ioFile.exists() && folderProxy != null) {
@@ -342,19 +346,32 @@ class MainViewModel(
                     // If the selected folder is a shared folder, it is removed from the user's realm table (userId_driveId)
                     // and added to the share realm (userId_share)
                     // Explicit captured scope (issue: round 5 #6): preservation and cache
-                    // deletion must not re-derive the account from the active one.
+                    // deletion must not re-derive the account from the active one. The shares
+                    // realm is keyed by the CAPTURED user (issue: round 7 #8).
                     FileController.removeFile(
                         fileId = file.id,
                         customRealm = currentDriveRealm,
                         userDrive = userDrive,
                     )
-                    FileController.getRealmInstance(UserDrive(sharedWithMe = true)).use { sharedRealm ->
+                    FileController.getRealmInstance(
+                        UserDrive(userId = presentationScope.userId, sharedWithMe = true)
+                    ).use { sharedRealm ->
                         FileController.updateFile(newParent.id, sharedRealm) { localFolder ->
                             runCatching { localFolder.children.add(file) }.onFailure(Sentry::captureException)
                         }
                     }
                 } else if (preserved) {
-                    FileController.addChild(newParent.id, file.apply { parentId = newParent.id }, currentDriveRealm)
+                    // The committed identity is the complete post-move one (issue: round 7 #5):
+                    // the stale source path must not survive the parent change, or derived
+                    // offline paths keep pointing at the location the bytes left.
+                    FileController.addChild(
+                        newParent.id,
+                        file.apply {
+                            parentId = newParent.id
+                            path = ""
+                        },
+                        currentDriveRealm,
+                    )
                 } else {
                     // Preservation incomplete (pending upload, protected destination): the row
                     // keeps its OLD identity and location; the offline sync and the shared
@@ -716,14 +733,19 @@ class MainViewModel(
     fun addSelectionToOffline(
         filesId: List<Int>,
         folderId: Int,
+        userDrive: UserDrive = UserDrive(),
         onSuccess: (() -> Unit)? = null,
     ) = liveData(Dispatchers.IO) {
+        // The captured scope flows through persistence AND enqueueing (issue: round 7 #8):
+        // resolving the active account after dispatch could persist and enqueue for another
+        // account than the one the selection was made in.
         FileController.markFilesAsOffline(
             filesId = filesId,
             isMarkedAsOffline = true,
+            userDrive = userDrive,
             setExplicitPin = true,
         )
-        Utils.enqueueBulkDownloadWorker(getApplication(), folderId)
+        Utils.enqueueBulkDownloadWorker(getApplication(), folderId, userDrive)
         onSuccess?.invoke()
         emit(FileResult(isSuccess = true))
     }
@@ -770,15 +792,23 @@ class MainViewModel(
             ioFile.delete()
             return true
         }
-        val offlineFile = newParent.getOfflineFile(application) ?: return false
+        val offlineFile = newParent.getOfflineFile(application, userDrive.userId) ?: return false
         val destinationFile = IOFile(offlineFile, file.name)
+        // The snapshot registers under the POST-MOVE identity (issue: round 7 #5): the edit
+        // belongs to the moved file, and registering the source parent would queue the upload
+        // for the old location while the caller commits the new one. Protection queries keep
+        // the source identity separately (oldIdentity* below).
+        val postMoveIdentity = File(id = file.id, driveId = userDrive.driveId).apply {
+            parentId = newParent.id
+            name = file.name
+        }
         return OfflineFolderController.reconcileMovedInheritedCopy(
             context = application,
             oldOfflineFile = ioFile,
             oldIdentityName = file.name,
             oldIdentityParentId = file.parentId,
             oldLastModifiedAt = file.lastModifiedAt,
-            newIdentity = file,
+            newIdentity = postMoveIdentity,
             userDrive = userDrive,
             newOfflineTarget = destinationFile,
         )
