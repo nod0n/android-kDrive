@@ -47,6 +47,7 @@ import io.sentry.Sentry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -125,6 +126,10 @@ object FolderFilesProvider {
                     isRoot = folderId == ROOT_ID,
                     rootFolder = rootFolder,
                     onRecursionStart = onRecursionStart,
+                    // CANCELLATION AFTER EACH RESOLVING HTTP (issue: round 20 #22): the
+                    // suspend caller's job is checked between the resolving responses and
+                    // the side effects.
+                    checkCancelled = { coroutineContext.ensureActive() },
                 )
             }
         }
@@ -139,6 +144,7 @@ object FolderFilesProvider {
         rootFolder: File? = null,
         onRecursionStart: (() -> Unit)? = null,
         observedById: Map<Int, File> = emptyMap(),
+        checkCancelled: () -> Unit = {},
     ) {
         val folderId = if (isRoot) SharedWithMe.id else folderFilesProviderArgs.folderId
         // PRE-REQUEST observations (issue: round 18 #21): the container's children detached
@@ -203,6 +209,7 @@ object FolderFilesProvider {
                     folderFilesProviderArgs = folderFilesProviderArgs,
                     cursor = apiResponse.cursor,
                     observedById = sequenceObservations,
+                    checkCancelled = checkCancelled,
                 )
             }
             apiResponse.isSuccess() -> {
@@ -218,6 +225,7 @@ object FolderFilesProvider {
                     folderId = folderId,
                     userDrive = folderFilesProviderArgs.userDrive,
                     deferredIds = commitOutcomes.deferredIds,
+                    checkCancelled = checkCancelled,
                 )
             }
         }
@@ -241,6 +249,7 @@ object FolderFilesProvider {
         folderId: Int,
         userDrive: UserDrive,
         deferredIds: Set<Int>,
+        checkCancelled: () -> Unit = {},
     ) {
         if (deferredIds.isEmpty()) return
         for (deferredId in OfflineFolderUtils.fairDeferredSelection(
@@ -256,6 +265,9 @@ object FolderFilesProvider {
                     okHttpClient = okHttpClient,
                 )
             }.getOrNull()?.data?.takeIf { it.id == deferredId } ?: continue
+            // Cancellation after the resolving HTTP and again after the coordination
+            // wait, before any side effect (issue: round 20 #22).
+            checkCancelled()
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withLocksFor(userDrive, listOf(deferredId, folderId).distinct()) {
                     val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(

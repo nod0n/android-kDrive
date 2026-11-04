@@ -363,7 +363,15 @@ object OfflineFolderUtils {
                         okHttpClient = okHttpClient,
                     )
                 }.getOrNull()
+                // CANCELLATION AFTER EACH RESOLVING HTTP (issue: round 20 #22): the
+                // pre-request check ran before the blocking call — a cancelled walk whose
+                // response just arrived must not run snapshot registration, relocation,
+                // metadata commits or coverage writes from it. Cancellation PROPAGATES
+                // (never an ordinary resolution failure).
+                coroutineContext.ensureActive()
                 val details = detailsResponse?.data?.takeIf { it.id == deferredId } ?: continue
+                // ...and again after the coordination wait, before any side effect.
+                coroutineContext.ensureActive()
                 val accepted = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withLocksFor(userDrive, listOf(deferredId, folderId).distinct()) {
                         val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(

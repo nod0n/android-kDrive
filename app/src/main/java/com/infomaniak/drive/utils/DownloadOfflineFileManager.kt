@@ -248,11 +248,12 @@ class DownloadOfflineFileManager(
         }
 
         when (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) {
-            // The EXACT fulfilled file-intent token (issue: round 19 #24): this transfer's
-            // generation was published — the marker is consumed conditionally on the row
-            // still being at the generation the transfer refreshed against.
+            // The EXACT fulfilled file-intent token is consumed INSIDE the publication's
+            // coordinated commit (issue: round 20 #20) — the FULFILLED arm runs no
+            // post-publication clear: an unpin could delete the published bytes and a
+            // re-pin establish a new marker between the publication's locks releasing
+            // and the late call.
             CachePromotionOutcome.FULFILLED -> {
-                clearPendingMarkerIfCurrent(file)
                 return ListenableWorker.Result.success()
             }
             // Deferred outcomes (conflict, superseded, protected/invalidated) retain the
@@ -412,10 +413,10 @@ class DownloadOfflineFileManager(
         // (whose pending marker the caller then ERASED, contradicting their own
         // retain-the-marker contract).
         when (published) {
-            // Completion (flag write, media scan, invalidation) already ran inside the per-file
-            // lock via onPublishedLocked (issue: round 5 #2). The caller may consume the
-            // marker: clearPendingMarkerIfCurrent re-validates the EXACT fulfilled intent
-            // token (the row is still at the generation this transfer refreshed against).
+            // Completion (flag write, media scan, invalidation) and the EXACT file-intent
+            // consumption already ran inside the per-file lock via the publication's
+            // coordinated commit (issues: round 5 #2, round 20 #20) — the caller runs no
+            // post-publication marker clear.
             PublicationOutcome.PUBLISHED -> CachePromotionOutcome.FULFILLED
             // Skipped outcomes leave the existing bytes and timestamps untouched (issue:
             // round 4 #1). Marker completion is NOT unconditional here (issue: round 17 #7):
@@ -1285,6 +1286,16 @@ class DownloadOfflineFileManager(
                         FileController.getFileById(realm, file.id)?.publishedCleanBaseline = file.lastModifiedAt
                     }
                 }
+                // EXACT FILE-INTENT CONSUMPTION (issue: round 20 #20): the fulfilled
+                // transfer's pending marker is consumed INSIDE the publication's
+                // coordinated commit — the CAS above validated this transfer's identity
+                // against the live row under the same locks, so the marker (if any)
+                // belongs to this generation's request, whose bytes are now published.
+                // The previous post-publication clear ran OUTSIDE coordination: an unpin
+                // could delete the published bytes and a re-pin establish a new marker
+                // for the same revision before the late call compared only server
+                // metadata — and erased the new intent.
+                FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false, userDrive = userDrive)
                 // Run the owner's completion while the per-file lock is still held
                 // (issue: round 5 #2) — and for an UNRESOLVED generation (issues: round 19
                 // #14, round 20 #14) return the TYPED unresolved outcome instead of
