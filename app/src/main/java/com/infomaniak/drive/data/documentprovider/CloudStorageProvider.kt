@@ -821,10 +821,12 @@ class CloudStorageProvider : DocumentsProvider() {
                     // with its bytes.
                     synchronized(OfflineFileCoordination.rootIntentMonitor) {
                         OfflineFileCoordination.withFileLock(userDrive, file.id) {
-                            if (cacheFile.exists() &&
-                                (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt &&
-                                file.isIntactFile(cacheFile)
-                            ) {
+                            // EXACT PUBLICATION TOKEN (issue: round 19 #15): the cached
+                            // generation dies only when its provenance record still names
+                            // THIS row's accepted revision — mtime+size alone let an
+                            // unproven or foreign-record cache be deleted under a
+                            // generation it never carried.
+                            if (DownloadOfflineFileManager.cacheBytesProvenCurrent(context, cacheFile, file, userDrive)) {
                                 DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
                                 runCatching { cacheFile.delete() }
                             }
@@ -863,8 +865,14 @@ class CloudStorageProvider : DocumentsProvider() {
                 return ParcelFileDescriptor.open(offlineFile, accessMode)
             }
 
-            // Get cache file if it's exists and if the file is updated
-            if (!file.isObsolete(cacheFile) && file.size == cacheFile.length()) {
+            // SAF CACHE FAST READ REQUIRES FULL PROVENANCE (issue: round 19 #15): the
+            // previous size+mtime heuristic served unproven bytes (a same-size edit
+            // retaining the old mtime, or a foreign-record cache) as the file's content.
+            // The fast read answers only through the FULL publication token — exact
+            // generation identity AND the provenance record naming this row's accepted
+            // revision; anything else re-downloads through the staged publication (which
+            // writes the record, so the next read is proven).
+            if (DownloadOfflineFileManager.cacheBytesProvenCurrent(context, cacheFile, file, userDrive)) {
                 return ParcelFileDescriptor.open(cacheFile, accessMode)
             }
 
@@ -891,20 +899,27 @@ class CloudStorageProvider : DocumentsProvider() {
                     cacheFile.parentFile,
                     "${cacheFile.name}.${java.util.UUID.randomUUID()}.part",
                 )
-                val stagedOk = runBlocking {
-                    runCatching {
-                        DownloadOfflineFileManager.saveRemoteData(TAG, response, staged)
-                    }.onFailure { exception ->
-                        SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
-                    }.isSuccess
-                }
-                if (stagedOk) {
-                    val outcome = runBlocking {
-                        DownloadOfflineFileManager.publishStagedCacheCopy(context, file, cacheFile, userDrive, staged)
+                try {
+                    val stagedOk = runBlocking {
+                        runCatching {
+                            DownloadOfflineFileManager.saveRemoteData(TAG, response, staged)
+                        }.onFailure { exception ->
+                            SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
+                        }.isSuccess
                     }
-                    if (outcome == PublicationOutcome.PUBLISHED) {
-                        return ParcelFileDescriptor.open(cacheFile, accessMode)
+                    if (stagedOk) {
+                        val outcome = runBlocking {
+                            DownloadOfflineFileManager.publishStagedCacheCopy(context, file, cacheFile, userDrive, staged)
+                        }
+                        if (outcome == PublicationOutcome.PUBLISHED) {
+                            return ParcelFileDescriptor.open(cacheFile, accessMode)
+                        }
                     }
+                } finally {
+                    // PARTIAL STAGING CLEANUP (issue: round 19 #15): a failed or
+                    // unpublished staging file never lingers; on success the staged file
+                    // was renamed away and this is a no-op.
+                    runCatching { if (staged.exists()) staged.delete() }
                 }
             }
         } catch (exception: Exception) {
