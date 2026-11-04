@@ -1249,15 +1249,24 @@ object FileController {
                                 // under its RESULTING parent — an accepted move whose live
                                 // row still names the old parent is committed and kept, not
                                 // dropped, so metadata never points at the emptied old
-                                // location. The old child is substituted only when its
-                                // replacement was actually rejected or deferred (the branch
-                                // above).
+                                // location. The child's acceptance is REVALIDATED inside the
+                                // committing transaction (issue: round 16 #8): parent
+                                // acceptance never authorizes a stale child replacement — a
+                                // row that moved or advanced while the parent response was
+                                // being applied keeps its current state, and the cascade
+                                // drops its entry. The old child is substituted only when
+                                // its replacement was actually rejected or deferred (the
+                                // branch above).
                                 else -> {
-                                    preservedFile.keepOldLocalFilesData(liveChild)
-                                    if (index >= 0) {
-                                        parentResponse.children[index] = preservedFile
+                                    if (isStaleReplacement(liveChild, preservedFile)) {
+                                        parentResponse.children.removeAll { it.id == preservedFile.id }
                                     } else {
-                                        parentResponse.children.add(preservedFile)
+                                        preservedFile.keepOldLocalFilesData(liveChild)
+                                        if (index >= 0) {
+                                            parentResponse.children[index] = preservedFile
+                                        } else {
+                                            parentResponse.children.add(preservedFile)
+                                        }
                                     }
                                 }
                             }

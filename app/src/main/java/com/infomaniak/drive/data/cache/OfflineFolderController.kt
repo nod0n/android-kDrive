@@ -707,19 +707,25 @@ object OfflineFolderController {
             OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
                 runCatching { realm.refresh() }
                 val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@withFileLock remoteFile
-                if (oldRow.isFolder()) return@withFileLock remoteFile
-                // Stale-response gate BEFORE ANY preservation side effect (issue: round 11 #2/#4):
-                // when the live row already holds a newer server generation — or, for replacement
-                // boundaries, a different location identity at an equal revision — the incoming
-                // response describes a revision that no longer exists; reconciling its bytes would
-                // snapshot a current edit under the obsolete identity, delete the original, and
-                // then be rejected at the metadata commit, leaving the live row's bytes absent and
-                // an upload targeting the old location. The OLD row is returned in place: the
-                // caller commits (or defers to) the live state, and nothing on the filesystem or
-                // in the upload queue is touched. Authoritative-change callers (the offline sync's
-                // actions) pass the action predicate — an identity difference at equal revisions
-                // is the change being applied there, not staleness.
+                // Stale-response gate BEFORE ANY preservation side effect (issue: round 11 #2/#4)
+                // and BEFORE the directory early return (issue: round 16 #8): directories
+                // previously returned the incoming payload before any freshness decision, and
+                // the details cascade then merged it as if accepted — a delayed D-at-A response
+                // restored obsolete ancestry over D's current row. EVERY row type is gated
+                // first; a stale directory returns the OLD row in place like a stale file.
+                // When the live row already holds a newer server generation — or, for
+                // replacement boundaries, a different location identity at an equal revision —
+                // the incoming response describes a revision that no longer exists; reconciling
+                // its bytes would snapshot a current edit under the obsolete identity, delete
+                // the original, and then be rejected at the metadata commit, leaving the live
+                // row's bytes absent and an upload targeting the old location. The OLD row is
+                // returned in place: the caller commits (or defers to) the live state, and
+                // nothing on the filesystem or in the upload queue is touched.
+                // Authoritative-change callers (the offline sync's actions) pass the action
+                // predicate — an identity difference at equal revisions is the change being
+                // applied there, not staleness.
                 if (isStale(oldRow, remoteFile, observedById[remoteFile.id])) return@withFileLock oldRow
+                if (oldRow.isFolder()) return@withFileLock remoteFile
                 val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
                     ?: return@withFileLock remoteFile
                 // SOURCE-OWNERSHIP GATE, before ANY preservation side effect (issue: round 16
