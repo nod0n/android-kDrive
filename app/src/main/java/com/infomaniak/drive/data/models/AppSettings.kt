@@ -18,6 +18,7 @@
 package com.infomaniak.drive.data.models
 
 import com.infomaniak.core.common.flowOnNewHandlerThread
+import com.infomaniak.drive.data.documentprovider.AppLockState
 import com.infomaniak.drive.utils.RealmModules
 import io.realm.DynamicRealm
 import io.realm.Realm
@@ -27,6 +28,7 @@ import io.realm.RealmObject
 import io.realm.kotlin.toFlow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.emitAll
@@ -86,35 +88,30 @@ open class AppSettings(
             replay = 1,
         )
 
-        /**
-         * Hook wired by the ordered settings lifecycle (AppLockState): registers each ordinary
-         * writer with the maintenance drain and refuses writes dispatched while maintenance is
-         * active, so no stale write can commit across logout deletion (Astra review R5-2).
-         */
-        interface SettingsWriteGate {
-            fun register(): Boolean
-            fun unregister()
-        }
-
-        @Volatile
-        internal var settingsWriteGate: SettingsWriteGate? = null
-
         fun updateAppSettings(scope: CoroutineScope = Companion.scope, onUpdate: AppSettings.() -> Unit) {
-            // Register before dispatch so the maintenance drain covers this write even if its
-            // coroutine starts late; refusal means the write is stale and is dropped.
-            val gate = settingsWriteGate
-            if (gate?.register() == false) return
-            scope.launch(Dispatchers.IO) {
-                try {
+            // Every write to this store joins the ordered settings lifecycle (Astra review
+            // R5-2/R6-2): registered synchronously before dispatch so the maintenance drain
+            // covers it even if its coroutine starts late, refused while maintenance is active
+            // (the write is stale and is dropped), and released exactly once on the job's actual
+            // completion — including cancellation before the body ever runs — so a running
+            // synchronous Realm write stays counted until it truly finishes. The coordinator is
+            // deliberately Realm-free: referencing it here must not initialize this class' Realm
+            // configuration before Realm.init (Astra review R6-1).
+            if (!AppLockState.registerSettingsWrite()) return
+            val job: Job
+            try {
+                job = scope.launch(Dispatchers.IO) {
                     getRealmInstance().use { realm ->
                         realm.executeTransaction {
                             onUpdate(getAppSettingsQuery(realm) ?: it.copyToRealm(AppSettings()))
                         }
                     }
-                } finally {
-                    gate?.unregister()
                 }
+            } catch (throwable: Throwable) {
+                AppLockState.unregisterSettingsWrite()
+                throw throwable
             }
+            job.invokeOnCompletion { AppLockState.unregisterSettingsWrite() }
         }
 
         /** Publishes an already-durable value to in-memory readers without writing the store. */

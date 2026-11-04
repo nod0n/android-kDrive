@@ -43,15 +43,19 @@ object AppLockState {
         onTransition = { onTransition?.invoke() },
     )
 
-    init {
-        // All writers to AppSettings.realm join the ordered lifecycle: the maintenance drain
-        // waits for registered ordinary writes, and writes dispatched under maintenance are
-        // dropped as stale (Astra review R5-2).
-        AppSettings.settingsWriteGate = object : AppSettings.Companion.SettingsWriteGate {
-            override fun register(): Boolean = transitions.registerSettingsWrite()
-            override fun unregister() = transitions.unregisterSettingsWrite()
-        }
-    }
+    // Deliberately no class-initialization-time reference to AppSettings here: this object is
+    // loaded during CloudStorageProvider's companion initialization, which runs before the
+    // provider's onCreate() has called initRealm() — touching the Realm-backed settings
+    // singleton at that point would build its RealmConfiguration before Realm.init and fail
+    // startup (Astra review R6-1). The coordinator itself is Realm-free, and AppSettings'
+    // ordinary writers reach it through the registration facade below at write time.
+
+    /** Registers an ordinary AppSettings.realm write with the maintenance drain; see
+     * [AppLockTransitions.registerSettingsWrite]. Returns false while maintenance is active. */
+    fun registerSettingsWrite(): Boolean = transitions.registerSettingsWrite()
+
+    /** Releases a registered ordinary settings write exactly once, on job completion. */
+    fun unregisterSettingsWrite() = transitions.unregisterSettingsWrite()
 
     /** Authoritative app-lock state for the provider gate. */
     fun isAppLockActive(): Boolean {
