@@ -1063,17 +1063,11 @@ class DownloadOfflineFileManager(
             }
 
             staged.setLastModified(file.getLastModifiedInMilliSecond())
-            // Final cancellation check immediately before the atomic replace (issue: round 7 #11).
-            checkCancelled()
-            // The OLD provenance is invalidated BEFORE the bytes are replaced (issue: round
-            // 16 #12): a crash between the rename and the new sidecar write must never leave
-            // the new bytes carrying the previous generation's provenance.
             val provenanceContext = appContextForCheck
             if (provenanceContext == null) {
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
             }
-            deletePublishedProvenance(provenanceContext, target)
             // PREPARE the staged record BEFORE the bytes are replaced (issue: round 18 #2):
             // the registry directories are created and verified and the staged record reads
             // back — a publication whose provenance cannot be established never moves its
@@ -1082,6 +1076,19 @@ class DownloadOfflineFileManager(
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
             }
+            // Final cancellation check AFTER the registry I/O, BEFORE the first mutation
+            // (issues: round 7 #11, round 19 #11): a cancelled publication mutates nothing —
+            // neither the destination's record nor its bytes.
+            checkCancelled()
+            // The OLD proof is retained for rollback (issue: round 19 #11): the atomicity of
+            // the replacement covers the PROOF as well as the bytes — a rename failure must
+            // leave the retained bytes carrying their generation's provenance.
+            val oldRecordFile = provenanceFileFor(provenanceContext, target)
+            val oldRecordText = if (oldRecordFile.exists()) runCatching { oldRecordFile.readText() }.getOrNull() else null
+            // The OLD provenance is invalidated BEFORE the bytes are replaced (issue: round
+            // 16 #12): a crash between the rename and the new sidecar write must never leave
+            // the new bytes carrying the previous generation's provenance.
+            deletePublishedProvenance(provenanceContext, target)
             if (staged.renameTo(target)) {
                 // The staged record travels onto the target with the rename (issue: round 18
                 // #2): provenance and bytes are published together — a failed move FAILS
@@ -1106,6 +1113,12 @@ class DownloadOfflineFileManager(
                 onPublishedLocked?.invoke()
                 return PublicationOutcome.PUBLISHED
             } else {
+                // A FAILED RENAME NEVER DELETES THE OLD TARGET (issue: round 19 #11): the
+                // rename touched nothing, so the retained bytes stay — and their proof is
+                // rolled back with them, keeping the destination's generation intact.
+                if (oldRecordText != null) {
+                    runCatching { provenanceFileFor(provenanceContext, target).writeText(oldRecordText) }
+                }
                 SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
@@ -1229,14 +1242,37 @@ class DownloadOfflineFileManager(
                     if (!prepareStagedProvenance(context, staged, file, userDrive)) {
                         PublicationOutcome.FAILED
                     } else {
+                        // Cancellation AFTER the registry I/O, BEFORE the first mutation
+                        // (issue: round 19 #11): a cancelled publication mutates nothing —
+                        // neither the destination's record nor its bytes.
+                        coroutineContext.ensureActive()
+                        // The OLD proof is retained for rollback (issue: round 19 #11): the
+                        // atomicity of the replacement covers the PROOF as well as the bytes.
+                        val oldRecordFile = provenanceFileFor(context, target)
+                        val oldRecordText = if (oldRecordFile.exists()) runCatching { oldRecordFile.readText() }.getOrNull() else null
                         deletePublishedProvenance(context, target)
-                        if (staged.renameTo(target) && movePublishedProvenance(context, staged, target)) {
-                            PublicationOutcome.PUBLISHED
-                        } else {
-                            // Fail closed: no unproven bytes at the destination.
-                            runCatching { target.delete() }
-                            SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
-                            PublicationOutcome.FAILED
+                        when {
+                            staged.renameTo(target) && movePublishedProvenance(context, staged, target) ->
+                                PublicationOutcome.PUBLISHED
+                            // A FAILED RENAME NEVER DELETES THE OLD TARGET (issue: round 19
+                            // #11): the rename touched nothing — the retained bytes stay, and
+                            // their proof is rolled back with them. The staged file's
+                            // presence distinguishes this from a rename that succeeded and
+                            // then failed its proof move.
+                            staged.exists() -> {
+                                if (oldRecordText != null) {
+                                    runCatching { provenanceFileFor(context, target).writeText(oldRecordText) }
+                                }
+                                SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                                PublicationOutcome.FAILED
+                            }
+                            else -> {
+                                // Fail closed: the rename replaced the old bytes and the
+                                // proof move failed — the NEW unproven bytes are discarded.
+                                runCatching { target.delete() }
+                                SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                                PublicationOutcome.FAILED
+                            }
                         }
                     }
                 }.onFailure { exception ->
@@ -1245,8 +1281,11 @@ class DownloadOfflineFileManager(
                 }.getOrDefault(PublicationOutcome.FAILED)
             }
         } finally {
-            // Staging cleanup on EVERY path, cancellation included (issue: round 18 #23).
+            // Staging cleanup on EVERY path, cancellation included (issue: round 18 #23),
+            // INCLUDING the staged provenance record (issue: round 19 #11): a prepared
+            // record whose bytes were never published must not linger in the registry.
             runCatching { if (staged.exists()) staged.delete() }
+            runCatching { deletePublishedProvenance(context, staged) }
         }
 
         /**
@@ -1315,7 +1354,11 @@ class DownloadOfflineFileManager(
                     SentryLog.e(TAG, "Staged offline publication failed for ${target.path}", exception)
                 }.getOrDefault(PublicationOutcome.FAILED)
 
+                // Staging cleanup on EVERY path (issue: round 18 #23), INCLUDING the staged
+                // provenance record (issue: round 19 #11): a prepared record whose bytes
+                // were never published must not linger in the registry.
                 runCatching { if (staged.exists()) staged.delete() }
+                runCatching { deletePublishedProvenance(appContext, staged) }
                 outcome
             }
         }
