@@ -428,8 +428,19 @@ class FileInfoActionsView @JvmOverloads constructor(
                 }
             }
         } else {
+            // Persist the single-file explicit request BEFORE enqueueing (issue: round 6 #5):
+            // without a cached copy, an ordinary unpinned file outside any root would fail the
+            // publication intent check and be silently skipped. This is the user's explicit
+            // offline request in the captured account, distinct from automatic refresh
+            // scheduling.
+            FileController.markFilesAsOffline(
+                filesId = listOf(fileId),
+                isMarkedAsOffline = true,
+                userDrive = capturedUserDrive,
+                setExplicitPin = true,
+            )
             Utils.downloadAsOfflineFile(context, file = this)
-            if (isMarkedAsOffline) mainViewModel.updateOfflineFile.value = id
+            mainViewModel.updateOfflineFile.value = fileId
         }
         refreshBottomSheetUi(file = this)
 

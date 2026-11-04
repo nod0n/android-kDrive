@@ -349,14 +349,6 @@ object Utils {
         workManager.enqueueUniqueWork(DownloadWorker.TAG, ExistingWorkPolicy.APPEND_OR_REPLACE, downloadRequest)
     }
 
-    fun downloadAsOfflineFiles(context: Context, folderId: Int, userDrive: UserDrive = UserDrive(), onSuccess: () -> Unit) =
-        liveData {
-            enqueueBulkDownloadWorker(context, folderId, userDrive)
-
-            onSuccess.invoke()
-            emit(FileResult(isSuccess = true))
-        }
-
     fun enqueueBulkDownloadWorker(
         context: Context,
         folderId: Int,

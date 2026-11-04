@@ -62,7 +62,6 @@ import com.infomaniak.drive.utils.BulkOperationsUtils.launchBulkOperationWorker
 import com.infomaniak.drive.utils.NotificationPermission
 import com.infomaniak.drive.utils.Utils
 import com.infomaniak.drive.utils.Utils.OTHER_ROOT_ID
-import com.infomaniak.drive.utils.Utils.downloadAsOfflineFiles
 import com.infomaniak.drive.utils.Utils.duplicateFilesClicked
 import com.infomaniak.drive.utils.Utils.moveFileClicked
 import com.infomaniak.drive.utils.showSnackbar
@@ -337,8 +336,7 @@ abstract class MultiSelectFragment(private val matomoCategory: MatomoCategory) :
                 )
             }
             BulkOperationType.ADD_OFFLINE -> {
-                // Set all selected file as offline in order for BulkDownloadWorker to download them
-                mainViewModel.markFilesAsOffline(selectedFiles.map { selectedFile -> selectedFile.id }, true)
+                // Persisted and enqueued by one awaited ViewModel operation (issue: round 6 #7)
                 sendActions(null)
             }
             else -> sendActions(null)
@@ -376,7 +374,7 @@ abstract class MultiSelectFragment(private val matomoCategory: MatomoCategory) :
             val mediator = mainViewModel.createMultiSelectMediator()
             enableMultiSelectButtons(false)
             when (type) {
-                BulkOperationType.ADD_OFFLINE -> sendAddOfflineAction(type, folderId, mediator)
+                BulkOperationType.ADD_OFFLINE -> sendAddOfflineAction(type, folderId, selectedFiles, mediator)
                 BulkOperationType.REMOVE_OFFLINE -> sendRemoveOfflineAction(type, selectedFiles, mediator)
                 else -> sendAllIndividualActions(selectedFiles, type, mediator, destinationFolder, color)
             }
@@ -411,13 +409,14 @@ abstract class MultiSelectFragment(private val matomoCategory: MatomoCategory) :
     private fun sendAddOfflineAction(
         type: BulkOperationType,
         folderId: Int?,
+        selectedFiles: List<File>,
         mediator: MediatorLiveData<MultiSelectMediatorState>,
     ) {
         if (folderId != null) {
             notificationPermission.checkNotificationPermission(requestPermission = true)
             mediator.addSource(
-                downloadAsOfflineFiles(
-                    context = requireContext(),
+                mainViewModel.addSelectionToOffline(
+                    filesId = selectedFiles.map { selectedFile -> selectedFile.id },
                     folderId = folderId,
                     onSuccess = { onIndividualActionSuccess(type) }
                 ),

@@ -707,18 +707,25 @@ class MainViewModel(
         ignoreSyncOffline = isRunning
     }
 
-    fun markFilesAsOffline(filesId: List<Int>, isMarkedAsOffline: Boolean) = viewModelScope.launch(Dispatchers.IO) {
-        FileController.getRealmInstance().use { realm ->
-            // The selection also persists the durable explicit-pin intent (issue: round 5 #15):
-            // the shared pending marker alone can be cleared by an overlapping inherited walk
-            // before the pin batch ever loads its files.
-            FileController.markFilesAsOffline(
-                customRealm = realm,
-                filesId = filesId,
-                isMarkedAsOffline = isMarkedAsOffline,
-                setExplicitPin = true,
-            )
-        }
+    /**
+     * One awaited bulk-offline operation (issue: round 6 #7): the durable explicit-pin and
+     * pending-marker transaction COMMITS before the pin batch is enqueued, so the worker can
+     * never enumerate an empty selection and leave the requests idle until an unrelated user
+     * action.
+     */
+    fun addSelectionToOffline(
+        filesId: List<Int>,
+        folderId: Int,
+        onSuccess: (() -> Unit)? = null,
+    ) = liveData(Dispatchers.IO) {
+        FileController.markFilesAsOffline(
+            filesId = filesId,
+            isMarkedAsOffline = true,
+            setExplicitPin = true,
+        )
+        Utils.enqueueBulkDownloadWorker(getApplication(), folderId)
+        onSuccess?.invoke()
+        emit(FileResult(isSuccess = true))
     }
 
     private fun mapCopyApiResponseToFileResult(apiResponse: ApiResponse<*>, fileName: String): FileResult {
