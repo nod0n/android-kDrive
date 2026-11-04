@@ -1422,6 +1422,18 @@ object OfflineFolderController {
             // edit retaining the old mtime previously classified as NONE and destructive
             // operations destroyed it without a snapshot.
             file.storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.PROVEN_CURRENT -> CopyProtection.NONE
+            // VERIFIED RETAINED GENERATION (issues: round 20 #3, round 20 #24, round 20
+            // #2): the bytes' IMMUTABLE content identity matches their provenance record
+            // — these ARE the generation the record published, even when the row's
+            // accepted metadata has moved on. Byte identity, not metadata currency, is
+            // what destructive cleanliness requires: root removal may delete them WITHOUT
+            // current remote content or recreated offline intent (the retained
+            // older-generation copy converges instead of pending forever), and the
+            // same-second same-size edit (hash mismatch) falls through to the preserved
+            // classes below instead of returning NONE.
+            DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile)
+                ?.takeIf { it.identifies(file, userDrive) && it.certifiesBytes(offlineFile) } != null ->
+                CopyProtection.NONE
             // POSITIVELY FOREIGN provenance (issue: round 19 #12): the record names another
             // owner at this location — the bytes are another identity's content. Never
             // classified as this row's edit, never snapshotted into this row's upload queue,

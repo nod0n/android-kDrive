@@ -745,10 +745,12 @@ class DownloadOfflineFileManager(
 
         /**
          * The identity recorded with published bytes (issues: round 16 #12/#13, round 17 #13,
-         * round 18 #2/#12): the FULL owner and generation identity — producing version,
-         * modification baseline and the accepted revision identity (revisedAt, updatedAt), the
-         * owning ACCOUNT, drive and file row, and the exact published location. A record that
-         * does not name this owner at this location is not provenance for these bytes.
+         * round 18 #2/#12, round 20 #3): the FULL owner and generation identity — producing
+         * version, modification baseline and the accepted revision identity (revisedAt,
+         * updatedAt), the owning ACCOUNT, drive and file row, the exact published location,
+         * and the IMMUTABLE CONTENT IDENTITY (the SHA-256 of the bytes as published — a
+         * metadata-only record can never authorize destructive cleanliness after mutable
+         * access; a same-size same-second edit breaks the identity).
          */
         internal data class PublishedProvenance(
             val version: Int,
@@ -758,29 +760,48 @@ class DownloadOfflineFileManager(
             val userId: Int,
             val driveId: Int,
             val fileId: Int,
+            val contentHash: String?,
             val absolutePath: String,
         ) {
-            /** Owner identity (issue: round 18 #12): the record must name THIS row — and, when
-             * the caller's account scope is known, THIS account — as the bytes' owner. A
-             * path-reused record inherited from another file (or another account's shared-drive
-             * row matching on coarse metadata) is not provenance. */
+            /** STRICT owner identity (issue: round 20 #11): the record must name THIS row,
+             * THIS drive, AND the caller's CAPTURED ACCOUNT — a null scope can never verify
+             * account ownership, so it never grants a currentness or ownership claim. A
+             * path-reused record inherited from another file (or another account's
+             * shared-drive row matching on coarse metadata) is not provenance. */
             internal fun identifies(file: File, userDrive: UserDrive?): Boolean =
-                fileId == file.id && driveId == file.driveId && (userDrive == null || userId == userDrive.userId)
+                userDrive != null && fileId == file.id && driveId == file.driveId &&
+                    userId == userDrive.userId
+
+            /** Row-and-drive identity only, WITHOUT an account claim (round 20 #11): the
+             * scopeless readability pre-check — matches prove at most that the record
+             * describes this row, never account ownership or currentness. */
+            internal fun rowIdentifies(file: File): Boolean =
+                fileId == file.id && driveId == file.driveId
 
             /** POSITIVELY foreign (issue: round 19 #12): the record names a DIFFERENT row,
              * drive, or — when the caller's account scope is known — a different account. An
              * unknown scope (userDrive == null) is unverifiable, not foreign. */
             internal fun positivelyForeignTo(file: File, userDrive: UserDrive?): Boolean =
                 fileId != file.id || driveId != file.driveId || (userDrive != null && userId != userDrive.userId)
+
+            /** IMMUTABLE BYTE IDENTITY (issues: round 20 #3/#24): the record's content hash
+             * is present and equals the CURRENT bytes' hash — these bytes ARE the
+             * generation the record published, whatever the row's accepted metadata now
+             * says. A hashless (legacy) record proves nothing about the bytes. */
+            internal fun certifiesBytes(bytes: IOFile): Boolean =
+                contentHash != null && contentHash == UploadFile.sha256OrNull(bytes)
         }
 
         private fun PublishedProvenance.recordText(target: IOFile): String =
-            "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${target.absolutePath}"
+            "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${contentHash ?: ""}|${target.absolutePath}"
 
         /**
          * Associates PUBLISHED bytes (cache or offline destination) with the content generation
          * that produced them and the owner that published them. The registry directories are
-         * created and verified first; a failed write is reported, never silently ignored.
+         * created and verified first; a failed write is reported, never silently ignored. The
+         * bytes' IMMUTABLE CONTENT IDENTITY is hashed at write time (issue: round 20 #3): a
+         * record without a computable byte identity is not written — it could authorize
+         * nothing.
          */
         private fun writePublishedProvenance(context: Context, target: IOFile, file: File, userDrive: UserDrive): Boolean {
             val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
@@ -793,8 +814,10 @@ class DownloadOfflineFileManager(
                     userId = userDrive.userId,
                     driveId = userDrive.driveId,
                     fileId = file.id,
+                    contentHash = UploadFile.sha256OrNull(target),
                     absolutePath = target.absolutePath,
                 )
+                if (provenance.contentHash == null) return@runCatching false
                 recordFile.writeText(provenance.recordText(target))
                 true
             }.getOrDefault(false)
@@ -838,8 +861,10 @@ class DownloadOfflineFileManager(
                     userId = userDrive.userId,
                     driveId = userDrive.driveId,
                     fileId = row.id,
+                    contentHash = UploadFile.sha256OrNull(target),
                     absolutePath = target.absolutePath,
                 )
+                if (provenance.contentHash == null) return@runCatching false
                 recordFile.writeText(provenance.recordText(target))
                 readPublishedProvenance(context, target) != null
             }.getOrDefault(false)
@@ -848,6 +873,11 @@ class DownloadOfflineFileManager(
         internal fun readPublishedProvenance(context: Context, publishedFile: IOFile): PublishedProvenance? = runCatching {
             val parts = provenanceFileFor(context, publishedFile).readText().trim().split("|")
             require(parts.size >= 8)
+            // FORMAT LADDER (issue: round 20 #3): 8-field records are the pre-hash format —
+            // their location is parts[7] and they carry NO byte identity (they can certify
+            // nothing about content); 9+-field records carry the immutable content hash at
+            // index 7 and re-join the location after it.
+            val legacyHashless = parts.size == 8
             val provenance = PublishedProvenance(
                 version = parts[0].trim().toInt(),
                 lastModifiedAt = parts[1].trim().toLong(),
@@ -856,8 +886,9 @@ class DownloadOfflineFileManager(
                 userId = parts[4].trim().toInt(),
                 driveId = parts[5].trim().toInt(),
                 fileId = parts[6].trim().toInt(),
+                contentHash = if (legacyHashless) null else parts[7].trim().takeIf { it.isNotEmpty() },
                 // The location is the LAST field and re-joins any '|' inside it.
-                absolutePath = parts.drop(7).joinToString("|"),
+                absolutePath = (if (legacyHashless) parts.drop(7) else parts.drop(8)).joinToString("|"),
             )
             // LOCATION identity (issue: round 18 #12): a record read at a different absolute
             // path than the one it names describes bytes elsewhere — never proof here. Legacy
@@ -913,6 +944,12 @@ class DownloadOfflineFileManager(
             val provenance = readPublishedProvenance(context, cacheFile)
             val transferVersion = file.version?.number ?: 0
             return transferVersion > 0 && provenance != null && provenance.identifies(file, userDrive) &&
+                // IMMUTABLE BYTE IDENTITY (issue: round 20 #3): the plain-cache validation
+                // inherits the same same-second-edit weakness the offline path had — the
+                // seconds-resolution mtime and size comparison alone cannot tell a
+                // same-size edit from the published generation. The record's content
+                // identity must match the current bytes.
+                provenance.certifiesBytes(cacheFile) &&
                 provenance.version == transferVersion && provenance.lastModifiedAt == file.lastModifiedAt
         }
 

@@ -340,39 +340,61 @@ open class File(
      */
     fun storedOfflineCopyState(context: Context, offlineFile: IOFile, userDrive: UserDrive? = null): StoredOfflineCopyState {
         if (!(isOffline || isInOfflineFolder)) return StoredOfflineCopyState.ABSENT_OR_STALE
-        // PROTECTED EDITS ARE EXPLICIT (issue: round 19 #13): a copy backing a pending or
-        // retained-unsent upload is the usable local content of an unsent edit — explicitly
-        // readable without generation proof, never "absent" (which would route entry paths
-        // into replacement decisions the protection then has to veto).
+        // EXISTENCE AND POSITIVE OWNERSHIP FIRST (issues: round 20 #12, round 19 #13): a
+        // copy backing a pending or retained-unsent upload is the usable local content of
+        // an unsent edit — recognized by its ORIGINAL URI and by DURABLE SNAPSHOT
+        // ownership (a protected original whose record owns it through its snapshot uri,
+        // not through this path's uri) — explicitly readable without generation proof,
+        // never "absent".
+        if (!offlineFile.exists()) return StoredOfflineCopyState.ABSENT_OR_STALE
         val protectedCopyUri = Uri.fromFile(offlineFile).toString()
+        val snapshotOwned = userDrive?.let { scope ->
+            UploadFile.hasDurableOriginalRevisionOwnership(
+                fileName = name,
+                remoteFolder = parentId,
+                driveId = scope.driveId,
+                userId = scope.userId,
+                fileModifiedAt = Date(offlineFile.lastModified()),
+                fileSize = offlineFile.length(),
+                contentHash = UploadFile.sha256OrNull(offlineFile),
+                originalFileId = id,
+            )
+        } == true
         if (UploadFile.hasPendingUpload(uri = protectedCopyUri) ||
-            UploadFile.hasRetainedUnsentUpload(uri = protectedCopyUri)
+            UploadFile.hasRetainedUnsentUpload(uri = protectedCopyUri) ||
+            snapshotOwned
         ) {
             return StoredOfflineCopyState.READABLE_UNVERIFIED
         }
-        // READABILITY IS INDEPENDENT OF THE REMOTE SIZE (issue: round 19 #13): the previous
-        // gate compared the bytes against the row's CURRENT remote size — a complete
-        // retained copy of an older generation became "absent" the moment a
-        // differently-sized newer revision committed. Presence here is the copy's OWN:
-        // non-empty bytes for a non-empty row (an empty copy of an empty row is intact).
-        // UNKNOWN size is conservative (round-19 build fix): a null row size cannot prove
-        // the row non-empty, so the empty-copy clause never fires on it — the copy stays
-        // readable and verification resolves the generation.
-        if (!offlineFile.exists() || (offlineFile.length() <= 0L && (size ?: 0L) > 0L)) return StoredOfflineCopyState.ABSENT_OR_STALE
+        val provenance = DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile)
+        // OWNER identity: a record that POSITIVELY names a different owner is a CONFLICT
+        // (issues: round 19 #12, round 20 #11) — never a readable copy of this row.
+        if (provenance?.positivelyForeignTo(this, userDrive) == true) return StoredOfflineCopyState.FOREIGN_CONFLICT
+        // IMMUTABLE BYTE IDENTITY (issues: round 20 #3, round 20 #12): a hash-ful record
+        // whose content hash does NOT match the current bytes describes DIFFERENT content
+        // — the copy is truncated, edited or stale beyond its own generation claim:
+        // nothing usable here. This closes the same-second same-size edit hole (the
+        // seconds-resolution mtime comparison alone still matched).
+        if (provenance != null && provenance.contentHash != null && !provenance.certifiesBytes(offlineFile)) {
+            return StoredOfflineCopyState.ABSENT_OR_STALE
+        }
+        // PRESENCE: a hash-ful record that CERTIFIES the bytes is valid regardless of
+        // length (a valid ZERO-BYTE generation included — issue: round 20 #12); hashless
+        // legacy copies need non-empty bytes for a non-empty row (unknown size
+        // conservative — it never proves the row non-empty).
+        if (provenance?.contentHash == null && offlineFile.length() <= 0L && (size ?: 0L) > 0L) {
+            return StoredOfflineCopyState.ABSENT_OR_STALE
+        }
         // OWN-GENERATION coherence (issue: round 18 #14): the copy's usability is judged
         // against the generation it was published under — never against current remote
         // metadata alone, which a backward-dated newer revision changes without the bytes
         // becoming unusable.
-        val provenance = DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile)
         val ownGeneration = provenance?.lastModifiedAt ?: effectivePublishedBaseline
         if ((offlineFile.lastModified() / 1_000L) != ownGeneration) return StoredOfflineCopyState.ABSENT_OR_STALE
         if (provenance == null) return StoredOfflineCopyState.READABLE_UNVERIFIED
-        // OWNER identity (issue: round 18 #12): a record inherited across a path reuse by
-        // another row (or, when the caller's account scope is known, published by another
-        // account on a shared drive) is not provenance for these bytes. A record that
-        // POSITIVELY names a different owner is a CONFLICT (issue: round 19 #12) — never a
-        // readable copy of this row; only an unverifiable account scope stays readable.
-        if (provenance.positivelyForeignTo(this, userDrive)) return StoredOfflineCopyState.FOREIGN_CONFLICT
+        // STRICT OWNER IDENTITY (issue: round 20 #11): CURRENTNESS requires the caller's
+        // CAPTURED ACCOUNT — a null scope never grants currentness; a scopeless row match
+        // stays readable-unverified at most.
         if (!provenance.identifies(this, userDrive)) return StoredOfflineCopyState.READABLE_UNVERIFIED
         val rowVersion = version?.number ?: 0
         // UNKNOWN GENERATION IS NEVER PROOF (issue: round 18 #13).
