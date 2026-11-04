@@ -251,10 +251,9 @@ class DownloadOfflineFileManager(
 
         runCatching { if (staged.exists()) staged.delete() }
         when (published) {
-            PublicationOutcome.PUBLISHED -> {
-                notifyCompleted(file, offlineFile, context)
-                true
-            }
+            // Completion (flag write, media scan, invalidation) already ran inside the per-file
+            // lock via onPublishedLocked (issue: round 5 #2).
+            PublicationOutcome.PUBLISHED -> true
             // Skipped outcomes leave the existing bytes and timestamps untouched (issue: round
             // 4 #1): only the pending marker is cleared, since there is nothing valid left to
             // download for this transfer.
@@ -395,10 +394,7 @@ class DownloadOfflineFileManager(
                     // Completion (flag writes, timestamp, media scan) only runs for bytes this
                     // transfer actually published; skipped outcomes leave the existing content
                     // untouched (issue: round 4 #1).
-                    PublicationOutcome.PUBLISHED -> {
-                        onProgress(100, file.id)
-                        notifyCompleted(file, offlineFile, context)
-                    }
+                    PublicationOutcome.PUBLISHED -> onProgress(100, file.id)
                     PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
                         clearPendingMarker(file.id)
                     }
@@ -420,277 +416,6 @@ class DownloadOfflineFileManager(
      */
     private fun clearPendingMarker(fileId: Int) {
         FileController.markFileAsOffline(fileId = fileId, isMarkedAsOffline = false, userDrive = userDrive)
-    }
-
-    /**
-     * Fetches the fresh remote metadata WITHOUT committing it to Realm: the caller preserves any
-     * old inherited copy first, then upserts (issue: round 3 #7).
-     */
-    private suspend fun fetchRemoteFileDetails(
-        context: Context,
-        fileId: Int,
-    ): File {
-        // Always use the captured account's HTTP client: the walk may target another account/drive
-        // than the currently active one (issue #1902).
-        val fileDetails = Dispatchers.IO {
-            ApiRepository.getFileDetails(
-                file = File(id = fileId, driveId = userDrive.driveId),
-                okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
-            )
-        }
-        val remoteFile = fileDetails.data
-        return if (fileDetails.isSuccess() && remoteFile != null) {
-            remoteFile
-        } else {
-            if (fileDetails.error?.exception is NetworkException) throw UploadTask.NetworkException()
-
-            val translateError = fileDetails.translateError()
-            val responseGsonType = object : TypeToken<ApiResponse<File>>() {}.type
-            val translatedErrorText = context.getString(translateError)
-            val responseJson = ApiController.gson.toJson(fileDetails, responseGsonType)
-            throw RemoteFileException("$responseJson $translatedErrorText")
-        }
-    }
-
-    /**
-     * Promotes an intact cache file through the same staged, validated publication as network
-     * downloads (issue: round 3 #3): partial promotion bytes never appear at the offline path,
-     * and the final coordinated recheck runs before the atomic replace.
-     */
-    private suspend fun moveCacheFileIfIntact(
-        context: Context,
-        file: File,
-        cacheFile: IOFile,
-        offlineFile: IOFile,
-    ): Boolean = withContext(Dispatchers.IO) {
-        if (file.isObsoleteOrNotIntact(cacheFile)) return@withContext false
-
-        val staged = newStagedFile(context, file)
-        val published = runCatching {
-            cacheFile.copyTo(staged, overwrite = true)
-            publishStagedOfflineFile(context, file, offlineFile, staged)
-        }.onFailure { exception ->
-            SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
-        }.getOrDefault(PublicationOutcome.FAILED)
-
-        runCatching { if (staged.exists()) staged.delete() }
-        when (published) {
-            PublicationOutcome.PUBLISHED -> {
-                notifyCompleted(file, offlineFile, context)
-                true
-            }
-            // Skipped outcomes leave the existing bytes and timestamps untouched (issue: round
-            // 4 #1): only the pending marker is cleared, since there is nothing valid left to
-            // download for this transfer.
-            PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
-                filesDownloaded += 1
-                clearPendingMarker(file.id)
-                true
-            }
-            PublicationOutcome.FAILED -> false
-        }
-    }
-
-    /**
-     * Final coordinated publication AND completion (issue: round 5 #2): the completion flag
-     * write, its exact-revision-verified invalidation and the media scan all run INSIDE the same
-     * per-file lock as the rename, so an edit becoming a pending upload (or a root removal
-     * retaining it) between publication and completion can neither be overwritten nor deleted.
-     */
-    private suspend fun publishStagedOfflineFile(
-        context: Context,
-        file: File,
-        target: IOFile,
-        staged: IOFile,
-    ): PublicationOutcome = publishStagedOfflineFile(
-        userDrive = userDrive,
-        isInheritedDownload = isInheritedDownload,
-        file = file,
-        target = target,
-        staged = staged,
-        onPublishedLocked = { completePublishedFileLocked(context, file, target) },
-    )
-
-    /**
-     * Completion core for bytes this transfer just published, executed while the per-file lock
-     * is still held. The redundant timestamp write is gone: the staged file was already
-     * timestamped with the remote revision before the atomic rename.
-     */
-    private fun completePublishedFileLocked(context: Context, file: File, target: IOFile) {
-        var coverageInvalidated = false
-
-        // All validation happens INSIDE the committing transaction (issue: round 3 #9): current
-        // explicit pin and durable ACTIVE root ancestry are re-derived here; a materialized
-        // inherited flag alone never authorizes retention.
-        FileController.getRealmInstance(userDrive).use { realm ->
-            realm.executeTransaction {
-                val liveFile = FileController.getFileById(realm, file.id)
-                val pinned = liveFile?.isOffline == true
-                val ancestorRootCovers = liveFile != null && OfflineFolderController.isInsideActiveRoot(realm, file.id)
-
-                when {
-                    isInheritedDownload && !pinned && !ancestorRootCovers -> {
-                        coverageInvalidated = true
-                    }
-                    isInheritedDownload && ancestorRootCovers -> {
-                        if (liveFile != null && liveFile.isValid) liveFile.isInOfflineFolder = true
-                    }
-                    else -> {
-                        if (liveFile != null && liveFile.isValid) {
-                            // A file covered by an offline folder keeps its inherited state: it
-                            // must not become an explicit pin, otherwise removing the folder
-                            // could not clean it up without stripping separately pinned files.
-                            liveFile.isOffline = liveFile.isOffline || !liveFile.isInOfflineFolder
-                        }
-                    }
-                }
-            }
-        }
-
-        if (coverageInvalidated) {
-            // Coverage disappeared while this transfer ran. Delete the target only if it is
-            // still exactly the revision this transfer published: anything else (an edit that
-            // became a pending upload, for instance) is owned by someone else now.
-            val isExactPublishedRevision = target.exists() && target.lastModified() / 1_000L == file.lastModifiedAt
-            if (isExactPublishedRevision) {
-                runCatching { target.delete() }
-                if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
-            }
-        } else {
-            if (file.isMedia()) MediaUtils.scanFile(context, target)
-        }
-        fileDownloaded(context, file.id)
-    }
-
-    private suspend fun startOfflineDownload(
-        context: Context,
-        file: File,
-        offlineFile: java.io.File,
-        onProgress: (progress: Int, fileId: Int) -> Unit,
-    ): ListenableWorker.Result = withContext(Dispatchers.IO) {
-
-        val okHttpClient = AccountUtils.getHttpClient(userDrive.userId, null)
-
-        val response = downloadFileResponseAsync(
-            fileUrl = ApiRoutes.downloadFile(file),
-            okHttpClient = okHttpClient,
-            downloadInterceptor = downloadProgressInterceptor(
-                getMostRecentLastUpdate = { lastUpdateProgressMillis },
-                onLastUpdateChange = { lastUpdate -> lastUpdateProgressMillis = lastUpdate },
-                onProgress = { progress ->
-                    ensureActive()
-
-                    onProgress(progress, file.id)
-
-                    if (downloadWorker.isForOneFile()) {
-                        updateDownloadNotification(
-                            context = context,
-                            contentTitle = file.name,
-                            contentText = "%d%%".format(progress),
-                            progressPercent = progress,
-                        )
-                    }
-
-                    SentryLog.d(downloadWorker.workerTag(), "download $progress%")
-                },
-            )
-        )
-
-        if (!response.isSuccessful) return@withContext ListenableWorker.Result.failure()
-
-        // Download into a unique, app-owned staged file (issue: round 3 #2): never a sibling of
-        // the offline path (a user file could live there), never shared between concurrent
-        // workers. In-progress bytes are never visible at the offline path.
-        val staged = newStagedFile(context, file)
-        lastDownloadedFile = staged
-        makeSureFileExists(staged) ?: return@withContext ListenableWorker.Result.failure()
-
-        runCatching {
-            val remoteDataHasBeenSaved = saveRemoteData(downloadWorker.workerTag(), response, staged)
-
-            // Validate before publishing (size when the remote metadata carries one), then hand
-            // over to the final coordinated publication (intent, pending uploads, target
-            // revision, atomic replace).
-            val sizeIsValidated = file.size == null || file.isIntactFile(staged)
-            if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated) {
-                val outcome = publishStagedOfflineFile(context, file, offlineFile, staged)
-                when (outcome) {
-                    PublicationOutcome.FAILED -> return@withContext ListenableWorker.Result.failure()
-                    // Completion (flag writes, timestamp, media scan) only runs for bytes this
-                    // transfer actually published; skipped outcomes leave the existing content
-                    // untouched (issue: round 4 #1).
-                    PublicationOutcome.PUBLISHED -> {
-                        onProgress(100, file.id)
-                        notifyCompleted(file, offlineFile, context)
-                    }
-                    PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
-                        clearPendingMarker(file.id)
-                    }
-                }
-                ListenableWorker.Result.success()
-            } else {
-                runCatching { staged.delete() }
-                ListenableWorker.Result.failure()
-            }
-        }.cancellable().getOrElse {
-            runCatching { staged.delete() }
-            throw it
-        }
-    }
-
-    /**
-     * Clears only the download-pending marker, without touching bytes, timestamps or coverage
-     * flags (issue: round 4 #1).
-     */
-    private fun clearPendingMarker(fileId: Int) {
-        FileController.markFileAsOffline(fileId = fileId, isMarkedAsOffline = false, userDrive = userDrive)
-    }
-
-    private fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
-        var coverageInvalidated = false
-
-        // All validation happens INSIDE the committing transaction (issue: round 3 #9), under
-        // the shared per-file coordination so a concurrent cleanup, move or upload registration
-        // cannot interleave (issue: round 4 #4). Current explicit pin and durable root ancestry
-        // are re-derived here; a materialized inherited flag alone never authorizes retention.
-        synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
-            FileController.getRealmInstance(userDrive).use { realm ->
-                realm.executeTransaction {
-                    val liveFile = FileController.getFileById(realm, file.id)
-                    val pinned = liveFile?.isOffline == true
-                    val ancestorRootCovers = liveFile != null && OfflineFolderController.isInsideActiveRoot(realm, file.id)
-
-                    when {
-                        isInheritedDownload && !pinned && !ancestorRootCovers -> {
-                            coverageInvalidated = true
-                        }
-                        isInheritedDownload && ancestorRootCovers -> {
-                            if (liveFile != null && liveFile.isValid) liveFile.isInOfflineFolder = true
-                        }
-                        else -> {
-                            if (liveFile != null && liveFile.isValid) {
-                                // A file covered by an offline folder keeps its inherited state: it
-                                // must not become an explicit pin, otherwise removing the folder
-                                // could not clean it up without stripping separately pinned files.
-                                liveFile.isOffline = liveFile.isOffline || !liveFile.isInOfflineFolder
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (coverageInvalidated) {
-            // The coverage (or pin) was removed while this download was in flight: an inherited
-            // download must never manufacture an explicit pin, so the orphaned copy is dropped
-            // (offline cache only).
-            runCatching { if (offlineFile.exists()) offlineFile.delete() }
-            if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
-        } else {
-            offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
-            if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
-        }
-        fileDownloaded(context, file.id)
     }
 
     private fun makeSureFileExists(offlineFile: java.io.File): Unit? {
@@ -788,6 +513,7 @@ class DownloadOfflineFileManager(
             file: File,
             target: IOFile,
             staged: IOFile,
+            onPublishedLocked: (() -> Unit)? = null,
         ): PublicationOutcome = withContext(Dispatchers.IO) {
             synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
                 coroutineContext.ensureActive()
