@@ -635,7 +635,9 @@ object FileController {
     }
 
     fun saveFavoritesFiles(files: List<File>, replaceOldData: Boolean = false, realm: Realm? = null) {
-        saveFiles(Favorites.file, files, replaceOldData, realm)
+        // Favorites is an active-account view; the boundary scope matches its realm
+        // (issue: round 7 #6).
+        saveFiles(Favorites.file, files, replaceOldData, realm, UserDrive())
     }
 
     private fun saveMySharesFiles(userDrive: UserDrive, files: ArrayList<File>, replaceOldData: Boolean) {
@@ -659,7 +661,7 @@ object FileController {
             }
 
             if (replaceOldData) removeFile(MyShares.id, keepCaches, keepFiles, realm, userDrive = userDrive)
-            saveFiles(MyShares.file, files, replaceOldData, realm)
+            saveFiles(MyShares.file, files, replaceOldData, realm, userDrive)
         }
     }
 
@@ -667,9 +669,17 @@ object FileController {
         folder: File,
         files: List<File>,
         replaceOldData: Boolean = false,
-        realm: Realm? = null
+        realm: Realm? = null,
+        userDrive: UserDrive? = null
     ) {
         val block: (Realm) -> Unit = { currentRealm ->
+            // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6):
+            // Favorites/MyShares listings replace identities too.
+            val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                realm = currentRealm,
+                remoteFiles = files,
+                userDrive = userDrive ?: UserDrive(),
+            )
             currentRealm.executeTransaction { realm ->
                 val newMySharesFolder = if (replaceOldData) {
                     realm.copyToRealmOrUpdate(folder)
@@ -677,11 +687,11 @@ object FileController {
                     currentRealm.where(File::class.java).equalTo(File::id.name, folder.id).findFirst()
                         ?: realm.copyToRealmOrUpdate(folder)
                 }
-                newMySharesFolder?.children?.addAll(realm, files)
+                newMySharesFolder?.children?.addAll(realm, committableFiles)
             }
         }
 
-        realm?.let(block) ?: getRealmInstance().use(block)
+        realm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
     private fun getDriveFileName(userDrive: UserDrive): String {
@@ -881,13 +891,18 @@ object FileController {
 
     fun storeRecentChanges(files: ArrayList<File>, isFirstPage: Boolean = false) {
         getRealmInstance().use {
+            // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6): an
+            // activity-driven rename reaching Recent Changes must not replace the identity
+            // before the owned copy at the old location is preserved; deferred files commit
+            // their OLD row.
+            val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(it, files, UserDrive())
             it.executeTransaction { realm ->
                 val folder = realm.where(File::class.java).equalTo(File::id.name, RecentChanges.id).findFirst()
                     ?: realm.copyToRealm(RecentChanges.file)
                 if (isFirstPage) {
                     folder.children = RealmList()
                 }
-                files.forEach { file ->
+                committableFiles.forEach { file ->
                     realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()?.let { realmFile ->
                         file.keepOldLocalFilesData(realmFile)
                     }
@@ -899,6 +914,18 @@ object FileController {
 
     fun storeFileActivities(fileActivities: ArrayList<FileActivity>) {
         getRealmInstance().use { realm ->
+            // Shared upsert boundary OUTSIDE the transaction (issue: round 7 #6): activity
+            // files are upserted recursively; an owned copy at a renamed/moved old location
+            // is preserved first, and a deferred activity keeps its OLD row.
+            fileActivities.forEach { fileActivity ->
+                fileActivity.file?.let { file ->
+                    fileActivity.file = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                        realm = realm,
+                        remoteFiles = listOf(file),
+                        userDrive = UserDrive(),
+                    ).first()
+                }
+            }
             realm.beginTransaction()
             fileActivities.forEach { fileActivity ->
                 fileActivity.userId = fileActivity.user?.id
@@ -914,12 +941,14 @@ object FileController {
     }
 
     fun storeGalleryDrive(mediaList: List<File>, isFirstPage: Boolean = false, customRealm: Realm? = null) {
-        val block: (Realm) -> Unit = {
-            it.executeTransaction { realm ->
+        val block: (Realm) -> Unit = { currentRealm ->
+            // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6).
+            val committableMedia = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(currentRealm, mediaList, UserDrive())
+            currentRealm.executeTransaction { realm ->
                 val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
                     ?: realm.copyToRealm(Gallery.file)
                 if (isFirstPage) galleryFolder.children = RealmList()
-                galleryFolder.children.addAll(realm, mediaList)
+                galleryFolder.children.addAll(realm, committableMedia)
             }
         }
         customRealm?.let(block) ?: getRealmInstance().use(block)
