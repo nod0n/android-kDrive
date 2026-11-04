@@ -811,7 +811,7 @@ class CloudStorageProvider : DocumentsProvider() {
                     // (issue: round 16 #12): stale provenance must never survive bytes it does
                     // not describe.
                     cacheFile.delete() // Delete old cache
-                    DownloadOfflineFileManager.deletePublishedProvenance(cacheFile)
+                    DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
                 }
             } else {
                 exception.printStackTrace()
@@ -831,7 +831,16 @@ class CloudStorageProvider : DocumentsProvider() {
 
         try {
             // Get offline file if it's intact
-            if (offlineFile != null && file.isOfflineAndIntact(offlineFile)) {
+            if (offlineFile != null && file.isOfflineAndReadable(context, offlineFile)) {
+                // READABLE retained copy (issue: round 17 #15): legacy pre-provenance bytes
+                // stay available; their generation is unverified — schedule verification so
+                // the walk/worker proves or refreshes them without blocking this read.
+                if (file.storedOfflineCopyState(context, offlineFile) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+                    OfflineFolderController.scheduleOfflineVerification(
+                        fileId = file.id,
+                        userDrive = UserDrive(userId = userDrive.userId, driveId = userDrive.driveId),
+                    )
+                }
                 return ParcelFileDescriptor.open(offlineFile, accessMode)
             }
 
@@ -859,7 +868,7 @@ class CloudStorageProvider : DocumentsProvider() {
                 // bytes it just wrote (issue: round 16 #12) — invalidate any sidecar from a
                 // previous generation so promotion can never mistake these bytes for a
                 // proven generation.
-                DownloadOfflineFileManager.deletePublishedProvenance(cacheFile)
+                DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
                 return ParcelFileDescriptor.open(cacheFile, accessMode)
             }
         } catch (exception: Exception) {
@@ -870,6 +879,7 @@ class CloudStorageProvider : DocumentsProvider() {
     }
 
     private suspend fun ParcelFileDescriptor.AutoCloseOutputStream.loadCachedData(
+        context: Context,
         remoteDataHasBeenSaved: Boolean,
         cacheFile: IOFile,
         file: File,
@@ -877,9 +887,9 @@ class CloudStorageProvider : DocumentsProvider() {
     ) {
         if (remoteDataHasBeenSaved) {
             cacheFile.setLastModified(file.getLastModifiedInMilliSecond())
-            // Direct cache writer provenance invalidation (issue: round 16 #12), as in
-            // [getDataFile].
-            DownloadOfflineFileManager.deletePublishedProvenance(cacheFile)
+            // Direct cache writer provenance invalidation (issue: round 16 #12, round 17 #1),
+            // as in [getDataFile].
+            DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
             cacheFile.inputStream().use { it.copyToCancellable(this) }
         } else {
             writePipe.closeWithError("Error occurred when download remote data")

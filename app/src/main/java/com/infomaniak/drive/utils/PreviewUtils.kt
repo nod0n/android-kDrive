@@ -226,6 +226,7 @@ internal suspend fun downloadFile(
         }
 
         val outcome = DownloadOfflineFileManager.publishDownloadedCopy(
+            context = context,
             file = file,
             target = externalOutputFile,
             userDrive = userDrive,

@@ -17,6 +17,8 @@
  */
 package com.infomaniak.drive.ui.fileList.preview.playback
 
+import com.infomaniak.drive.data.cache.OfflineFolderController
+import com.infomaniak.drive.data.models.StoredOfflineCopyState
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -96,7 +98,20 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun isOfflineFileComplete(offlineFile: IOFile?) = offlineFile?.let { currentFile?.isOfflineAndIntact(it) } ?: false
+    private fun isOfflineFileComplete(offlineFile: IOFile?): Boolean = offlineFile?.let { stored ->
+        currentFile?.let { file ->
+            // READABLE retained copy (issue: round 17 #15): availability without generation
+            // proof; unverified copies are scheduled for verification.
+            val readable = file.isOfflineAndReadable(getApplication(), stored)
+            if (readable && file.storedOfflineCopyState(getApplication(), stored) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+                OfflineFolderController.scheduleOfflineVerification(
+                    fileId = file.id,
+                    userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId),
+                )
+            }
+            readable
+        }
+    } ?: false
 
     companion object {
         private const val TAG = "PlaybackViewModel"

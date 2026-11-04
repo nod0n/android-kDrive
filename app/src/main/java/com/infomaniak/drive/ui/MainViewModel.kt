@@ -785,7 +785,7 @@ class MainViewModel(
                 // provenance sidecar dies with the bytes (issue: round 16 #12).
                 deleteOfflinePath?.let { path ->
                     mediaFile?.let { file -> file.deleteInMediaScan(context, userDrive) }
-                    DownloadOfflineFileManager.deletePublishedProvenance(IOFile(path))
+                    DownloadOfflineFileManager.deletePublishedProvenance(context, IOFile(path))
                     runCatching { IOFile(path).takeIf { it.exists() }?.delete() }
                 }
                 deleteCachePath?.let { path ->

@@ -345,7 +345,7 @@ object OfflineFolderUtils {
             val offlineFile = localFile.getOfflineFile(context, userDrive.userId)
             val hasPendingUpload = offlineFile != null &&
                     UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())
-            val hasIntactOfflineCopy = offlineFile != null && localFile.isOfflineAndIntact(offlineFile)
+            val hasIntactOfflineCopy = offlineFile != null && localFile.isOfflineAndProvenCurrent(context, offlineFile)
             val isLocallyModified = offlineFile != null && offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
                 // Edit detection judges against the PUBLISHED byte baseline, not accepted

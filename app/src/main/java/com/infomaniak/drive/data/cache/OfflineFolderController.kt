@@ -672,7 +672,7 @@ object OfflineFolderController {
                                     // generation to a later file there. Best effort: a failed
                                     // sidecar move never fails the byte migration — the copy
                                     // simply loses provenance and a later walk re-downloads it.
-                                    DownloadOfflineFileManager.movePublishedProvenance(oldOfflineFile, target)
+                                    DownloadOfflineFileManager.movePublishedProvenance(context, oldOfflineFile, target)
                                 }
                                 renamed
                             }.getOrDefault(false)
@@ -1138,6 +1138,29 @@ object OfflineFolderController {
     internal enum class CopyProtection { NONE, PENDING_UPLOAD, UPLOADED, DIRTY }
 
     /**
+     * Schedules generation VERIFICATION for a readable-but-unproven offline copy (issue:
+     * round 17 #15): legacy pre-provenance bytes stay readable, and the pending-download
+     * marker drives the walk/worker verification, so a legacy copy is neither blocked behind
+     * its missing provenance nor silently treated as current. Coordinated like every intent
+     * write, idempotent; the verification's publication records the generation and clears
+     * the marker.
+     */
+    fun scheduleOfflineVerification(fileId: Int, userDrive: UserDrive) {
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, fileId) {
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    runCatching { realm.refresh() }
+                    realm.executeTransaction {
+                        val liveRow = FileController.getFileById(realm, fileId) ?: return@executeTransaction
+                        if (liveRow.isMarkedAsOffline) return@executeTransaction
+                        liveRow.isMarkedAsOffline = true
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * Preservation state of an existing offline copy, shared with the deferred-cleanup
      * completion check (issue #1902): [PENDING_UPLOAD] and [DIRTY] copies must survive cleanup,
      * [UPLOADED] copies are content-safe duplicates, [NONE] copies are clearable.
@@ -1239,7 +1262,7 @@ object OfflineFolderController {
     ) {
         // The published generation's provenance sidecar dies with the bytes (issue: round
         // 16 #12): an orphaned sidecar must never lend its generation to later bytes.
-        DownloadOfflineFileManager.deletePublishedProvenance(offlineFile)
+        DownloadOfflineFileManager.deletePublishedProvenance(context, offlineFile)
         runCatching { offlineFile.delete() }.onFailure { exception ->
             SentryLog.e(TAG, "Failed to delete offline file ${offlineFile.path}", exception)
         }.onSuccess {

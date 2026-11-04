@@ -318,28 +318,55 @@ open class File(
     }
 
     /**
-     * File is offline and local file is the same as in the server (same modification date and size)
+     * State of the retained offline copy of this row (issues: round 17 #13/#14/#15) — three
+     * DISTINCT answers, never conflated:
+     *  - [StoredOfflineCopyState.PROVEN_CURRENT]: the bytes are PROVEN to be the accepted
+     *    remote generation — coarse baseline AND the published generation's recorded
+     *    provenance (complete baseline plus accepted revisedAt/updatedAt identity, and a
+     *    known version when the row carries one) all match.
+     *  - [StoredOfflineCopyState.READABLE_UNVERIFIED]: a complete copy exists and stays
+     *    READABLE (legacy pre-provenance bytes, or a coarse match whose generation cannot
+     *    be proven) — access is preserved, but it is never proof of current content;
+     *    verification is scheduled instead.
+     *  - [StoredOfflineCopyState.ABSENT_OR_STALE]: nothing usable at the path.
      */
-    fun isOfflineAndIntact(offlineFile: IOFile): Boolean {
-        // Explicit pins and files covered by an offline folder (issue #1902) are both offline:
-        // the existence, timestamp and size checks below are unchanged.
-        if (!((isOffline || isInOfflineFolder)
-                    && ((offlineFile.lastModified() / 1_000L) == lastModifiedAt && isIntactFile(offlineFile)))
-        ) {
-            return false
+    fun storedOfflineCopyState(context: Context, offlineFile: IOFile): StoredOfflineCopyState {
+        if (!(isOffline || isInOfflineFolder)) return StoredOfflineCopyState.ABSENT_OR_STALE
+        if (!((offlineFile.lastModified() / 1_000L) == lastModifiedAt && isIntactFile(offlineFile))) {
+            return StoredOfflineCopyState.ABSENT_OR_STALE
         }
-        // GENERATION PROVENANCE of the published bytes (issue: round 16 #13): coarse mtime and
-        // size cannot distinguish two same-second, same-size revisions — R1's published bytes
-        // passed this check after R2 (same mtime, same size) was accepted, so the walk queued
-        // nothing and completed with R1's content. The sidecar written at publication names
-        // the producing generation: a KNOWN row version must match it, and a missing sidecar
-        // (bytes published before provenance existed, or of unknown origin) is never proven
-        // current. Unproven copies are re-downloaded once; every publication records its
-        // generation, so provenance is restored on that pass.
-        val provenance = DownloadOfflineFileManager.readPublishedProvenance(offlineFile) ?: return false
+        // GENERATION PROVENANCE of the published bytes (issues: round 16 #13, round 17 #13):
+        // coarse mtime and size cannot distinguish two same-second, same-size revisions, and
+        // an UNKNOWN row version is not equality with an arbitrary published generation — the
+        // sidecar's COMPLETE recorded baseline (version, modification time) AND its accepted
+        // revision identity (revisedAt, updatedAt) must match the row's accepted metadata.
+        val provenance = DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile)
+            ?: return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (provenance.second != lastModifiedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
         val rowVersion = version?.number ?: 0
-        return rowVersion <= 0 || provenance.first == rowVersion
+        if (rowVersion > 0 && provenance.first != rowVersion) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (revisedAt > 0 && provenance.third > 0 && provenance.third != revisedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (provenance.fourth > 0 && provenance.fourth != updatedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        return StoredOfflineCopyState.PROVEN_CURRENT
     }
+
+    /**
+     * Whether the retained offline copy is PROVEN to be the accepted remote generation —
+     * the current-content proof used by completeness decisions (walk scheduling, worker fast
+     * paths, completion validation). Never confers mere readability (issue: round 17 #15).
+     */
+    fun isOfflineAndProvenCurrent(context: Context, offlineFile: IOFile): Boolean =
+        storedOfflineCopyState(context, offlineFile) == StoredOfflineCopyState.PROVEN_CURRENT
+
+    /**
+     * Whether a complete, readable offline copy exists WITHOUT proving its generation —
+     * access decisions (previews, playback, SAF reads) use this so legacy pre-provenance
+     * bytes stay available immediately after upgrade (issue: round 17 #15); the copy's
+     * generation is unverified and verification is scheduled separately.
+     */
+    fun isOfflineAndReadable(context: Context, offlineFile: IOFile): Boolean =
+        (isOffline || isInOfflineFolder) &&
+            ((offlineFile.lastModified() / 1_000L) == lastModifiedAt && isIntactFile(offlineFile))
 
     fun getConvertedPdfCache(context: Context, userDrive: UserDrive): IOFile {
         val folder = IOFile(context.cacheDir, "converted_pdf/${userDrive.userId}/${userDrive.driveId}")
@@ -623,7 +650,10 @@ open class File(
                             OfflineFileCoordination.withFileLock(userDrive, id) {
                                 val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
                                     runCatching { realm.refresh() }
-                                    FileController.getFileById(realm, id)?.let { live -> realm.copyFromRealm(live, 0) }
+                                    // DEPTH-ONE detached copy (issue: round 17 #14): the version must survive — a
+                                    // depth-zero copy turns a KNOWN mismatching generation
+                                    // into the permissive unknown-version case.
+                                    FileController.getFileById(realm, id)?.let { live -> realm.copyFromRealm(live, 1) }
                                 }
                                 val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
                                 val targetUri = Uri.fromFile(cacheFile).toString()
@@ -643,7 +673,7 @@ open class File(
                                     // and the mutating decision would register an upload
                                     // that can restore old content over the newer
                                     // generation — no snapshot is manufactured here.
-                                    (liveRow.isOfflineAndIntact(cacheFile) ||
+                                    (liveRow.isOfflineAndProvenCurrent(context, cacheFile) ||
                                         UploadFile.hasPendingUpload(uri = targetUri) ||
                                         UploadFile.hasRetainedUnsentUpload(uri = targetUri) ||
                                         // Durable SNAPSHOT registrations own the original
@@ -751,3 +781,6 @@ open class File(
         }
     }
 }
+
+/** State of a row's retained offline copy — see [File.storedOfflineCopyState] (round 17 #13/#14/#15). */
+enum class StoredOfflineCopyState { PROVEN_CURRENT, READABLE_UNVERIFIED, ABSENT_OR_STALE }

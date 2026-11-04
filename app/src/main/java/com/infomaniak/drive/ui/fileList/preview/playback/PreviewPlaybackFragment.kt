@@ -17,6 +17,10 @@
  */
 package com.infomaniak.drive.ui.fileList.preview.playback
 
+import com.infomaniak.drive.data.cache.OfflineFolderController
+import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.data.models.StoredOfflineCopyState
 import android.app.AppOpsManager
 import android.content.Intent
 import android.os.Bundle
@@ -245,7 +249,19 @@ open class PreviewPlaybackFragment : PreviewFragment() {
         }
     }
 
-    private fun isOfflineFileComplete(offlineFile: IOFile?) = offlineFile?.let { file.isOfflineAndIntact(it) } ?: false
+    private fun isOfflineFileComplete(offlineFile: IOFile?): Boolean = offlineFile?.let {
+        // READABLE retained copy (issue: round 17 #15): legacy pre-provenance bytes stay
+        // available; an unverified generation is scheduled for verification, never treated
+        // as current.
+        val readable = file.isOfflineAndReadable(requireContext(), it)
+        if (readable && file.storedOfflineCopyState(requireContext(), it) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+            OfflineFolderController.scheduleOfflineVerification(
+        fileId = file.id,
+        userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId),
+    )
+        }
+        readable
+    } ?: false
 
     companion object {
         private const val SOURCE_ERROR = "Source error"

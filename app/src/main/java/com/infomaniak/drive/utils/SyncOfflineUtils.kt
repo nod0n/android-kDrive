@@ -664,7 +664,7 @@ object SyncOfflineUtils {
             if (liveRow.isMedia()) liveRow.deleteInMediaScan(context, userDrive)
         }
 
-        if (!liveRow.isMarkedAsOffline && (!remoteFile.isOfflineAndIntact(remoteOfflineFile) || pathChanged)) {
+        if (!liveRow.isMarkedAsOffline && (!remoteFile.isOfflineAndProvenCurrent(context, remoteOfflineFile) || pathChanged)) {
             // Preservation against the OLD row baseline BEFORE the metadata replacement
             // (issue: round 8 #1): with baseline T1, an unregistered local edit T2 and a newer
             // remote revision T3 (T1 < T2 < T3), committing T3 metadata first would advance the
@@ -712,7 +712,7 @@ object SyncOfflineUtils {
             )
             return DownloadActionOutcome(handled = true, pendingOperation = operation)
         }
-        if (liveRow.isMarkedAsOffline && !remoteFile.isOfflineAndIntact(remoteOfflineFile)) {
+        if (liveRow.isMarkedAsOffline && !remoteFile.isOfflineAndProvenCurrent(context, remoteOfflineFile)) {
             // A pending marker alone does not prove that any worker owns the refresh (issue:
             // round 7 #16): it can outlive failed or cancelled work, and reporting this action
             // handled without durable work would advance the sync cursor past a missing or

@@ -31,6 +31,7 @@ import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
+import com.infomaniak.drive.data.models.StoredOfflineCopyState
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
@@ -56,7 +57,28 @@ class DownloadProgressViewModel : ViewModel() {
             return@launch
         }
 
-        if (file.isObsoleteOrNotIntact(outputFile)) {
+        // SHARED current-content validation at entry (issues: round 17 #13/#14/#15): an
+        // offline-owned destination answers through its three distinct copy states —
+        // PROVEN current completes, READABLE-but-unverified completes with verification
+        // scheduled (legacy access preserved, never falsely current), ABSENT/STALE downloads.
+        if (file.isOffline || file.isInOfflineFolder) {
+            when (file.storedOfflineCopyState(context, outputFile)) {
+                StoredOfflineCopyState.PROVEN_CURRENT -> {
+                    downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
+                    return@launch
+                }
+                StoredOfflineCopyState.READABLE_UNVERIFIED -> {
+                    OfflineFolderController.scheduleOfflineVerification(fileId = file.id, userDrive = userDrive)
+                    downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
+                    return@launch
+                }
+                StoredOfflineCopyState.ABSENT_OR_STALE -> Unit
+            }
+        } else if (!file.isObsoleteOrNotIntact(outputFile)) {
+            downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
+            return@launch
+        }
+        if (file.isObsoleteOrNotIntact(outputFile) || file.isOffline || file.isInOfflineFolder) {
             if ((file.isOffline || file.isInOfflineFolder) &&
                 OfflineFolderController.decisionForReplacingOwnedCopy(file, outputFile, userDrive) ==
                 OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL
@@ -96,6 +118,7 @@ class DownloadProgressViewModel : ViewModel() {
         // per-file locks. An offline-owned destination never holds partial or deleted bytes
         // while the download runs.
         val outcome = DownloadOfflineFileManager.publishDownloadedCopy(
+            context = context,
             file = file,
             target = outputFile,
             userDrive = userDrive,
@@ -131,7 +154,10 @@ class DownloadProgressViewModel : ViewModel() {
                         OfflineFileCoordination.withFileLock(userDrive, file.id) {
                             val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
                                 runCatching { realm.refresh() }
-                                FileController.getFileById(realm, file.id)?.let { live -> realm.copyFromRealm(live, 0) }
+                                // DEPTH-ONE detached copy (issue: round 17 #14): a depth-zero copy discards the
+                                // embedded version and converts a KNOWN mismatching
+                                // generation into the permissive unknown-version case.
+                                FileController.getFileById(realm, file.id)?.let { live -> realm.copyFromRealm(live, 1) }
                             }
                             val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
                             val targetUri = Uri.fromFile(outputFile).toString()
@@ -145,7 +171,7 @@ class DownloadProgressViewModel : ViewModel() {
                                 // old generation's clean bytes as an edit against the
                                 // replacement baseline and manufacture an upload that can
                                 // restore old content over the newer generation.
-                                (liveRow.isOfflineAndIntact(outputFile) ||
+                                (liveRow.isOfflineAndProvenCurrent(context, outputFile) ||
                                     UploadFile.hasPendingUpload(uri = targetUri) ||
                                     UploadFile.hasRetainedUnsentUpload(uri = targetUri) ||
                                     // Durable SNAPSHOT registrations own the original

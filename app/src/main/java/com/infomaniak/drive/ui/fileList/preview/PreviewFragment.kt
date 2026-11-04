@@ -17,6 +17,9 @@
  */
 package com.infomaniak.drive.ui.fileList.preview
 
+import com.infomaniak.drive.data.cache.OfflineFolderController
+import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.data.models.StoredOfflineCopyState
 import android.os.Bundle
 import android.view.View
 import androidx.core.view.isGone
@@ -114,7 +117,18 @@ open class PreviewFragment : Fragment() {
 
     protected fun isOfflineCopyIntact(): Boolean {
         return file.getOfflineFile(requireContext(), previewSliderViewModel.userDrive.userId)
-            ?.let { file.isOfflineAndIntact(it) } == true
+            ?.let {
+                // READABLE retained copy (issue: round 17 #15): availability without
+                // generation proof; unverified copies are scheduled for verification.
+                val readable = file.isOfflineAndReadable(requireContext(), it)
+                if (readable && file.storedOfflineCopyState(requireContext(), it) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+                    OfflineFolderController.scheduleOfflineVerification(
+        fileId = file.id,
+        userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId),
+    )
+                }
+                readable
+            } == true
     }
 
     protected open fun showNoNetwork() {
