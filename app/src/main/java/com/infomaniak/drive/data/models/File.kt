@@ -510,7 +510,17 @@ open class File(
             getOfflineFile(context, userId)?.apply {
                 // Never drop the bytes backing a pending upload when the cache row goes away
                 // (issue #1902); the upload still reads from this file.
-                if (exists() && !UploadFile.hasPendingUpload(uri = Uri.fromFile(this).toString())) {
+                // DELETION-BOUNDARY RECOVERY EXCLUSION (issue: round 23 #3): bytes governed
+                // by an unresolved durable recovery are recovery-managed state — deleting
+                // them destroys the recovery's subject. The re-read fails closed.
+                if (exists() && !UploadFile.hasPendingUpload(uri = Uri.fromFile(this).toString()) &&
+                    !DownloadOfflineFileManager.hasUnresolvedRecovery(
+                        context,
+                        UserDrive(userId, driveId),
+                        id,
+                        absolutePath,
+                    )
+                ) {
                     // The published generation's record dies with the bytes (issue: round 18
                     // #12): every byte-deletion path clears matching provenance — an orphaned
                     // record must never lend its generation to bytes later published here.

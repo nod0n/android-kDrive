@@ -1201,10 +1201,18 @@ class DownloadOfflineFileManager(
             file: File,
             userDrive: UserDrive,
             backupHash: String,
+            expectedPublicationHash: String?,
+            expectedPublicationRecordText: String?,
         ): Boolean = runCatching {
+            // RECORD v3 (issue: round 23 #2): the operation's EXPECTED TARGET PUBLICATION
+            // (the staged generation's content hash and the proof the target will carry)
+            // rides the record — the reconciliation can then distinguish INTERRUPTED
+            // PUBLICATION OUTPUT (the target already holds the expected bytes: complete
+            // the publication with its captured proof) from a PROVEN INTERVENING EDIT,
+            // and never auto-uploads arbitrary changed targets.
             recoveryRecordFile(context, recoveryFile).writeText(
                 listOf(
-                    "2",
+                    "3",
                     target.absolutePath,
                     recoveryFile.absolutePath,
                     oldTargetMtimeMillis.toString(),
@@ -1213,6 +1221,8 @@ class DownloadOfflineFileManager(
                     userDrive.userId.toString(),
                     userDrive.driveId.toString(),
                     backupHash,
+                    expectedPublicationHash ?: "",
+                    expectedPublicationRecordText ?: "",
                 ).joinToString("\n")
             )
             true
@@ -1228,42 +1238,136 @@ class DownloadOfflineFileManager(
             val userId: Int,
             val driveId: Int,
             val backupHash: String?,
+            val expectedPublicationHash: String?,
+            val expectedPublicationRecordText: String?,
+            val legacy: Boolean,
         )
 
+        /**
+         * Versioned recovery-record parsing (issue: round 23 #3): v3 (11 fields, the
+         * expected target publication), v2 (9 fields, round 22) and — CONSERVATIVELY — the
+         * legacy five-field v1. A v1 record carried no owner identity and no backup hash:
+         * the identity is derived from the backup file's own name (newStagedFile embeds
+         * id_driveId) and the immutable backup hash is computed from the backup itself at
+         * reconciliation. A legacy record whose identity cannot be derived stays
+         * unparseable (unresolved, never deleted, never auto-registered).
+         */
         private fun readRecoveryRecord(recordFile: IOFile): RecoveryRecord? = runCatching {
-            val parts = recordFile.readText().split("\n", limit = 9)
-            require(parts.size == 9)
-            RecoveryRecord(
-                recordFile = recordFile,
-                targetPath = parts[1],
-                recoveryPath = parts[2],
-                oldTargetMtimeMillis = parts[3].trim().toLongOrNull() ?: return null,
-                oldRecordText = parts[4].takeIf { it.isNotEmpty() },
-                fileId = parts[5].trim().toIntOrNull() ?: return null,
-                userId = parts[6].trim().toIntOrNull() ?: return null,
-                driveId = parts[7].trim().toIntOrNull() ?: return null,
-                backupHash = parts[8].trim().takeIf { it.isNotEmpty() },
-            )
+            val text = recordFile.readText()
+            val v3 = text.split("\n", limit = 11)
+            if (v3.size == 11 && v3[0].trim() == "3") {
+                return@runCatching RecoveryRecord(
+                    recordFile = recordFile,
+                    targetPath = v3[1],
+                    recoveryPath = v3[2],
+                    oldTargetMtimeMillis = v3[3].trim().toLongOrNull() ?: return null,
+                    oldRecordText = v3[4].takeIf { it.isNotEmpty() },
+                    fileId = v3[5].trim().toIntOrNull() ?: return null,
+                    userId = v3[6].trim().toIntOrNull() ?: return null,
+                    driveId = v3[7].trim().toIntOrNull() ?: return null,
+                    backupHash = v3[8].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationHash = v3[9].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationRecordText = v3[10].takeIf { it.isNotEmpty() },
+                    legacy = false,
+                )
+            }
+            val v2 = text.split("\n", limit = 9)
+            if (v2.size == 9 && v2[0].trim() == "2") {
+                return@runCatching RecoveryRecord(
+                    recordFile = recordFile,
+                    targetPath = v2[1],
+                    recoveryPath = v2[2],
+                    oldTargetMtimeMillis = v2[3].trim().toLongOrNull() ?: return null,
+                    oldRecordText = v2[4].takeIf { it.isNotEmpty() },
+                    fileId = v2[5].trim().toIntOrNull() ?: return null,
+                    userId = v2[6].trim().toIntOrNull() ?: return null,
+                    driveId = v2[7].trim().toIntOrNull() ?: return null,
+                    backupHash = v2[8].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationHash = null,
+                    expectedPublicationRecordText = null,
+                    legacy = false,
+                )
+            }
+            val v1 = text.split("\n", limit = 5)
+            if (v1.size == 5 && v1[0].trim() == "1") {
+                val recoveryName = IOFile(v1[2]).name
+                val nameParts = recoveryName.split("_")
+                val derivedFileId = nameParts.getOrNull(0)?.trim()?.toIntOrNull() ?: return null
+                val derivedDriveId = nameParts.getOrNull(1)?.trim()?.toIntOrNull() ?: return null
+                return@runCatching RecoveryRecord(
+                    recordFile = recordFile,
+                    targetPath = v1[1],
+                    recoveryPath = v1[2],
+                    oldTargetMtimeMillis = v1[3].trim().toLongOrNull() ?: return null,
+                    oldRecordText = v1[4].takeIf { it.isNotEmpty() },
+                    fileId = derivedFileId,
+                    userId = 0,
+                    driveId = derivedDriveId,
+                    backupHash = null,
+                    expectedPublicationHash = null,
+                    expectedPublicationRecordText = null,
+                    legacy = true,
+                )
+            }
+            null
         }.getOrNull()
 
         /**
-         * The file ids with a PENDING durable recovery in [userDrive]'s scope (issue: round
-         * 22 #3): a per-file durable EXCLUSION from edit classification, registration and
-         * replacement — partial bytes from an interrupted publication must never be
-         * classified as an edit, snapshotted, or replaced while the recovery is
-         * unresolved. Unrelated files progress independently.
+         * The file ids with a PENDING durable recovery in [userDrive]'s scope (issues:
+         * round 22 #3, round 23 #3): a per-file durable EXCLUSION from edit
+         * classification, registration and replacement — partial bytes from an interrupted
+         * publication must never be classified as an edit, snapshotted, or replaced while
+         * the recovery is unresolved. Unrelated files progress independently. A LEGACY v1
+         * record (no owner identity) matches by its name-derived (fileId, driveId) pair
+         * under any userId. Returns NULL when the recovery state CANNOT be enumerated (an
+         * I/O failure): the caller must treat null as "exclude conservatively" — an
+         * enumeration failure never means "no pending recovery".
          */
-        internal fun pendingRecoveryFileIds(context: Context, userDrive: UserDrive): Set<Int> = runCatching {
+        internal fun pendingRecoveryFileIds(context: Context, userDrive: UserDrive): Set<Int>? = runCatching {
             stagingDirectory(context)
                 .listFiles { f -> f.name.endsWith(".recovery") }
                 ?.mapNotNull { recordFile ->
-                    readRecoveryRecord(recordFile)?.takeIf { record ->
-                        record.userId == userDrive.userId && record.driveId == userDrive.driveId
-                    }?.fileId
+                    val record = readRecoveryRecord(recordFile) ?: return@mapNotNull null
+                    when {
+                        !record.legacy && record.userId == userDrive.userId &&
+                            record.driveId == userDrive.driveId -> record.fileId
+                        record.legacy && record.driveId == userDrive.driveId -> record.fileId
+                        else -> null
+                    }
                 }
+                ?.filter { it > 0 }
                 ?.toSet()
-                ?: emptySet()
-        }.getOrDefault(emptySet())
+        }.getOrNull()
+
+        /**
+         * Whether an UNRESOLVED durable recovery still governs [fileId] or the bytes at
+         * [targetPath] (issue: round 23 #3): re-read INSIDE the final mutation locks — the
+         * batch-captured exclusion set predates the HTTP/lock window, and a recovery
+         * created during it must still exclude the file. Matches by owner identity OR by
+         * the recorded target path (covering legacy records whose identity could not be
+         * derived). An enumeration/read failure fails CLOSED (true): unresolved recovery
+         * state is never silently absent.
+         */
+        internal fun hasUnresolvedRecovery(
+            context: Context,
+            userDrive: UserDrive,
+            fileId: Int,
+            targetPath: String?,
+        ): Boolean = runCatching {
+            stagingDirectory(context)
+                .listFiles { f -> f.name.endsWith(".recovery") }
+                ?.any { recordFile ->
+                    val record = readRecoveryRecord(recordFile)
+                    record != null && (
+                        (!record.legacy && record.fileId == fileId &&
+                            record.userId == userDrive.userId && record.driveId == userDrive.driveId) ||
+                            (record.legacy && record.fileId == fileId &&
+                                record.driveId == userDrive.driveId) ||
+                            (targetPath != null &&
+                                IOFile(record.targetPath).absolutePath == targetPath)
+                        )
+                } == true
+        }.getOrDefault(true)
 
         /**
          * Reconciles interrupted publications left by crashes or failed restores (issues:
@@ -1331,13 +1435,40 @@ class DownloadOfflineFileManager(
                 runCatching { record.recordFile.delete() }
                 return true
             }
-            if (target.exists() && readPublishedProvenance(context, target)?.certifiesBytes(target) == true) {
+            // SELF-CERTIFYING DISPOSAL REQUIRES THE RECORDED OWNER (issue: round 23 #2):
+            // a target whose certifying record names ANOTHER identity (or another file)
+            // is not this recovery's completed publication — the state stays unresolved.
+            val targetProof = if (target.exists()) readPublishedProvenance(context, target) else null
+            if (targetProof != null && targetProof.certifiesBytes(target) &&
+                targetProof.identifies(
+                    File(id = record.fileId, driveId = record.driveId),
+                    UserDrive(userId = record.userId, driveId = record.driveId),
+                )
+            ) {
                 runCatching { recoveryFile.delete() }
                 runCatching { record.recordFile.delete() }
                 return true
             }
-            val backupHash = record.backupHash
+            // The backup's IMMUTABLE verification basis (issue: round 23 #2): the record's
+            // hash when carried; a legacy record's backup is hashed NOW (the backup file
+            // is never mutated after creation). An unverifiable backup stays unresolved.
+            val backupHash = record.backupHash ?: UploadFile.sha256OrNull(recoveryFile)
+            if (backupHash == null) return false
             val currentTargetHash = if (target.exists()) UploadFile.sha256OrNull(target) else null
+            // INTERRUPTED PUBLICATION OUTPUT (issue: round 23 #2): the target already
+            // carries the EXPECTED publication's bytes — the rename completed before the
+            // record move. The publication is COMPLETED with its captured expected proof
+            // (never re-classified as an edit, never re-downloaded); an unreadable
+            // expected-proof write leaves the state unresolved.
+            if (currentTargetHash != null && record.expectedPublicationHash == currentTargetHash) {
+                if (record.expectedPublicationRecordText != null) {
+                    runCatching { provenanceFileFor(context, target).writeText(record.expectedPublicationRecordText) }
+                    if (readPublishedProvenance(context, target) == null) return false
+                }
+                runCatching { recoveryFile.delete() }
+                runCatching { record.recordFile.delete() }
+                return true
+            }
             if (backupHash != null && currentTargetHash != null && currentTargetHash == backupHash) {
                 // The target is STILL the backed-up generation (the rename never happened
                 // or a previous restore completed): establish the retained proof and
@@ -1353,30 +1484,59 @@ class DownloadOfflineFileManager(
                 return true
             }
             if (target.exists() && currentTargetHash != null) {
-                // CHANGED TARGET (issue: round 22 #2): the bytes are a NEWER REVISION (a
-                // later edit or another identity's content) — never overwritten with the
-                // backup. The intervening revision is explicitly PRESERVED (the same
-                // universal edit-snapshot path, allowed to resolve this recovery); only a
-                // verified preservation disposes the recovery.
-                return FileController.getRealmInstance(recordScope).use { realm ->
-                    runCatching { realm.refresh() }
-                    val row = FileController.getFileById(realm, record.fileId) ?: return@use false
-                    val preserved = OfflineFolderController.registerDirtySnapshot(
+                // INTERRUPTED RESTORE OUTPUT (issue: round 23 #2): readable bytes that are
+                // a strict PREFIX of the immutable backup are a partially copied restore —
+                // completing the VERIFIED restore over them is the resolution (they are
+                // the backup's own content, never an edit to preserve).
+                if (target.length() < recoveryFile.length() &&
+                    filePrefixMatches(target, recoveryFile, target.length())
+                ) {
+                    return restoreRecoveryCopy(
                         context = context,
-                        file = row,
-                        offlineFile = target,
-                        userDrive = recordScope,
-                        allowPendingRecoveryResolution = true,
+                        recoveryFile = recoveryFile,
+                        target = target,
+                        recordFile = record.recordFile,
+                        oldRecordText = record.oldRecordText,
+                        oldTargetMtimeMillis = record.oldTargetMtimeMillis,
+                        expectedBackupHash = backupHash,
                     )
-                    if (!preserved) return@use false
-                    runCatching { recoveryFile.delete() }
-                    runCatching { record.recordFile.delete() }
-                    true
                 }
-            } else {
-                // A partial or unreadable target matching neither the backup nor a
-                // self-certifying publication: the VERIFIED restore is the only
-                // resolution (the previous sweep's blind overwrite is gone). Its
+                // PROVEN INTERVENING EDIT ONLY (issue: round 23 #2): the bytes differ from
+                // BOTH the backup and the expected publication. They are a genuine newer
+                // revision only when the target is NEWER than the backed-up generation AND
+                // the current row EXCLUSIVELY owns the recorded target path (the record's
+                // file id alone never authorized registration). Anything else — older or
+                // equal-mtime different bytes, a contested or re-owned path — stays
+                // UNRESOLVED: never auto-uploaded, never overwritten; the recovery state
+                // is retained for a later sweep.
+                val newerThanBackedUp = target.lastModified() > record.oldTargetMtimeMillis
+                val rowOwnsTarget = runCatching {
+                    FileController.getRealmInstance(recordScope).use { realm ->
+                        runCatching { realm.refresh() }
+                        val row = FileController.getFileById(realm, record.fileId)
+                        row != null && row.getOfflineFile(context, recordScope.userId)?.absolutePath == target.absolutePath &&
+                            appContextForOwnership()?.let { ctx ->
+                                OfflineFolderController.exclusivePathOwner(realm, ctx, recordScope, target.path)
+                            } == row.id
+                    }
+                }.getOrDefault(false)
+                if (!newerThanBackedUp || !rowOwnsTarget) return false
+                val preserved = OfflineFolderController.registerDirtySnapshot(
+                    context = context,
+                    file = FileController.getRealmInstance(recordScope).use { realm ->
+                        runCatching { realm.refresh() }
+                        FileController.getFileById(realm, record.fileId)?.let { realm.copyFromRealm(it, 1) }
+                    } ?: return false,
+                    offlineFile = target,
+                    userDrive = recordScope,
+                    allowPendingRecoveryResolution = true,
+                )
+                if (!preserved) return false
+                runCatching { recoveryFile.delete() }
+                runCatching { record.recordFile.delete() }
+                return true
+            } else if (!target.exists()) {
+                // A MISSING target: the VERIFIED restore is the only resolution. Its
                 // verified outcome IS the branch's result: a failed restore stays
                 // unresolved (the recovery state is retained for the next sweep).
                 return restoreRecoveryCopy(
@@ -1386,9 +1546,53 @@ class DownloadOfflineFileManager(
                     recordFile = record.recordFile,
                     oldRecordText = record.oldRecordText,
                     oldTargetMtimeMillis = record.oldTargetMtimeMillis,
+                    expectedBackupHash = backupHash,
                 )
+            } else {
+                // An UNREADABLE CHANGED target (issue: round 23 #2): never overwritten —
+                // the unreadable bytes could be mid-write content of another writer; the
+                // state stays unresolved for a later sweep.
+                return false
             }
         }
+
+        private fun appContextForOwnership(): android.content.Context? = Realm.getApplicationContext()
+
+        /**
+         * Whether [prefixFile]'s bytes are exactly [prefixFile]'s first [prefixLength] of
+         * [fullFile] (issue: round 23 #2): interrupted restore output is a strict prefix of
+         * the immutable backup — distinguishable from a genuine edit without trusting mtimes.
+         */
+        private fun filePrefixMatches(prefixFile: IOFile, fullFile: IOFile, prefixLength: Long): Boolean = runCatching {
+            if (prefixFile.length() != prefixLength || fullFile.length() < prefixLength) return@runCatching false
+            prefixFile.inputStream().use { a ->
+                fullFile.inputStream().use { b ->
+                    val bufA = ByteArray(64 * 1024)
+                    val bufB = ByteArray(64 * 1024)
+                    var remaining = prefixLength
+                    while (remaining > 0) {
+                        val chunk = minOf(remaining, bufA.size.toLong()).toInt()
+                        var readA = 0
+                        while (readA < chunk) {
+                            val r = a.read(bufA, readA, chunk - readA)
+                            if (r < 0) return@runCatching false
+                            readA += r
+                        }
+                        var readB = 0
+                        while (readB < chunk) {
+                            val r = b.read(bufB, readB, chunk - readB)
+                            if (r < 0) return@runCatching false
+                            readB += r
+                        }
+                        for (i in 0 until chunk) {
+                            if (bufA[i] != bufB[i]) return@runCatching false
+                        }
+                        remaining -= chunk
+                    }
+                    true
+                }
+            }
+        }.getOrDefault(false)
 
         /**
          * RESTORES the retained old bytes with their retained proof and verifies the result
@@ -1407,12 +1611,18 @@ class DownloadOfflineFileManager(
             recordFile: IOFile,
             oldRecordText: String?,
             oldTargetMtimeMillis: Long,
+            expectedBackupHash: String? = null,
         ): Boolean = runCatching {
             recoveryFile.copyTo(target, overwrite = true)
             val targetHash = UploadFile.sha256OrNull(target)
-            val backupHash = UploadFile.sha256OrNull(recoveryFile)
+            val backupHashNow = UploadFile.sha256OrNull(recoveryFile)
+            // IMMUTABLE VERIFICATION (issue: round 23 #2): the restored bytes verify
+            // against the RECORD's immutable backup hash — and the backup itself must
+            // still hash to it (a corrupted backup never "restores" successfully).
             val restoredOk = target.exists() && target.length() == recoveryFile.length() &&
-                targetHash != null && targetHash == backupHash &&
+                targetHash != null && backupHashNow != null &&
+                (expectedBackupHash == null || backupHashNow == expectedBackupHash) &&
+                targetHash == backupHashNow &&
                 target.setLastModified(oldTargetMtimeMillis)
             if (!restoredOk) return@runCatching false
             if (oldRecordText != null) {
@@ -1597,8 +1807,13 @@ class DownloadOfflineFileManager(
                 // recovery for this file keeps its target out of replacement entirely —
                 // the recovery sweep owns the resolution, and the intent is RETAINED
                 // (SKIPPED_CONFLICT below never clears the marker).
+                // PENDING-RECOVERY EXCLUSION OUTSIDE TARGET EXISTENCE (issue: round 23 #3):
+                // re-read under the publication's final locks, by identity AND by target
+                // path — a missing target with an unresolved recovery is recovery-managed
+                // state (a crash deleted the bytes mid-recovery), and the publication must
+                // never treat the path as free. An enumeration failure fails CLOSED.
                 val pendingRecoveryExcludes = appContext != null &&
-                    pendingRecoveryFileIds(appContext, userDrive).contains(file.id)
+                    hasUnresolvedRecovery(appContext, userDrive, file.id, target.absolutePath)
                 // NON-DESTRUCTIVE STAGED COMPARISON ELIGIBILITY (issue: round 22 #6): set by
                 // the classification below when the retained bytes carry no content proof —
                 // the freshly staged copy may then CERTIFY them without replacing them first.
@@ -1763,6 +1978,12 @@ class DownloadOfflineFileManager(
             // A backup without its durable association is never kept (issues: round 21
             // #9/#10, round 22 #2): an anonymous staged file cannot be reconciled after
             // restart.
+            // THE EXPECTED TARGET PUBLICATION (issue: round 23 #2): the staged
+            // generation's hash and the proof the target will carry ride the record, so
+            // the reconciliation can complete an interrupted publication instead of
+            // mis-classifying its output as an edit.
+            val expectedPublicationHash = UploadFile.sha256OrNull(staged)
+            val expectedPublicationRecordText = readPublishedProvenance(provenanceContext, staged)?.recordText(target)
             val recoveryRecorded = recoveryFile == null || (backupHash != null &&
                 writeRecoveryRecord(
                     provenanceContext,
@@ -1773,6 +1994,8 @@ class DownloadOfflineFileManager(
                     file,
                     userDrive,
                     backupHash,
+                    expectedPublicationHash,
+                    expectedPublicationRecordText,
                 ))
             if (!recoveryOk || !recoveryRecorded) {
                 runCatching { recoveryFile?.delete() }
@@ -2027,6 +2250,10 @@ class DownloadOfflineFileManager(
                         // round 22 #2); its durable record carries the owner scope, file
                         // identity and the backup's immutable hash.
                         val backupHash = if (recoveryFile != null) UploadFile.sha256OrNull(recoveryFile) else null
+                        // THE EXPECTED TARGET PUBLICATION (issue: round 23 #2), as in the
+                        // shared publication above.
+                        val expectedPublicationHash = UploadFile.sha256OrNull(staged)
+                        val expectedPublicationRecordText = readPublishedProvenance(context, staged)?.recordText(target)
                         val recoveryRecorded = recoveryFile == null || (backupHash != null &&
                             writeRecoveryRecord(
                                 context,
@@ -2037,6 +2264,8 @@ class DownloadOfflineFileManager(
                                 file,
                                 userDrive,
                                 backupHash,
+                                expectedPublicationHash,
+                                expectedPublicationRecordText,
                             ))
                         if (!recoveryOk || !recoveryRecorded) {
                             runCatching { recoveryFile?.delete() }

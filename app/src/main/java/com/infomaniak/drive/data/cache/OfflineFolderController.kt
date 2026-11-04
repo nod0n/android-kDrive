@@ -1591,8 +1591,15 @@ object OfflineFolderController {
         // would upload an unknown generation as an edit. ONLY the reconciliation sweep's
         // explicit intervening-revision preservation passes true (it IS the resolution
         // step).
+        // UNDER-FINAL-LOCKS RECHECK (issue: round 23 #3): the durable recovery state is
+        // re-read HERE — inside the caller's mutation locks — not from a batch-captured
+        // set: a recovery created during the HTTP/lock window is still an exclusion, and
+        // an enumeration failure fails CLOSED. This gate covers every registration caller
+        // (the sync's own snapshot registration included). Only the reconciliation sweep's
+        // explicit intervening-revision preservation passes true (it IS the resolution
+        // step), and the sweep itself validates the recorded owner/path first (round 23 #2).
         if (!allowPendingRecoveryResolution &&
-            DownloadOfflineFileManager.pendingRecoveryFileIds(context, userDrive).contains(file.id)
+            DownloadOfflineFileManager.hasUnresolvedRecovery(context, userDrive, file.id, offlineFile.absolutePath)
         ) {
             return false
         }

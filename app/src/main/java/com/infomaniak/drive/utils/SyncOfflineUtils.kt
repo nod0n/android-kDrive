@@ -253,7 +253,14 @@ object SyncOfflineUtils {
             // bytes from an interrupted restore are never classified as an edit,
             // registered, or replaced; unrelated files progress independently.
             DownloadOfflineFileManager.reconcileInterruptedRecoveries(context)
+            // FAIL-CLOSED SELECTION (issue: round 23 #3): an enumeration failure never
+            // means "no pending recovery" — the whole pass defers (the next sync retries)
+            // rather than classifying possibly-recovery-managed bytes.
             val pendingRecoveryIds = DownloadOfflineFileManager.pendingRecoveryFileIds(context, userDrive)
+            if (pendingRecoveryIds == null) {
+                SentryLog.i("SyncOffline", "Recovery state unresolvable; deferring this sync pass")
+                return
+            }
             val fileActionsBody = localFilesMap.values.map { file ->
                 FileLastActivityBody.FileActionBody(
                     id = file.id,
