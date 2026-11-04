@@ -386,7 +386,14 @@ class MainViewModel(
                             // nothing owned): nothing to preserve — the identity commit proceeds.
                         }
 
-                        if (accepted && preserved) {
+                        // SOURCE UNLINK DELAYED UNTIL DESTINATION VERIFICATION (issue:
+                        // round 21 #8): the cross-realm transfer below verifies the
+                        // destination's committed graph BEFORE the source row is unlinked
+                        // or removed — the previous order removed the source backlink
+                        // first, so a failed verification stranded the row from both
+                        // sides (the shared case unlinks inside its verified branch). A
+                        // local (non-shared) move commits its backlink here as before.
+                        if (accepted && preserved && !isSharedWithMe) {
                             FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
                                 // Ignore expired transactions when it's suspended
                                 // In case the phone is slow or in standby, the transaction can create an IllegalStateException
@@ -443,6 +450,27 @@ class MainViewModel(
                                         node.children.forEach { pending.add(it) }
                                     }
                                 }.onFailure(Sentry::captureException)
+                                // DESTINATION-ONLY DESCENDANTS (issue: round 21 #7): the tree
+                                // rename below relocates the destination's EXISTING subtree
+                                // too — descendants that exist only in the destination (not
+                                // in the source snapshot) previously fell outside the
+                                // source-derived lock set. Their ids join the lock set (row
+                                // walk here; the byte relocation itself re-walks the moved
+                                // FILE tree under the locks).
+                                runCatching {
+                                    sharedRealm.where(File::class.java)
+                                        .equalTo(File::id.name, file.id)
+                                        .findFirst()?.let { existingTreeRoot ->
+                                            val walker = ArrayDeque<File>().apply { add(existingTreeRoot) }
+                                            val seen = mutableSetOf<Int>()
+                                            while (walker.isNotEmpty()) {
+                                                val node = walker.removeFirst()
+                                                if (!seen.add(node.id)) continue
+                                                graphIds.add(node.id)
+                                                node.children.forEach { walker.add(it) }
+                                            }
+                                        }
+                                }.onFailure(Sentry::captureException)
                                 OfflineFileCoordination.withLocksFor(sharedScope, graphIds) {
                                     // COMPLETE FRESH DESTINATION ANCESTRY (issue: round 19
                                     // #10): both the inserted and the identity-changed root
@@ -477,9 +505,60 @@ class MainViewModel(
                                                                 // coordinated byte worker serializes on
                                                                 // these same descendant locks (all held),
                                                                 // so the rename cannot race publication,
-                                                                // cleanup or registration. Best effort
-                                                                // on the tree's provenance sidecars.
-                                                                oldBytes.renameTo(newBytes)
+                                                                // cleanup or registration.
+                                                                //
+                                                                // ACTIVE-OWNERSHIP DEFERRAL + PROVENANCE
+                                                                // RELOCATION (issue: round 21 #7): the
+                                                                // renamed tree takes EVERY copy under the
+                                                                // old directory — destination-only
+                                                                // descendants included (locked via the
+                                                                // destination walk above). A pending or
+                                                                // retained-unsent record on ANY relocated
+                                                                // copy's OLD literal URI defers the merge:
+                                                                // the record would open a URI the rename
+                                                                // destroys, and the deferral keeps the tree
+                                                                // until the upload completes. Otherwise every
+                                                                // moved copy's path-keyed PROVENANCE record
+                                                                // travels with the bytes — a stranded
+                                                                // old-path record could lend its generation
+                                                                // to later bytes at the old location.
+                                                                val relocatedPairs = mutableListOf<Pair<IOFile, IOFile>>()
+                                                                var subtreeOk = true
+                                                                val treeWalker = ArrayDeque<IOFile>().apply { add(oldBytes) }
+                                                                while (treeWalker.isNotEmpty()) {
+                                                                    val node = treeWalker.removeFirst()
+                                                                    if (node.isDirectory) node.listFiles()?.forEach { treeWalker.add(it) }
+                                                                    val nodeUri = Uri.fromFile(node).toString()
+                                                                    if (UploadFile.hasPendingUpload(uri = nodeUri) ||
+                                                                        UploadFile.hasRetainedUnsentUpload(uri = nodeUri)
+                                                                    ) {
+                                                                        subtreeOk = false
+                                                                        break
+                                                                    }
+                                                                    if (node.isFile) {
+                                                                        relocatedPairs +=
+                                                                            node to IOFile(node.path.replaceFirst(oldBytes.path, newBytes.path))
+                                                                    }
+                                                                }
+                                                                if (!subtreeOk) {
+                                                                    false
+                                                                } else {
+                                                                    val renamed = oldBytes.renameTo(newBytes)
+                                                                    if (renamed) {
+                                                                        relocatedPairs.forEach { (oldCopy, newCopy) ->
+                                                                            if (oldCopy.path != newCopy.path) {
+                                                                                runCatching {
+                                                                                    DownloadOfflineFileManager.movePublishedProvenance(
+                                                                                        application,
+                                                                                        oldCopy,
+                                                                                        newCopy,
+                                                                                    )
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    renamed
+                                                                }
                                                             }.getOrDefault(false)
                                                             else -> OfflineFolderController.reconcileMovedInheritedCopy(
                                                                 context = application,
@@ -525,12 +604,19 @@ class MainViewModel(
                                                     // (issues: round 13 #12, round 19 #10) — an
                                                     // existing row whose authoritative parent is
                                                     // NOT this container must not gain a wrong
-                                                    // backlink; its own subtree stays.
+                                                    // backlink. But its MISSING source descendants
+                                                    // still merge beneath it WHEREVER it lives
+                                                    // (issue: round 21 #8): the previous immediate
+                                                    // return stopped at every existing intermediate,
+                                                    // so missing source grandchildren never merged
+                                                    // and no retry could converge.
+                                                    val detachedChildren = copy.children.toList()
                                                     if (existing.parentId == parentOwnerId &&
                                                         parentList.none { it.id == copy.id }
                                                     ) {
                                                         parentList.add(existing)
                                                     }
+                                                    for (childCopy in detachedChildren) mergeChild(existing.children, existing.id, childCopy)
                                                     return
                                                 }
                                                 val detachedChildren = copy.children.toList()
@@ -591,15 +677,39 @@ class MainViewModel(
                                             .findFirst()
                                         val membershipOk = committedRoot != null && FileController.getFileById(sharedRealm, newParent.id)
                                             ?.children?.any { it.id == file.id } == true
-                                        val requiredIds = graphIds - newParent.id
-                                        val descendantsOk = requiredIds.all { id ->
-                                            sharedRealm.where(File::class.java).equalTo(File::id.name, id).findFirst() != null
+                                        // REQUIRED-GRAPH RELATIONSHIPS (issue: round 21 #8):
+                                        // every required id must be REACHABLE from the committed
+                                        // root through the destination's LIVE children lists —
+                                        // id existence alone previously satisfied verification
+                                        // with the required parent/child relationships
+                                        // unverified (a required id existing ELSEWHERE in the
+                                        // realm — unreachable from the moved tree — passed
+                                        // while the graph under the moved root stayed
+                                        // incomplete, erasing source metadata the reachable
+                                        // destination never received).
+                                        val reachable = mutableSetOf<Int>()
+                                        if (committedRoot != null) {
+                                            val relationWalker = ArrayDeque<File>().apply { add(committedRoot) }
+                                            val relationSeen = mutableSetOf<Int>()
+                                            while (relationWalker.isNotEmpty()) {
+                                                val node = relationWalker.removeFirst()
+                                                if (!relationSeen.add(node.id)) continue
+                                                reachable.add(node.id)
+                                                node.children.forEach { relationWalker.add(it) }
+                                            }
                                         }
+                                        val requiredIds = graphIds - newParent.id
+                                        val descendantsOk = requiredIds.all { it in reachable }
                                         membershipOk && descendantsOk
                                     }.getOrDefault(false)
                                 }
                             }
                             if (destinationVerified) {
+                                // The source backlink is removed only AFTER the destination's
+                                // committed graph verified (issue: round 21 #8).
+                                FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
+                                    runCatching { localFolder.children.remove(file) }
+                                }
                                 FileController.removeFile(
                                     fileId = file.id,
                                     customRealm = currentDriveRealm,
