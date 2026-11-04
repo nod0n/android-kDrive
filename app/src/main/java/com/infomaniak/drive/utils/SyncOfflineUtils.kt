@@ -487,7 +487,7 @@ object SyncOfflineUtils {
                                     freshSource.exists() && run {
                                         // Historical provenance anchored BEFORE the relocation
                                         // (issue: round 17 #3).
-                                        OfflineFolderController.anchorHistoricalBaseline(realm, liveRow, freshSource)
+                                        OfflineFolderController.anchorHistoricalBaseline(context, realm, liveRow, freshSource, userDrive)
                                         !OfflineFolderController.reconcileMovedInheritedCopy(
                                         context = context,
                                         oldOfflineFile = freshSource,
@@ -811,7 +811,7 @@ object SyncOfflineUtils {
             if (liveRow.isMarkedAsOffline) return DownloadActionOutcome(handled = false)
             if (freshOffline.exists() && run {
                 // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
-                OfflineFolderController.anchorHistoricalBaseline(realm, liveRow, freshOffline)
+                OfflineFolderController.anchorHistoricalBaseline(context, realm, liveRow, freshOffline, userDrive)
                 !OfflineFolderController.reconcileMovedInheritedCopy(
                     context = context,
                     oldOfflineFile = freshOffline,

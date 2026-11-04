@@ -22,6 +22,7 @@ import android.net.Uri
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.OfflineRoot
+import com.infomaniak.drive.data.models.StoredOfflineCopyState
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
@@ -397,7 +398,9 @@ object OfflineFolderController {
                 val offlineFile = child.getOfflineFile(context, userDrive.userId) ?: continue
                 if (!offlineFile.exists()) continue
                 when (protectionStateOf(child, offlineFile, userDrive)) {
-                    CopyProtection.PENDING_UPLOAD, CopyProtection.DIRTY -> return true
+                    // UNPROVEN_HISTORICAL (issue: round 19 #2): unproven bytes are preserved
+                    // through destructive operations — their folder is required ancestry.
+                    CopyProtection.PENDING_UPLOAD, CopyProtection.DIRTY, CopyProtection.UNPROVEN_HISTORICAL -> return true
                     CopyProtection.UPLOADED, CopyProtection.NONE -> Unit
                 }
             }
@@ -775,27 +778,20 @@ object OfflineFolderController {
                 // touched) and a later pass retries once the duplicate resolves.
                 val pathOwnerId = exclusivePathOwner(realm, context, userDrive, oldOffline.path)
                 if (pathOwnerId != oldRow.id) return@withFileLock oldRow
-                // Historical baseline ANCHOR (issues: round 16 #2, round 18 #6): a row whose
-                // bytes were published before the baseline field existed carries UNSET (null
-                // — and, consistently, a non-positive repaired value). While those bytes
-                // still verify against the row's CURRENT metadata with SUFFICIENT BYTE
-                // PROVENANCE (intact size, and a modification time not newer than that
-                // metadata), that metadata IS their provable baseline — persist it NOW,
-                // before this replacement can change the metadata, or a later pass would
-                // compare the bytes against the REPLACEMENT's modification time and
-                // reclassify the old-clean copy as a local edit (the migrated zero-baseline
-                // trace: clean bytes at 100, replacement metadata at 90 — without the anchor
-                // the fallback becomes 90 and the old bytes upload over the newer revision).
-                // An unprovable historical copy keeps unset — never anchored from mtime alone
-                // — and stays preserved: the replacement flow's protection and the upload
-                // completion's exact-revision reconciliation prevent old bytes from destroying
-                // newer content, and a genuine edit still snapshots below.
+                // Historical baseline ANCHOR (issues: round 16 #2, round 18 #6, round 19 #2):
+                // a row whose bytes were published before the baseline field existed carries
+                // UNSET (null — and, consistently, a non-positive repaired value). The anchor
+                // is written ONLY from AUTHORITATIVE content proof — the published
+                // generation's provenance record naming THIS row's accepted metadata — never
+                // from a size/mtime comparison: a same-size local edit retaining the old
+                // mtime was previously anchored CLEAN and destructive operations then
+                // destroyed it without a snapshot. An unproven historical copy keeps unset
+                // and is PRESERVED (protection classifies it unproven-historical); the
+                // replacement flow's protection and the upload completion's exact-revision
+                // reconciliation gate the destructive paths, and a genuine edit still
+                // snapshots below.
                 if ((oldRow.publishedCleanBaseline ?: 0L) <= 0L &&
-                    oldRow.isIntactFile(oldOffline) &&
-                    !OfflineFolderPolicy.isLocallyModified(
-                        offlineFileLastModifiedMillis = oldOffline.lastModified(),
-                        remoteLastModifiedAtSeconds = oldRow.lastModifiedAt,
-                    )
+                    oldRow.storedOfflineCopyState(context, oldOffline, userDrive) == StoredOfflineCopyState.PROVEN_CURRENT
                 ) {
                     runCatching {
                         realm.executeTransaction { oldRow.publishedCleanBaseline = oldRow.lastModifiedAt }
@@ -935,6 +931,10 @@ object OfflineFolderController {
                 } else {
                     OwnedCopyReplacementDecision.KEEP_LOCAL
                 }
+            // Unproven historical bytes (issue: round 19 #2): preserved, never snapshotted
+            // for upload; the replacement defers and the verification path resolves the
+            // generation.
+            CopyProtection.UNPROVEN_HISTORICAL -> OwnedCopyReplacementDecision.KEEP_LOCAL
             CopyProtection.UPLOADED, CopyProtection.NONE -> OwnedCopyReplacementDecision.REPLACEABLE
         }
     }
@@ -1001,6 +1001,9 @@ object OfflineFolderController {
                     // Snapshot registration failed: keep bytes AND identity/metadata (round 4 #6).
                     PreservationOutcome.PRESERVED
                 }
+            // Unproven historical bytes (issue: round 19 #2): preserved — no snapshot, no
+            // deletion — until the verification path resolves their generation.
+            CopyProtection.UNPROVEN_HISTORICAL -> PreservationOutcome.PRESERVED
             CopyProtection.UPLOADED, CopyProtection.NONE -> PreservationOutcome.CONTENT_SAFE
         }
     }
@@ -1216,6 +1219,13 @@ object OfflineFolderController {
                         result.keptOfflineFilesCount++
                         return@withFileLock
                     }
+                    // Unproven historical bytes (issue: round 19 #2): the coverage flags and
+                    // the bytes are RETAINED — never snapshotted for upload, never cleared —
+                    // until the verification path resolves the generation.
+                    CopyProtection.UNPROVEN_HISTORICAL -> {
+                        result.keptOfflineFilesCount++
+                        return@withFileLock
+                    }
                     CopyProtection.UPLOADED -> needsSnapshot = false
                     CopyProtection.DIRTY -> {
                         val uploadRegistered = registerDirtySnapshot(context, liveRow, offlineFile, userDrive)
@@ -1265,7 +1275,7 @@ object OfflineFolderController {
         }
     }
 
-    internal enum class CopyProtection { NONE, PENDING_UPLOAD, UPLOADED, DIRTY }
+    internal enum class CopyProtection { NONE, PENDING_UPLOAD, UPLOADED, DIRTY, UNPROVEN_HISTORICAL }
 
     /**
      * Schedules generation VERIFICATION for a readable-but-unproven offline copy (issues:
@@ -1338,11 +1348,16 @@ object OfflineFolderController {
 
     /**
      * Preservation state of an existing offline copy, shared with the deferred-cleanup
-     * completion check (issue #1902): [PENDING_UPLOAD] and [DIRTY] copies must survive cleanup,
-     * [UPLOADED] copies are content-safe duplicates, [NONE] copies are clearable.
+     * completion check (issue #1902): [PENDING_UPLOAD] and [DIRTY] copies must survive
+     * cleanup, [UPLOADED] copies are content-safe duplicates, [NONE] copies are clearable,
+     * and [CopyProtection.UNPROVEN_HISTORICAL] copies — bytes whose content is neither
+     * provably the published generation nor a durably owned upload revision — are PRESERVED
+     * through destructive operations without being snapshotted for upload (issue: round 19
+     * #2).
      */
     internal fun protectionStateOf(file: File, offlineFile: IOFile, userDrive: UserDrive): CopyProtection {
         val fileModifiedAt = Date(offlineFile.lastModified())
+        val context = Realm.getApplicationContext() ?: return CopyProtection.UNPROVEN_HISTORICAL
         // EXACT content identity (issue: round 18 #7): a record matching the destination
         // identity and modification date owns these bytes only when it provably holds THEIR
         // content — a same-mtime record of a different revision (an edit that retained the
@@ -1372,6 +1387,12 @@ object OfflineFolderController {
                 pendingOnly = false,
                 contentHash = contentHash,
             ) -> CopyProtection.UPLOADED
+            // AUTHORITATIVE content proof decides cleanliness (issue: round 19 #2): bytes
+            // are the published generation only when the provenance record names THIS row's
+            // accepted metadata. Size and a not-newer mtime never do — a same-size local
+            // edit retaining the old mtime previously classified as NONE and destructive
+            // operations destroyed it without a snapshot.
+            file.storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.PROVEN_CURRENT -> CopyProtection.NONE
             OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
                 // The PUBLISHED byte baseline, not accepted server metadata (issue: round
@@ -1379,27 +1400,30 @@ object OfflineFolderController {
                 // generation commits are not a local edit.
                 remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
             ) -> CopyProtection.DIRTY
-            else -> CopyProtection.NONE
+            // Unproven historical bytes (issue: round 19 #2): not proven as the published
+            // generation, not newer than their baseline — an ambiguous retained copy (or a
+            // same-mtime edit). PRESERVED: destructive operations keep the bytes and the
+            // row; they are never snapshotted for upload (uncertain content must not be
+            // automatically uploaded over a newer revision), and the ordinary verification
+            // path resolves their generation.
+            else -> CopyProtection.UNPROVEN_HISTORICAL
         }
     }
 
     /**
      * Establishes a historical row's byte provenance BEFORE any relocation or metadata
-     * change (issues: round 17 #3, round 18 #6): bytes that still verify against the row's
-     * current metadata WITH sufficient byte provenance — intact size, modification time not
-     * newer than that metadata — have that metadata persisted as their baseline. UNSET is
-     * consistent everywhere: null AND a non-positive repaired value (a legacy zero is not
-     * provenance and must anchor exactly like a never-written baseline). An unprovable
-     * historical copy keeps unset — it is never anchored from an mtime comparison alone,
-     * and it is not automatically labeled and uploaded as a local edit: the replacement
-     * flow's protection and the upload completion's exact-revision reconciliation gate the
-     * destructive paths while the copy stays preserved.
+     * change (issues: round 17 #3, round 18 #6, round 19 #2): the baseline is anchored ONLY
+     * from AUTHORITATIVE content proof — the published generation's provenance record naming
+     * THIS row's accepted metadata. UNSET is consistent everywhere: null AND a non-positive
+     * repaired value. An unproven historical copy keeps unset — it is never anchored from a
+     * size/mtime comparison (a same-size edit retaining the old mtime was previously
+     * certified clean), and it is not automatically labeled and uploaded as a local edit:
+     * destructive operations PRESERVE it until the verification path resolves the
+     * generation.
      */
-    internal fun anchorHistoricalBaseline(realm: Realm, row: File, bytes: IOFile) {
+    internal fun anchorHistoricalBaseline(context: Context, realm: Realm, row: File, bytes: IOFile, userDrive: UserDrive) {
         if ((row.publishedCleanBaseline ?: 0L) > 0L) return
-        if (row.isIntactFile(bytes) &&
-            !OfflineFolderPolicy.isLocallyModified(bytes.lastModified(), row.lastModifiedAt)
-        ) {
+        if (row.storedOfflineCopyState(context, bytes, userDrive) == StoredOfflineCopyState.PROVEN_CURRENT) {
             runCatching { realm.executeTransaction { row.publishedCleanBaseline = row.lastModifiedAt } }
         }
     }
