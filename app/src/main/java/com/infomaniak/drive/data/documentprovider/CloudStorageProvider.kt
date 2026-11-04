@@ -680,7 +680,7 @@ class CloudStorageProvider : DocumentsProvider() {
                                                 oldIdentityParentId = freshFile.parentId,
                                                 // The bytes' provenance baseline (issue: round 16 #2),
                                                 // never bare (possibly replaced) server metadata.
-                                                oldLastModifiedAt = freshFile.publishedCleanBaseline ?: freshFile.lastModifiedAt,
+                                                oldLastModifiedAt = freshFile.effectivePublishedBaseline,
                                                 newIdentity = File(id = freshFile.id, driveId = userDrive.driveId).apply {
                                                     parentId = freshTargetParent.id
                                                     name = freshFile.name

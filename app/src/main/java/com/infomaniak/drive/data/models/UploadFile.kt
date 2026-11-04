@@ -448,7 +448,7 @@ open class UploadFile(
                             return@withFileLock
                         }
                         val uploadedBaselineSeconds = record.fileModifiedAt.time / 1_000L
-                        if ((liveRow.publishedCleanBaseline ?: 0L) >= uploadedBaselineSeconds) return@withFileLock
+                        if (liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds) return@withFileLock
                         realm.executeTransaction { liveRow.publishedCleanBaseline = uploadedBaselineSeconds }
                     }
                 }

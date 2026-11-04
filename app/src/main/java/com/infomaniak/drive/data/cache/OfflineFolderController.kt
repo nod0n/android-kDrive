@@ -789,7 +789,7 @@ object OfflineFolderController {
                     }
                     if (OfflineFolderPolicy.isLocallyModified(
                             offlineFileLastModifiedMillis = oldOffline.lastModified(),
-                            remoteLastModifiedAtSeconds = oldRow.publishedCleanBaseline ?: oldRow.lastModifiedAt,
+                            remoteLastModifiedAtSeconds = oldRow.effectivePublishedBaseline,
                         )
                     ) {
                         val registered = registerDirtySnapshot(context, oldRow, oldOffline, userDrive)
@@ -804,7 +804,7 @@ object OfflineFolderController {
                         oldIdentityParentId = oldRow.parentId,
                         // The OLD bytes' provenance baseline (issue: round 16 #2), not the
                         // possibly-replaced server metadata.
-                        oldLastModifiedAt = oldRow.publishedCleanBaseline ?: oldRow.lastModifiedAt,
+                        oldLastModifiedAt = oldRow.effectivePublishedBaseline,
                         newIdentity = remoteFile,
                         userDrive = userDrive,
                     )
@@ -1171,7 +1171,7 @@ object OfflineFolderController {
                 // The PUBLISHED byte baseline, not accepted server metadata (issue: round
                 // 15 #6) — retained old-clean bytes after a backward-dated newer
                 // generation commits are not a local edit.
-                remoteLastModifiedAtSeconds = file.publishedCleanBaseline ?: file.lastModifiedAt,
+                remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
             ) -> CopyProtection.DIRTY
             else -> CopyProtection.NONE
         }

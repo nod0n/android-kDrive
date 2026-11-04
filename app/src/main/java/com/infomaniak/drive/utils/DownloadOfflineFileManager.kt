@@ -199,7 +199,7 @@ class DownloadOfflineFileManager(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
                 // The PUBLISHED byte baseline, not accepted server metadata (issue: round
                 // 15 #6) — retained old-clean bytes are not a local edit.
-                remoteLastModifiedAtSeconds = file.publishedCleanBaseline ?: file.lastModifiedAt,
+                remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
             )
         ) {
             return ListenableWorker.Result.success()
@@ -842,7 +842,7 @@ class DownloadOfflineFileManager(
                     // retained old-clean bytes as an edit.
                     else -> OfflineFolderPolicy.isLocallyModified(
                         offlineFileLastModifiedMillis = target.lastModified(),
-                        remoteLastModifiedAtSeconds = liveOwner.publishedCleanBaseline ?: liveOwner.lastModifiedAt,
+                        remoteLastModifiedAtSeconds = liveOwner.effectivePublishedBaseline,
                     )
                 }
 

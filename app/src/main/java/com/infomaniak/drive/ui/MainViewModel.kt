@@ -966,7 +966,7 @@ class MainViewModel(
             oldIdentityParentId = file.parentId,
             // The bytes' provenance baseline (issue: round 16 #2), never bare server metadata
             // that a backward-dated replacement may have moved away from the bytes.
-            oldLastModifiedAt = file.publishedCleanBaseline ?: file.lastModifiedAt,
+            oldLastModifiedAt = file.effectivePublishedBaseline,
             newIdentity = postMoveIdentity,
             userDrive = userDrive,
             newOfflineTarget = destinationFile,

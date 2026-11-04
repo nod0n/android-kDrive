@@ -431,12 +431,27 @@ class FileMigration : RealmMigration {
                 // BOXED column for the nullable model property (issue: round 16 #1): the model
                 // declares `Long?`, whose Realm schema column is the boxed java.lang.Long and
                 // NULLABLE — a primitive long column would mismatch the generated model schema
-                // on every supported migration chain from versions 0–13 (fresh schema-14
-                // creation does not exercise this step). No v14 database has shipped: the
-                // in-place correction is safe; a FUTURE schema bump must add a v14→v15 step
-                // that asserts/repairs this column's boxed nullability for databases already
-                // migrated by an older build.
+                // on every supported migration chain from versions 0–13.
                 addField(File::publishedCleanBaseline.name, Long::class.javaObjectType)
+            }
+
+            oldVersionTemp++
+        }
+
+        // Migrated to version 15
+        // - REPAIR `publishedCleanBaseline` on databases already migrated to version 14 by an
+        //   older build, whose column was created REQUIRED (primitive long): opening version 14
+        //   runs no migration step, so the generated model's nullable property could never
+        //   load. The repair is conditional — a database migrated by the corrected 13→14 step
+        //   already carries the nullable column and is left untouched — and preserves every
+        //   row (issue: round 17 #21). Legacy required-long rows keep their zero default, which
+        //   is NOT publication provenance: every baseline consumer treats a non-positive
+        //   baseline as unset (issue: round 17 #21/#3).
+        if (oldVersionTemp == 14L) {
+            schema[File::class.java.simpleName]?.apply {
+                if (isRequired(File::publishedCleanBaseline.name)) {
+                    setRequired(File::publishedCleanBaseline.name, false)
+                }
             }
 
             oldVersionTemp++
@@ -468,7 +483,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 14L // Must be bumped when the schema changes
+        const val DB_VERSION = 15L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }

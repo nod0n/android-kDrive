@@ -371,7 +371,7 @@ object SyncOfflineUtils {
                                         oldIdentityParentId = localFile.parentId,
                                         // The live bytes' provenance baseline (issue: round 16 #2),
                                         // never the possibly-replaced server metadata.
-                                        oldLastModifiedAt = liveRow.publishedCleanBaseline ?: liveRow.lastModifiedAt,
+                                        oldLastModifiedAt = liveRow.effectivePublishedBaseline,
                                         newIdentity = remoteFile,
                                         userDrive = userDrive,
                                         realm = realm,
@@ -648,7 +648,7 @@ object SyncOfflineUtils {
                     oldIdentityParentId = file.parentId,
                     // The live bytes' provenance baseline (issue: round 16 #2), never the
                     // detached observation's (possibly stale) metadata.
-                    oldLastModifiedAt = liveRow.publishedCleanBaseline ?: liveRow.lastModifiedAt,
+                    oldLastModifiedAt = liveRow.effectivePublishedBaseline,
                     newIdentity = remoteFile,
                     userDrive = userDrive,
                     realm = realm,

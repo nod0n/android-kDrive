@@ -165,6 +165,16 @@ open class File(
 
     ) : RealmObject(), Parcelable {
 
+    /**
+     * The baseline the bytes at this row's offline path were published under, for edit
+     * detection (issues: round 15 #6, round 17 #3/#21): the recorded baseline when POSITIVE —
+     * a legacy required-long migration leaves a ZERO default, which is NOT publication
+     * provenance and must behave exactly like an unset baseline (fall back to
+     * [lastModifiedAt]) — else the accepted server metadata.
+     */
+    val effectivePublishedBaseline: Long
+        get() = publishedCleanBaseline?.takeIf { it > 0 } ?: lastModifiedAt
+
     val hasThumbnail inline get() = supportedBy?.contains(SupportedByType.THUMBNAIL.apiValue) ?: false
     val hasOnlyoffice inline get() = supportedBy?.contains(SupportedByType.ONLYOFFICE.apiValue) ?: false
 
