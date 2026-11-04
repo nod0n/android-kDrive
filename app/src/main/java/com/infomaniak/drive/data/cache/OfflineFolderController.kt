@@ -190,6 +190,24 @@ object OfflineFolderController {
         return customRealm?.let(block) ?: FileController.getRealmInstance(userDrive).use(block)
     }
 
+    /**
+     * Whether an ACTIVE root record covering [folderId] — its own row or any ancestor — was
+     * COMMITTED after [sinceEpochMillis] (issue: round 11 #8): the freshness gate for
+     * remote-listing cleanup. Roots predating a traversal remain the listing's maintenance
+     * responsibility (the walk must keep clearing stale rows beneath them), while a root
+     * committed between the traversal's collection checks and its destructive decisions is a
+     * newly authoritative owner whose record the traversal's parent-only predicates never
+     * saw — its coverage must stop those decisions.
+     */
+    internal fun hasActiveRootCoveringSince(folderId: Int, realm: Realm, sinceEpochMillis: Long): Boolean {
+        getOfflineRoot(folderId, customRealm = realm)?.let { ownRoot ->
+            if (ownRoot.isValid && !ownRoot.isPendingRemoval && ownRoot.createdAt.time > sinceEpochMillis) return true
+        }
+        return walkAncestryForRoot(realm, folderId) { root ->
+            root.isValid && !root.isPendingRemoval && root.createdAt.time > sinceEpochMillis
+        }
+    }
+
     fun getOfflineRoot(folderId: Int, userDrive: UserDrive = UserDrive(), customRealm: Realm? = null): OfflineRoot? {
         val block: (Realm) -> OfflineRoot? = { realm ->
             realm.where(OfflineRoot::class.java)
@@ -834,13 +852,13 @@ object OfflineFolderController {
                     if (isAborted()) return@executeTransaction
                     val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
                     if (liveRow.isOffline) return@executeTransaction
-                    // Caller-supplied freshness predicate, evaluated INSIDE the committing
-                    // transaction (issue: round 8 #8): each clearing context revalidates the
+                    // Caller-supplied freshness predicate, evaluated on the transaction-fresh
+                    // CURRENT row (issue: round 8 #8): each clearing context revalidates the
                     // ancestry that authorizes IT — the root-removal cleanup rejects rows a
                     // newly added nested root now covers, the orphan sweep rejects rows a
                     // root newly covers. A nil predicate keeps the pre-existing semantics:
                     // the walk's and the sync's remote-listing truth needs no ancestry gate.
-                    isStillClearable?.let { clearable -> if (!clearable(realm, file)) return@executeTransaction }
+                    isStillClearable?.let { clearable -> if (!clearable(realm, liveRow)) return@executeTransaction }
                     liveRow.isInOfflineFolder = false
                     liveRow.isMarkedAsOffline = false
                     cleared = true
@@ -850,47 +868,54 @@ object OfflineFolderController {
             return
         }
 
-        val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return
-        if (!offlineFile.exists()) {
-            OfflineFileCoordination.withFileLock(userDrive, file.id) {
-                var cleared = false
-                runCatching { realm.refresh() }
-                realm.executeTransaction {
-                    if (isAborted()) return@executeTransaction
-                    val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
-                    if (liveRow.isOffline) return@executeTransaction
-                    // Caller-supplied freshness predicate, evaluated INSIDE the committing
-                    // transaction (issue: round 8 #8): each clearing context revalidates the
-                    // ancestry that authorizes IT — the root-removal cleanup rejects rows a
-                    // newly added nested root now covers, the orphan sweep rejects rows a
-                    // root newly covers. A nil predicate keeps the pre-existing semantics:
-                    // the walk's and the sync's remote-listing truth needs no ancestry gate.
-                    isStillClearable?.let { clearable -> if (!clearable(realm, file)) return@executeTransaction }
-                    liveRow.isInOfflineFolder = false
-                    liveRow.isMarkedAsOffline = false
-                    cleared = true
-                }
-                if (!cleared) result.keptOfflineFilesCount++
-            }
-            return
-        }
-
-        // GLOBAL root-intent monitor OUTSIDE the file lock (issue: round 10 #5): the intent
-        // decision, the coverage freshness decision and the byte deletion hold it
-        // continuously, so a nested-root addition — whose own lock no traversal holds —
-        // commits only before this whole section starts or after its byte deletion ends.
-        // Consistent order: intent monitor → file locks → Realm transaction.
+        // EVERYTHING a file decision needs is resolved INSIDE coordination (issue: round 11
+        // #9): the intent monitor precedes the file lock (one consistent order), the Realm is
+        // refreshed, and the CURRENT row, its derived path, the bytes' existence and the
+        // protection state are read under the lock — the caller's snapshot row can be stale
+        // (a move reconciled the copy elsewhere since collection), and branch selection from
+        // that stale view cleared a current row using an obsolete path's existence result and
+        // judged protection against bytes the row no longer owns.
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                runCatching { realm.refresh() }
+                val liveRow = FileController.getFileById(realm, file.id) ?: return@withFileLock
+                if (liveRow.isOffline) return@withFileLock
+                // Caller-supplied freshness predicate, evaluated on the refreshed CURRENT row
+                // INSIDE coordination (issues: round 8 #8, round 11 #8/#9): a root committed
+                // after the caller collected this row is seen here, before any flag or byte
+                // is touched.
+                isStillClearable?.let { clearable ->
+                    if (!clearable(realm, liveRow)) {
+                        result.keptOfflineFilesCount++
+                        return@withFileLock
+                    }
+                }
+                val offlineFile = liveRow.getOfflineFile(context, userDrive.userId) ?: return@withFileLock
+
+                if (!offlineFile.exists()) {
+                    var cleared = false
+                    realm.executeTransaction {
+                        if (isAborted()) return@executeTransaction
+                        val committedRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
+                        if (committedRow.isOffline) return@executeTransaction
+                        isStillClearable?.let { clearable -> if (!clearable(realm, committedRow)) return@executeTransaction }
+                        committedRow.isInOfflineFolder = false
+                        committedRow.isMarkedAsOffline = false
+                        cleared = true
+                    }
+                    if (!cleared) result.keptOfflineFilesCount++
+                    return@withFileLock
+                }
+
                 val needsSnapshot: Boolean
-                when (protectionStateOf(file, offlineFile, userDrive)) {
+                when (protectionStateOf(liveRow, offlineFile, userDrive)) {
                     CopyProtection.PENDING_UPLOAD -> {
                         result.keptOfflineFilesCount++
                         return@withFileLock
                     }
                     CopyProtection.UPLOADED -> needsSnapshot = false
                     CopyProtection.DIRTY -> {
-                        val uploadRegistered = registerDirtySnapshot(context, file, offlineFile, userDrive)
+                        val uploadRegistered = registerDirtySnapshot(context, liveRow, offlineFile, userDrive)
                         if (!uploadRegistered) {
                             // Keep the bytes and the flags rather than losing the edit; a later attempt
                             // (next sync) retries the snapshot.
@@ -904,18 +929,16 @@ object OfflineFolderController {
 
                 // The committing transaction revalidates the removal intent (root revival via the
                 // abort predicate), the live pin state AND the context's fresh coverage predicate
-                // on a refreshed Realm, immediately before the flags clear (issues: round 7 #9,
-                // round 9 #6) — this is the branch that actually deletes existing bytes, so it
-                // needs the same freshness gates as the flag-only branches.
+                // on the transaction-fresh row, immediately before the flags clear (issues: round
+                // 7 #9, round 9 #6, round 11 #9).
                 var cleared = false
-                runCatching { realm.refresh() }
                 realm.executeTransaction {
                     if (isAborted()) return@executeTransaction
-                    val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
-                    if (liveRow.isOffline) return@executeTransaction
-                    isStillClearable?.let { clearable -> if (!clearable(realm, liveRow)) return@executeTransaction }
-                    liveRow.isInOfflineFolder = false
-                    liveRow.isMarkedAsOffline = false
+                    val committedRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
+                    if (committedRow.isOffline) return@executeTransaction
+                    isStillClearable?.let { clearable -> if (!clearable(realm, committedRow)) return@executeTransaction }
+                    committedRow.isInOfflineFolder = false
+                    committedRow.isMarkedAsOffline = false
                     cleared = true
                 }
                 if (cleared) {
@@ -926,9 +949,9 @@ object OfflineFolderController {
                     // through this decision and the deletion — a nested-root addition cannot
                     // commit inside it.
                     runCatching { realm.refresh() }
-                    val intentRevoked = isAborted() || (isStillClearable?.invoke(realm, file) == false)
+                    val intentRevoked = isAborted() || (isStillClearable?.invoke(realm, liveRow) == false)
                     if (!intentRevoked) {
-                        deleteOfflineCopy(context, file, offlineFile, userDrive, result)
+                        deleteOfflineCopy(context, liveRow, offlineFile, userDrive, result)
                     } else {
                         result.keptOfflineFilesCount++
                     }

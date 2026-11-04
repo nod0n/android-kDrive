@@ -428,6 +428,45 @@ object OfflineFolderUtils {
         FileController.getFileById(currentRealm, candidate.id)?.parentId == expectedParentId
     }
 
+    /**
+     * Destructive-decision predicate for the flat children cleanup (issues: round 11 #8): the
+     * listing-parent match of [listingClearable] PLUS a revalidation, inside the committing
+     * transaction, that no root covering the candidate was COMMITTED after
+     * [traversalStartedMillis]. Roots predating the traversal stay the listing's maintenance
+     * responsibility (the walk must keep clearing stale rows beneath them); a root committed
+     * after the traversal collected this child is a newly authoritative owner the collection
+     * checks never saw — it stops this decision.
+     */
+    private fun listingAbsentClearable(expectedParentId: Int, traversalStartedMillis: Long): (Realm, File) -> Boolean =
+        { currentRealm, candidate ->
+            listingClearable(expectedParentId)(currentRealm, candidate) &&
+                !OfflineFolderController.hasActiveRootCoveringSince(candidate.id, currentRealm, traversalStartedMillis)
+        }
+
+    /**
+     * Destructive-decision predicate for the absent-subtree traversal (issues: round 11
+     * #8/#10), evaluated inside the committing transaction on the refreshed live row:
+     *  - the ORIGINAL absent-subtree boundary still holds — [boundaryFolderId] still hangs
+     *    from [boundaryListedParentId], the parent its listing authority spoke for (an
+     *    immediate-parent match of a descendant cannot detect a subtree move, since the
+     *    parent-child links travel with the move);
+     *  - the candidate's own immediate-parent match still holds (issue: round 9 #6);
+     *  - no root covering the candidate — its own record or its ancestry — was committed
+     *    after [traversalStartedMillis] (issue: round 11 #8): a newly authoritative root
+     *    stops the decision, while roots predating the traversal stay the listing's
+     *    maintenance responsibility.
+     */
+    private fun absentSubtreeClearable(
+        boundaryFolderId: Int,
+        boundaryListedParentId: Int,
+        expectedParentId: Int,
+        traversalStartedMillis: Long,
+    ): (Realm, File) -> Boolean = { currentRealm, candidate ->
+        FileController.getFileById(currentRealm, boundaryFolderId)?.parentId == boundaryListedParentId &&
+            FileController.getFileById(currentRealm, candidate.id)?.parentId == expectedParentId &&
+            !OfflineFolderController.hasActiveRootCoveringSince(candidate.id, currentRealm, traversalStartedMillis)
+    }
+
     private fun cleanupConfirmedAbsentChildren(
         context: Context,
         realm: Realm,
@@ -436,6 +475,10 @@ object OfflineFolderUtils {
         remoteFileIds: Set<Int>,
     ) {
         val result = OfflineFolderController.RemovalResult()
+        // The traversal's freshness horizon (issue: round 11 #8): roots committed AFTER this
+        // moment are newly authoritative owners the collection checks never saw, and every
+        // destructive decision below revalidates against them.
+        val traversalStartedMillis = System.currentTimeMillis()
         val children = realm.where(File::class.java)
             .equalTo(File::parentId.name, folderId)
             .findAll()
@@ -446,7 +489,7 @@ object OfflineFolderUtils {
 
             if (child.isFolder()) {
                 if (OfflineFolderController.isOfflineRoot(child.id, customRealm = realm)) return@forEach
-                clearConfirmedAbsentSubtree(context, realm, child.id, folderId, userDrive, result)
+                clearConfirmedAbsentSubtree(context, realm, child.id, folderId, userDrive, result, traversalStartedMillis)
             } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
                     isOffline = child.isOffline,
                     isInOfflineFolder = child.isInOfflineFolder,
@@ -459,8 +502,9 @@ object OfflineFolderUtils {
                     userDrive = userDrive,
                     result = result,
                     isFolder = false,
-                    // The listing of [folderId] is this cleanup's authority (issue: round 9 #6).
-                    isStillClearable = listingClearable(folderId),
+                    // The listing of [folderId] is this cleanup's authority (issue: round 9 #6),
+                    // revalidated against roots committed after collection (issue: round 11 #8).
+                    isStillClearable = listingAbsentClearable(folderId, traversalStartedMillis),
                 )
             }
         }
@@ -481,6 +525,7 @@ object OfflineFolderUtils {
         listedParentId: Int,
         userDrive: UserDrive,
         result: OfflineFolderController.RemovalResult,
+        traversalStartedMillis: Long,
     ) {
         val visited = mutableSetOf(rootFolderId)
         // folderId to the parent the traversal reached it from — the only parent relationship
@@ -490,10 +535,13 @@ object OfflineFolderUtils {
 
         while (queue.isNotEmpty()) {
             val (currentId, collectedParentId) = queue.removeFirst()
-            // Stop at every remaining active root encountered deeper in the subtree: its own
-            // record and walk establish (or disprove) its coverage independently (issue: round
-            // 3 #11).
-            if (currentId != rootFolderId && OfflineFolderController.hasActiveOfflineRoot(currentId, customRealm = realm)) {
+            // Active-root revalidation at EVERY queue node, INCLUDING the boundary folder
+            // itself (issue: round 11 #8): a root record committed after the traversal decided
+            // [rootFolderId] was not a root owns the subtree's coverage now — its own walk
+            // establishes it, so this traversal stops entirely instead of clearing beneath
+            // the new authority. A deeper root keeps its independent walk (issue: round 3 #11).
+            if (OfflineFolderController.hasActiveOfflineRoot(currentId, customRealm = realm)) {
+                if (currentId == rootFolderId) break
                 continue
             }
             val currentFolder = FileController.getFileById(realm, currentId) ?: continue
@@ -504,13 +552,17 @@ object OfflineFolderUtils {
                 userDrive = userDrive,
                 result = result,
                 isFolder = true,
-                isStillClearable = listingClearable(collectedParentId),
+                // The original absent-subtree boundary and the new-root check travel INSIDE
+                // the decision (issues: round 11 #8/#10).
+                isStillClearable = absentSubtreeClearable(rootFolderId, listedParentId, collectedParentId, traversalStartedMillis),
             )
             // The subtree's original listing authority dies with the folder's rejection
             // (issue: round 10 #6): if the folder was not cleared because its live parent
             // moved — another subtree owns it now — descending would clear children whose
             // only "authority" is an immediate-parent match against the moved row. The
-            // boundary is revalidated at EVERY level, not assumed from the top.
+            // boundary is revalidated at EVERY level, not assumed from the top; the same
+            // boundary also gates every descendant's destructive decision below, so a move
+            // BETWEEN queue iterations stops the remaining descendants too (issue: round 11 #10).
             if (!listingClearable(collectedParentId)(realm, currentFolder)) continue
 
             realm.where(File::class.java)
@@ -532,7 +584,7 @@ object OfflineFolderUtils {
                             userDrive = userDrive,
                             result = result,
                             isFolder = false,
-                            isStillClearable = listingClearable(currentId),
+                            isStillClearable = absentSubtreeClearable(rootFolderId, listedParentId, currentId, traversalStartedMillis),
                         )
                     }
                 }
