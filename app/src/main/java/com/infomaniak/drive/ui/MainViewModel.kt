@@ -409,7 +409,14 @@ class MainViewModel(
                             // capture) — with the complete post-move identity applied: the
                             // stale source parent/path must not survive, or uploads keep
                             // targeting the old location (issue: round 8 #5).
-                            val movedChild = freshRow?.let { currentDriveRealm.copyFromRealm(it, 0) }?.apply {
+                            // CROSS-REALM transfer copy is DEPTH ONE (issue: round 16 #10): a
+                            // depth-zero copy would upsert a truncated observation into the
+                            // shares realm — embedded rights/version dropped and the child
+                            // ownership graph nulled while isComplete stays true. The depth-one
+                            // copy carries the embedded metadata and the direct children's
+                            // primitives into the destination realm; the accepted managed
+                            // identity still provides the committed local fields.
+                            val movedChild = freshRow?.let { currentDriveRealm.copyFromRealm(it, 1) }?.apply {
                                 parentId = newParent.id
                                 path = ""
                             } ?: file.apply {
@@ -447,27 +454,31 @@ class MainViewModel(
                     } else if (accepted && preserved) {
                         // The committed identity is the complete post-move one (issue: round 7 #5):
                         // the stale source path must not survive the parent change, or derived
-                        // offline paths keep pointing at the location the bytes left. The add
-                        // commits the FRESH row's current local fields with the moved identity
-                        // applied (issue: round 15 #14); the acceptance gate already rejected
-                        // intervening identity changes under this section's locks.
-                        val movedChild = freshRow?.let { currentDriveRealm.copyFromRealm(it, 0) }?.apply {
-                            parentId = newParent.id
-                            path = ""
-                        } ?: file.apply {
-                            parentId = newParent.id
-                            path = ""
+                        // offline paths keep pointing at the location the bytes left.
+                        // SAME-REALM moves mutate the ACCEPTED MANAGED row in place (issue:
+                        // round 16 #10): a depth-zero detached copy inserted into the managed
+                        // children list UPSERTS by primary key and would overwrite the embedded
+                        // metadata (rights, version, external import) and null a folder's child
+                        // list while retaining isComplete. Mutating the identity/path on the
+                        // live row and linking it preserves the whole graph, and the link's
+                        // transaction-fresh container check now applies (the committed row
+                        // names this destination).
+                        freshRow?.let { acceptedRow ->
+                            FileController.updateFile(file.id, currentDriveRealm, userDrive = userDrive) { localFile ->
+                                localFile.parentId = newParent.id
+                                localFile.path = ""
+                            }
+                            FileController.addChild(newParent.id, acceptedRow, currentDriveRealm, userDrive)
+                        } ?: run {
+                            // The row vanished mid-section: recreate the moved identity from the
+                            // captured request object — an INSERT (no existing row is overwritten;
+                            // later listings restore the full model).
+                            val movedChild = file.apply {
+                                parentId = newParent.id
+                                path = ""
+                            }
+                            FileController.addChild(newParent.id, movedChild, currentDriveRealm, userDrive)
                         }
-                        FileController.addChild(
-                            newParent.id,
-                            movedChild,
-                            currentDriveRealm,
-                            userDrive,
-                            // This add also COMMITS the post-move identity (issue: round 14
-                            // #11): the row still holds the source parent, so the fresh-row
-                            // container check must not apply.
-                            revalidateExistingRow = false,
-                        )
                     } else {
                         // Preservation incomplete or a newer committed identity won (pending
                         // upload, protected destination, intervening commit): the row keeps its
