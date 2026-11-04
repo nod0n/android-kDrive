@@ -791,6 +791,16 @@ object FileController {
                             if (accepted) {
                                 val previousParentId = freshRow?.parentId
                                 if (freshRow != null) actionFile.keepOldLocalFilesData(freshRow)
+                                // The payload's METADATA commits even when the destination
+                                // backlink already exists (issue: round 19 #9): the previous
+                                // order committed the payload only through the list-add, so
+                                // an existing backlink skipped the metadata upsert and the
+                                // row kept its pre-move identity while the obsolete
+                                // backlinks were removed.
+                                it.insertOrUpdate(actionFile)
+                                // SEPARATELY link and unlink (issue: round 19 #9): the
+                                // backlink's presence decides only the LINK half; the
+                                // obsolete backlinks are removed regardless.
                                 if (destinationRow.children.none { it.id == actionFile.id }) {
                                     destinationRow.children.add(actionFile)
                                 }
