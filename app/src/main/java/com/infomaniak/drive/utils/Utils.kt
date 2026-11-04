@@ -72,6 +72,10 @@ import com.infomaniak.drive.ui.fileList.preview.PreviewPDFActivity
 import com.infomaniak.drive.ui.fileList.preview.PreviewSliderFragmentArgs
 import com.infomaniak.drive.utils.SyncUtils.uploadFolder
 import com.infomaniak.drive.views.FileInfoActionsView.Companion.SINGLE_OPERATION_CUSTOM_TAG
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.util.Date
 import kotlin.math.pow
 
@@ -384,6 +388,19 @@ object Utils {
         }
         workManager.enqueueUniqueWork(uniqueName, policy, downloadRequest)
     }
+
+    /**
+     * Fire-and-forget entry for [reconfigureOfflineFolderWork] running in a process-lifetime
+     * scope (issue: round 6 #8): the settings dialog that requests the reconfiguration
+     * dismisses itself immediately, and a dialog-owned coroutine would be cancelled before
+     * the awaited WorkManager cancellation and the replacement enqueue complete — leaving the
+     * original failure mode (cancelled work, nothing rescheduled) intact.
+     */
+    fun reconfigureOfflineFolderWorkAsync(context: Context) {
+        reconfigurationScope.launch { reconfigureOfflineFolderWork(context) }
+    }
+
+    private val reconfigurationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * Cancels all offline folder download chains and re-enqueues their durable work with the

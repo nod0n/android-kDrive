@@ -18,7 +18,6 @@
 package com.infomaniak.drive.views
 
 import android.content.DialogInterface
-import androidx.lifecycle.lifecycleScope
 import com.infomaniak.core.legacy.utils.setBackNavigationResult
 import com.infomaniak.drive.MatomoDrive
 import com.infomaniak.drive.MatomoDrive.trackSettingsEvent
@@ -26,8 +25,6 @@ import com.infomaniak.drive.R
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.ui.menu.settings.SettingsFragment.Companion.KEY_BACK_ACTION_BOTTOM_SHEET
 import com.infomaniak.drive.utils.Utils
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 
 class SyncOfflineSelectBottomSheetDialog : SyncSelectBottomSheetDialog() {
 
@@ -40,14 +37,11 @@ class SyncOfflineSelectBottomSheetDialog : SyncSelectBottomSheetDialog() {
             AppSettings.onlyWifiSyncOffline = value
             // WorkManager constraints are captured at enqueue time (issue: round 4 #14):
             // reconfigure existing offline folder chains so a Wi-Fi-only change cannot leave a
-            // mobile-data job running, nor an unmetered job blocked. The reconfiguration AWAITS
-            // the cancellations and explicitly re-enqueues the durable roots and unfinished pin
-            // requests with the fresh constraints (issue: round 5 #17) — cancellation alone
-            // would lose them.
-            val context = requireContext()
-            lifecycleScope.launch(Dispatchers.IO) {
-                Utils.reconfigureOfflineFolderWork(context)
-            }
+            // mobile-data job running, nor an unmetered job blocked. The reconfiguration runs
+            // in a process-lifetime scope (issue: round 6 #8): this dialog dismisses itself
+            // immediately, and a dialog-owned coroutine would be cancelled before the awaited
+            // cancellation and the replacement enqueue complete.
+            Utils.reconfigureOfflineFolderWorkAsync(requireContext())
         }
 
     override fun trackEvent(name: MatomoDrive.MatomoName) = trackSettingsEvent(name)
