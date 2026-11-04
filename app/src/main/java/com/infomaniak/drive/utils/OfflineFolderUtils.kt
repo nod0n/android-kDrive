@@ -229,62 +229,30 @@ object OfflineFolderUtils {
         val last = lastResponse ?: return FolderWalkOutcome.INCOMPLETE
         val remoteIds = allPages.mapTo(mutableSetOf()) { it.id }
 
-        // Capture every locally owned copy (explicit pins included — the walk would otherwise
-        // replace their metadata too — and directories excluded, since directories are not file
-        // content) at its OLD location, BEFORE any metadata replacement (issue: round 4 #9).
-        data class OldOwnedCopy(val fileId: Int, val oldOffline: IOFile, val oldName: String, val oldParentId: Int, val oldLastModifiedAt: Long)
-        val oldOwnedCopies = allPages.mapNotNull { remoteFile ->
+        // Read-only MOVE-CANDIDATE detection (issue: round 12 #1): the previous preliminary
+        // pass RECONCILED moved copies here — outside any coordination and before the shared
+        // stale gate — so a delayed listing naming an obsolete location could snapshot a
+        // current edit under that identity and delete the original before the newer row
+        // rejected the listing. ALL preservation now runs inside saveRemoteFiles' coordinated
+        // validate–preserve–commit boundary; this pass only records which listed files changed
+        // location (directories excluded — not file content), to derive the walk's
+        // deferred-move outcome AFTER the commit from pure row reads.
+        data class MoveCandidate(val fileId: Int, val locationChanged: Boolean)
+        val moveCandidates = allPages.mapNotNull { remoteFile ->
             val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@mapNotNull null
             if (oldRow.isFolder()) return@mapNotNull null
             val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() } ?: return@mapNotNull null
-            OldOwnedCopy(remoteFile.id, oldOffline, oldRow.name, oldRow.parentId, oldRow.lastModifiedAt)
-        }
-
-        // Preserve BEFORE committing replacement metadata: files whose reconciliation did not
-        // complete keep their OLD metadata (excluded from this page's commit) so no edited bytes
-        // are ever stranded at an untracked path (issues: round 4 #2, #5, #9).
-        val unresolvedMoveIds = mutableSetOf<Int>()
-        oldOwnedCopies.forEach { old ->
-            val newIdentity = allPages.firstOrNull { it.id == old.fileId } ?: return@forEach
             // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7),
             // exactly like the per-file download manager: a remote path string can never equal
             // the local offline directory path, so the previous comparison classified every
             // unchanged file as a move and pushed clean copies through reconciliation.
-            val newOffline = newIdentity.getOfflineFile(context, userDrive.userId)
-            val locationChanged = newOffline == null || newOffline.path != old.oldOffline.path
-            if (locationChanged && !OfflineFolderController.reconcileMovedInheritedCopy(
-                    context = context,
-                    oldOfflineFile = old.oldOffline,
-                    oldIdentityName = old.oldName,
-                    oldIdentityParentId = old.oldParentId,
-                    oldLastModifiedAt = old.oldLastModifiedAt,
-                    newIdentity = newIdentity,
-                    userDrive = userDrive,
-                )
-            ) {
-                unresolvedMoveIds.add(old.fileId)
-            }
-        }
-        if (unresolvedMoveIds.isNotEmpty()) {
-            SentryLog.i(TAG, "Deferred ${unresolvedMoveIds.size} move(s) whose old copies are not safely preserved yet")
-        }
-
-        val committableFiles = allPages.filterNot { it.id in unresolvedMoveIds }
-
-        // Deferred moves keep their presentation membership (issue: round 5 #8): the retained
-        // OLD row joins the commit list so the folder listing does not lose the file while its
-        // reconciliation is deferred. Managed rows are merged with themselves by
-        // saveRemoteFiles and re-flagged at their old location, which never schedules a
-        // re-download: deferred copies are dirty or upload-protected by definition.
-        val presentationFiles = if (unresolvedMoveIds.isEmpty()) {
-            committableFiles
-        } else {
-            committableFiles + unresolvedMoveIds.mapNotNull { FileController.getFileById(realm, it) }
+            val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
+            MoveCandidate(remoteFile.id, newOffline == null || newOffline.path != oldOffline.path)
         }
 
         val completeResponse = CursorApiResponse<List<File>>(
             result = last.result,
-            data = presentationFiles,
+            data = allPages,
             error = last.error,
             responseAt = last.responseAt,
             cursor = last.cursor,
@@ -311,11 +279,24 @@ object OfflineFolderUtils {
         // classify retained sources as confirmed deletions and clear their coverage.
         cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds)
 
-        if (unresolvedMoveIds.isNotEmpty()) {
+        // Deferred moves are the listed files whose location changed and whose row did NOT take
+        // the listing's identity at commit — the coordinated boundary deferred their
+        // preservation (or the listing was rejected as stale, which is not a deferral: a
+        // strictly newer row means the listing simply lost the race) (issue: round 12 #1).
+        val deferredMoveIds = moveCandidates.filter { candidate ->
+            if (!candidate.locationChanged) return@filter false
+            val row = FileController.getFileById(realm, candidate.fileId) ?: return@filter false
+            val listed = allPages.firstOrNull { it.id == candidate.fileId } ?: return@filter false
+            (row.parentId != listed.parentId || row.name != listed.name) &&
+                !FileController.isStaleReplacement(row, listed)
+        }
+
+        if (deferredMoveIds.isNotEmpty()) {
             // The move reconciliation is incomplete: the affected files keep their old metadata
             // and location this round, and the root stays incomplete for retry (issue: round
             // 5 #8/#9). The folder itself WAS fully listed — independent folders keep walking
             // so one occupied destination cannot starve the whole root (issue: round 6 #10).
+            SentryLog.i(TAG, "Deferred ${deferredMoveIds.size} move(s) whose old copies are not safely preserved yet")
             return FolderWalkOutcome.DEFERRED_MOVES
         }
 

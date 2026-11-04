@@ -583,65 +583,74 @@ object OfflineFolderController {
         val context = Realm.getApplicationContext() ?: return remoteFiles
         if (remoteFiles.isEmpty()) return remoteFiles
         return remoteFiles.map { remoteFile ->
-            val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@map remoteFile
-            if (oldRow.isFolder()) return@map remoteFile
-            // Stale-response gate BEFORE ANY preservation side effect (issue: round 11 #2/#4):
-            // when the live row already holds a newer server generation — or, for replacement
-            // boundaries, a different location identity at an equal revision — the incoming
-            // response describes a revision that no longer exists; reconciling its bytes would
-            // snapshot a current edit under the obsolete identity, delete the original, and
-            // then be rejected at the metadata commit, leaving the live row's bytes absent and
-            // an upload targeting the old location. The OLD row is returned in place: the
-            // caller commits (or defers to) the live state, and nothing on the filesystem or
-            // in the upload queue is touched. Authoritative-change callers (the offline sync's
-            // actions) pass the generation-only predicate — an identity difference at equal
-            // revisions is the change being applied there, not staleness.
-            if (isStale(oldRow, remoteFile)) return@map oldRow
-            val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
-                ?: return@map remoteFile
-            // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7).
-            val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
-            val locationChanged = newOffline == null || newOffline.path != oldOffline.path
-            if (!locationChanged) {
-                // Pre-existing bytes are judged against the OLD baseline BEFORE the incoming
-                // metadata replaces it (issue: round 7 #2): a freshly upserted row cannot
-                // establish the cleanliness of bytes it did not write. Baseline T1, unsent
-                // edit T2, incoming T3 (T1 < T2 < T3): committing T3 first would classify the
-                // T2 edit as clean and let publication or root removal destroy it. A pending
-                // or retained-unsent record already owns the copy; a dirty copy is snapshotted
-                // against the OLD baseline first, and a failed registration defers the whole
-                // commit so the edit is never replaced unowned.
-                val targetUri = Uri.fromFile(oldOffline).toString()
-                if (UploadFile.hasPendingUpload(uri = targetUri) ||
-                    UploadFile.hasRetainedUnsentUpload(uri = targetUri)
-                ) {
-                    return@map remoteFile
+            // Fresh validate–preserve under coordination (issue: round 12 #1): the boundary
+            // acquires each file's lock ITSELF — reentrant when a coordinated caller already
+            // holds the set — and REFRESHES the Realm before reading the source
+            // identity/baseline, so standalone callers (the sync, the details cascade,
+            // single-file upserts) get the same freshness and serialization as the graph
+            // commits, and no preservation decision is made on a stale Realm view.
+            OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
+                runCatching { realm.refresh() }
+                val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@withFileLock remoteFile
+                if (oldRow.isFolder()) return@withFileLock remoteFile
+                // Stale-response gate BEFORE ANY preservation side effect (issue: round 11 #2/#4):
+                // when the live row already holds a newer server generation — or, for replacement
+                // boundaries, a different location identity at an equal revision — the incoming
+                // response describes a revision that no longer exists; reconciling its bytes would
+                // snapshot a current edit under the obsolete identity, delete the original, and
+                // then be rejected at the metadata commit, leaving the live row's bytes absent and
+                // an upload targeting the old location. The OLD row is returned in place: the
+                // caller commits (or defers to) the live state, and nothing on the filesystem or
+                // in the upload queue is touched. Authoritative-change callers (the offline sync's
+                // actions) pass the generation-only predicate — an identity difference at equal
+                // revisions is the change being applied there, not staleness.
+                if (isStale(oldRow, remoteFile)) return@withFileLock oldRow
+                val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
+                    ?: return@withFileLock remoteFile
+                // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7).
+                val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
+                val locationChanged = newOffline == null || newOffline.path != oldOffline.path
+                if (!locationChanged) {
+                    // Pre-existing bytes are judged against the OLD baseline BEFORE the incoming
+                    // metadata replaces it (issue: round 7 #2): a freshly upserted row cannot
+                    // establish the cleanliness of bytes it did not write. Baseline T1, unsent
+                    // edit T2, incoming T3 (T1 < T2 < T3): committing T3 first would classify the
+                    // T2 edit as clean and let publication or root removal destroy it. A pending
+                    // or retained-unsent record already owns the copy; a dirty copy is snapshotted
+                    // against the OLD baseline first, and a failed registration defers the whole
+                    // commit so the edit is never replaced unowned.
+                    val targetUri = Uri.fromFile(oldOffline).toString()
+                    if (UploadFile.hasPendingUpload(uri = targetUri) ||
+                        UploadFile.hasRetainedUnsentUpload(uri = targetUri)
+                    ) {
+                        return@withFileLock remoteFile
+                    }
+                    if (OfflineFolderPolicy.isLocallyModified(
+                            offlineFileLastModifiedMillis = oldOffline.lastModified(),
+                            remoteLastModifiedAtSeconds = oldRow.lastModifiedAt,
+                        )
+                    ) {
+                        val registered = registerDirtySnapshot(context, oldRow, oldOffline, userDrive)
+                        if (!registered) return@withFileLock oldRow
+                    }
+                    return@withFileLock remoteFile
                 }
-                if (OfflineFolderPolicy.isLocallyModified(
-                        offlineFileLastModifiedMillis = oldOffline.lastModified(),
-                        remoteLastModifiedAtSeconds = oldRow.lastModifiedAt,
+                if (reconcileMovedInheritedCopy(
+                        context = context,
+                        oldOfflineFile = oldOffline,
+                        oldIdentityName = oldRow.name,
+                        oldIdentityParentId = oldRow.parentId,
+                        oldLastModifiedAt = oldRow.lastModifiedAt,
+                        newIdentity = remoteFile,
+                        userDrive = userDrive,
                     )
                 ) {
-                    val registered = registerDirtySnapshot(context, oldRow, oldOffline, userDrive)
-                    if (!registered) return@map oldRow
+                    remoteFile
+                } else {
+                    // Preservation incomplete (pending upload, snapshot failed, protected
+                    // destination): keep the OLD row authoritative for this commit.
+                    oldRow
                 }
-                return@map remoteFile
-            }
-            if (reconcileMovedInheritedCopy(
-                    context = context,
-                    oldOfflineFile = oldOffline,
-                    oldIdentityName = oldRow.name,
-                    oldIdentityParentId = oldRow.parentId,
-                    oldLastModifiedAt = oldRow.lastModifiedAt,
-                    newIdentity = remoteFile,
-                    userDrive = userDrive,
-                )
-            ) {
-                remoteFile
-            } else {
-                // Preservation incomplete (pending upload, snapshot failed, protected
-                // destination): keep the OLD row authoritative for this commit.
-                oldRow
             }
         }
     }
