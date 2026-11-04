@@ -238,13 +238,12 @@ object OfflineFolderUtils {
             hasMore = false,
         )
 
-        // Explicit per-file outcomes (issue: round 13 #8): the commit itself reports which
-        // rows did NOT take the listing's identity — no post-commit inference from resolved
-        // paths, which could only see location changes and missed unchanged-path snapshot
-        // failures entirely. Accepted files are absent from the set; rejected and deferred
-        // files are both present and are separated below. Every sibling continues regardless:
-        // the outcomes are per-file, never an abort.
-        val substitutedOrDroppedIds = processPage(
+        // Explicit per-file outcomes (issues: round 13 #8, round 14 #8): the commit itself
+        // reports which rows did NOT take the listing's identity, classified at the commit —
+        // no post-commit inference from resolved paths, and no conflation of an unresolved
+        // rejection with a proven supersession. Every sibling continues regardless: the
+        // outcomes are per-file, never an abort.
+        val commitOutcomes = processPage(
             context = context,
             realm = realm,
             rootFolderId = rootFolderId,
@@ -264,14 +263,12 @@ object OfflineFolderUtils {
         // classify retained sources as confirmed deletions and clear their coverage.
         cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds)
 
-        // A live row that is strictly NEWER than the listing is a race LOSS, not a deferral:
-        // the newer identity stands and the next listing refetches it. Only a row still
-        // matching the listing's generation is UNFINISHED reconciliation (issue: round 12 #1).
-        val deferredMoveIds = substitutedOrDroppedIds.filter { id ->
-            val row = FileController.getFileById(realm, id) ?: return@filter false
-            val listed = allPages.firstOrNull { it.id == id } ?: return@filter false
-            !FileController.isStaleReplacement(row, listed)
-        }
+        // DEFERRALS keep the walk incomplete (issue: round 14 #8): an ambiguous identity tie
+        // rejected for a missing observation is NOT a completed reconciliation — its retained
+        // old copy can be intact and produce no download, so treating it as complete would
+        // advance root completion over unfinished work. A PROVEN supersession is the listing
+        // losing the race: the next listing refetches it and does not defer the walk.
+        val deferredMoveIds = commitOutcomes.deferredIds
 
         if (deferredMoveIds.isNotEmpty()) {
             // The reconciliation is incomplete: the affected files keep their old metadata
@@ -288,7 +285,7 @@ object OfflineFolderUtils {
     /**
      * Commits the (already preservation-filtered) remote children of [folderId] into the local
      * cache and materializes the folder coverage on them. Returns [FileController.saveRemoteFiles]'s
-     * explicit per-file non-acceptance outcomes (issue: round 13 #8).
+     * explicit per-file commit outcomes (issues: round 13 #8, round 14 #8).
      */
     private fun processPage(
         context: Context,
@@ -301,11 +298,11 @@ object OfflineFolderUtils {
         fileIds: MutableList<Int>,
         folderQueue: ArrayDeque<Int>,
         visitedFolderIds: MutableSet<Int>,
-    ): Set<Int> {
-        val remoteFiles = apiResponse.data ?: return emptySet()
+    ): FileController.ListingCommitOutcomes {
+        val remoteFiles = apiResponse.data ?: return FileController.ListingCommitOutcomes(emptySet(), emptySet())
         val folderProxy = FileController.getFileById(realm, folderId)
 
-        val substitutedOrDroppedIds = FileController.saveRemoteFiles(
+        val commitOutcomes = FileController.saveRemoteFiles(
             realm = realm,
             localFolderProxy = folderProxy,
             remoteFolder = folderProxy ?: File(id = folderId, driveId = userDrive.driveId, type = File.Type.DIRECTORY.value)
@@ -368,7 +365,7 @@ object OfflineFolderUtils {
                 }
             }
         }
-        return substitutedOrDroppedIds
+        return commitOutcomes
     }
 
     /**

@@ -1466,12 +1466,16 @@ object FileController {
     }
 
     /**
-     * Commits a folder listing and returns the ids of the children whose row did NOT take the
-     * listing's identity at commit (issue: round 13 #8) — a DEFERRAL (the shared boundary kept
-     * the old row because the old copy's preservation is unfinished) or a REJECTION (the live
-     * row was strictly newer; the listing lost the race). Accepted ids are absent. The caller
-     * holds the listing context and separates the two via [isStaleReplacement] against the
-     * listed row.
+     * Explicit per-file commit outcomes (issue: round 14 #8): ACCEPTED ids are absent from
+     * both sets; a DEFERRED id is unfinished reconciliation — an ambiguous identity tie or a
+     * preservation deferral — and keeps the walk incomplete; a SUPERSEDED id is a PROVEN
+     * newer live generation (the listing lost the race and the next listing refetches it).
+     */
+    data class ListingCommitOutcomes(val deferredIds: Set<Int>, val supersededIds: Set<Int>)
+
+    /**
+     * Commits a folder listing and returns the [ListingCommitOutcomes] of the children whose
+     * row did NOT take the listing's identity at commit (issues: round 13 #8, round 14 #8).
      */
     fun saveRemoteFiles(
         realm: Realm,
@@ -1481,8 +1485,8 @@ object FileController {
         isFirstPage: Boolean,
         isCompleteFolder: Boolean,
         userDrive: UserDrive,
-    ): Set<Int> {
-        val remoteFiles = apiResponse.data ?: return emptySet()
+    ): ListingCommitOutcomes {
+        val remoteFiles = apiResponse.data ?: return ListingCommitOutcomes(emptySet(), emptySet())
 
         // Save remote folder if it doesn't exist locally
         var newLocalFolderProxy: File? = null
@@ -1563,7 +1567,26 @@ object FileController {
             }
         }
         }
-        return substitutedOrDroppedIds
+        // Explicit outcome classification (issue: round 14 #8): each non-accepted id is
+        // judged from the committed live row against the LISTED row — a PROVEN newer
+        // generation (server generation or strictly newer updatedAt) is superseded;
+        // everything else (an ambiguous identity tie, a preservation deferral) stays
+        // UNRESOLVED and keeps the reconciliation incomplete. Under this section's locks
+        // the committed rows cannot change between the transaction and this read.
+        val deferredIds = mutableSetOf<Int>()
+        val supersededIds = mutableSetOf<Int>()
+        for (id in substitutedOrDroppedIds) {
+            val liveRow = getFileById(realm, id)
+            val listed = remoteFiles.firstOrNull { it.id == id }
+            if (liveRow == null || listed == null) {
+                deferredIds.add(id)
+            } else if (isSupersededGeneration(liveRow, listed) || liveRow.updatedAt > listed.updatedAt) {
+                supersededIds.add(id)
+            } else {
+                deferredIds.add(id)
+            }
+        }
+        return ListingCommitOutcomes(deferredIds, supersededIds)
     }
 
     /**
