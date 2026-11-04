@@ -326,7 +326,24 @@ object SyncOfflineUtils {
             if (publishedProof != null && publishedProof.identifies(file, userDrive) &&
                 publishedProof.certifiesBytes(ioFile)
             ) continue
-            if (ioFile.lastModified() / 1_000L > file.effectivePublishedBaseline) {
+            // SAME-MTIME DRIFT IS AN EDIT (issue: round 23 #5): bytes differing from
+            // their own recorded hash but retaining the published mtime failed the outer
+            // mtime filter and never reached the upload path's hash-drift predicate —
+            // without a remote activity the edit stayed unsynchronized indefinitely.
+            // The upload path repeats the COMPLETE classification under coordination
+            // before any registration (issue: round 23 #4).
+            val noActionProvenDrift = publishedProof != null && publishedProof.identifies(file, userDrive) &&
+                publishedProof.contentHash != null &&
+                UploadFile.sha256OrNull(ioFile) != publishedProof.contentHash
+            // POSITIVELY FOREIGN PROVENANCE IS NEVER A CANDIDATE (issue: round 23 #4).
+            val noActionForeign = publishedProof?.positivelyForeignTo(file, userDrive) == true
+            // The mtime arm requires an ANCHORED baseline (issue: round 23 #4): a
+            // backward-dated accepted metadata must never re-label historical clean
+            // bytes as uploads.
+            val noActionAnchored = (file.publishedCleanBaseline ?: 0L) > 0L
+            if (!noActionForeign && (noActionProvenDrift ||
+                    (noActionAnchored && ioFile.lastModified() / 1_000L > file.effectivePublishedBaseline))
+            ) {
                 uploadFile(
                     context = context,
                     localFile = file,
@@ -533,17 +550,32 @@ object SyncOfflineUtils {
                     // record whose content hash does NOT match the bytes is an edit
                     // REGARDLESS of the mtime test — the mtime-only upload predicate
                     // previously missed the same-mtime drift entirely.
+                    val operationProof = freshIoFile?.let { DownloadOfflineFileManager.readPublishedProvenance(context, it) }
                     val provenHashDrift = freshIoFile != null && liveRow != null &&
-                        DownloadOfflineFileManager.readPublishedProvenance(context, freshIoFile)?.let {
+                        operationProof?.let {
                             it.identifies(liveRow, userDrive) && it.contentHash != null &&
                                 UploadFile.sha256OrNull(freshIoFile) != it.contentHash
                         } == true
+                    // POSITIVELY FOREIGN PROVENANCE IS NEVER AN EDIT (issue: round 23 #4):
+                    // a path attributed to F but recorded as G defers — the bytes are
+                    // another identity's content, never registered under F.
+                    val operationForeign = liveRow != null &&
+                        operationProof?.positivelyForeignTo(liveRow, userDrive) == true
+                    // The mtime arm requires an ANCHORED baseline (issue: round 23 #4):
+                    // historical clean bytes above backward-dated accepted metadata are
+                    // not uploads; only an authoritative anchored baseline makes the
+                    // seconds-resolution mtime comparison trustworthy.
+                    val operationAnchored = (liveRow?.publishedCleanBaseline ?: 0L) > 0L
                     // Operation selection from PUBLISHED-BYTE provenance (issue: round 17 #3):
                     // bytes are an edit iff NEWER THAN THEIR OWN published baseline — a clean
                     // copy with a preserved future mtime is never uploaded over a newer server
                     // revision; remote REVISION ordering separately selects reconciliation.
-                    val bytesEdited = (freshSourceModifiedSeconds > (liveRow?.effectivePublishedBaseline ?: 0L) &&
-                        !durablePublication) || provenHashDrift
+                    val bytesEdited = !operationForeign && (
+                        (operationAnchored &&
+                            freshSourceModifiedSeconds > (liveRow?.effectivePublishedBaseline ?: 0L) &&
+                            !durablePublication) ||
+                            provenHashDrift
+                        )
                     val remoteNewer = remoteFile.revisedAt > (liveRow?.revisedAt ?: 0L)
                     when {
                         bytesEdited ->
@@ -828,8 +860,17 @@ object SyncOfflineUtils {
             val provenHashDrift = publishedProof?.identifies(liveRow, userDrive) == true &&
                 publishedProof.contentHash != null &&
                 UploadFile.sha256OrNull(freshSource) != publishedProof.contentHash
-            val uploadStillNeeded = (freshModifiedSeconds > liveRow.effectivePublishedBaseline && !durablePublication) ||
-                provenHashDrift
+            // POSITIVELY FOREIGN PROVENANCE IS NEVER A REGISTRATION (issue: round 23 #4),
+            // and the mtime arm requires an ANCHORED baseline (issue: round 23 #4) — the
+            // same classification as the operation selection above.
+            val registrationForeign = publishedProof?.positivelyForeignTo(liveRow, userDrive) == true
+            val registrationAnchored = (liveRow.publishedCleanBaseline ?: 0L) > 0L
+            val uploadStillNeeded = !registrationForeign && (
+                (registrationAnchored &&
+                    freshModifiedSeconds > liveRow.effectivePublishedBaseline &&
+                    !durablePublication) ||
+                    provenHashDrift
+                )
             if (!uploadStillNeeded) return true
             val uri = Uri.fromFile(freshSource)
             val fileModifiedAt = Date(freshSource.lastModified())

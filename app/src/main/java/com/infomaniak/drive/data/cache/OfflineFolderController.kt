@@ -625,6 +625,32 @@ object OfflineFolderController {
         // competes with publication, cleanup and upload registration for the same bytes.
         OfflineFileCoordination.withFileLock(userDrive, newIdentity.id) {
             val fileModifiedAt = Date(oldOfflineFile.lastModified())
+            // ONE FRESH SCOPE+OWNERSHIP+CONTENT CLASSIFICATION decides the destructive
+            // arms (issues: round 22 #4, round 23 #4) — computed BEFORE any destructive
+            // arm runs:
+            //  - a positively foreign record on the old path DEFERS — the bytes are
+            //    another identity's content: never snapshotted under this identity,
+            //    never deleted, never renamed; the foreign check PRECEDES the
+            //    completed-upload deletion (a path attributed to F but recorded as G
+            //    was previously deletable under F);
+            //  - ONLY a record-identified, HASH-FULL record whose hash MISMATCHES the
+            //    bytes is a positively established edit — registered before the
+            //    relocation; a HASHLESS record proves nothing about content (a newer
+            //    mtime under it is not an edit), and CERTIFIED published bytes are
+            //    never an edit, not when the Realm baseline lags;
+            //  - UNPROVEN historical bytes (no identifying record, or an unanchored
+            //    baseline a backward-dated revision re-labels) DEFER: never
+            //    auto-uploaded, never deleted; verification resolves their generation.
+            val relocationRecord = DownloadOfflineFileManager.readPublishedProvenance(context, oldOfflineFile)
+            val relocationIdentifies = relocationRecord?.identifies(newIdentity, userDrive) == true
+            val relocationBytesHash = UploadFile.sha256OrNull(oldOfflineFile)
+            val relocationCertified = relocationIdentifies &&
+                relocationRecord.contentHash != null &&
+                relocationBytesHash != null &&
+                relocationRecord.contentHash == relocationBytesHash
+            val relocationProvenDrift = relocationIdentifies &&
+                relocationRecord.contentHash != null &&
+                relocationRecord.contentHash != relocationBytesHash
             return when {
                 // A pending upload owns the bytes at the old path until it completes (issue:
                 // round 5 #9): committing the new metadata now would leave the upload reading a
@@ -646,6 +672,7 @@ object OfflineFolderController {
                             originalFileId = newIdentity.id,
                         )
                     } == true -> false
+                relocationRecord?.positivelyForeignTo(newIdentity, userDrive) == true -> false
                 contentHashOf(oldOfflineFile)?.let { hash ->
                     UploadFile.hasUploadRecordFor(
                         fileName = oldIdentityName,
@@ -662,31 +689,7 @@ object OfflineFolderController {
                     DownloadOfflineFileManager.deletePublishedProvenance(context, oldOfflineFile)
                     runCatching { oldOfflineFile.delete() }.isSuccess
                 }
-                // ONE FRESH SCOPE+OWNERSHIP+CONTENT CLASSIFICATION decides the destructive
-                // arms (issue: round 22 #4):
-                //  - a positively foreign record on the old path DEFERS — the bytes are
-                //    another identity's content: never snapshotted under this identity,
-                //    never deleted, never renamed;
-                //  - a KNOWN record whose hash MISMATCHES the bytes is a PROVEN same-mtime
-                //    edit: snapshotted before the relocation (the mtime test alone missed
-                //    it);
-                //  - a genuine edit against the record-identified generation is snapshotted
-                //    as before;
-                //  - UNPROVEN historical bytes (no identifying record — an unset baseline a
-                //    backward-dated revision re-labels through the fallback, or a hashless
-                //    legacy record) DEFER: never auto-uploaded, never deleted; verification
-                //    resolves their generation.
-                DownloadOfflineFileManager.readPublishedProvenance(context, oldOfflineFile)
-                    ?.positivelyForeignTo(newIdentity, userDrive) == true -> false
-                DownloadOfflineFileManager.readPublishedProvenance(context, oldOfflineFile)?.let { record ->
-                    record.identifies(newIdentity, userDrive) && (
-                        (record.contentHash != null && UploadFile.sha256OrNull(oldOfflineFile) != record.contentHash) ||
-                            OfflineFolderPolicy.isLocallyModified(
-                                offlineFileLastModifiedMillis = oldOfflineFile.lastModified(),
-                                remoteLastModifiedAtSeconds = oldLastModifiedAt,
-                            )
-                        )
-                } == true -> {
+                relocationProvenDrift -> {
                     val registered = registerDirtySnapshot(context, newIdentity, oldOfflineFile, userDrive)
                     if (registered) {
                         // Every byte deletion clears matching provenance (issue: round 18 #12).
@@ -694,7 +697,7 @@ object OfflineFolderController {
                         runCatching { oldOfflineFile.delete() }.isSuccess
                     } else false
                 }
-                OfflineFolderPolicy.isLocallyModified(
+                !relocationCertified && OfflineFolderPolicy.isLocallyModified(
                     offlineFileLastModifiedMillis = oldOfflineFile.lastModified(),
                     remoteLastModifiedAtSeconds = oldLastModifiedAt,
                 ) -> false
