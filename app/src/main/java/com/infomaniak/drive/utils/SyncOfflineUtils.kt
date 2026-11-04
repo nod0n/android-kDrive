@@ -296,7 +296,7 @@ object SyncOfflineUtils {
                 } else {
                     // Bytes are safely at (or durably registered for) the new location: commit
                     // the new identity so the row and the offline path agree.
-                    FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+                    FileController.updateExistingFile(newFile = remoteFile, realm = realm, userDrive = userDrive)
                     true
                 }
             }
@@ -425,7 +425,7 @@ object SyncOfflineUtils {
             if (remoteFile != null) {
                 remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
                 remoteFile.size = ioFile.length()
-                FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+                FileController.updateExistingFile(newFile = remoteFile, realm = realm, userDrive = userDrive)
             }
 
             context.syncImmediately(isAutomaticTrigger = false)
@@ -487,7 +487,7 @@ object SyncOfflineUtils {
                 userDrive = userDrive,
             ).first()
             if (commitFile !== remoteFile) return DownloadActionOutcome(handled = false)
-            FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+            FileController.updateExistingFile(newFile = remoteFile, realm = realm, userDrive = userDrive)
             // Preserve the download origin: a refresh of a file covered by an offline folder is
             // an inherited download, so its completion can never manufacture an explicit pin
             // after an unmark (issue #1902). The enqueue's Operation is returned UNAWAITED

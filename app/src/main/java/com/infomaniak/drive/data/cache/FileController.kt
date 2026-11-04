@@ -581,7 +581,7 @@ object FileController {
             if (!realmFolder.children.contains(preservedActionFile)) {
                 realm.executeTransaction { realmFolder.children.add(preservedActionFile) }
             } else {
-                updateFileFromActivity(realm, preservedActionFile, realmFolder.id)
+                updateFileFromActivity(realm, preservedActionFile, realmFolder.id, userDrive)
             }
         }
     }
@@ -615,10 +615,11 @@ object FileController {
 
     fun updateExistingFile(
         newFile: File,
-        realm: Realm
+        realm: Realm,
+        userDrive: UserDrive,
     ) {
         getFileById(realm, newFile.id)?.let { localFile ->
-            insertOrUpdateFile(realm, newFile, localFile)
+            insertOrUpdateFile(realm, newFile, localFile, userDrive)
         }
     }
 
@@ -626,12 +627,21 @@ object FileController {
         realm: Realm,
         newFile: File,
         oldFile: File? = null,
+        userDrive: UserDrive,
         moreTransaction: (() -> Unit)? = null
     ) {
-        realm.executeTransaction {
-            if (oldFile?.isUsable() == true) newFile.keepOldLocalFilesData(oldFile)
-            moreTransaction?.invoke()
-            it.insertOrUpdate(newFile)
+        // Identity/revision metadata writers share the publisher's per-file coordination
+        // (issue: round 9 #7): without it, a writer could commit a newer identity or baseline
+        // between the publisher's supersession check and its rename — the publisher's
+        // check-and-rename is only a CAS if every identity/revision writer takes the same
+        // lock. Java monitors are reentrant, so writers already holding the file's lock
+        // (upload registration, move reconciliation) nest safely.
+        synchronized(OfflineFileCoordination.lockFor(userDrive, newFile.id)) {
+            realm.executeTransaction {
+                if (oldFile?.isUsable() == true) newFile.keepOldLocalFilesData(oldFile)
+                moreTransaction?.invoke()
+                it.insertOrUpdate(newFile)
+            }
         }
     }
 
@@ -786,7 +796,7 @@ object FileController {
             ).first()
             ApiRepository.getFileDetails(File(id = remoteFile.parentId, driveId = userDrive.driveId)).data?.let {
                 it.children = RealmList(preservedFile)
-                insertOrUpdateFile(realm, it)
+                insertOrUpdateFile(realm, it, userDrive = userDrive)
             }
         }
 
@@ -806,7 +816,7 @@ object FileController {
                             remoteFiles = listOf(remoteFile),
                             userDrive = userDrive,
                         ).first()
-                        insertOrUpdateFile(realm, preservedFile, getFileProxyById(fileId, customRealm = realm))
+                        insertOrUpdateFile(realm, preservedFile, getFileProxyById(fileId, customRealm = realm), userDrive)
                     }
                 }
                 remoteFile
@@ -1209,9 +1219,9 @@ object FileController {
         return customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
-    private fun updateFileFromActivity(realm: Realm, remoteFile: File, folderId: Int) {
+    private fun updateFileFromActivity(realm: Realm, remoteFile: File, folderId: Int, userDrive: UserDrive) {
         getFileProxyById(remoteFile.id, customRealm = realm)?.let { localFile ->
-            insertOrUpdateFile(realm, remoteFile, localFile)
+            insertOrUpdateFile(realm, remoteFile, localFile, userDrive)
         } ?: also {
             realm.executeTransaction {
                 realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
@@ -1245,10 +1255,10 @@ object FileController {
                 userDrive = userDrive,
             ).first()
             val localFile = getFileById(realm, preservedFile.id)
-            insertOrUpdateFile(realm, preservedFile, localFile)
+            insertOrUpdateFile(realm, preservedFile, localFile, userDrive)
 
             val driveId = userDrive.driveId
-            resolveAndLinkFileAncestorsChain(realm, preservedFile.parentId, preservedFile.id, driveId, okHttpClient)
+            resolveAndLinkFileAncestorsChain(realm, preservedFile.parentId, preservedFile.id, driveId, userDrive, okHttpClient)
         }
     }
 
@@ -1257,13 +1267,14 @@ object FileController {
         parentId: Int,
         childId: Int,
         driveId: Int,
+        userDrive: UserDrive,
         okHttpClient: OkHttpClient,
     ) {
         if (parentId == 0) return
         if (tryLinkToExistingParent(realm, parentId, childId)) return
 
-        val remoteParent = saveRemoteFileAncestorToDb(realm, parentId, childId, driveId, okHttpClient) ?: return
-        resolveAndLinkFileAncestorsChain(realm, remoteParent.parentId, parentId, driveId, okHttpClient)
+        val remoteParent = saveRemoteFileAncestorToDb(realm, parentId, childId, driveId, userDrive, okHttpClient) ?: return
+        resolveAndLinkFileAncestorsChain(realm, remoteParent.parentId, parentId, driveId, userDrive, okHttpClient)
     }
 
     private fun saveRemoteFileAncestorToDb(
@@ -1271,10 +1282,11 @@ object FileController {
         parentId: Int,
         childId: Int,
         driveId: Int,
+        userDrive: UserDrive,
         okHttpClient: OkHttpClient,
     ): File? {
         val remoteParent = getRemoteFile(fileId = parentId, driveId = driveId, okHttpClient = okHttpClient) ?: return null
-        insertOrUpdateFile(realm, remoteParent)
+        insertOrUpdateFile(realm, remoteParent, userDrive = userDrive)
         linkChildToParent(realm, parentId = parentId, childId = childId)
         return remoteParent
     }

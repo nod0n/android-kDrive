@@ -111,7 +111,7 @@ class DownloadOfflineFileManager(
         }
 
         FileController.getRealmInstance(userDrive).use { realm ->
-            FileController.updateExistingFile(newFile = commitFile, realm = realm)
+            FileController.updateExistingFile(newFile = commitFile, realm = realm, userDrive = userDrive)
         }
 
         val file = remoteFile
@@ -561,19 +561,31 @@ class DownloadOfflineFileManager(
             // ancestry (a materialized inherited flag alone never authorizes retention); a
             // pin download accepts its own pending marker or explicit pin as the user's
             // request. The same realm read also decides whether this transfer's captured
-            // revision has been superseded (issue: round 8 #9).
+            // identity/revision has been superseded (issues: round 8 #9, round 9 #7).
+            val appContextForCheck = Realm.getApplicationContext()
             var supersededGeneration = false
             val intentOk = FileController.getRealmInstance(userDrive).use { realm ->
                 val live = FileController.getFileById(realm, file.id)
                 val pinned = live?.isOffline == true
                 val ancestryCovers = OfflineFolderController.isInsideActiveRoot(realm, file.id)
-                // Superseded-generation rejection (issue: round 8 #9): the transfer carries
-                // the revision it actually downloaded; a live row naming a NEWER revision
-                // means another generation already committed (or is committing) that content.
-                // Serializing individual writes does not order the generations: without this
-                // check a slower T1 transfer would replace a published T2 and then run T1's
-                // completion against T2's metadata and marker.
-                supersededGeneration = live != null && live.lastModifiedAt > file.lastModifiedAt
+                // Superseded rejection — FULL identity CAS (issues: round 8 #9, round 9 #7):
+                // the transfer is stale when the live row names a NEWER revision OR a
+                // different location identity (direct rename/move, or an ancestor-chain
+                // change that moved the resolved offline path). Publishing at the old
+                // location and completing against the new row would desync bytes and
+                // metadata even without a content-timestamp change. Identity/revision
+                // writers take the same per-file lock (FileController.insertOrUpdateFile),
+                // so a writer cannot commit between this check and the rename; the check
+                // and the publication form one compare-and-set.
+                supersededGeneration = live != null && (
+                    live.lastModifiedAt > file.lastModifiedAt ||
+                        live.parentId != file.parentId ||
+                        live.name != file.name ||
+                        run {
+                            val livePath = appContextForCheck?.let { ctx -> live.getOfflineFile(ctx, userDrive.userId)?.path }
+                            livePath == null || livePath != target.path
+                        }
+                    )
                 if (isInheritedDownload) {
                     pinned || ancestryCovers
                 } else {
