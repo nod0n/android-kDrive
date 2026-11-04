@@ -810,11 +810,25 @@ class CloudStorageProvider : DocumentsProvider() {
                         userId = userDrive.userId,
                     ).store()
                     context.syncImmediately(isAutomaticTrigger = false)
-                    // Direct cache writers invalidate the generation sidecar with the bytes
-                    // (issue: round 16 #12): stale provenance must never survive bytes it does
-                    // not describe.
-                    cacheFile.delete() // Delete old cache
-                    DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
+                    // EXACT, COORDINATED cache cleanup (issues: round 16 #12, round 18 #11):
+                    // the SAF edit supersedes the cached generation — its removal runs under
+                    // the intent monitor and the file lock with an exact pre-edit generation
+                    // check (mtime + intact size against the row's still-accepted metadata),
+                    // so a concurrent promotion's validation-and-staging — which holds the
+                    // same section — can no longer copy bytes that are being deleted (or
+                    // have been replaced) underneath it, and the provenance record dies
+                    // with its bytes.
+                    synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                        OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                            if (cacheFile.exists() &&
+                                (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt &&
+                                file.isIntactFile(cacheFile)
+                            ) {
+                                DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
+                                runCatching { cacheFile.delete() }
+                            }
+                        }
+                    }
                 }
             } else {
                 exception.printStackTrace()
@@ -863,16 +877,31 @@ class CloudStorageProvider : DocumentsProvider() {
             )
 
             if (response.isSuccessful) {
-                runBlocking {
-                    DownloadOfflineFileManager.saveRemoteData(TAG, response, cacheFile)
+                // STAGED PUBLICATION (issues: round 16 #12, round 18 #11): the download is
+                // written to a UNIQUE staging file and only the final replacement runs
+                // through the shared coordinated plain-cache protocol — timestamp, prepared
+                // and verified provenance, atomic rename, provenance move, all under the
+                // file lock. The previous direct write into the cache truncated and rewrote
+                // bytes a concurrent promotion had already validated and staged — the staged
+                // copy could then publish mixed bytes under the previously validated
+                // generation, which the post-write invalidation could not retract.
+                val staged = IOFile(
+                    cacheFile.parentFile,
+                    "${cacheFile.name}.${java.util.UUID.randomUUID()}.part",
+                )
+                val stagedOk = runCatching {
+                    DownloadOfflineFileManager.saveRemoteData(TAG, response, staged)
+                }.onFailure { exception ->
+                    SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
+                }.isSuccess
+                if (stagedOk) {
+                    val outcome = runBlocking {
+                        DownloadOfflineFileManager.publishStagedCacheCopy(context, file, cacheFile, userDrive, staged)
+                    }
+                    if (outcome == DownloadOfflineFileManager.PublicationOutcome.PUBLISHED) {
+                        return ParcelFileDescriptor.open(cacheFile, accessMode)
+                    }
                 }
-                cacheFile.setLastModified(file.getLastModifiedInMilliSecond())
-                // Direct cache writer: the SAF route has no generation provenance for the
-                // bytes it just wrote (issue: round 16 #12) — invalidate any sidecar from a
-                // previous generation so promotion can never mistake these bytes for a
-                // proven generation.
-                DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
-                return ParcelFileDescriptor.open(cacheFile, accessMode)
             }
         } catch (exception: Exception) {
             SentryLog.e(TAG, "An error has occurred on getDataFile", exception)

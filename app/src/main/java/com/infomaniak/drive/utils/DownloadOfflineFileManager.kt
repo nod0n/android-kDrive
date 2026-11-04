@@ -247,12 +247,21 @@ class DownloadOfflineFileManager(
         // The previous published copy is never deleted upfront: the fresh download is staged in
         // an app-owned directory and published by an atomic rename, so a failed transfer never
         // destroys it (issue: round 3 #2/#4).
-        // CONDITIONAL cache cleanup (issue: round 17 #6): only a cache still representing
-        // THIS transfer's source revision goes — a later publication's bytes are never
-        // removed by this older transfer, and the provenance record dies with its bytes.
-        if (cacheFile.exists() && (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt && file.isIntactFile(cacheFile)) {
-            cacheFile.delete()
-            deletePublishedProvenance(context, cacheFile)
+        // CONDITIONAL cache cleanup (issues: round 17 #6, round 18 #11): only a cache still
+        // representing THIS transfer's source revision goes — a later publication's bytes are
+        // never removed by this older transfer — and the exact check and the deletion run
+        // under the intent monitor and the file lock, so another publication can no longer
+        // replace the cache between the check and the deletion.
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                if (cacheFile.exists() &&
+                    (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt &&
+                    file.isIntactFile(cacheFile)
+                ) {
+                    deletePublishedProvenance(context, cacheFile)
+                    runCatching { cacheFile.delete() }
+                }
+            }
         }
 
         return if (currentFile?.rights?.canRead == false) {
@@ -1125,23 +1134,87 @@ class DownloadOfflineFileManager(
                 return PublicationOutcome.FAILED
             }
             val outcome = runCatching {
-                publishStagedOfflineFile(userDrive, isInheritedDownload = false, authoritativeFile, offlineFile, staged)
+                publishStagedOfflineFile(
+                    userDrive,
+                    isInheritedDownload = false,
+                    authoritativeFile,
+                    offlineFile,
+                    staged,
+                    onPublishedLocked = {
+                        // EXACT-GENERATION cache cleanup INSIDE the publication's locks
+                        // (issues: round 17 #6, round 18 #11): the promoted cache goes only
+                        // when it still IS the staged source revision, and the exact check
+                        // and the deletion run under the SAME monitor and file locks that
+                        // serialized the publication — another publication can no longer
+                        // replace the cache between the check and the deletion.
+                        if (cacheFile.exists() &&
+                            (cacheFile.lastModified() / 1_000L) == authoritativeFile.lastModifiedAt &&
+                            authoritativeFile.isIntactFile(cacheFile)
+                        ) {
+                            deletePublishedProvenance(context, cacheFile)
+                            runCatching { cacheFile.delete() }
+                        }
+                    },
+                )
             }.onFailure { exception ->
                 SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
             }.getOrDefault(PublicationOutcome.FAILED)
 
             runCatching { if (staged.exists()) staged.delete() }
-            if (outcome == PublicationOutcome.PUBLISHED) {
-                // CONDITIONAL cache cleanup (issue: round 17 #6): the promoted cache goes
-                // only when it still IS the staged source revision.
-                if (cacheFile.exists() && (cacheFile.lastModified() / 1_000L) == authoritativeFile.lastModifiedAt &&
-                    authoritativeFile.isIntactFile(cacheFile)
-                ) {
-                    runCatching { cacheFile.delete() }
-                    deletePublishedProvenance(context, cacheFile)
-                }
-            }
             return outcome
+        }
+
+        /**
+         * The SHARED plain-cache publication protocol (issue: round 18 #11): a completely
+         * staged copy is published to a plain cache destination through ONE synchronous
+         * section under the file lock — timestamp, prepared-and-verified provenance record,
+         * atomic rename, provenance move — with the cancellation re-check INSIDE the lock
+         * (issue: round 18 #23) and staging cleanup on every path. Used by the network
+         * re-download route AND the SAF data writer, whose previous direct write into the
+         * cache truncated bytes a concurrent promotion had already validated and staged.
+         */
+        internal suspend fun publishStagedCacheCopy(
+            context: Context,
+            file: File,
+            target: IOFile,
+            userDrive: UserDrive,
+            staged: IOFile,
+        ): PublicationOutcome = try {
+            OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                // Cancellation re-check AFTER the blocking lock (issue: round 18 #23):
+                // lock acquisition does not respond to coroutine cancellation — a
+                // cancelled transfer that waited here must not replace a newer cache
+                // and report PUBLISHED. The exception PROPAGATES (never converted
+                // into an ordinary outcome) and the staged bytes are cleaned up in
+                // the finally below.
+                coroutineContext.ensureActive()
+                runCatching {
+                    staged.setLastModified(file.getLastModifiedInMilliSecond())
+                    // PREPARE the staged record BEFORE the bytes are replaced (issue:
+                    // round 18 #2): the registry directories are created and verified
+                    // and the staged record reads back — a missing staged record is
+                    // failure, never a successful move of "nothing".
+                    if (!prepareStagedProvenance(context, staged, file, userDrive)) {
+                        PublicationOutcome.FAILED
+                    } else {
+                        deletePublishedProvenance(context, target)
+                        if (staged.renameTo(target) && movePublishedProvenance(context, staged, target)) {
+                            PublicationOutcome.PUBLISHED
+                        } else {
+                            // Fail closed: no unproven bytes at the destination.
+                            runCatching { target.delete() }
+                            SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                            PublicationOutcome.FAILED
+                        }
+                    }
+                }.onFailure { exception ->
+                    if (exception is CancellationException) throw exception
+                    SentryLog.e(TAG, "Staged cache publication failed for ${target.path}", exception)
+                }.getOrDefault(PublicationOutcome.FAILED)
+            }
+        } finally {
+            // Staging cleanup on EVERY path, cancellation included (issue: round 18 #23).
+            runCatching { if (staged.exists()) staged.delete() }
         }
 
         /**
@@ -1195,46 +1268,7 @@ class DownloadOfflineFileManager(
                     runCatching { if (staged.exists()) staged.delete() }
                     return PublicationOutcome.FAILED
                 }
-                val outcome = try {
-                    OfflineFileCoordination.withFileLock(userDrive, file.id) {
-                        // Cancellation re-check AFTER the blocking lock (issue: round 18 #23):
-                        // lock acquisition does not respond to coroutine cancellation — a
-                        // cancelled transfer that waited here must not replace a newer cache
-                        // and report PUBLISHED. The exception PROPAGATES (never converted
-                        // into an ordinary outcome) and the staged bytes are cleaned up in
-                        // the finally below.
-                        coroutineContext.ensureActive()
-                        runCatching {
-                            staged.setLastModified(file.getLastModifiedInMilliSecond())
-                            // PREPARE the staged record BEFORE the bytes are replaced (issue:
-                            // round 18 #2): the registry directories are created and verified
-                            // and the staged record reads back — the previous flow wrote the
-                            // record and IGNORED the result, then reported PUBLISHED through
-                            // a move that succeeds for a missing record. A missing staged
-                            // record is failure, never a successful move of "nothing".
-                            if (!prepareStagedProvenance(context, staged, file, userDrive)) {
-                                PublicationOutcome.FAILED
-                            } else {
-                                deletePublishedProvenance(context, target)
-                                if (staged.renameTo(target) && movePublishedProvenance(context, staged, target)) {
-                                    PublicationOutcome.PUBLISHED
-                                } else {
-                                    // Fail closed: no unproven bytes at the destination.
-                                    runCatching { target.delete() }
-                                    SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
-                                    PublicationOutcome.FAILED
-                                }
-                            }
-                        }.onFailure { exception ->
-                            if (exception is CancellationException) throw exception
-                            SentryLog.e(TAG, "Staged cache publication failed for ${target.path}", exception)
-                        }.getOrDefault(PublicationOutcome.FAILED)
-                    }
-                } finally {
-                    // Staging cleanup on EVERY path, cancellation included (issue: round 18 #23).
-                    runCatching { if (staged.exists()) staged.delete() }
-                }
-                outcome
+                publishStagedCacheCopy(context, file, target, userDrive, staged)
             } else {
                 val appContext = Realm.getApplicationContext()
                 if (appContext == null) {
