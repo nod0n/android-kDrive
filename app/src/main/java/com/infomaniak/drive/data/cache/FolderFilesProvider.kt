@@ -605,7 +605,7 @@ object FolderFilesProvider {
                             }
                             deletable
                         } else {
-                            when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(liveRow, userDrive)) {
+                            when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(liveRow, userDrive, realm)) {
                                 OfflineFolderController.PreservationOutcome.CONTENT_SAFE -> {
                                     runCatching { liveRow.deleteCaches(context, userDrive.userId) }
                                     realm.executeTransaction { if (liveRow.isValid) liveRow.deleteFromRealm() }

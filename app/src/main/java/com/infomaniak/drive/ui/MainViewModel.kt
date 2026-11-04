@@ -769,7 +769,7 @@ class MainViewModel(
                                 // retained-unsent edit keeps its bytes; a dirty copy is snapshotted
                                 // first (a failed registration keeps the copy); an uploaded or
                                 // clean copy is replaceable.
-                                when (OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, offlineFile, userDrive)) {
+                                when (OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, offlineFile, userDrive, realm)) {
                                     OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL -> Unit
                                     OfflineFolderController.OwnedCopyReplacementDecision.REPLACEABLE -> {
                                         deleteOfflinePath = offlineFile.path
@@ -959,6 +959,8 @@ class MainViewModel(
             parentId = newParent.id
             name = file.name
         }
+        // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
+        OfflineFolderController.anchorHistoricalBaseline(realm, file, ioFile)
         return OfflineFolderController.reconcileMovedInheritedCopy(
             context = application,
             oldOfflineFile = ioFile,

@@ -373,10 +373,16 @@ object SyncOfflineUtils {
                     // current location, decides upload vs download vs rename.
                     val freshIoFile = liveRow?.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
                     val freshSourceModifiedSeconds = (freshIoFile?.lastModified() ?: 0L) / 1_000L
+                    // Operation selection from PUBLISHED-BYTE provenance (issue: round 17 #3):
+                    // bytes are an edit iff NEWER THAN THEIR OWN published baseline — a clean
+                    // copy with a preserved future mtime is never uploaded over a newer server
+                    // revision; remote REVISION ordering separately selects reconciliation.
+                    val bytesEdited = freshSourceModifiedSeconds > (liveRow?.effectivePublishedBaseline ?: 0L)
+                    val remoteNewer = remoteFile.revisedAt > (liveRow?.revisedAt ?: 0L)
                     when {
-                        freshSourceModifiedSeconds > remoteFile.revisedAt ->
+                        bytesEdited ->
                             uploadFile(context, localFile, remoteFile, userDrive, realm, actionAt)
-                        freshSourceModifiedSeconds < remoteFile.revisedAt -> {
+                        remoteNewer -> {
                             downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                             downloadOutcome.handled
                         }
@@ -393,7 +399,11 @@ object SyncOfflineUtils {
                                 // live row's current path — the pre-pass ioFile can be stale
                                 // or reused by another file.
                                 liveRow.getOfflineFile(context, userDrive.userId)?.let { freshSource ->
-                                    freshSource.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
+                                    freshSource.exists() && run {
+                                        // Historical provenance anchored BEFORE the relocation
+                                        // (issue: round 17 #3).
+                                        OfflineFolderController.anchorHistoricalBaseline(realm, liveRow, freshSource)
+                                        !OfflineFolderController.reconcileMovedInheritedCopy(
                                         context = context,
                                         oldOfflineFile = freshSource,
                                         oldIdentityName = localFile.name,
@@ -405,6 +415,7 @@ object SyncOfflineUtils {
                                         userDrive = userDrive,
                                         realm = realm,
                                     )
+                                    }
                                 } == true
                                 ->
                                     // Preservation incomplete (pending upload, snapshot
@@ -518,6 +529,12 @@ object SyncOfflineUtils {
                 // Nothing owned at the current location: consume with no side effect.
                 return true
             }
+            // EXCLUSIVE fresh source ownership before any snapshot (issue: round 17 #2): a
+            // path co-claimed by another row defers registration — never snapshot foreign
+            // bytes under this file's identity.
+            if (OfflineFolderController.exclusivePathOwner(realm, context, userDrive, freshSource.path) != liveRow.id) {
+                return true
+            }
             // UPLOAD-NEED revalidation against the FRESH bytes (issue: round 16 #5): branch
             // selection happened earlier against possibly stale timestamps — the bytes
             // actually resolved here decide, on the same seconds precision as
@@ -525,9 +542,13 @@ object SyncOfflineUtils {
             // revision are not an unsent edit (the stale-selection trace: clean bytes at Q
             // queued for upload over a newer remote F revision); consume with no side effect
             // — a download or nothing owns the refresh now.
+            // UPLOAD NEED against PUBLISHED-BYTE provenance (issue: round 17 #3): an edit
+            // is bytes NEWER THAN THEIR OWN baseline — remote mtime inequality never
+            // manufactures an upload of clean bytes; unproven historical content is
+            // conservative (the effective baseline falls back to accepted metadata, and the
+            // edited judgement preserves it).
             val freshModifiedSeconds = freshSource.lastModified() / 1_000L
-            val uploadStillNeeded = freshModifiedSeconds >
-                (remoteFile?.revisedAt ?: liveRow.revisedAt)
+            val uploadStillNeeded = freshModifiedSeconds > liveRow.effectivePublishedBaseline
             if (!uploadStillNeeded) return true
             val uri = Uri.fromFile(freshSource)
             val fileModifiedAt = Date(freshSource.lastModified())
@@ -670,7 +691,10 @@ object SyncOfflineUtils {
             // its own protection checks: moving or deleting the bytes here would race it. The
             // action stays pending for a later sync (issue: round 6 #11).
             if (liveRow.isMarkedAsOffline) return DownloadActionOutcome(handled = false)
-            if (freshOffline.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
+            if (freshOffline.exists() && run {
+                // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
+                OfflineFolderController.anchorHistoricalBaseline(realm, liveRow, freshOffline)
+                !OfflineFolderController.reconcileMovedInheritedCopy(
                     context = context,
                     oldOfflineFile = freshOffline,
                     oldIdentityName = file.name,
@@ -682,6 +706,7 @@ object SyncOfflineUtils {
                     userDrive = userDrive,
                     realm = realm,
                 )
+                }
             ) {
                 // Preservation incomplete: keep the old bytes and metadata; a later sync
                 // retries the refresh (issues: round 5 #4, round 6 #11).

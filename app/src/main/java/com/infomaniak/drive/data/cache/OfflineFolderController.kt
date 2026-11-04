@@ -834,8 +834,19 @@ object OfflineFolderController {
      * usable local content; a dirty copy is snapshotted into the durable upload queue first —
      * a failed registration keeps the local copy; content-safe copies are replaceable.
      */
-    fun decisionForReplacingOwnedCopy(file: File, offlineFile: IOFile, userDrive: UserDrive): OwnedCopyReplacementDecision {
+    fun decisionForReplacingOwnedCopy(
+        file: File,
+        offlineFile: IOFile,
+        userDrive: UserDrive,
+        realm: Realm? = null,
+    ): OwnedCopyReplacementDecision {
         val context = Realm.getApplicationContext() ?: return OwnedCopyReplacementDecision.KEEP_LOCAL
+        // EXCLUSIVE fresh source ownership before any snapshot side effect (issue: round 17
+        // #2): a path co-claimed by another row defers conservatively (KEEP_LOCAL) — the
+        // bytes there may be another file's sole edit.
+        if (realm != null && exclusivePathOwner(realm, context, userDrive, offlineFile.path) != file.id) {
+            return OwnedCopyReplacementDecision.KEEP_LOCAL
+        }
         return when (protectionStateOf(file, offlineFile, userDrive)) {
             CopyProtection.PENDING_UPLOAD -> OwnedCopyReplacementDecision.KEEP_LOCAL
             CopyProtection.DIRTY ->
@@ -865,11 +876,17 @@ object OfflineFolderController {
      * Directories are not file-content: their children are preserved individually by the
      * recursive removal (issue: round 4 #12).
      */
-    fun preserveInheritedCopyBeforeRemoval(file: File, userDrive: UserDrive): PreservationOutcome {
+    fun preserveInheritedCopyBeforeRemoval(file: File, userDrive: UserDrive, realm: Realm? = null): PreservationOutcome {
         val context = Realm.getApplicationContext() ?: return PreservationOutcome.PRESERVED
         if (file.isOffline || file.isFolder() || !file.isInOfflineFolder) return PreservationOutcome.CONTENT_SAFE
         val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return PreservationOutcome.CONTENT_SAFE
         if (!offlineFile.exists()) return PreservationOutcome.CONTENT_SAFE
+        // EXCLUSIVE fresh source ownership before snapshot or deletion (issue: round 17 #2):
+        // an ambiguous or foreign path PRESERVES (defers) — never snapshots or deletes bytes
+        // whose owner is contested.
+        if (realm != null && exclusivePathOwner(realm, context, userDrive, offlineFile.path) != file.id) {
+            return PreservationOutcome.PRESERVED
+        }
         return when (protectionStateOf(file, offlineFile, userDrive)) {
             CopyProtection.PENDING_UPLOAD -> PreservationOutcome.PRESERVED
             CopyProtection.DIRTY ->
@@ -1065,6 +1082,14 @@ object OfflineFolderController {
                 }
                 val offlineFile = liveRow.getOfflineFile(context, userDrive.userId) ?: return@withFileLock
 
+                // EXCLUSIVE fresh source ownership before snapshot or deletion (issue: round
+                // 17 #2): stale F and current G can both claim P — cleanup of F must never
+                // snapshot or delete G's sole edited bytes; the ambiguous path is KEPT.
+                if (exclusivePathOwner(realm, context, userDrive, offlineFile.path) != liveRow.id) {
+                    result.keptOfflineFilesCount++
+                    return@withFileLock
+                }
+
                 if (!offlineFile.exists()) {
                     var cleared = false
                     realm.executeTransaction {
@@ -1197,6 +1222,19 @@ object OfflineFolderController {
                 remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
             ) -> CopyProtection.DIRTY
             else -> CopyProtection.NONE
+        }
+    }
+
+    /**
+     * Establishes a historical row's byte provenance BEFORE any relocation or metadata
+     * change (issue: round 17 #3): bytes that still verify against the row's current
+     * metadata have that metadata persisted as their baseline; an unprovable historical
+     * copy keeps null and is treated conservatively (edited) downstream.
+     */
+    internal fun anchorHistoricalBaseline(realm: Realm, row: File, bytes: IOFile) {
+        if (row.publishedCleanBaseline != null) return
+        if (!OfflineFolderPolicy.isLocallyModified(bytes.lastModified(), row.lastModifiedAt)) {
+            runCatching { realm.executeTransaction { row.publishedCleanBaseline = row.lastModifiedAt } }
         }
     }
 

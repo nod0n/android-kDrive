@@ -402,7 +402,7 @@ object FileController {
                         if (!keepFileCaches.contains(fileId)) {
                             // Inherited copies are preserved before any deletion (issue: round 3 #6):
                             // a pending upload keeps its bytes, a dirty copy is snapshotted first.
-                            when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(file, resolvedUserDrive)) {
+                            when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(file, resolvedUserDrive, realm)) {
                                 // Content safe (or nothing to preserve): bytes and row can go.
                                 OfflineFolderController.PreservationOutcome.CONTENT_SAFE -> {
                                     if (!keepFileCaches.contains(fileId)) {
@@ -542,6 +542,8 @@ object FileController {
                 parentId = liveRow.parentId
                 name = newName
             }
+            // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
+            OfflineFolderController.anchorHistoricalBaseline(realm, liveRow, oldOffline)
             OfflineFolderController.reconcileMovedInheritedCopy(
                 context = context,
                 oldOfflineFile = oldOffline,
