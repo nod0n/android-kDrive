@@ -41,6 +41,7 @@ import com.infomaniak.drive.data.models.file.FileVersion
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.utils.IOFile
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.RealmListParceler.FileCategoryRealmListParceler
 import com.infomaniak.drive.utils.RealmListParceler.FileRealmListParceler
 import com.infomaniak.drive.utils.RealmListParceler.IntRealmListParceler
@@ -577,23 +578,34 @@ open class File(
                     // that destination holds usable content (issue: round 12 #11): metadata
                     // ownership alone reports completion over a missing or obsolete retained
                     // copy — a newer generation can supersede an in-flight preview before any
-                    // usable bytes exist at the unchanged path. The destination must exist and
-                    // either match the accepted CURRENT content baseline or be an explicitly
-                    // protected owned local edit (a pending/unsent upload's copy); otherwise
-                    // the preview fails here — deferred to a refetch — and 100 is never
-                    // emitted.
+                    // usable bytes exist at the unchanged path.
                     if (destinationIsOwnedOfflineCopy) {
-                        val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
-                            FileController.getFileById(realm, id)?.let { live -> realm.copyFromRealm(live, 0) }
+                        // Validation under the shared protocol (issue: round 13 #11): intent
+                        // monitor → file lock → refreshed row, so the baseline the retained
+                        // bytes are judged against cannot move between the read and the
+                        // decision.
+                        val usable = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                            OfflineFileCoordination.withFileLock(userDrive, id) {
+                                val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
+                                    runCatching { realm.refresh() }
+                                    FileController.getFileById(realm, id)?.let { live -> realm.copyFromRealm(live, 0) }
+                                }
+                                val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
+                                liveRow != null &&
+                                    (liveRow.isOffline || liveRow.isInOfflineFolder) &&
+                                    livePath == cacheFile.path &&
+                                    cacheFile.exists() &&
+                                    // An EXACT current clean baseline (issue: round 13 #11):
+                                    // "not older" accepts retained bytes whose timestamp is
+                                    // NEWER than a backward-dated newer baseline (R1 at 100 vs
+                                    // baseline 90) — only equality with the row's own
+                                    // modification time and size, or a positively established
+                                    // protected local edit, makes the retained bytes usable.
+                                    (liveRow.isOfflineAndIntact(cacheFile) ||
+                                        OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, cacheFile, userDrive) ==
+                                        OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL)
+                            }
                         }
-                        val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
-                        val usable = liveRow != null &&
-                            (liveRow.isOffline || liveRow.isInOfflineFolder) &&
-                            livePath == cacheFile.path &&
-                            cacheFile.exists() &&
-                            (!liveRow.isObsoleteOrNotIntact(cacheFile) ||
-                                OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, cacheFile, userDrive) ==
-                                OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL)
                         if (!usable) {
                             throw java.io.IOException("Superseded preview left no usable destination for $name")
                         }

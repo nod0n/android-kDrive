@@ -32,6 +32,7 @@ import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.utils.IOFile
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import okhttp3.Response
@@ -117,20 +118,28 @@ class DownloadProgressViewModel : ViewModel() {
                     // Supersession is completion only when the CURRENT row still owns the
                     // scoped destination AND that destination holds usable content (issue:
                     // round 12 #11): metadata ownership alone accepts an obsolete retained
-                    // copy. The destination must exist and either match the accepted CURRENT
-                    // content baseline or be an explicitly protected owned local edit;
-                    // anything else defers (null), like an invalidated intent.
-                    val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
-                        FileController.getFileById(realm, file.id)?.let { live -> realm.copyFromRealm(live, 0) }
+                    // copy. Validation runs under the shared protocol (issue: round 13 #11):
+                    // intent monitor → file lock → refreshed row. An EXACT current clean
+                    // baseline (equality with the row's own modification time and size —
+                    // "not older" accepts retained bytes newer than a backward-dated newer
+                    // baseline) or a positively established protected local edit; anything
+                    // else defers (null), like an invalidated intent.
+                    val usable = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                        OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                            val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
+                                runCatching { realm.refresh() }
+                                FileController.getFileById(realm, file.id)?.let { live -> realm.copyFromRealm(live, 0) }
+                            }
+                            val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
+                            liveRow != null &&
+                                (liveRow.isOffline || liveRow.isInOfflineFolder) &&
+                                livePath == outputFile.path &&
+                                outputFile.exists() &&
+                                (liveRow.isOfflineAndIntact(outputFile) ||
+                                    OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, outputFile, userDrive) ==
+                                    OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL)
+                        }
                     }
-                    val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
-                    val usable = liveRow != null &&
-                        (liveRow.isOffline || liveRow.isInOfflineFolder) &&
-                        livePath == outputFile.path &&
-                        outputFile.exists() &&
-                        (!liveRow.isObsoleteOrNotIntact(outputFile) ||
-                            OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, outputFile, userDrive) ==
-                            OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL)
                     if (usable) PROGRESS_COMPLETE else null
                 }
                 else -> PROGRESS_COMPLETE

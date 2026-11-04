@@ -397,7 +397,14 @@ class FileInfoActionsView @JvmOverloads constructor(
         val cacheFile = getCacheFile(context, capturedUserDrive)
         val offlineFile = getOfflineFile(context, capturedUserDrive.userId)
 
-        if (cacheFile.exists() && path.isNotEmpty() && !isObsoleteOrNotIntact(cacheFile)) {
+        // Promotion eligibility is an EXACT current clean baseline (issue: round 13 #11):
+        // "not older" passes retained cache bytes whose timestamp is newer than a
+        // backward-dated newer baseline — the stale generation would be published and
+        // pinned as clean. A copy not exactly at the row's baseline routes to the
+        // pending-download path below, which fetches the current identity.
+        if (cacheFile.exists() && path.isNotEmpty() &&
+            isIntactFile(cacheFile) && (cacheFile.lastModified() / 1_000L) == lastModifiedAt
+        ) {
             offlineFile?.let { target ->
                 val file = this
                 // UI promotion routes through the same protected, coordinated publication as the
@@ -406,7 +413,7 @@ class FileInfoActionsView @JvmOverloads constructor(
                 // offline state kept only after a confirmed publication.
                 CoroutineScope(Dispatchers.IO).launch {
                     FileController.updateOfflineStatus(fileId, isOffline = true, userDrive = capturedUserDrive)
-                    val published = DownloadOfflineFileManager.promoteCacheToOffline(
+                    val outcome = DownloadOfflineFileManager.promoteCacheToOffline(
                         context = context,
                         file = file,
                         cacheFile = cacheFile,
@@ -414,14 +421,48 @@ class FileInfoActionsView @JvmOverloads constructor(
                         userDrive = capturedUserDrive,
                     )
                     CoroutineScope(Dispatchers.Main).launch {
-                        if (published) {
-                            file.isOffline = true
-                            onItemClickListener.onCacheAddedToOffline()
-                        } else {
-                            CoroutineScope(Dispatchers.IO).launch {
-                                FileController.updateOfflineStatus(fileId, isOffline = false, userDrive = capturedUserDrive)
+                        when (outcome) {
+                            // Success is a confirmed publication, or the publication's own
+                            // under-lock validation that the destination holds protected
+                            // owned content that wins over the promoted bytes (issue: round
+                            // 13 #13).
+                            DownloadOfflineFileManager.PublicationOutcome.PUBLISHED,
+                            DownloadOfflineFileManager.PublicationOutcome.SKIPPED_PROTECTED,
+                            -> {
+                                file.isOffline = true
+                                onItemClickListener.onCacheAddedToOffline()
                             }
-                            file.isOffline = false
+                            DownloadOfflineFileManager.PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                                // The cached copy's generation was superseded before
+                                // publication: announcing success would leave the pin over a
+                                // destination that may hold no usable bytes for the current
+                                // identity. The user's intent is still on (the same
+                                // coordinated publication verified it immediately before the
+                                // supersession check), so the pin stays and pending work is
+                                // persisted: the pending-download marker plus a refresh of
+                                // the current identity through the offline worker.
+                                file.isOffline = true
+                                CoroutineScope(Dispatchers.IO).launch {
+                                    FileController.markFilesAsOffline(
+                                        filesId = listOf(fileId),
+                                        isMarkedAsOffline = true,
+                                        userDrive = capturedUserDrive,
+                                        setExplicitPin = true,
+                                    )
+                                    Utils.downloadAsOfflineFile(context, file = file, userDrive = capturedUserDrive)
+                                }
+                            }
+                            // Invalidation (the intent disappeared mid-transfer) and failure
+                            // are never successes (issue: round 13 #13): the pin is rolled
+                            // back like the pre-existing failure path.
+                            DownloadOfflineFileManager.PublicationOutcome.SKIPPED_INVALIDATED,
+                            DownloadOfflineFileManager.PublicationOutcome.FAILED,
+                            -> {
+                                CoroutineScope(Dispatchers.IO).launch {
+                                    FileController.updateOfflineStatus(fileId, isOffline = false, userDrive = capturedUserDrive)
+                                }
+                                file.isOffline = false
+                            }
                         }
                         refreshBottomSheetUi(currentFile)
                     }

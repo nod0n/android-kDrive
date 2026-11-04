@@ -713,7 +713,9 @@ class DownloadOfflineFileManager(
          * UI cache promotion (issue: round 4 #8): routes through the same protected, coordinated
          * publication as the workers. The caller sets the explicit pin BEFORE calling so the
          * intent check sees the user's request; the cache source is deleted only after a
-         * confirmed publication.
+         * confirmed publication. Returns the full [PublicationOutcome] (issue: round 13 #13):
+         * a superseded or invalidated publication is NOT a success the UI may promote — the
+         * caller decides what remains of the user's intent per outcome.
          */
         internal suspend fun promoteCacheToOffline(
             context: Context,
@@ -721,7 +723,7 @@ class DownloadOfflineFileManager(
             cacheFile: IOFile,
             offlineFile: IOFile,
             userDrive: UserDrive,
-        ): Boolean {
+        ): PublicationOutcome {
             val staged = newStagedFile(context, file)
             val outcome = runCatching {
                 cacheFile.copyTo(staged, overwrite = true)
@@ -734,7 +736,7 @@ class DownloadOfflineFileManager(
             if (outcome == PublicationOutcome.PUBLISHED) {
                 runCatching { if (cacheFile.exists()) cacheFile.delete() }
             }
-            return outcome != PublicationOutcome.FAILED
+            return outcome
         }
 
         /**
