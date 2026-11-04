@@ -24,6 +24,7 @@ import com.infomaniak.core.auth.TokenAuthenticator
 import com.infomaniak.core.auth.TokenInterceptor
 import com.infomaniak.core.network.networking.HttpClientConfig
 import com.infomaniak.core.network.networking.HttpUtils
+import com.infomaniak.core.network.networking.ManualAuthorizationRequired
 import com.infomaniak.drive.TokenInterceptorListenerProvider
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.cache.FileController
@@ -33,7 +34,7 @@ import com.infomaniak.drive.utils.AccountUtils
 import io.realm.Realm
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.lock
+import kotlin.concurrent.withLock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
@@ -124,6 +125,10 @@ class GalleryViewModel : ViewModel() {
                 userId = userDrive.userId,
             )
             addInterceptor(Interceptor { chain ->
+                // Manual headers only: the annotation's contract (authorization not provided
+                // by getHeaders) is satisfied right here by the captured-user TokenInterceptor
+                // and TokenAuthenticator added just below.
+                @OptIn(ManualAuthorizationRequired::class)
                 chain.request().newBuilder().headers(HttpUtils.getHeaders()).build().let(chain::proceed)
             })
             addInterceptor(TokenInterceptor(tokenInterceptorListener))
@@ -278,7 +283,7 @@ class GalleryViewModel : ViewModel() {
                 // transaction form one boundary inside the same lock that every newer load's
                 // writes must acquire, so an obsolete load can never commit after a
                 // replacement refresh (a stale first page would otherwise reset it).
-                resources.mutationLock.lock {
+                resources.mutationLock.withLock {
                     if (job.isActive && generation == loadGeneration) {
                         didFetchAnyPage = true
                         // Store every raw page unfiltered so the offline cache keeps covering
@@ -304,7 +309,7 @@ class GalleryViewModel : ViewModel() {
         }
 
         if (isFirstPage && didFetchAnyPage) {
-            resources.mutationLock.lock {
+            resources.mutationLock.withLock {
                 if (job.isActive && generation == loadGeneration) FileController.removeOrphanFiles(realm)
             }
         }
