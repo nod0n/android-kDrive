@@ -869,25 +869,30 @@ object OfflineFolderController {
             }
 
             // The committing transaction revalidates the removal intent (root revival via the
-            // abort predicate) and the live pin state on a refreshed Realm, immediately before
-            // the flags clear (issue: round 7 #9).
+            // abort predicate), the live pin state AND the context's fresh coverage predicate
+            // on a refreshed Realm, immediately before the flags clear (issues: round 7 #9,
+            // round 9 #6) — this is the branch that actually deletes existing bytes, so it
+            // needs the same freshness gates as the flag-only branches.
             var cleared = false
             runCatching { realm.refresh() }
             realm.executeTransaction {
                 if (isAborted()) return@executeTransaction
                 val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
                 if (liveRow.isOffline) return@executeTransaction
+                isStillClearable?.let { clearable -> if (!clearable(realm, liveRow)) return@executeTransaction }
                 liveRow.isInOfflineFolder = false
                 liveRow.isMarkedAsOffline = false
                 cleared = true
             }
             if (cleared) {
-                // Intent re-check AFTER the commit, BEFORE the bytes go (issue: round 8 #8):
-                // the flag commit and the byte deletion must share one intent protocol — a
-                // revival between the committing transaction and the deletion keeps the
-                // bytes, so the revived root's walk finds the copy it just re-requested
-                // instead of deleting it.
-                if (!isAborted()) {
+                // Intent AND freshness re-check AFTER the commit, BEFORE the bytes go (issues:
+                // round 8 #8, round 9 #6): the flag commit and the byte deletion must share one
+                // intent protocol. A revival of the removed root, or a nested-root addition —
+                // a different lock, invisible to the abort predicate — between the committing
+                // transaction and the deletion keeps the bytes, so the newly established
+                // coverage finds its copy instead of losing it to the cleanup.
+                val intentRevoked = isAborted() || (isStillClearable?.invoke(realm, file) == false)
+                if (!intentRevoked) {
                     deleteOfflineCopy(context, file, offlineFile, userDrive, result)
                 } else {
                     result.keptOfflineFilesCount++

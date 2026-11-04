@@ -417,6 +417,17 @@ object OfflineFolderUtils {
      * obsolete cached ancestry cannot establish protection. A vanished subfolder that is itself
      * a remaining root is skipped: its own durable record owns its subtree's cleanup.
      */
+    /**
+     * Freshness predicate for remote-listing cleanup (issue: round 9 #6): the authoritative
+     * listing of a parent authorizes clearing only a row whose LIVE parent relationship still
+     * matches — a row moved under another parent between collection and clearing belongs to
+     * that other subtree now, and this listing does not speak for it. A row deleted in the
+     * meantime is skipped as well (nothing left to clear).
+     */
+    private fun listingClearable(expectedParentId: Int): (Realm, File) -> Boolean = { currentRealm, candidate ->
+        FileController.getFileById(currentRealm, candidate.id)?.parentId == expectedParentId
+    }
+
     private fun cleanupConfirmedAbsentChildren(
         context: Context,
         realm: Realm,
@@ -435,7 +446,7 @@ object OfflineFolderUtils {
 
             if (child.isFolder()) {
                 if (OfflineFolderController.isOfflineRoot(child.id, customRealm = realm)) return@forEach
-                clearConfirmedAbsentSubtree(context, realm, child.id, userDrive, result)
+                clearConfirmedAbsentSubtree(context, realm, child.id, folderId, userDrive, result)
             } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
                     isOffline = child.isOffline,
                     isInOfflineFolder = child.isInOfflineFolder,
@@ -448,6 +459,8 @@ object OfflineFolderUtils {
                     userDrive = userDrive,
                     result = result,
                     isFolder = false,
+                    // The listing of [folderId] is this cleanup's authority (issue: round 9 #6).
+                    isStillClearable = listingClearable(folderId),
                 )
             }
         }
@@ -465,14 +478,18 @@ object OfflineFolderUtils {
         context: Context,
         realm: Realm,
         rootFolderId: Int,
+        listedParentId: Int,
         userDrive: UserDrive,
         result: OfflineFolderController.RemovalResult,
     ) {
         val visited = mutableSetOf(rootFolderId)
-        val queue = ArrayDeque(listOf(rootFolderId))
+        // folderId to the parent the traversal reached it from — the only parent relationship
+        // this cleanup's listing authority covers (issue: round 9 #6).
+        val queue = ArrayDeque<Pair<Int, Int>>()
+        queue.add(rootFolderId to listedParentId)
 
         while (queue.isNotEmpty()) {
-            val currentId = queue.removeFirst()
+            val (currentId, collectedParentId) = queue.removeFirst()
             // Stop at every remaining active root encountered deeper in the subtree: its own
             // record and walk establish (or disprove) its coverage independently (issue: round
             // 3 #11).
@@ -487,6 +504,7 @@ object OfflineFolderUtils {
                 userDrive = userDrive,
                 result = result,
                 isFolder = true,
+                isStillClearable = listingClearable(collectedParentId),
             )
 
             realm.where(File::class.java)
@@ -495,7 +513,7 @@ object OfflineFolderUtils {
                 .createSnapshot()
                 .forEach { child ->
                     if (child.isFolder()) {
-                        if (visited.add(child.id)) queue.add(child.id)
+                        if (visited.add(child.id)) queue.add(child.id to currentId)
                     } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
                             isOffline = child.isOffline,
                             isInOfflineFolder = child.isInOfflineFolder,
@@ -508,6 +526,7 @@ object OfflineFolderUtils {
                             userDrive = userDrive,
                             result = result,
                             isFolder = false,
+                            isStillClearable = listingClearable(currentId),
                         )
                     }
                 }
