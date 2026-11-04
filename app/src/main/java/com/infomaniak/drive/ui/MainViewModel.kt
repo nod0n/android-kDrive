@@ -790,6 +790,10 @@ class MainViewModel(
                                 // clean copy is replaceable.
                                 when (OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, offlineFile, userDrive, realm)) {
                                     OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL -> Unit
+                                    // Contested/foreign path (issue: round 18 #5): preserve the
+                                    // bytes like KEEP_LOCAL — they are NOT certified as this
+                                    // file's content, so they are also never deleted here.
+                                    OfflineFolderController.OwnedCopyReplacementDecision.DEFERRED_FOREIGN -> Unit
                                     OfflineFolderController.OwnedCopyReplacementDecision.REPLACEABLE -> {
                                         deleteOfflinePath = offlineFile.path
                                         if (liveRow.isMedia()) mediaFile = realm.copyFromRealm(liveRow, 0)

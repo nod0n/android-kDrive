@@ -838,6 +838,14 @@ object OfflineFolderController {
         KEEP_LOCAL,
         /** Nothing owned is lost by replacing the bytes (snapshot succeeded or content-safe). */
         REPLACEABLE,
+        /**
+         * FRESH ownership could not be established for these bytes (issue: round 18 #5): the
+         * path is contested, ambiguous or foreign, or the row no longer binds it — NO snapshot
+         * was taken and the bytes are NOT certified as this file's usable content. Callers
+         * must neither complete over them nor delete them; a fresh download defers through
+         * the coordinated publication instead.
+         */
+        DEFERRED_FOREIGN,
     }
 
     /**
@@ -846,6 +854,12 @@ object OfflineFolderController {
      * deleting an inherited edit. A copy backing a pending or retained-unsent upload is the
      * usable local content; a dirty copy is snapshotted into the durable upload queue first —
      * a failed registration keeps the local copy; content-safe copies are replaceable.
+     *
+     * FRESH exclusive ownership is MANDATORY inside this API (issue: round 18 #5): callers
+     * that cannot supply a coordinated Realm — the presentation entry points (preview
+     * conversion, download dialog), which previously omitted the argument and thereby
+     * SKIPPED the ownership check — get the complete section here: intent monitor → file
+     * lock → refreshed scoped Realm → current identity/path/ownership → snapshot.
      */
     fun decisionForReplacingOwnedCopy(
         file: File,
@@ -854,11 +868,43 @@ object OfflineFolderController {
         realm: Realm? = null,
     ): OwnedCopyReplacementDecision {
         val context = Realm.getApplicationContext() ?: return OwnedCopyReplacementDecision.KEEP_LOCAL
-        // EXCLUSIVE fresh source ownership before any snapshot side effect (issue: round 17
-        // #2): a path co-claimed by another row defers conservatively (KEEP_LOCAL) — the
-        // bytes there may be another file's sole edit.
-        if (realm != null && exclusivePathOwner(realm, context, userDrive, offlineFile.path) != file.id) {
-            return OwnedCopyReplacementDecision.KEEP_LOCAL
+        return if (realm != null) {
+            decisionForOwnedCopyWithFreshOwnership(context, file, offlineFile, userDrive, realm)
+        } else synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                FileController.getRealmInstance(userDrive).use { freshRealm ->
+                    runCatching { freshRealm.refresh() }
+                    val live = FileController.getFileById(freshRealm, file.id)
+                        ?: return@withFileLock OwnedCopyReplacementDecision.DEFERRED_FOREIGN
+                    // CURRENT identity and path (issue: round 18 #5): a row moved, renamed or
+                    // re-published since the presentation row was captured no longer binds
+                    // these bytes — the captured F/path pair must not authorize a snapshot.
+                    val liveOfflinePath = live.getOfflineFile(context, userDrive.userId)?.path
+                    if (liveOfflinePath != offlineFile.path) {
+                        return@withFileLock OwnedCopyReplacementDecision.DEFERRED_FOREIGN
+                    }
+                    decisionForOwnedCopyWithFreshOwnership(context, live, offlineFile, userDrive, freshRealm)
+                }
+            }
+        }
+    }
+
+    /**
+     * Decision body run under the caller's coordination, with a live row and a Realm whose
+     * view is current (issue: round 18 #5): the exclusive path owner is established BEFORE
+     * any snapshot side effect, and a foreign or ambiguous path yields
+     * [OwnedCopyReplacementDecision.DEFERRED_FOREIGN] — never [OwnedCopyReplacementDecision
+     * .KEEP_LOCAL], which certifies the bytes as usable local content.
+     */
+    private fun decisionForOwnedCopyWithFreshOwnership(
+        context: Context,
+        file: File,
+        offlineFile: IOFile,
+        userDrive: UserDrive,
+        realm: Realm,
+    ): OwnedCopyReplacementDecision {
+        if (exclusivePathOwner(realm, context, userDrive, offlineFile.path) != file.id) {
+            return OwnedCopyReplacementDecision.DEFERRED_FOREIGN
         }
         return when (protectionStateOf(file, offlineFile, userDrive)) {
             CopyProtection.PENDING_UPLOAD -> OwnedCopyReplacementDecision.KEEP_LOCAL
@@ -894,10 +940,35 @@ object OfflineFolderController {
         if (file.isOffline || file.isFolder() || !file.isInOfflineFolder) return PreservationOutcome.CONTENT_SAFE
         val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return PreservationOutcome.CONTENT_SAFE
         if (!offlineFile.exists()) return PreservationOutcome.CONTENT_SAFE
-        // EXCLUSIVE fresh source ownership before snapshot or deletion (issue: round 17 #2):
-        // an ambiguous or foreign path PRESERVES (defers) — never snapshots or deletes bytes
-        // whose owner is contested.
-        if (realm != null && exclusivePathOwner(realm, context, userDrive, offlineFile.path) != file.id) {
+        // FRESH exclusive source ownership is MANDATORY inside this preservation API (issue:
+        // round 18 #5, same class as the replacement decision): a caller without a Realm gets
+        // the coordinated section here; an ambiguous or foreign path PRESERVES (defers) —
+        // never snapshots or deletes bytes whose owner is contested.
+        return if (realm != null) {
+            preserveWithFreshOwnership(context, file, offlineFile, userDrive, realm)
+        } else synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                FileController.getRealmInstance(userDrive).use { freshRealm ->
+                    runCatching { freshRealm.refresh() }
+                    val live = FileController.getFileById(freshRealm, file.id)
+                        ?: return@withFileLock PreservationOutcome.PRESERVED
+                    val liveOfflinePath = live.getOfflineFile(context, userDrive.userId)?.path
+                    if (liveOfflinePath != offlineFile.path) return@withFileLock PreservationOutcome.PRESERVED
+                    preserveWithFreshOwnership(context, live, offlineFile, userDrive, freshRealm)
+                }
+            }
+        }
+    }
+
+    /** Preservation body under the caller's coordination with a current Realm (issue: round 18 #5). */
+    private fun preserveWithFreshOwnership(
+        context: Context,
+        file: File,
+        offlineFile: IOFile,
+        userDrive: UserDrive,
+        realm: Realm,
+    ): PreservationOutcome {
+        if (exclusivePathOwner(realm, context, userDrive, offlineFile.path) != file.id) {
             return PreservationOutcome.PRESERVED
         }
         return when (protectionStateOf(file, offlineFile, userDrive)) {

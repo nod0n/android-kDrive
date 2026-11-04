@@ -125,25 +125,14 @@ class DownloadOfflineFileManager(
         // Realm/FS mutation — never the monitor from inside an already-held file lock.
         val committed = synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
-                val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
-                    // The transfer's basis [file] is the request-observed state (issue: round 13
-                    // #1): a tied-timestamp identity change is accepted only while the live row
-                    // still matches it.
-                    OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                        realm = realm,
-                        remoteFiles = listOf(remoteFile),
-                        userDrive = userDrive,
-                        observedById = mapOf(remoteFile.id to file),
-                    ).first()
-                }
                 // COMPLETE DESTINATION-CHAIN validation BEFORE any preservation side
-                // effect (issue: round 17 #8, superseding the round-16 #20 single-parent
-                // check that ran after the boundary): every ancestor of the incoming
-                // metadata's destination — not just the immediate parent, whose own ancestry
-                // could be missing — must currently exist, or the whole operation defers
-                // WITHOUT touching source bytes; otherwise preservation could migrate or
-                // snapshot/delete the old copy and only then discover the unusable
-                // destination, leaving the old metadata pointing at an emptied location.
+                // effect (issue: round 18 #3, restoring the round-17 #8 intent: the
+                // boundary call below PRESERVES — migrates, snapshots or deletes — the old
+                // copy, so the incoming metadata's complete destination ancestry must be
+                // refreshed and validated FIRST; the previous order ran the check after
+                // the boundary, so a response moving F beneath an uncached ancestor could
+                // move F's clean bytes — or snapshot and delete its dirty source — before
+                // the check returned false, leaving the old row at the emptied location).
                 // The same validation is re-applied to the boundary-committed identity
                 // before the metadata commit.
                 fun destinationChainExists(parentId: Int, realm: Realm): Boolean {
@@ -164,6 +153,17 @@ class DownloadOfflineFileManager(
                 if (!prePreservationChainOk) {
                     SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its destination chain is incomplete")
                     return@withFileLock false
+                }
+                val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
+                    // The transfer's basis [file] is the request-observed state (issue: round 13
+                    // #1): a tied-timestamp identity change is accepted only while the live row
+                    // still matches it.
+                    OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                        realm = realm,
+                        remoteFiles = listOf(remoteFile),
+                        userDrive = userDrive,
+                        observedById = mapOf(remoteFile.id to file),
+                    ).first()
                 }
                 if (commitFile !== remoteFile) {
                     SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
