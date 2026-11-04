@@ -431,14 +431,25 @@ object OfflineFolderUtils {
         var currentId: Int? = FileController.getFileById(currentRealm, candidate.id)?.parentId
         val visited = mutableSetOf(candidate.id)
         while (!reachesBoundary && currentId != null && visited.add(currentId)) {
+            // Independent-root ownership FIRST, on every chain node INCLUDING the boundary
+            // (issue: round 14 #9): an active root at any node — or at the boundary itself —
+            // owns the coverage, and reaching the boundary must not short-circuit that
+            // check the way the previous order did.
+            if (OfflineFolderController.hasActiveOfflineRoot(currentId, customRealm = currentRealm)) break
             if (currentId == boundaryFolderId) {
                 reachesBoundary = true
                 break
             }
-            if (OfflineFolderController.hasActiveOfflineRoot(currentId, customRealm = currentRealm)) break
             currentId = FileController.getFileById(currentRealm, currentId)?.parentId
         }
         boundaryHolds && reachesBoundary &&
+            // FRESH ownership checks that do not depend on the generation (issue: round 14
+            // #9): the boundary's own record and the candidate's own record (the
+            // boundary-self case bypasses the chain walk entirely) are re-read INSIDE this
+            // committing transaction — a root committed after the walk's last outer
+            // transaction is still seen here, so the generation stamp alone never decides.
+            !OfflineFolderController.hasActiveOfflineRoot(boundaryFolderId, customRealm = currentRealm) &&
+            !OfflineFolderController.hasActiveOfflineRoot(candidate.id, customRealm = currentRealm) &&
             !OfflineFolderController.hasActiveRootCoveringSince(candidate.id, currentRealm, traversalStartedGeneration)
     }
 

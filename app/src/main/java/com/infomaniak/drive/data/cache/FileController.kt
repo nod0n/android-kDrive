@@ -1813,7 +1813,13 @@ object FileController {
             // acquisitions could cycle against ascending multi-lock commits).
             var linkedParentId = 0
             var linkedChildId = 0
-            val committed = OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
+            // The primary upsert joins the OUTER intent protocol (issue: round 14 #10): the
+            // deep-link caller accepts directories, and inserting a missing directory row
+            // ESTABLISHES ancestry — without the monitor, such an insert can commit while
+            // cleanup holds the monitor and a descendant's lock, and newly covered bytes can
+            // be deleted after cleanup's last check. Order: intent monitor → file lock.
+            val committed = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
                 // Shared upsert boundary (issue: round 6 #4): preserve the owned copy at the old
                 // location before the metadata replacement; a deferred reconciliation commits the
                 // OLD row instead of the new identity.
@@ -1836,6 +1842,7 @@ object FileController {
                 linkedParentId = preservedFile.parentId
                 linkedChildId = preservedFile.id
                 accepted
+                }
             }
             // Propagate rejection (issue: round 12 #2): a rejected response left the newer
             // live row authoritative — continuing the ancestor linking would attach the LIVE
