@@ -283,55 +283,72 @@ object OfflineFolderUtils {
         val deferredMoveIds = commitOutcomes.deferredIds
 
         if (deferredMoveIds.isNotEmpty()) {
-            // ANCHORED RESOLUTION for deferred tie-ids (issue: round 17 #17): a deferral
-            // relative to a MISSING observation is this listing's permanent blind spot — a
-            // move-in candidate's old row lives in ANOTHER folder, so every future listing
-            // of this folder would defer it the same way (a livelock until some other pass
-            // relocates the old row). The candidate's CURRENT LOCAL ROW, detached before
-            // any further mutation, is the missing anchor: re-committing the SAME fully
-            // aggregated page — a partial page would replace the folder's whole membership
-            // (the commit clears children on the first page) — with the completed
-            // observation map re-runs the exact acceptance the next listing would have
-            // performed, through the same identity and preservation gates, this pass. No
-            // additional request is needed; the anchor is the pre-commit row state itself.
-            // BOUNDED: only the first candidates are anchored per pass; the rest stay
-            // deferred exactly as before.
-            val anchoredObservations = buildMap<Int, File> {
-                putAll(observedById)
-                for (deferredId in deferredMoveIds.sorted().take(ANCHORED_RESOLUTION_BUDGET)) {
-                    coroutineContext.ensureActive()
-                    FileController.getFileById(realm, deferredId)?.let { row ->
-                        put(deferredId, realm.copyFromRealm(row, 1))
+            // NEW AUTHORITATIVE RESOLUTION for deferred tie-ids (issues: round 18 #4/#21,
+            // replacing the round-17 local-anchor re-commit): the previous design grafted a
+            // POST-RESPONSE local row onto the ALREADY-RECEIVED listing response as its
+            // "missing" observation — a fabricated request observation. Trace: the request
+            // observed F at A; another operation commits F at B with tied timestamps and a
+            // local edit; the listing correctly rejects the stale A response; the retry then
+            // observed B AFTER receiving A, passed the same-observation check, and could
+            // register B's edit under A's identity and delete/move B's source. An
+            // already-received response's observation is IMMUTABLE — it is never replaced.
+            // Instead, each selected deferred id gets a NEW details request issued AFTER its
+            // detached pre-request observation is captured, and THAT response is committed
+            // against THAT observation through the same preservation boundary and the
+            // in-transaction conditional acceptance — as a SINGLE-FILE commit, never
+            // [processPage] (its isFirstPage=true commit would replace the folder's whole
+            // membership). A move-in candidate's old row (the reason every listing of this
+            // folder deferred it) is the genuine pre-request observation of its NEW request,
+            // so the livelock the round-17 design addressed stays resolved. UNRESOLVED ids
+            // (no row, failed request, superseded/preservation deferral) keep the walk
+            // incomplete for the next pass.
+            var resolvedAny = false
+            for (deferredId in fairDeferredSelection(deferredMoveIds, folderId, DEFERRED_RESOLUTION_BUDGET)) {
+                coroutineContext.ensureActive()
+                // PRE-REQUEST observation (issue: round 18 #4): the candidate's current local
+                // row, detached BEFORE the resolving request — never grafted onto the old
+                // response.
+                val preObservation = FileController.getFileById(realm, deferredId)
+                    ?.let { row -> realm.copyFromRealm(row, 1) } ?: continue
+                val detailsResponse = runCatching {
+                    ApiRepository.getFileDetails(
+                        file = File(id = deferredId, driveId = userDrive.driveId),
+                        okHttpClient = okHttpClient,
+                    )
+                }.getOrNull()
+                val details = detailsResponse?.data?.takeIf { it.id == deferredId } ?: continue
+                val accepted = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withFileLock(userDrive, deferredId) {
+                        val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                            realm = realm,
+                            remoteFiles = listOf(details),
+                            userDrive = userDrive,
+                            observedById = mapOf(deferredId to preObservation),
+                        ).first()
+                        if (committable !== details) {
+                            // Preservation deferred (stale gate or unfinished preservation):
+                            // the id stays deferred for the next pass.
+                            false
+                        } else {
+                            FileController.updateExistingFileIfNotOlder(
+                                newFile = committable,
+                                realm = realm,
+                                userDrive = userDrive,
+                                observed = preObservation,
+                            )
+                        }
                     }
                 }
+                if (accepted) resolvedAny = true
             }
-            val fileIdsBefore = fileIds.size
-            val retryOutcomes = processPage(
-                context = context,
-                realm = realm,
-                rootFolderId = rootFolderId,
-                folderId = folderId,
-                userDrive = userDrive,
-                apiResponse = completeResponse,
-                isCompleteFolder = true,
-                fileIds = fileIds,
-                folderQueue = folderQueue,
-                visitedFolderIds = visitedFolderIds,
-                observedById = anchoredObservations,
-            )
-            // The bounded re-commit may have collected duplicate file ids (the same
-            // children committed twice); keep the collected list a set-like progression.
-            if (fileIds.size > fileIdsBefore) {
-                val deduplicated = fileIds.distinct()
-                fileIds.clear()
-                fileIds.addAll(deduplicated)
-            }
-            if (retryOutcomes.deferredIds.isNotEmpty()) {
-                // The reconciliation is incomplete: the affected files keep their old metadata
-                // and location this round, and the root stays incomplete for retry (issue: round
-                // 5 #8/#9). The folder itself WAS fully listed — independent folders keep walking
-                // so one occupied destination cannot starve the whole root (issue: round 6 #10).
-                SentryLog.i(TAG, "Deferred ${retryOutcomes.deferredIds.size} file(s) whose old copies are not safely preserved yet")
+            if (!resolvedAny) {
+                // NOTHING resolved this pass (all budget entries unresolved): the
+                // reconciliation is incomplete — the affected files keep their old metadata
+                // and location this round, and the root stays incomplete for retry (issue:
+                // round 5 #8/#9). The folder itself WAS fully listed — independent folders
+                // keep walking so one occupied destination cannot starve the whole root
+                // (issue: round 6 #10).
+                SentryLog.i(TAG, "Deferred ${deferredMoveIds.size} file(s) whose old copies are not safely preserved yet")
                 return FolderWalkOutcome.DEFERRED_MOVES
             }
         }
@@ -769,5 +786,24 @@ object OfflineFolderUtils {
      * 17 #17): one pathological folder cannot spin the walk into an unbounded request loop;
      * the remainder stays deferred for the next listing.
      */
-    private const val ANCHORED_RESOLUTION_BUDGET = 4
+    private const val DEFERRED_RESOLUTION_BUDGET = 4
+
+    /**
+     * Rotating resolution cursor per folder (issue: round 18 #21): a FAIR slice of the
+     * deferred ids per pass — the previous `sorted().take(budget)` let permanent
+     * preservation conflicts occupy the budget on every pass and starve a valid later
+     * candidate forever. The cursor advances by the budget each pass and wraps, so every
+     * deferred id eventually gets its resolving request; a pass that resolves ANY of its
+     * slice keeps the walk going, and a fully-unresolved slice reports the deferral.
+     */
+    private val deferredResolutionCursors = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+
+    private fun fairDeferredSelection(deferredIds: Set<Int>, folderId: Int, budget: Int): List<Int> {
+        val ordered = deferredIds.sorted()
+        if (ordered.size <= budget) return ordered
+        // merge returns the NEW cursor value (old + budget; absent counts as 0).
+        val newCursor = deferredResolutionCursors.merge(folderId, budget, Int::plus) ?: budget
+        val offset = (newCursor - budget).mod(ordered.size)
+        return List(budget) { index -> ordered[(offset + index) % ordered.size] }
+    }
 }

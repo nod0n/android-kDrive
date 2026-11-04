@@ -136,8 +136,27 @@ object FolderFilesProvider {
         cursor: String? = null,
         rootFolder: File? = null,
         onRecursionStart: (() -> Unit)? = null,
+        observedById: Map<Int, File> = emptyMap(),
     ) {
         val folderId = if (isRoot) SharedWithMe.id else folderFilesProviderArgs.folderId
+        // PRE-REQUEST observations (issue: round 18 #21): the container's children detached
+        // BEFORE the first page of this request sequence — the same anchor the recursive
+        // walker commits against, so a same-folder identity tie (e.g. a same-second rename
+        // between the request and the commit) resolves through the shared boundary instead
+        // of deferring on every pass. The map is captured ONCE per sequence and threaded
+        // through every page and the recursion: all pages belong to one request sequence
+        // and share its immutable pre-request state. A row moving INTO this folder from
+        // another container is not among the pre-request children — its observation is
+        // unknowable before the response names it; it defers to the next listing pass,
+        // exactly as before (the offline walk resolves such candidates with fresh
+        // details requests instead, issue: round 18 #4).
+        val sequenceObservations = if (cursor == null) {
+            FileController.getFileById(realm, folderId)?.children
+                ?.associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
+                ?: emptyMap()
+        } else {
+            observedById
+        }
         val apiResponse = if (isRoot) {
             ApiRepository.getSharedWithMeFiles(
                 okHttpClient = okHttpClient,
@@ -162,7 +181,8 @@ object FolderFilesProvider {
             apiResponse = apiResponse,
             isFirstPage = cursor == null,
             isCompleteFolder = !apiResponse.hasMore,
-            userDrive = folderFilesProviderArgs.userDrive
+            userDrive = folderFilesProviderArgs.userDrive,
+            observedById = sequenceObservations,
         )
 
         when {
@@ -175,6 +195,7 @@ object FolderFilesProvider {
                     isRoot = isRoot,
                     folderFilesProviderArgs = folderFilesProviderArgs,
                     cursor = apiResponse.cursor,
+                    observedById = sequenceObservations,
                 )
             }
             apiResponse.isSuccess() -> {
