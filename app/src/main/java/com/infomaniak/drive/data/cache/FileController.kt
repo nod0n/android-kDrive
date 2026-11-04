@@ -412,14 +412,16 @@ object FileController {
     ): Boolean {
         val context = Realm.getApplicationContext() ?: return false
         val scope = userDrive ?: UserDrive()
-        val block: (Realm) -> Boolean = { realm ->
-            val liveRow = getFileProxyById(file.id, customRealm = realm) ?: return@block true
-            if (liveRow.isFolder()) return@block true
+        // A lambda stored in a variable has no implicit label: the explicit [renameBlock]
+        // label is what the early returns below target (round-6 compile fix).
+        val block: (Realm) -> Boolean = renameBlock@{ realm ->
+            val liveRow = getFileProxyById(file.id, customRealm = realm) ?: return@renameBlock true
+            if (liveRow.isFolder()) return@renameBlock true
             val oldOffline = liveRow.getOfflineFile(context, scope.userId)?.takeIf { it.exists() }
-                ?: return@block true
+                ?: return@renameBlock true
             val newOffline = oldOffline.parentFile?.let { parent -> IOFile(parent, newName) }
-                ?: return@block false
-            if (newOffline.path == oldOffline.path) return@block true
+                ?: return@renameBlock false
+            if (newOffline.path == oldOffline.path) return@renameBlock true
             // The dirty-copy snapshot registers under the NEW name: the edit belongs to the
             // renamed file, and uploading it under the old name would recreate that name
             // remotely.
