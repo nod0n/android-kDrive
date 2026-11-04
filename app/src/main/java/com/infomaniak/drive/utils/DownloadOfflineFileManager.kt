@@ -252,7 +252,15 @@ class DownloadOfflineFileManager(
         cacheFile: IOFile,
         offlineFile: IOFile,
     ): Boolean = withContext(Dispatchers.IO) {
-        if (file.isObsoleteOrNotIntact(cacheFile)) return@withContext false
+        // EXACT current clean baseline (issue: round 14 #14): "not older" accepts cache bytes
+        // whose timestamp is NEWER than a legitimate backward-dated newer baseline — the old
+        // generation's bytes would then be relabeled as current by the publication's
+        // timestamp write, and every later intact check would accept them as the new
+        // generation. A cache copy not exactly at this transfer's baseline is rejected and
+        // the current content downloads instead.
+        if (!(cacheFile.exists() && file.isIntactFile(cacheFile) && (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt)) {
+            return@withContext false
+        }
 
         val staged = newStagedFile(context, file)
         val published = runCatching {
@@ -634,6 +642,17 @@ class DownloadOfflineFileManager(
                         // staged bytes.
                         ((live.version?.number ?: 0) > 0 && (file.version?.number ?: 0) > 0 &&
                             live.version?.number != file.version?.number) ||
+                        // Ambiguous version provenance (issue: round 14 #7): when exactly ONE
+                        // side carries the authoritative version and the complete coarse
+                        // baseline ties, timestamp/size equality alone cannot prove the same
+                        // content generation — an inherited or omitted version must not
+                        // falsely prove equality with an in-flight transfer. The publication
+                        // defers (SKIPPED_SUPERSEDED) and the retry obtains the authoritative
+                        // identity: details routes carry the version expansion, so the
+                        // worker's refetch and the deferred markers' refresh resolve it.
+                        // Both sides UNKNOWN remains the documented coarse-baseline case.
+                        (((live.version?.number ?: 0) > 0) != ((file.version?.number ?: 0) > 0) &&
+                            live.lastModifiedAt == file.lastModifiedAt && live.size == file.size) ||
                         live.lastModifiedAt != file.lastModifiedAt ||
                         live.size != file.size ||
                         run {
