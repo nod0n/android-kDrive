@@ -253,7 +253,7 @@ object FolderFilesProvider {
                 // resolve their move-in candidates exactly like the offline walk: fresh
                 // pre-observed details requests, fair per-item outcomes. Unresolved
                 // candidates wait for the NEXT listing pass; this never converges in place.
-                resolveDeferredCandidatesOnce(
+                val unresolvedCount = resolveDeferredCandidatesOnce(
                     realm = realm,
                     okHttpClient = okHttpClient,
                     folderId = folderId,
@@ -261,6 +261,20 @@ object FolderFilesProvider {
                     deferredIds = accumulatedDeferredIds + commitOutcomes.deferredIds,
                     checkCancelled = checkCancelled,
                 )
+                if (unresolvedCount > 0) {
+                    // INCOMPLETE RECONCILIATION OUTLIVES PAGINATION (issue: round 22 #17,
+                    // round 23 #16): the shared sequence previously IGNORED the resolver's
+                    // returned count entirely — a fully listed folder with unresolved
+                    // candidates stayed durably complete, and cached completeness
+                    // (needToLoadFromRemote) suppressed any redrive. The same durable
+                    // marker as the ordinary route: the next visit re-drives the remote
+                    // load and the budgeted resolver, independent of pagination; a later
+                    // fully resolving pass re-persists the pagination completeness through
+                    // saveRemoteFiles.
+                    FileController.updateFile(folderId, realm) { folderRow ->
+                        folderRow.isComplete = false
+                    }
+                }
             }
         }
     }
@@ -363,6 +377,7 @@ object FolderFilesProvider {
                                 // shared-root candidate never linked.
                                 val pseudoContainerMembership = folderId == SharedWithMe.id ||
                                     (folderId == ROOT_ID && userDrive.sharedWithMe)
+                                var membershipAccepted = false
                                 realm.executeTransaction {
                                     val freshRow = FileController.getFileById(realm, deferredId)
                                         ?: return@executeTransaction
@@ -373,7 +388,21 @@ object FolderFilesProvider {
                                     ) {
                                         container.children.add(freshRow)
                                     }
+                                    // An already-linked member is equally accepted: the link
+                                    // only runs when absent, acceptance is the membership
+                                    // itself.
+                                    if (container != null && membershipOk) membershipAccepted = true
                                 }
+                                // ACTUAL ACCEPTED OUTCOMES (issue: round 23 #16): the
+                                // resolver's returned count never counted resolutions —
+                                // `resolvedIds` was never written, so every nonempty
+                                // deferred set reported fully unresolved even after
+                                // accepted commits, durably marking fully reconciled
+                                // folders incomplete. Membership acceptance (committed AND
+                                // linked under the container) is the resolution outcome;
+                                // budget-skips, failed fetches, boundary rejections and
+                                // uncommitted resolutions stay unresolved.
+                                if (membershipAccepted) resolvedIds.add(deferredId)
                             }
                         }
                     }
