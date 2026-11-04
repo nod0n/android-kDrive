@@ -235,10 +235,12 @@ internal suspend fun downloadFile(
         if (outcome == PublicationOutcome.FAILED) {
             throw Exception("Download error")
         }
-        if (outcome != PublicationOutcome.SKIPPED_INVALIDATED) {
-            // The destination holds valid content (freshly published, or a protected/
-            // superseded retained copy): the preview can show it. An invalidated intent is
-            // NOT reported as a completed download.
+        // 100 is emitted ONLY for outcomes whose destination is already valid (issues: round
+        // 10 #9, round 11 #11): a superseded transfer's destination is validated by the
+        // caller — which emits completion itself once the CURRENT row provably owns the
+        // scoped path — so emitting here would report completion before that validation, and
+        // an invalidated intent is NOT reported as a completed download.
+        if (outcome == PublicationOutcome.PUBLISHED || outcome == PublicationOutcome.SKIPPED_PROTECTED) {
             onProgress(PROGRESS_COMPLETE)
         }
         return outcome

@@ -30,6 +30,7 @@ import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.R
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.ui.fileList.DownloadProgressViewModel.Companion.PROGRESS_COMPLETE
 import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.documentprovider.CloudStorageProvider
 import com.infomaniak.drive.data.models.drive.Category
@@ -572,11 +573,30 @@ open class File(
             when (outcome) {
                 PublicationOutcome.PUBLISHED, PublicationOutcome.SKIPPED_PROTECTED -> Unit
                 PublicationOutcome.SKIPPED_SUPERSEDED -> {
-                    // A concurrent rename/move can have left the retained path missing:
-                    // validate the scoped destination before naming it, or fail the preview.
-                    if (!cacheFile.exists()) {
+                    // Usable only when the CURRENT row still owns the named destination
+                    // (issue: round 11 #11): the offline path is parent+name derived, so
+                    // another file can occupy the obsolete location — existence alone would
+                    // return that file's bytes as this preview's source. The live row must
+                    // still hold the offline intent and resolve to the same scoped path.
+                    // Completion (100) is emitted only AFTER that validation — the transfer
+                    // layer no longer emits it for a superseded outcome — and a failure
+                    // defers the preview to a refetch.
+                    if (destinationIsOwnedOfflineCopy) {
+                        val liveOwnership = FileController.getRealmInstance(userDrive).use { realm ->
+                            FileController.getFileById(realm, id)?.let { live ->
+                                (live.isOffline || live.isInOfflineFolder) to
+                                    live.getOfflineFile(context, userDrive.userId)?.path
+                            }
+                        }
+                        if (liveOwnership?.first != true || liveOwnership.second != cacheFile.path) {
+                            throw java.io.IOException("Superseded preview left no usable destination for $name")
+                        }
+                    } else if (!cacheFile.exists()) {
+                        // Id-derived cache destinations cannot be occupied by another file's
+                        // row; only a vanished destination is unusable.
                         throw java.io.IOException("Superseded preview left no usable destination for $name")
                     }
+                    onProgress(PROGRESS_COMPLETE)
                 }
                 PublicationOutcome.SKIPPED_INVALIDATED ->
                     // The offline intent or destination disappeared mid-download (root

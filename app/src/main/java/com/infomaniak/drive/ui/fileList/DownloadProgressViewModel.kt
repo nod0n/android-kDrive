@@ -71,7 +71,7 @@ class DownloadProgressViewModel : ViewModel() {
                 )
 
                 if (apiResponse.isSuccessful) {
-                    saveData(file, outputFile, apiResponse, userDrive)
+                    saveData(context, file, outputFile, apiResponse, userDrive)
                 } else {
                     downloadProgressLiveData.postValue(null)
                 }
@@ -84,7 +84,7 @@ class DownloadProgressViewModel : ViewModel() {
         }
     }
 
-    private suspend fun saveData(file: File, outputFile: IOFile, response: Response, userDrive: UserDrive) {
+    private suspend fun saveData(context: Context, file: File, outputFile: IOFile, response: Response, userDrive: UserDrive) {
         // The final replacement goes through the coordinated staged publication (issue:
         // round 8 #2): the preflight check above ran before the request, so it cannot
         // authorize deleting a revision saved to the offline path in the meantime — the
@@ -104,11 +104,28 @@ class DownloadProgressViewModel : ViewModel() {
         }
         // A skipped transfer never modifies the retained destination, and the dialog does not
         // report an invalidated intent (pin/root removed mid-download) or a failure as a
-        // completed download (issue: round 9 #1); a protected or superseded skip keeps the
-        // valid retained content and reports completion (issue: round 9 #1).
+        // completed download (issue: round 9 #1). Supersession is completion only when the
+        // CURRENT row still owns the scoped destination (issue: round 11 #11): the offline
+        // path is parent+name derived, so another file can occupy the obsolete location and
+        // the retained bytes would be that file's — the live row must still hold the offline
+        // intent and resolve to the same path; anything else defers (null), like an
+        // invalidated intent.
         downloadProgressLiveData.postValue(
             when (outcome) {
                 PublicationOutcome.SKIPPED_INVALIDATED, PublicationOutcome.FAILED -> null
+                PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                    val liveOwnership = FileController.getRealmInstance(userDrive).use { realm ->
+                        FileController.getFileById(realm, file.id)?.let { live ->
+                            (live.isOffline || live.isInOfflineFolder) to
+                                live.getOfflineFile(context, userDrive.userId)?.path
+                        }
+                    }
+                    if (liveOwnership?.first == true && liveOwnership.second == outputFile.path && outputFile.exists()) {
+                        PROGRESS_COMPLETE
+                    } else {
+                        null
+                    }
+                }
                 else -> PROGRESS_COMPLETE
             }
         )
