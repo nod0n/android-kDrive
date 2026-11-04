@@ -329,6 +329,7 @@ object SyncOfflineUtils {
                                         realm = realm,
                                         userDrive = userDrive,
                                         requireActionAtOrAfter = actionAt,
+                                        observed = localFile,
                                     )
                             }
                         }
@@ -488,6 +489,7 @@ object SyncOfflineUtils {
                     realm = realm,
                     userDrive = userDrive,
                     requireActionAtOrAfter = actionLastActionAt,
+                    observed = localFile,
                 )
                 if (!advanced) {
                     SentryLog.i("SyncOffline", "Upload advance rejected for ${localFile.id}; snapshot ownership retained")
@@ -583,6 +585,7 @@ object SyncOfflineUtils {
                 realm = realm,
                 userDrive = userDrive,
                 requireActionAtOrAfter = actionLastActionAt,
+                observed = file,
             )
             if (!committed) return DownloadActionOutcome(handled = false)
             // Preserve the download origin: a refresh of a file covered by an offline folder is

@@ -834,6 +834,7 @@ object FileController {
         realm: Realm,
         userDrive: UserDrive,
         requireActionAtOrAfter: Long? = null,
+        observed: File? = null,
     ): Boolean {
         return insertOrUpdateFile(
             realm = realm,
@@ -844,9 +845,11 @@ object FileController {
             // #10) — an unavailable timestamp applies no cursor constraint instead of a
             // zero bound that would reject every row with a positive cursor — and the gate
             // accounts for newer metadata committed by non-Sync writers via the updatedAt
-            // ordering (issue: round 13 #3).
+            // ordering (issue: round 13 #3). The request ANCHOR is forwarded (issue: round
+            // 14 #2): a tie the pre-preservation gate resolved through it must not be
+            // re-rejected at the commit — that would defer a preserved rename forever.
             acceptIf = { live ->
-                live != null && !isStaleForAuthoritativeAction(live, newFile, requireActionAtOrAfter)
+                live != null && !isStaleForAuthoritativeAction(live, newFile, requireActionAtOrAfter, observed)
             },
         )
     }
