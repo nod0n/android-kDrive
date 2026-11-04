@@ -927,7 +927,24 @@ class CloudStorageProvider : DocumentsProvider() {
                             SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
                         }.isSuccess
                     }
-                    if (stagedOk) {
+                    if (stagedOk &&
+                        runBlocking {
+                            // GENERATION-BOUND RESPONSE BINDING (issue: round 23 #22): the
+                            // SAF publication previously published current-route response
+                            // bytes under the EARLIER metadata capture's version — R2
+                            // bytes returned after an R1 metadata fetch received an R1
+                            // proof. The shared post-download establishment runs before
+                            // the coordinated plain-cache publication, OUTSIDE every
+                            // lock; an unestablishable generation leaves the staged bytes
+                            // to the finally-cleanup, the open fails, and no
+                            // known-version proof is issued from an unbound response.
+                            DownloadOfflineFileManager.reestablishDownloadedGeneration(
+                                file = file,
+                                userDrive = userDrive,
+                                okHttpClient = okHttpClient,
+                            )
+                        }
+                    ) {
                         val outcome = runBlocking {
                             DownloadOfflineFileManager.publishStagedCacheCopy(context, file, cacheFile, userDrive, staged)
                         }

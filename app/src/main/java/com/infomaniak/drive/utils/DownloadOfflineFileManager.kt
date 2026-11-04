@@ -687,24 +687,11 @@ class DownloadOfflineFileManager(
             // copy is discarded and the intent retained (the pending marker stays for the
             // re-drive); the next pass re-fetches the metadata and re-downloads. No
             // known-version proof is manufactured from an unbound response.
-            val generationEstablished = runCatching {
-                val postDownload = ApiRepository.getFileDetails(
-                    file = File(id = file.id, driveId = userDrive.driveId),
-                    okHttpClient = okHttpClient,
-                )
-                postDownload.data?.takeIf { postDownload.isSuccess() && it.id == file.id }?.let { fresh ->
-                    val freshVersion = fresh.version?.number ?: 0
-                    val claimedVersion = file.version?.number ?: 0
-                    when {
-                        freshVersion > 0 && claimedVersion > 0 ->
-                            freshVersion == claimedVersion && fresh.revisedAt == file.revisedAt
-                        else ->
-                            fresh.revisedAt == file.revisedAt &&
-                                fresh.lastModifiedAt == file.lastModifiedAt &&
-                                fresh.size == file.size
-                    }
-                } == true
-            }.getOrDefault(false)
+            val generationEstablished = reestablishDownloadedGeneration(
+                file = file,
+                userDrive = userDrive,
+                okHttpClient = okHttpClient,
+            )
             if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated && !generationEstablished) {
                 runCatching { staged.delete() }
                 SentryLog.i(
@@ -2472,6 +2459,56 @@ class DownloadOfflineFileManager(
          * partial bytes — or delete existing bytes — at the destination. The destination is
          * never touched before the staged copy is complete.
          */
+        /**
+         * Generation establishment for a completed download (issue: round 22 #23, round 23
+         * #22): the download route carries no revision token, so the only available
+         * establishment is a post-download details comparison — and a LATER details
+         * response is not response-bound identity (nothing here establishes a server
+         * guarantee excluding cached/stale or ABA observations). Coarse field equality is
+         * accepted ONLY when NEITHER side reported a version: a KNOWN claimed version with
+         * an unknown fresh version passes nothing (the fresh response that cannot report a
+         * version against a versioned claim establishes no generation). Every `false`
+         * means the bytes' generation is UNKNOWABLE — the caller discards the bytes and
+         * preserves the intent; no known-version proof is manufactured from an unbound
+         * response.
+         */
+        private fun downloadedGenerationEstablished(file: File, fresh: File): Boolean {
+            val freshVersion = fresh.version?.number ?: 0
+            val claimedVersion = file.version?.number ?: 0
+            return when {
+                freshVersion > 0 && claimedVersion > 0 ->
+                    freshVersion == claimedVersion && fresh.revisedAt == file.revisedAt
+                freshVersion <= 0 && claimedVersion <= 0 ->
+                    fresh.revisedAt == file.revisedAt &&
+                        fresh.lastModifiedAt == file.lastModifiedAt &&
+                        fresh.size == file.size
+                // KNOWN CLAIMED, UNKNOWN FRESH (issue: round 23 #22): the previous coarse
+                // fallback accepted this arm — a versioned claim meeting a version-less
+                // details response was "proved" by mutable field equality alone.
+                else -> false
+            }
+        }
+
+        /**
+         * The post-download details re-fetch (OUTSIDE every lock) that the worker's and the
+         * direct callers' generation binding runs before any publication (issue: round 22
+         * #23, round 23 #22). An indeterminate answer (transport failure, error response,
+         * identity mismatch, unestablishable comparison) is `false`, never a pass.
+         */
+        internal suspend fun reestablishDownloadedGeneration(
+            file: File,
+            userDrive: UserDrive,
+            okHttpClient: OkHttpClient,
+        ): Boolean = runCatching {
+            val postDownload = ApiRepository.getFileDetails(
+                file = File(id = file.id, driveId = userDrive.driveId),
+                okHttpClient = okHttpClient,
+            )
+            postDownload.data
+                ?.takeIf { postDownload.isSuccess() && it.id == file.id }
+                ?.let { fresh -> downloadedGenerationEstablished(file, fresh) }
+        }.getOrDefault(null) == true
+
         internal suspend fun publishDownloadedCopy(
             context: Context,
             file: File,
@@ -2510,6 +2547,26 @@ class DownloadOfflineFileManager(
                     runCatching { if (staged.exists()) staged.delete() }
                     return PublicationOutcome.FAILED
                 }
+                // GENERATION-BOUND RESPONSE BINDING, EVERY DIRECT CALLER (issue: round 23
+                // #22): the preview, dialog and SAF publications previously published
+                // current-route response bytes under the EARLIER metadata capture's
+                // version — R2 bytes returned after an R1 metadata fetch received an R1
+                // proof. The worker's post-download establishment runs here too, OUTSIDE
+                // every lock, before any publication; an unestablishable generation
+                // discards the staged bytes and fails the transfer — nothing is
+                // published, no intent/marker is consumed, and no known-version proof is
+                // issued from an unbound response. (Public-share destinations are out of
+                // scope: the share routes cannot re-establish generation here at all.)
+                if (!file.isPublicShared() &&
+                    !reestablishDownloadedGeneration(
+                        file = file,
+                        userDrive = userDrive,
+                        okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
+                    )
+                ) {
+                    runCatching { if (staged.exists()) staged.delete() }
+                    return PublicationOutcome.FAILED
+                }
                 publishStagedCacheCopy(context, file, target, userDrive, staged)
             } else {
                 val appContext = Realm.getApplicationContext()
@@ -2520,6 +2577,23 @@ class DownloadOfflineFileManager(
                 val staged = newStagedFile(appContext, file)
                 val outcome = runCatching {
                     writeStaged(staged)
+                    // GENERATION-BOUND RESPONSE BINDING, EVERY DIRECT CALLER (issue:
+                    // round 23 #22): the same establishment as the worker and the plain
+                    // cache branch, OUTSIDE every lock, before any publication. An
+                    // unestablishable generation fails the transfer: the failure path
+                    // below discards the staged bytes and any prepared record, no
+                    // intent/marker is consumed, and no known-version proof is issued
+                    // from an unbound response. (Public-share destinations are out of
+                    // scope: the share routes cannot re-establish generation here.)
+                    if (!file.isPublicShared() &&
+                        !reestablishDownloadedGeneration(
+                            file = file,
+                            userDrive = userDrive,
+                            okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
+                        )
+                    ) {
+                        error("Downloaded generation could not be established for file ${file.id}")
+                    }
                     publishStagedOfflineFile(userDrive, isInheritedDownload, file, target, staged)
                 }.onFailure { exception ->
                     SentryLog.e(TAG, "Staged offline publication failed for ${target.path}", exception)
