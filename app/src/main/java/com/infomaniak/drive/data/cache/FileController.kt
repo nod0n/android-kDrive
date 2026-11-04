@@ -74,6 +74,13 @@ object FileController {
     /** Ancestry resolutions per gallery pass (issue: round 19 #27) — bounded, retried next refresh. */
     private const val GALLERY_ANCESTRY_RESOLUTION_BUDGET = 4
 
+    /**
+     * Fair rotating start offset for the gallery ancestry work set (issue: round 22 #16): each
+     * pass starts its bounded budget at the next rotation position, so a persistently failing
+     * ancestor request cannot consume the budget ahead of independent candidates forever.
+     */
+    private val galleryAncestryRotationOffset = java.util.concurrent.atomic.AtomicLong(0)
+
     private val minDateToIgnoreCache = Calendar.getInstance().apply { add(Calendar.MONTH, -2) }.timeInMillis / 1000 // 3 month
 
     fun getFileById(realm: Realm, fileId: Int): File? {
@@ -1872,17 +1879,31 @@ object FileController {
             // destination. The budget bounds the pass; an unresolved payload keeps its
             // row (the re-link below) and retries on the next gallery refresh — never a
             // silent discard.
-            var ancestryBudget = GALLERY_ANCESTRY_RESOLUTION_BUDGET
-            ownedMovesRequiringAncestry.forEach { media ->
-                if (ancestryBudget <= 0) return@forEach
-                val missingAncestorId = firstMissingAncestorId(currentRealm, media.parentId) ?: return@forEach
-                ancestryBudget--
-                val ancestorDetails = runCatching {
-                    ApiRepository.getFileDetails(
-                        file = File(id = missingAncestorId, driveId = userDrive.driveId),
-                        okHttpClient = okHttpClient,
-                    )
-                }.getOrNull()?.data?.takeIf { it.id == missingAncestorId } ?: return@forEach
+            //
+            // FAIR ROTATING WORK SET (issue: round 22 #16): the pass previously always
+            // started at the first media-order candidate — four repeatedly failing
+            // ancestor requests consumed the whole budget before later candidates were
+            // ever considered, and several payloads sharing one missing ancestor each
+            // paid for it. Candidates are DEDUPLICATED per pass (one request per unique
+            // missing ancestor) and the pass starts at a rotating offset that advances
+            // every refresh; a failing candidate's request is simply retained for the
+            // next pass while independent candidates progress.
+            val ancestryCandidates = ownedMovesRequiringAncestry.mapNotNull { media ->
+                firstMissingAncestorId(currentRealm, media.parentId)
+            }.distinct()
+            if (ancestryCandidates.isNotEmpty()) {
+                val startOffset = (galleryAncestryRotationOffset.getAndIncrement() % ancestryCandidates.size).toInt()
+                val rotatedCandidates = ancestryCandidates.drop(startOffset) + ancestryCandidates.take(startOffset)
+                var ancestryBudget = GALLERY_ANCESTRY_RESOLUTION_BUDGET
+                rotatedCandidates.forEach { missingAncestorId ->
+                    if (ancestryBudget <= 0) return@forEach
+                    ancestryBudget--
+                    val ancestorDetails = runCatching {
+                        ApiRepository.getFileDetails(
+                            file = File(id = missingAncestorId, driveId = userDrive.driveId),
+                            okHttpClient = okHttpClient,
+                        )
+                    }.getOrNull()?.data?.takeIf { it.id == missingAncestorId } ?: return@forEach
                 // SAME CONTINUOUS PROTOCOL (issue: round 22 #14): the ancestor's commit
                 // runs under the intent monitor and the COMPLETE ascending lock set (the
                 // ancestor and its resulting parent) — the previous lockless upsert
@@ -1920,6 +1941,7 @@ object FileController {
                             )
                         }
                     }
+                }
                 }
             }
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
