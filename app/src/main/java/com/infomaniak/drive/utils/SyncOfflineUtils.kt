@@ -99,7 +99,7 @@ object SyncOfflineUtils {
         }
     }
 
-    private fun processChunk(
+    private suspend fun processChunk(
         context: Context,
         coroutineScope: CoroutineScope,
         userDrive: UserDrive,
@@ -162,7 +162,7 @@ object SyncOfflineUtils {
         }
     }
 
-    private fun handleFileAction(
+    private suspend fun handleFileAction(
         context: Context,
         fileAction: LastFileAction,
         localFilesMap: Map<Int, File>,
@@ -197,7 +197,7 @@ object SyncOfflineUtils {
         }
     }
 
-    private fun updateFile(
+    private suspend fun updateFile(
         context: Context,
         ioFile: IOFile,
         localFile: File,
@@ -340,7 +340,7 @@ object SyncOfflineUtils {
     /**
      * Update the local file with the remote file
      */
-    private fun downloadOfflineFile(
+    private suspend fun downloadOfflineFile(
         context: Context,
         file: File,
         remoteFile: File,
@@ -377,16 +377,34 @@ object SyncOfflineUtils {
         }
 
         if (!file.isMarkedAsOffline && (!remoteFile.isOfflineAndIntact(remoteOfflineFile) || pathChanged)) {
+            // Preservation against the OLD row baseline BEFORE the metadata replacement
+            // (issue: round 8 #1): with baseline T1, an unregistered local edit T2 and a newer
+            // remote revision T3 (T1 < T2 < T3), committing T3 metadata first would advance the
+            // baseline, and the subsequent download would then classify the T2 bytes as clean
+            // and replace them. The shared boundary judges the existing copy against the old
+            // row, snapshots a dirty edit into the durable upload queue, and returns the OLD row
+            // when preservation fails — in that case the action stays deferred and the cursor
+            // is retained.
+            val commitFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                realm = realm,
+                remoteFiles = listOf(remoteFile),
+                userDrive = userDrive,
+            ).first()
+            if (commitFile !== remoteFile) return false
             FileController.updateExistingFile(newFile = remoteFile, realm = realm)
             // Preserve the download origin: a refresh of a file covered by an offline folder is
             // an inherited download, so its completion can never manufacture an explicit pin
-            // after an unmark (issue #1902).
-            Utils.downloadAsOfflineFile(
-                context = context,
-                file = remoteFile,
-                userDrive = userDrive,
-                isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
-            )
+            // after an unmark (issue #1902). The enqueue's persistence is awaited before this
+            // action reports handled (issue: round 8 #12).
+            if (!Utils.downloadAsOfflineFileAwaitingEnqueue(
+                    context = context,
+                    file = remoteFile,
+                    userDrive = userDrive,
+                    isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+                )
+            ) {
+                return false
+            }
             return true
         }
         if (file.isMarkedAsOffline && !remoteFile.isOfflineAndIntact(remoteOfflineFile)) {
@@ -394,13 +412,18 @@ object SyncOfflineUtils {
             // round 7 #16): it can outlive failed or cancelled work, and reporting this action
             // handled without durable work would advance the sync cursor past a missing or
             // stale pin. Idempotently enqueue the scoped refresh — the download chain is
-            // serialized, so a worker that already owns the file simply completes first.
-            Utils.downloadAsOfflineFile(
-                context = context,
-                file = remoteFile,
-                userDrive = userDrive,
-                isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
-            )
+            // serialized, so a worker that already owns the file simply completes first. The
+            // enqueue's persistence is awaited before handled is reported; an enqueue failure
+            // defers the action and retains the cursor (issue: round 8 #12).
+            if (!Utils.downloadAsOfflineFileAwaitingEnqueue(
+                    context = context,
+                    file = remoteFile,
+                    userDrive = userDrive,
+                    isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+                )
+            ) {
+                return false
+            }
         }
         // The local state already matches the remote revision, or a queued worker durably owns
         // the refresh: nothing left to do for this action (issue: round 6 #11).

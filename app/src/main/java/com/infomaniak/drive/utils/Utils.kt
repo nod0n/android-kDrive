@@ -41,6 +41,7 @@ import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.Operation
 import androidx.work.WorkManager
 import androidx.work.workDataOf
 import androidx.concurrent.futures.await
@@ -72,6 +73,7 @@ import com.infomaniak.drive.ui.fileList.preview.PreviewPDFActivity
 import com.infomaniak.drive.ui.fileList.preview.PreviewSliderFragmentArgs
 import com.infomaniak.drive.utils.SyncUtils.uploadFolder
 import com.infomaniak.drive.views.FileInfoActionsView.Companion.SINGLE_OPERATION_CUSTOM_TAG
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -329,6 +331,39 @@ object Utils {
         userDrive: UserDrive = UserDrive(),
         isInheritedDownload: Boolean = false,
     ) {
+        enqueueOfflineDownload(context, file, userDrive, isInheritedDownload)
+    }
+
+    /**
+     * Same enqueue as [downloadAsOfflineFile], but awaits WorkManager's persistence of the
+     * request before returning (issue: round 8 #12): the fire-and-forget enqueue discards the
+     * [Operation], so a caller that reports its action "handled" on enqueue alone can advance
+     * a durable cursor while the request is not persisted yet — a process death or enqueue
+     * failure in that window leaves the consumed action without durable work. A failed or
+     * cancelled await returns false so the caller reports the action deferred instead.
+     */
+    suspend fun downloadAsOfflineFileAwaitingEnqueue(
+        context: Context,
+        file: File,
+        userDrive: UserDrive = UserDrive(),
+        isInheritedDownload: Boolean = false,
+    ): Boolean {
+        return try {
+            enqueueOfflineDownload(context, file, userDrive, isInheritedDownload).result.await()
+            true
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (exception: Exception) {
+            false
+        }
+    }
+
+    private fun enqueueOfflineDownload(
+        context: Context,
+        file: File,
+        userDrive: UserDrive,
+        isInheritedDownload: Boolean,
+    ): Operation {
         val workManager = WorkManager.getInstance(context)
 
         if (file.isMarkedAsOffline) workManager.cancelAllWorkByTag(file.getWorkerTag())
@@ -352,7 +387,7 @@ object Utils {
             .setExpeditedIfAvailable()
             .build()
 
-        workManager.enqueueUniqueWork(DownloadWorker.TAG, ExistingWorkPolicy.APPEND_OR_REPLACE, downloadRequest)
+        return workManager.enqueueUniqueWork(DownloadWorker.TAG, ExistingWorkPolicy.APPEND_OR_REPLACE, downloadRequest)
     }
 
     fun enqueueBulkDownloadWorker(
