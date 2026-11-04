@@ -153,9 +153,20 @@ class AppLockTransitions(
             }
 
             val persisted = persist(enabled)
-            admission.write {
-                policyGeneration += 1
-                if (pendingGeneration == generation && persisted) pendingGeneration = null
+            if (persisted) {
+                // The committed write is the durable verification: publish the matching cache
+                // and clear any unresolved-maintenance denial inside this same admission
+                // boundary, so a successful request is a reachable recovery path (R6-3).
+                admission.write {
+                    policyGeneration += 1
+                    if (pendingGeneration == generation) pendingGeneration = null
+                    if (unresolvedMaintenanceDenial) {
+                        unresolvedMaintenanceDenial = false
+                        publish(enabled)
+                    }
+                }
+            } else {
+                admission.write { policyGeneration += 1 }
             }
             cancelAdmittedWork()
             onTransition()
@@ -235,18 +246,19 @@ class AppLockTransitions(
     }
 
     /**
-     * Maintenance reconcile (R5-3): a successful durable read plus this matching publication
-     * complete together — clears the pending denial and the unresolved-maintenance state and
-     * publishes [durableEnabled], the value future durable reads will actually present (an
-     * absent store reads as the default disabled value).
+     * Maintenance reconcile (R5-3/R6-3): clears the pending denial and the
+     * unresolved-maintenance state and publishes [durableEnabled] — the value future durable
+     * reads will actually present (an absent store reads as the default disabled value) — all
+     * inside one admission boundary so read-verification, publication and clearing complete
+     * together.
      */
     fun reconcileAfterMaintenance(durableEnabled: Boolean) {
         admission.write {
             policyGeneration += 1
             pendingGeneration = null
             unresolvedMaintenanceDenial = false
+            publish(durableEnabled)
         }
-        publish(durableEnabled)
         onTransition()
     }
 
