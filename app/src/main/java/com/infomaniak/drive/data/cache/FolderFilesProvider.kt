@@ -312,17 +312,27 @@ object FolderFilesProvider {
                         // POST-LOCK-WAIT check (issue: round 21 #22): the caller's executing
                         // context rides the cancellation callback.
                         checkCancelled()
+                        // THE CANDIDATE'S ACTUAL SCOPE THROUGH PRESERVATION AND UPDATE
+                        // (issue: round 22 #18): the details request and the row lock already
+                        // use candidateScope — preservation (snapshot registration, offline
+                        // path derivation, ownership identity) and the conditional update
+                        // previously still received the presentation CONTAINER scope, so a
+                        // shared candidate from drive D2 displayed under D1 snapshotted
+                        // under D1 and mutated through D1-keyed locks no D2 worker serializes
+                        // with. The container scope keeps only the presentation membership
+                        // lock; the row-then-container nesting order is this resolver's
+                        // consistent combined order.
                         val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                             realm = realm,
                             remoteFiles = listOf(details),
-                            userDrive = userDrive,
+                            userDrive = candidateScope,
                             observedById = mapOf(deferredId to preObservation),
                         ).first()
                         if (committable === details) {
                             val committed = FileController.updateExistingFileIfNotOlder(
                                 newFile = committable,
                                 realm = realm,
-                                userDrive = userDrive,
+                                userDrive = candidateScope,
                                 observed = preObservation,
                             )
                             if (committed) {
