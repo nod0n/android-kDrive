@@ -153,9 +153,14 @@ object FolderFilesProvider {
         // exactly as before (the offline walk resolves such candidates with fresh
         // details requests instead, issue: round 18 #4).
         val sequenceObservations = if (cursor == null) {
-            FileController.getFileById(realm, folderId)?.children
-                ?.associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
-                ?: emptyMap()
+            // DURABLE PRE-HTTP MEMBERSHIP (issue: round 19 #25): the same basis as the
+            // walk's observations — the presentation children list is cleared and rebuilt
+            // by every first-page commit, so a retained pending candidate whose link a
+            // previous pass dropped lost its observation and its retry authority.
+            realm.where(File::class.java)
+                .equalTo(File::parentId.name, folderId)
+                .findAll()
+                .associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
         } else {
             observedById
         }

@@ -194,18 +194,22 @@ object OfflineFolderUtils {
         // response was in flight predates this stamp.
         val requestGeneration = OfflineFolderController.rootIntentGeneration(rootFolderId)
 
-        // COMPLETE PRE-REQUEST OBSERVATIONS (issue: round 16 #16): the folder's children as
-        // they stood before the FIRST listing request — detached at depth one, so the
-        // embedded version survives (issue: round 16 #9). They anchor tied identity changes
-        // through the shared boundary and the committing transaction: without them a
-        // legitimate same-second directory rename was rejected on every pass, and the
-        // offline sync (which excludes directories) provided no recovery route. They are
-        // ALSO the cleanup's candidate authority (issue: round 18 #25): a child whose
-        // membership was established AFTER the request (a move-in, or a newer walk's
-        // publication) is not in this map and is never cleared by this response.
-        val observedById = FileController.getFileById(realm, folderId)?.children
-            ?.associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
-            ?: emptyMap()
+        // COMPLETE PRE-REQUEST OBSERVATIONS (issues: round 16 #16, round 19 #25): the
+        // folder's children as they stood before the FIRST listing request — detached at
+        // depth one, so the embedded version survives (issue: round 16 #9). The basis is
+        // the DURABLE PARENT MEMBERSHIP (the parentId chains), captured BEFORE the HTTP
+        // request — the previous presentation children-list basis was cleared and rebuilt
+        // by every first-page commit, so a retained pending candidate whose link a
+        // previous pass had dropped lost its observation, and with it its cleanup retry
+        // authority. They anchor tied identity changes through the shared boundary and
+        // the committing transaction, and they are ALSO the cleanup's candidate authority
+        // (issue: round 18 #25): a child whose membership was established AFTER the
+        // request (a move-in, or a newer walk's publication) is not in this map and is
+        // never cleared by this response.
+        val observedById = realm.where(File::class.java)
+            .equalTo(File::parentId.name, folderId)
+            .findAll()
+            .associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
 
         while (true) {
             coroutineContext.ensureActive()
@@ -667,12 +671,23 @@ object OfflineFolderUtils {
 
             if (child.isFolder()) {
                 if (OfflineFolderController.isOfflineRoot(child.id, customRealm = realm)) return@forEach
+                // The boundary's PRE-REQUEST identity must still describe the live folder
+                // (issue: round 19 #25): a folder restored or re-created since the request
+                // is a newer identity this response is not the authority for.
+                val liveChild = FileController.getFileById(realm, child.id)
+                val observedChild = observedById[child.id]
+                if (liveChild == null || observedChild == null ||
+                    !FileController.isSameObservation(liveChild, observedChild)
+                ) {
+                    return@forEach
+                }
                 clearConfirmedAbsentSubtree(context, realm, child.id, folderId, userDrive, result, traversalStartedGeneration)
             } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
                     isOffline = child.isOffline,
                     isInOfflineFolder = child.isInOfflineFolder,
                 )
             ) {
+                val fileClearable = listingAbsentClearable(folderId, traversalStartedGeneration)
                 OfflineFolderController.clearFileCoverage(
                     context = context,
                     realm = realm,
@@ -681,8 +696,17 @@ object OfflineFolderUtils {
                     result = result,
                     isFolder = false,
                     // The listing of [folderId] is this cleanup's authority (issue: round 9 #6),
-                    // revalidated against roots changed after the REQUEST (issue: round 18 #25).
-                    isStillClearable = listingAbsentClearable(folderId, traversalStartedGeneration),
+                    // revalidated against roots changed after the REQUEST (issue: round 18
+                    // #25) — and the candidate's FULL PRE-REQUEST IDENTITY is compared
+                    // THROUGH the destroying transaction (issue: round 19 #25): a restore
+                    // or newer generation committed since the request is not this
+                    // response's to clear.
+                    isStillClearable = { currentRealm, candidate ->
+                        fileClearable(currentRealm, candidate) &&
+                            observedById[candidate.id]?.let { observed ->
+                                FileController.isSameObservation(candidate, observed)
+                            } == true
+                    },
                 )
             }
         }
