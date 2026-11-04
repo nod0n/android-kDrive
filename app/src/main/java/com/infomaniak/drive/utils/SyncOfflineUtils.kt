@@ -547,9 +547,46 @@ object SyncOfflineUtils {
                             // download branch runs for the accepted revision.
                             when {
                                 liveRow == null -> true
+                                // ACCEPT/CLASSIFY THE INCOMING GENERATION BEFORE BYTE PROOF
+                                // (issue: round 19 #22): a same-second re-upload advances the
+                                // VERSION without moving revisedAt — the previous byte-proof
+                                // fall-through (proven-current, then the bare marker)
+                                // consumed the action on R1's published bytes while the
+                                // incoming R2 waited unclassified. Two KNOWN, differing
+                                // versions classify the incoming generation FIRST: the
+                                // scoped download branch runs for it.
+                                ((remoteFile.version?.number ?: 0) > 0) &&
+                                    ((liveRow.version?.number ?: 0) > 0) &&
+                                    (remoteFile.version?.number ?: 0) > (liveRow.version?.number ?: 0) -> {
+                                    downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
+                                    downloadOutcome.handled
+                                }
                                 freshIoFile != null &&
                                     liveRow.isOfflineAndProvenCurrent(context, freshIoFile, userDrive) -> true
-                                liveRow.isMarkedAsOffline -> true
+                                liveRow.isMarkedAsOffline -> {
+                                    // MARKER ALONE IS NOT DURABLE WORK (issue: round 19 #22):
+                                    // the marker's enqueue may have failed (the marker is its
+                                    // retry evidence) or its work may have been lost —
+                                    // consuming the action on the bare marker advanced the
+                                    // cursor over work that might never run. The
+                                    // account-scoped KEEP verification enqueue is idempotent:
+                                    // re-establishing the work here is a no-op when it is
+                                    // already pending, and the cursor advance waits for the
+                                    // enqueue's WorkManager persistence (the pending
+                                    // advance) before consuming. A failed enqueue keeps the
+                                    // marker and defers the action.
+                                    val operation = runCatching {
+                                        Utils.downloadAsOfflineFileOperation(
+                                            context = context,
+                                            file = liveRow,
+                                            userDrive = userDrive,
+                                            isInheritedDownload = !liveRow.isOffline,
+                                            cancelPendingWork = false,
+                                        )
+                                    }.getOrNull()
+                                    downloadOutcome = DownloadActionOutcome(handled = operation != null, pendingOperation = operation)
+                                    downloadOutcome.handled
+                                }
                                 else -> {
                                     downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                                     downloadOutcome.handled
