@@ -33,6 +33,8 @@ import com.infomaniak.drive.utils.SyncUtils.syncImmediately
 import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
 import java.util.Date
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Realm data access for the durable offline folder roots (issue #1902).
@@ -43,6 +45,28 @@ import java.util.Date
  * another overlapping root.
  */
 object OfflineFolderController {
+
+    // Process-local monotonic root-intent generations (issue: round 12 #9): every root state
+    // change — creation, revival, pending-removal marking, record deletion — records a
+    // strictly increasing generation per folderId. Wall-clock creation time missed revivals
+    // (which retain their original createdAt) and broke on same-millisecond or
+    // backward-adjusted clocks. Process-local by design: after a restart the map rebuilds
+    // empty and pre-existing roots are conservatively treated as predating any traversal,
+    // preserving the listing-maintenance semantics; every intra-process race the freshness
+    // horizon exists for is covered.
+    private val rootIntentGenerations = ConcurrentHashMap<Int, Long>()
+    private val rootIntentGenerationClock = AtomicLong()
+
+    /** Records a root state change for [folderId]; callers invoke it at every record mutation. */
+    internal fun noteRootIntentChange(folderId: Int) {
+        rootIntentGenerations.merge(folderId, rootIntentGenerationClock.incrementAndGet()) { current, next -> maxOf(current, next) }
+    }
+
+    /** The generation stamp a cleanup traversal takes BEFORE its collection checks. */
+    internal fun currentRootIntentGeneration(): Long = rootIntentGenerationClock.get()
+
+    private fun rootIntentChangedSince(folderId: Int, sinceGeneration: Long): Boolean =
+        (rootIntentGenerations[folderId] ?: 0L) > sinceGeneration
 
     data class RemovalResult(
         var rootExisted: Boolean = false,
@@ -67,6 +91,7 @@ object OfflineFolderController {
                     } else if (existingRoot != null) {
                         // Re-marking a root whose deferred cleanup is still running revives it.
                         realm.executeTransaction { if (existingRoot.isValid) existingRoot.isPendingRemoval = false }
+                        noteRootIntentChange(folder.id)
                         updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
                         true
                     } else {
@@ -81,6 +106,7 @@ object OfflineFolderController {
                             ).apply { initUid() }
                             it.copyToRealm(root)
                         }
+                        noteRootIntentChange(folder.id)
                         // Mark the root folder itself as covered and its walk as pending until the
                         // BulkDownloadWorker has walked it once.
                         updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
@@ -118,12 +144,14 @@ object OfflineFolderController {
 
                     if (isCoveredByAncestorRoot) {
                         realm.executeTransaction { if (root.isValid) root.deleteFromRealm() }
+                        noteRootIntentChange(folderId)
                         RemovalResult(rootExisted = true)
                     } else {
                         // Persist the deferred-cleanup intent BEFORE any cleanup runs: the record is
                         // the durable owner and must exist while protected copies remain (issue:
                         // round 3 #8).
                         realm.executeTransaction { if (root.isValid) root.isPendingRemoval = true }
+                        noteRootIntentChange(folderId)
 
                         val result = clearCoverageRecursively(context, realm, folderId, userDrive) {
                             // Abort as soon as the record is gone (completed elsewhere) or revived.
@@ -148,6 +176,7 @@ object OfflineFolderController {
                                     ?.takeIf { it.isValid && it.isPendingRemoval }
                                     ?.deleteFromRealm()
                             }
+                            noteRootIntentChange(folderId)
                         }
                         result
                     }
@@ -191,20 +220,22 @@ object OfflineFolderController {
     }
 
     /**
-     * Whether an ACTIVE root record covering [folderId] — its own row or any ancestor — was
-     * COMMITTED after [sinceEpochMillis] (issue: round 11 #8): the freshness gate for
-     * remote-listing cleanup. Roots predating a traversal remain the listing's maintenance
-     * responsibility (the walk must keep clearing stale rows beneath them), while a root
-     * committed between the traversal's collection checks and its destructive decisions is a
-     * newly authoritative owner whose record the traversal's parent-only predicates never
-     * saw — its coverage must stop those decisions.
+     * Whether an ACTIVE root record covering [folderId] — its own row or any ancestor —
+     * changed intent after [sinceGeneration] (issues: round 11 #8, round 12 #9): the
+     * freshness gate for remote-listing cleanup, keyed on the monotonic root-intent
+     * generations rather than wall-clock creation time, so a REVIVED root's renewed intent
+     * is caught too. Roots whose intent predates the traversal's stamp remain the listing's
+     * maintenance responsibility (the walk must keep clearing stale rows beneath them),
+     * while a root created or revived between the traversal's collection checks and its
+     * destructive decisions is a newly authoritative owner whose state those checks never
+     * saw — it stops those decisions.
      */
-    internal fun hasActiveRootCoveringSince(folderId: Int, realm: Realm, sinceEpochMillis: Long): Boolean {
+    internal fun hasActiveRootCoveringSince(folderId: Int, realm: Realm, sinceGeneration: Long): Boolean {
         getOfflineRoot(folderId, customRealm = realm)?.let { ownRoot ->
-            if (ownRoot.isValid && !ownRoot.isPendingRemoval && ownRoot.createdAt.time > sinceEpochMillis) return true
+            if (ownRoot.isValid && !ownRoot.isPendingRemoval && rootIntentChangedSince(folderId, sinceGeneration)) return true
         }
         return walkAncestryForRoot(realm, folderId) { root ->
-            root.isValid && !root.isPendingRemoval && root.createdAt.time > sinceEpochMillis
+            root.isValid && !root.isPendingRemoval && rootIntentChangedSince(root.folderId, sinceGeneration)
         }
     }
 
@@ -421,6 +452,7 @@ object OfflineFolderController {
                         ?.takeIf { it.isValid && it.isPendingRemoval }
                         ?.deleteFromRealm()
                 }
+                noteRootIntentChange(root.folderId)
             }
         }
     }
