@@ -415,9 +415,12 @@ object OfflineFolderController {
             return when {
                 // A pending upload owns the bytes at the old path until it completes (issue:
                 // round 5 #9): committing the new metadata now would leave the upload reading a
-                // location the walk no longer tracks. Deferring keeps the old row and location
-                // authoritative; the caller retries reconciliation after the upload finished.
+                // location the walk no longer tracks. The same applies to an UNSENT record
+                // retained after failure/cancellation (issue: round 6 #1). Deferring keeps the
+                // old row and location authoritative; the caller retries reconciliation after
+                // the upload finished.
                 UploadFile.hasPendingUpload(uri = Uri.fromFile(oldOfflineFile).toString()) ||
+                    UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(oldOfflineFile).toString()) ||
                     UploadFile.hasUploadRecordFor(
                         fileName = oldIdentityName,
                         remoteFolder = oldIdentityParentId,
@@ -717,7 +720,11 @@ object OfflineFolderController {
     internal fun protectionStateOf(file: File, offlineFile: IOFile, userDrive: UserDrive): CopyProtection {
         val fileModifiedAt = Date(offlineFile.lastModified())
         return when {
-            UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) -> CopyProtection.PENDING_UPLOAD
+            // A pending upload owns the bytes; so does an UNSENT record retained after a
+            // failure or cancellation (soft-deleted): it is still the only copy of the edit,
+            // regardless of the row's advanced clean baseline (issue: round 6 #1).
+            UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) ||
+                UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(offlineFile).toString()) -> CopyProtection.PENDING_UPLOAD
             UploadFile.hasUploadRecordFor(
                 fileName = file.name,
                 remoteFolder = file.parentId,

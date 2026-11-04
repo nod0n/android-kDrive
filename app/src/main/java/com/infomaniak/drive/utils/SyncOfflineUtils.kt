@@ -280,11 +280,11 @@ object SyncOfflineUtils {
             // per-file coordination so a publication or cleanup cannot interleave (issue:
             // round 4 #4).
             synchronized(OfflineFileCoordination.lockFor(userDrive, localFile.id)) {
-                if (remoteFile != null) {
-                    remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
-                    remoteFile.size = ioFile.length()
-                    FileController.updateExistingFile(newFile = remoteFile, realm = realm)
-                }
+                // Registration FIRST (issue: round 6 #4): if the upload record cannot be created,
+                // the replacement metadata must not be committed — a committed clean baseline
+                // without a durable owner would leave the copy reading as clean and unprotected.
+                // If the metadata write fails after a successful registration, the record still
+                // owns the source and the next sync retries.
                 UploadFile(
                     uri = uri.toString(),
                     driveId = userDrive.driveId,
@@ -295,6 +295,12 @@ object SyncOfflineUtils {
                     type = UploadFile.Type.SYNC_OFFLINE.name,
                     userId = userDrive.userId,
                 ).store()
+
+                if (remoteFile != null) {
+                    remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
+                    remoteFile.size = ioFile.length()
+                    FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+                }
 
                 context.syncImmediately(isAutomaticTrigger = false)
             }

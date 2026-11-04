@@ -369,6 +369,25 @@ open class UploadFile(
         }
 
         /**
+         * Whether [uri] is still owned by an UNSENT offline upload record, whether currently
+         * pending OR retained after a failure/cancellation (soft-deleted with [deletedAt]).
+         * Such a record means these bytes are the only copy of an unsent edit: that is content
+         * ownership, independent of the upload's scheduling state (issue: round 6 #1) — a
+         * soft-deleted unsent record must keep protecting its source exactly like a pending
+         * one, even when the file row's clean baseline was advanced at registration.
+         */
+        fun hasRetainedUnsentUpload(uri: String, customRealm: Realm? = null): Boolean {
+            val block: (Realm) -> Boolean = { realm ->
+                realm.uploadTable
+                    .equalTo(UploadFile::uri.name, uri)
+                    .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
+                    .isNull(UploadFile::uploadAt.name)
+                    .count() > 0
+            }
+            return customRealm?.let(block) ?: getRealmInstance().use(block)
+        }
+
+        /**
          * Whether an upload record already exists for this exact content revision (identified by
          * file name, target folder, drive, user and modification date). Distinct from
          * [hasPendingUpload]: the uri of an offline folder snapshot changes per revision, so the
