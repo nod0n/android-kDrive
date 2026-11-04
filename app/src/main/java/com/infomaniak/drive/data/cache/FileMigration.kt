@@ -428,7 +428,15 @@ class FileMigration : RealmMigration {
         //   a local edit after a backward-dated newer generation commits, issue: round 15 #6)
         if (oldVersionTemp == 13L) {
             schema[File::class.java.simpleName]?.apply {
-                addField(File::publishedCleanBaseline.name, Long::class.java)
+                // BOXED column for the nullable model property (issue: round 16 #1): the model
+                // declares `Long?`, whose Realm schema column is the boxed java.lang.Long and
+                // NULLABLE — a primitive long column would mismatch the generated model schema
+                // on every supported migration chain from versions 0–13 (fresh schema-14
+                // creation does not exercise this step). No v14 database has shipped: the
+                // in-place correction is safe; a FUTURE schema bump must add a v14→v15 step
+                // that asserts/repairs this column's boxed nullability for databases already
+                // migrated by an older build.
+                addField(File::publishedCleanBaseline.name, Long::class.javaObjectType)
             }
 
             oldVersionTemp++
