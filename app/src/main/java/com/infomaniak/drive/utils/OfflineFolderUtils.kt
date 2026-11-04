@@ -334,7 +334,10 @@ object OfflineFolderUtils {
             // so the livelock the round-17 design addressed stays resolved. UNRESOLVED ids
             // (no row, failed request, superseded/preservation deferral) keep the walk
             // incomplete for the next pass.
-            var resolvedAny = false
+            // ALL UNRESOLVED IDS ARE TRACKED (issue: round 19 #19): an id leaves this set
+            // only when ITS OWN resolution is accepted — the folder completes only when
+            // the set is EMPTY, never because one resolution succeeded.
+            val unresolvedIds = deferredMoveIds.toMutableSet()
             for (deferredId in fairDeferredSelection(deferredMoveIds, folderId, DEFERRED_RESOLUTION_BUDGET)) {
                 coroutineContext.ensureActive()
                 // PRE-REQUEST observation (issue: round 18 #4): the candidate's current local
@@ -350,7 +353,7 @@ object OfflineFolderUtils {
                 }.getOrNull()
                 val details = detailsResponse?.data?.takeIf { it.id == deferredId } ?: continue
                 val accepted = synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                    OfflineFileCoordination.withFileLock(userDrive, deferredId) {
+                    OfflineFileCoordination.withLocksFor(userDrive, listOf(deferredId, folderId).distinct()) {
                         val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                             realm = realm,
                             remoteFiles = listOf(details),
@@ -362,25 +365,64 @@ object OfflineFolderUtils {
                             // the id stays deferred for the next pass.
                             false
                         } else {
-                            FileController.updateExistingFileIfNotOlder(
+                            val committed = FileController.updateExistingFileIfNotOlder(
                                 newFile = committable,
                                 realm = realm,
                                 userDrive = userDrive,
                                 observed = preObservation,
                             )
+                            if (committed) {
+                                // RESOLVED MOVE-IN MATERIALIZATION (issue: round 19 #19):
+                                // a single-file commit bypasses [processPage], whose child
+                                // commits link the row under the container, materialize
+                                // inherited coverage and mark the download intent — without
+                                // this a resolved move-in stayed stranded from traversal
+                                // with no coverage and no download.
+                                realm.executeTransaction {
+                                    val freshRow = FileController.getFileById(realm, deferredId)
+                                        ?: return@executeTransaction
+                                    val container = FileController.getFileById(realm, folderId)
+                                    if (container != null && freshRow.parentId == folderId &&
+                                        container.children.none { it.id == deferredId }
+                                    ) {
+                                        container.children.add(freshRow)
+                                    }
+                                    // COVERAGE + DOWNLOAD INTENT (mirrors processPage's
+                                    // materialization): flagged covered only under the
+                                    // walk's STILL-ACTIVE root; the pending marker drives
+                                    // the worker for a copy that is not proven current and
+                                    // not owned by a pending upload.
+                                    if (!freshRow.isFolder() &&
+                                        OfflineFolderController.hasActiveOfflineRoot(rootFolderId, customRealm = realm) &&
+                                        OfflineFolderController.isInsideActiveRoot(realm, deferredId)
+                                    ) {
+                                        freshRow.isInOfflineFolder = true
+                                        val offlineFile = freshRow.getOfflineFile(context, userDrive.userId)
+                                        val needsDownload = offlineFile == null ||
+                                            !freshRow.isOfflineAndProvenCurrent(context, offlineFile, userDrive)
+                                        if (needsDownload && (offlineFile == null ||
+                                                !UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()))
+                                        ) {
+                                            freshRow.isMarkedAsOffline = true
+                                            fileIds.add(freshRow.id)
+                                        }
+                                    }
+                                }
+                            }
+                            committed
                         }
                     }
                 }
-                if (accepted) resolvedAny = true
+                if (accepted) unresolvedIds.remove(deferredId)
             }
-            if (!resolvedAny) {
-                // NOTHING resolved this pass (all budget entries unresolved): the
-                // reconciliation is incomplete — the affected files keep their old metadata
-                // and location this round, and the root stays incomplete for retry (issue:
-                // round 5 #8/#9). The folder itself WAS fully listed — independent folders
-                // keep walking so one occupied destination cannot starve the whole root
-                // (issue: round 6 #10).
-                SentryLog.i(TAG, "Deferred ${deferredMoveIds.size} file(s) whose old copies are not safely preserved yet")
+            if (unresolvedIds.isNotEmpty()) {
+                // ANY UNRESOLVED ID KEEPS THE FOLDER INCOMPLETE (issue: round 19 #19): one
+                // accepted resolution is that file's resolution, not the folder's
+                // completion — the affected files keep their old metadata and location,
+                // and the root stays incomplete for retry (issue: round 5 #8/#9). The
+                // folder itself WAS fully listed — independent folders keep walking so one
+                // occupied destination cannot starve the whole root (issue: round 6 #10).
+                SentryLog.i(TAG, "Deferred ${unresolvedIds.size} file(s) whose old copies are not safely preserved yet")
                 return FolderWalkOutcome.DEFERRED_MOVES
             }
         }
