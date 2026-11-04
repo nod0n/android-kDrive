@@ -122,7 +122,15 @@ class DownloadOfflineFileManager(
         // inside the boundary and the commit reenter this lock.
         val committed = OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
             val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
-                OfflineFolderController.reconcileOwnedCopiesBeforeCommit(realm, listOf(remoteFile), userDrive).first()
+                // The transfer's basis [file] is the request-observed state (issue: round 13
+                // #1): a tied-timestamp identity change is accepted only while the live row
+                // still matches it.
+                OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                    realm = realm,
+                    remoteFiles = listOf(remoteFile),
+                    userDrive = userDrive,
+                    observedById = mapOf(remoteFile.id to file),
+                ).first()
             }
             if (commitFile !== remoteFile) {
                 SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
@@ -134,9 +142,9 @@ class DownloadOfflineFileManager(
             // otherwise this transfer's later publication compares against the rolled-back row,
             // passes, and leaves bytes and metadata describing different revisions. The
             // acceptance decision reads the live row INSIDE the committing transaction
-            // (issue: round 11 #5).
+            // (issue: round 11 #5) against the request-observed basis (issue: round 13 #1).
             FileController.getRealmInstance(userDrive).use { realm ->
-                FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive)
+                FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive, observed = file)
             }
         }
         if (!committed) {
@@ -616,14 +624,18 @@ class DownloadOfflineFileManager(
                         (live.revisedAt == 0L && live.lastModifiedAt > file.lastModifiedAt) ||
                         live.parentId != file.parentId ||
                         live.name != file.name ||
-                        // Accepted content-generation identity (issue: round 12 #6): the
-                        // committed metadata and this transfer must describe the SAME
-                        // revision — an equal-seconds newer revision (a different version
-                        // number or modification baseline) supersedes the staged bytes, so
-                        // completion can never run against newer metadata while installing
-                        // older bytes.
-                        (live.version?.number ?: 0) != (file.version?.number ?: 0) ||
+                        // Accepted content-generation identity (issues: round 12 #6, round
+                        // 13 #9): the committed metadata and this transfer must describe the
+                        // SAME revision. UNKNOWN version data (listing rows omit the
+                        // optional expansion) is not a generation difference — only two
+                        // KNOWN, differing version numbers supersede; the COMPLETE content
+                        // baseline (modification time AND size) decides otherwise, so a
+                        // tied-timestamp same-size-differs revision still supersedes the
+                        // staged bytes.
+                        ((live.version?.number ?: 0) > 0 && (file.version?.number ?: 0) > 0 &&
+                            live.version?.number != file.version?.number) ||
                         live.lastModifiedAt != file.lastModifiedAt ||
+                        live.size != file.size ||
                         run {
                             val livePath = appContextForCheck?.let { ctx -> live.getOfflineFile(ctx, userDrive.userId)?.path }
                             livePath == null || livePath != target.path

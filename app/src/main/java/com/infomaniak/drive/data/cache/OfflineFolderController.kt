@@ -608,9 +608,10 @@ object OfflineFolderController {
         realm: Realm,
         remoteFiles: List<File>,
         userDrive: UserDrive,
-        isStale: (live: File, incoming: File) -> Boolean = { live, incoming ->
+        isStale: (live: File, incoming: File, observed: File?) -> Boolean = { live, incoming, _ ->
             FileController.isStaleReplacement(live, incoming)
         },
+        observedById: Map<Int, File> = emptyMap(),
     ): List<File> {
         val context = Realm.getApplicationContext() ?: return remoteFiles
         if (remoteFiles.isEmpty()) return remoteFiles
@@ -634,9 +635,9 @@ object OfflineFolderController {
                 // an upload targeting the old location. The OLD row is returned in place: the
                 // caller commits (or defers to) the live state, and nothing on the filesystem or
                 // in the upload queue is touched. Authoritative-change callers (the offline sync's
-                // actions) pass the generation-only predicate — an identity difference at equal
-                // revisions is the change being applied there, not staleness.
-                if (isStale(oldRow, remoteFile)) return@withFileLock oldRow
+                // actions) pass the action predicate — an identity difference at equal revisions
+                // is the change being applied there, not staleness.
+                if (isStale(oldRow, remoteFile, observedById[remoteFile.id])) return@withFileLock oldRow
                 val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
                     ?: return@withFileLock remoteFile
                 // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7).

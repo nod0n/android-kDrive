@@ -597,18 +597,20 @@ object FileController {
         }
     }
 
-    fun upsertActionFile(realm: Realm, folderId: Int, actionFile: File, userDrive: UserDrive) {
+    fun upsertActionFile(realm: Realm, folderId: Int, actionFile: File, userDrive: UserDrive, actionAt: Long? = null) {
         // Shared upsert boundary (issue: round 5 #5): an activity refresh can carry a
         // rename/move; the owned copy at the old location is preserved before the metadata
         // replacement, and a deferred reconciliation keeps the OLD row authoritative.
-        // Authoritative-change flow (the activity event IS the change): the generation-only
-        // gate — an identity difference at equal revisions is the rename being applied, and a
-        // superseded ACTION is already prevented upstream by the activity ordering.
+        // Authoritative-change flow (the activity event IS the change): the action gate —
+        // newer generations AND newer non-Sync metadata reject the activity, and its
+        // nullable timestamp bounds the row's activity cursor (issue: round 13 #3).
         val preservedActionFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
             realm = realm,
             remoteFiles = listOf(actionFile),
             userDrive = userDrive,
-            isStale = { live, incoming -> FileController.isSupersededGeneration(live, incoming) },
+            isStale = { live, incoming, _ ->
+                FileController.isStaleForAuthoritativeAction(live, incoming, actionAt)
+            },
         ).first()
         realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
             if (!realmFolder.children.contains(preservedActionFile)) {
@@ -623,7 +625,7 @@ object FileController {
                     }
                 }
             } else {
-                updateFileFromActivity(realm, preservedActionFile, realmFolder.id, userDrive)
+                updateFileFromActivity(realm, preservedActionFile, realmFolder.id, userDrive, actionAt)
             }
         }
     }
@@ -697,20 +699,53 @@ object FileController {
     /**
      * Whether [incoming] metadata must be rejected by a REPLACEMENT boundary — a path whose
      * incoming row would overwrite the live one wholesale (listings, the download manager's
-     * refresh, graph imports). Beyond [isSupersededGeneration], the SERVER MUTATION timestamp
-     * ([File.updatedAt] — bumped by every rename/move/metadata change and copied monotonically
-     * onto the row) orders two observations of the same content revision (issue: round 12 #3):
-     * an observation from an OLDER server state is stale, while a response describing a LATER
-     * server mutation — a CURRENT rename at an unchanged content revision — is ACCEPTED. The
-     * previous equal-revision identity rejection refused exactly that response on every
-     * listing and refetch (refetching returns the same comparison), permanently rejecting
-     * legitimate renames and stranding already-moved bytes.
+     * refresh, graph imports). Beyond [isSupersededGeneration] and the [File.updatedAt]
+     * ordering (issue: round 12 #3), an IDENTITY TIE — all ordering fields equal but name or
+     * parent differing — is accepted ONLY when the live row still matches the
+     * request-observed state [observed] exactly (issue: round 13 #1): a rename inside the
+     * timestamp interval ties on every server timestamp, so a delayed response naming the
+     * abandoned location is indistinguishable from a current one by timestamps alone.
+     * Accepting such a tie let preservation register a current edit under the OBSOLETE
+     * identity and delete the original — a misdirected SYNC_OFFLINE upload that no later
+     * listing can undo. Without an observed basis the tie is rejected (deferred): renames
+     * reach the row through the authoritative action path, and a deferral never spends
+     * preservation side effects. With a basis, a tied rename against an UNCHANGED
+     * observation is the server's current truth and is accepted.
      */
-    internal fun isStaleReplacement(live: File, incoming: File): Boolean = when {
+    internal fun isStaleReplacement(live: File, incoming: File, observed: File? = null): Boolean = when {
         isSupersededGeneration(live, incoming) -> true
         live.updatedAt > incoming.updatedAt -> true
+        isSameIdentity(live, incoming) -> false
+        // Identity tie: unchanged observation required, otherwise ambiguous → reject.
+        observed == null || !isSameObservation(live, observed) -> true
         else -> false
     }
+
+    /** Whether two rows describe the same identity/generation observation of one file. */
+    private fun isSameObservation(a: File, b: File): Boolean =
+        a.revisedAt == b.revisedAt &&
+            a.updatedAt == b.updatedAt &&
+            (a.version?.number ?: 0) == (b.version?.number ?: 0) &&
+            a.parentId == b.parentId &&
+            a.name == b.name
+
+    private fun isSameIdentity(live: File, incoming: File): Boolean =
+        live.parentId == incoming.parentId && live.name == incoming.name
+
+    /**
+     * Whether an AUTHORITATIVE ACTION (the offline sync's rename/move/download/upload
+     * registration, folder activities) is stale against the live row (issues: round 12 #5,
+     * round 13 #3/#10): a strictly newer committed generation rejects it, and so does newer
+     * metadata committed OUTSIDE Sync — listings and details can move a file without
+     * advancing its activity cursor, so [File.updatedAt] ordering applies here too, not only
+     * the Sync cursor. [actionAt] is the action's nullable ordering token; an unavailable
+     * timestamp (null or 0, legacy data) applies no cursor bound — the generation and
+     * updatedAt gates remain the fallback both before preservation and at commit.
+     */
+    internal fun isStaleForAuthoritativeAction(live: File, incoming: File, actionAt: Long?): Boolean =
+        isSupersededGeneration(live, incoming) ||
+            live.updatedAt > incoming.updatedAt ||
+            (actionAt != null && actionAt > 0 && live.lastActionAt >= actionAt)
 
     /**
      * Conditional metadata replacement (issue: round 10 #4, refined round 11 #4/#5/#6): the
@@ -722,15 +757,21 @@ object FileController {
      * publication's supersession check and its rename. Returns false (nothing written) when
      * the incoming row is stale or the row vanished.
      */
-    fun updateExistingFileIfNotOlder(newFile: File, realm: Realm, userDrive: UserDrive): Boolean {
+    fun updateExistingFileIfNotOlder(
+        newFile: File,
+        realm: Realm,
+        userDrive: UserDrive,
+        observed: File? = null,
+    ): Boolean {
         return insertOrUpdateFile(
             realm = realm,
             newFile = newFile,
             oldFile = getFileById(realm, newFile.id),
             userDrive = userDrive,
             // Must EXIST (issue: round 12 #2): a worker refresh without a live row has nothing
-            // to refresh — absence is rejection, not insertion.
-            acceptIf = { live -> live != null && !isStaleReplacement(live, newFile) },
+            // to refresh — absence is rejection, not insertion. [observed] carries the
+            // request-observed row state for tied-timestamp acceptance (issue: round 13 #1).
+            acceptIf = { live -> live != null && !isStaleReplacement(live, newFile, observed) },
         )
     }
 
@@ -745,19 +786,20 @@ object FileController {
         newFile: File,
         realm: Realm,
         userDrive: UserDrive,
-        requireActionAtOrAfter: Long = Long.MAX_VALUE,
+        requireActionAtOrAfter: Long? = null,
     ): Boolean {
         return insertOrUpdateFile(
             realm = realm,
             newFile = newFile,
             oldFile = getFileById(realm, newFile.id),
             userDrive = userDrive,
-            // Must EXIST (issue: round 12 #2), generation-only, and the row's activity cursor
-            // must not already be PAST the action being applied (issue: round 12 #5) — a
-            // delayed action's commit must not overwrite a location a later action already
-            // committed, nor rewind anything.
+            // Must EXIST (issue: round 12 #2). The action bound is NULLABLE (issue: round 13
+            // #10) — an unavailable timestamp applies no cursor constraint instead of a
+            // zero bound that would reject every row with a positive cursor — and the gate
+            // accounts for newer metadata committed by non-Sync writers via the updatedAt
+            // ordering (issue: round 13 #3).
             acceptIf = { live ->
-                live != null && !isSupersededGeneration(live, newFile) && live.lastActionAt <= requireActionAtOrAfter
+                live != null && !isStaleForAuthoritativeAction(live, newFile, requireActionAtOrAfter)
             },
         )
     }
@@ -1515,7 +1557,7 @@ object FileController {
         return customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
-    private fun updateFileFromActivity(realm: Realm, remoteFile: File, folderId: Int, userDrive: UserDrive) {
+    private fun updateFileFromActivity(realm: Realm, remoteFile: File, folderId: Int, userDrive: UserDrive, actionAt: Long? = null) {
         // Branch split on row EXISTENCE only (the conditional commit's result must not select
         // the child-add path): a stale response keeps the live row and must not re-add it as a
         // child of the container.
@@ -1661,6 +1703,13 @@ object FileController {
         isInOfflineFolder = oldFile.isInOfflineFolder
         responseAt = oldFile.responseAt
         if (path.isEmpty() && oldFile.path.isNotEmpty()) path = oldFile.path
+        // Omitted version data is UNKNOWN, not a generation difference (issue: round 13 #9):
+        // listing routes omit the optional version expansion, so a same-generation response
+        // would otherwise null out a populated version and make later transfers fail the
+        // version comparison. Inherit the live row's version only here — the acceptance
+        // gates have already established the incoming row is not older, so this can never
+        // relabel stale content with a newer version.
+        if ((version?.number ?: 0) == 0 && (oldFile.version?.number ?: 0) > 0) version = oldFile.version
         // NO revisedAt transplant (issue: round 11 #4): the incoming row carries its own
         // server revision; copying the live row's newer timestamp onto a stale incoming
         // object would LABEL old content as the newer generation — the publication
