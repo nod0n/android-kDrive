@@ -222,12 +222,18 @@ object OfflineFolderUtils {
                 order = order,
             )
 
+            // CANCELLATION IMMEDIATELY POST-HTTP, BEFORE ANY EFFECT (issue: round 19 #26):
+            // the loop-top check ran BEFORE the request — a cancelled walk whose response
+            // just arrived must not run any effect from it (the root-removal path in
+            // particular).
+            coroutineContext.ensureActive()
+
             if (!apiResponse.isSuccess()) {
                 // A deleted root folder answers object_not_found on its first page: only this
                 // explicit, verified missing-object response drops the durable root; transient
                 // or indeterminate failures preserve it for a retry.
                 if (isRootFolder && cursor == null && isRootGone(apiResponse)) {
-                    removeRootCoverage(context, realm, folderId, userDrive)
+                    removeRootCoverage(context, realm, folderId, userDrive, requestGeneration)
                     return FolderWalkOutcome.INCOMPLETE
                 }
                 SentryLog.i(TAG, "Failed to list folder $folderId (cursor: ${cursor != null})")
@@ -265,6 +271,8 @@ object OfflineFolderUtils {
         }
 
         val last = lastResponse ?: return FolderWalkOutcome.INCOMPLETE
+        // Post-HTTP cancellation before the commit/cleanup effects (issue: round 19 #26).
+        coroutineContext.ensureActive()
         val remoteIds = allPages.mapTo(mutableSetOf()) { it.id }
 
         val completeResponse = CursorApiResponse<List<File>>(
@@ -841,9 +849,30 @@ object OfflineFolderUtils {
      * the inherited coverage below it. Explicit pins and files under another root are kept, and
      * nothing outside the offline cache is deleted.
      */
-    private fun removeRootCoverage(context: Context, realm: Realm, rootFolderId: Int, userDrive: UserDrive) {
-        SentryLog.i(TAG, "Offline root folder $rootFolderId disappeared remotely, removing its coverage")
-        OfflineFolderController.removeOfflineRoot(folderId = rootFolderId, userDrive = userDrive, customRealm = realm)
+    private fun removeRootCoverage(
+        context: Context,
+        realm: Realm,
+        rootFolderId: Int,
+        userDrive: UserDrive,
+        requestGeneration: Long,
+    ) {
+        // EXACT REQUEST-GENERATION AUTHORITY UNDER THE INTENT MONITOR (issue: round 19
+        // #26): the OBJECT_NOT_FOUND answer belongs to the request whose generation was
+        // captured BEFORE it — a root removed and REVIVED (or a newer walk started) while
+        // the response was in flight is a newer authority this response says nothing
+        // about. The removal runs under the intent monitor, and only while the root's
+        // generation is still the request's.
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            if (OfflineFolderController.rootIntentChangedSince(rootFolderId, requestGeneration)) {
+                SentryLog.i(
+                    TAG,
+                    "Root $rootFolderId intent changed while the listing was in flight; removal deferred to the newer authority",
+                )
+                return
+            }
+            SentryLog.i(TAG, "Offline root folder $rootFolderId disappeared remotely, removing its coverage")
+            OfflineFolderController.removeOfflineRoot(folderId = rootFolderId, userDrive = userDrive, customRealm = realm)
+        }
     }
 
     /**
