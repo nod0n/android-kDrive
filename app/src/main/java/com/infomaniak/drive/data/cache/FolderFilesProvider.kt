@@ -268,11 +268,16 @@ object FolderFilesProvider {
                     okHttpClient = okHttpClient,
                 )
             }.getOrNull()?.data?.takeIf { it.id == deferredId } ?: continue
-            // Cancellation after the resolving HTTP and again after the coordination
-            // wait, before any side effect (issue: round 20 #22).
+            // Cancellation after the resolving HTTP, before any side effect (issue: round
+            // 20 #22) — and AGAIN after the coordination wait (issue: round 21 #22): the
+            // previous second check would have run BEFORE the lock acquisition, so a
+            // cancellation while blocked still allowed preservation and commits afterward.
             checkCancelled()
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withLocksFor(userDrive, listOf(deferredId, folderId).distinct()) {
+                    // POST-LOCK-WAIT check (issue: round 21 #22): the caller's executing
+                    // context rides the cancellation callback.
+                    checkCancelled()
                     val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                         realm = realm,
                         remoteFiles = listOf(details),

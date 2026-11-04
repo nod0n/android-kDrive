@@ -370,10 +370,16 @@ object OfflineFolderUtils {
                 // (never an ordinary resolution failure).
                 coroutineContext.ensureActive()
                 val details = detailsResponse?.data?.takeIf { it.id == deferredId } ?: continue
-                // ...and again after the coordination wait, before any side effect.
-                coroutineContext.ensureActive()
+                // ...and AGAIN AFTER the coordination wait (issue: round 21 #22): the
+                // previous second check ran BEFORE the lock acquisition, so a cancellation
+                // while blocked still allowed preservation and commits afterward. The
+                // executing context is captured in the suspend caller and checked with the
+                // non-suspending extension INSIDE the section, after all required locks
+                // are held, before any side effect.
+                val executingContext = coroutineContext
                 val accepted = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withLocksFor(userDrive, listOf(deferredId, folderId).distinct()) {
+                        executingContext.ensureActive()
                         val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                             realm = realm,
                             remoteFiles = listOf(details),

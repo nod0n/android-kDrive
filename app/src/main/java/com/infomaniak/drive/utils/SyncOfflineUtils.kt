@@ -246,6 +246,12 @@ object SyncOfflineUtils {
         pendingAdvances: MutableList<PendingCursorAdvance>,
     ) {
         if (localFilesMap.isNotEmpty()) {
+            // DURABLE PUBLICATION RECONCILIATION BEFORE EVERY EDIT SELECTION (issue: round
+            // 21 #10): interrupted publications (crash between the rename and the baseline
+            // commit, or a failed restore) are resolved from their durable recovery records
+            // BEFORE the activity and no-action paths select uploads — a stale baseline must
+            // never re-classify freshly published (or restored) bytes as an unsent edit.
+            DownloadOfflineFileManager.reconcileInterruptedRecoveries(context)
             val fileActionsBody = localFilesMap.values.map { file ->
                 FileLastActivityBody.FileActionBody(
                     id = file.id,
@@ -492,11 +498,21 @@ object SyncOfflineUtils {
                     // current location, decides upload vs download vs rename.
                     val freshIoFile = liveRow?.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
                     val freshSourceModifiedSeconds = (freshIoFile?.lastModified() ?: 0L) / 1_000L
+                    // DURABLE PUBLICATION BEFORE EDIT SELECTION (issue: round 21 #10): a
+                    // crash after bytes+provenance publication but before the baseline
+                    // commit leaves the OLD baseline — the provenance record's immutable
+                    // byte identity is the durable publication evidence, and a certified
+                    // copy is never an edit (the same evidence the no-action sweep uses);
+                    // an EDIT after that publication fails the hash and stays an edit.
+                    val durablePublication = freshIoFile != null && liveRow != null &&
+                        DownloadOfflineFileManager.readPublishedProvenance(context, freshIoFile)
+                            ?.let { it.identifies(liveRow, userDrive) && it.certifiesBytes(freshIoFile) } == true
                     // Operation selection from PUBLISHED-BYTE provenance (issue: round 17 #3):
                     // bytes are an edit iff NEWER THAN THEIR OWN published baseline — a clean
                     // copy with a preserved future mtime is never uploaded over a newer server
                     // revision; remote REVISION ordering separately selects reconciliation.
-                    val bytesEdited = freshSourceModifiedSeconds > (liveRow?.effectivePublishedBaseline ?: 0L)
+                    val bytesEdited = freshSourceModifiedSeconds > (liveRow?.effectivePublishedBaseline ?: 0L) &&
+                        !durablePublication
                     val remoteNewer = remoteFile.revisedAt > (liveRow?.revisedAt ?: 0L)
                     when {
                         bytesEdited ->
@@ -599,6 +615,19 @@ object SyncOfflineUtils {
                                 // publication CAS rejects a genuinely superseded payload).
                                 liveRow.size != remoteFile.size ||
                                     liveRow.lastModifiedAt != remoteFile.lastModifiedAt -> {
+                                    downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
+                                    downloadOutcome.handled
+                                }
+                                // UNKNOWN INCOMING IDENTITY IS NEVER EQUAL (issue: round 21
+                                // #19): a payload that OMITS its version while retaining the
+                                // live generation's coarse identity (size, mtime, same-second
+                                // revisedAt) is an UNRESOLVABLE candidate — it may be a
+                                // different generation. Coarse equality and the OLD row's
+                                // byte proof must not authorize consuming the activity: the
+                                // scoped download branch resolves the identity
+                                // authoritatively (its publication CAS rejects a genuinely
+                                // superseded payload; an equal generation converges).
+                                (remoteFile.version?.number ?: 0) <= 0 && ((liveRow.version?.number ?: 0) > 0) -> {
                                     downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                                     downloadOutcome.handled
                                 }
@@ -724,9 +753,12 @@ object SyncOfflineUtils {
             }
             // EXCLUSIVE fresh source ownership before any snapshot (issue: round 17 #2): a
             // path co-claimed by another row defers registration — never snapshot foreign
-            // bytes under this file's identity.
+            // bytes under this file's identity. A FAILED/AMBIGUOUS ownership answer is
+            // UNRESOLVED, not handled (issue: round 21 #26): consuming the activity here
+            // would drop a dirty rename/move identity without preserving or committing it —
+            // the cursor stays until a fresh, exact registration succeeds.
             if (OfflineFolderController.exclusivePathOwner(realm, context, userDrive, freshSource.path) != liveRow.id) {
-                return true
+                return false
             }
             // UPLOAD-NEED revalidation against the FRESH bytes (issue: round 16 #5): branch
             // selection happened earlier against possibly stale timestamps — the bytes
@@ -741,7 +773,16 @@ object SyncOfflineUtils {
             // conservative (the effective baseline falls back to accepted metadata, and the
             // edited judgement preserves it).
             val freshModifiedSeconds = freshSource.lastModified() / 1_000L
-            val uploadStillNeeded = freshModifiedSeconds > liveRow.effectivePublishedBaseline
+            // DURABLE PUBLICATION BEFORE REGISTRATION (issue: round 21 #10): a crash after
+            // bytes+provenance publication but before the baseline commit leaves the OLD
+            // baseline — the provenance record's immutable byte identity is the durable
+            // publication evidence, and certified bytes are the accepted published
+            // generation, never an unsent edit to re-register (an EDIT after the
+            // publication fails the hash and registers normally).
+            val publishedProof = DownloadOfflineFileManager.readPublishedProvenance(context, freshSource)
+            val durablePublication = publishedProof?.identifies(liveRow, userDrive) == true &&
+                publishedProof.certifiesBytes(freshSource)
+            val uploadStillNeeded = freshModifiedSeconds > liveRow.effectivePublishedBaseline && !durablePublication
             if (!uploadStillNeeded) return true
             val uri = Uri.fromFile(freshSource)
             val fileModifiedAt = Date(freshSource.lastModified())
@@ -763,7 +804,11 @@ object SyncOfflineUtils {
             // retained A's modification date — B registers normally.
             val registrationName = remoteFile?.name ?: liveRow.name
             val registrationFolder = remoteFile?.parentId ?: liveRow.parentId
-            val registrationHash = UploadFile.sha256OrNull(freshSource) ?: return true
+            // An UNREADABLE source is unresolved, not handled (issue: round 21 #26): the
+            // previous `true` consumed a dirty rename/move activity without preserving or
+            // committing its new identity — the cursor stays until a fresh, exact
+            // registration succeeds.
+            val registrationHash = UploadFile.sha256OrNull(freshSource) ?: return false
             if (UploadFile.hasUploadRecordFor(
                     fileName = registrationName,
                     remoteFolder = registrationFolder,
