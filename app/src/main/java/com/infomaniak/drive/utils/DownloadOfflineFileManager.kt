@@ -1308,7 +1308,7 @@ class DownloadOfflineFileManager(
                 val recordScope = UserDrive(userId = record.userId, driveId = record.driveId)
                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withFileLock(recordScope, record.fileId) {
-                        runCatching { reconcileOneRecovery(context, record, recoveryFile, target) }.getOrDefault(false)
+                        runCatching { reconcileOneRecovery(context, record, recordScope, recoveryFile, target) }.getOrDefault(false)
                     }
                 }
                 if (!resolved) allResolved = false
@@ -1319,6 +1319,7 @@ class DownloadOfflineFileManager(
         private fun reconcileOneRecovery(
             context: Context,
             record: RecoveryRecord,
+            recordScope: UserDrive,
             recoveryFile: IOFile,
             target: IOFile,
         ): Boolean {
@@ -1375,8 +1376,10 @@ class DownloadOfflineFileManager(
             } else {
                 // A partial or unreadable target matching neither the backup nor a
                 // self-certifying publication: the VERIFIED restore is the only
-                // resolution (the previous sweep's blind overwrite is gone).
-                restoreRecoveryCopy(
+                // resolution (the previous sweep's blind overwrite is gone). Its
+                // verified outcome IS the branch's result: a failed restore stays
+                // unresolved (the recovery state is retained for the next sweep).
+                return restoreRecoveryCopy(
                     context = context,
                     recoveryFile = recoveryFile,
                     target = target,
@@ -1642,11 +1645,17 @@ class DownloadOfflineFileManager(
                                 ownerRow != null && ownerProof?.identifies(ownerRow, userDrive) == true
                             }
                         }.getOrDefault(false)
+                        // The record's content hash hoisted NULLABLY (round-22 build fix):
+                        // the when-branches are independent — branch two's ownerProof
+                        // non-null check does not smart-cast branch three's receiver. A
+                        // null record (or a hashless one) classifies through the same arms
+                        // as before; nothing is weakened.
+                        val ownerContentHash = ownerProof?.contentHash
                         var classified = when {
                             currentTargetHash == null -> true
                             ownerProof != null && ownerRowIdentifies && ownerProof.certifiesBytes(target) -> false
-                            ownerRowIdentifies && ownerProof.contentHash != null &&
-                                ownerProof.contentHash != currentTargetHash -> true
+                            ownerRowIdentifies && ownerContentHash != null &&
+                                ownerContentHash != currentTargetHash -> true
                             else -> true
                         }
                         // STAGED COMPARISON (issue: round 22 #6): only UNPROVEN

@@ -458,7 +458,7 @@ object SyncOfflineUtils {
                     }
                 }
             }
-            else -> updateFile(context, localFile, fileAction, userDrive, realm, pendingAdvances)
+            else -> updateFile(context, localFile, fileAction, userDrive, realm, pendingAdvances, pendingRecoveryIds)
         }
     }
 
@@ -469,6 +469,7 @@ object SyncOfflineUtils {
         userDrive: UserDrive,
         realm: Realm,
         pendingAdvances: MutableList<PendingCursorAdvance>,
+        pendingRecoveryIds: Set<Int>,
     ): Boolean {
         val remoteFile = fileAction.file
         if (remoteFile == null) {
