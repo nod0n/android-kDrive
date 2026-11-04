@@ -89,7 +89,18 @@ class DownloadProgressViewModel : ViewModel() {
             return@launch
         }
         if (file.isObsoleteOrNotIntact(outputFile) || file.isOffline || file.isInOfflineFolder) {
-            if ((file.isOffline || file.isInOfflineFolder) &&
+            // PRESERVATION-REQUIRED IS NOT USABLE-COMPLETE (issue: round 22 #7): KEEP_LOCAL
+            // certifies preservation, not usability — a pending record after the original
+            // disappeared, a failed snapshot registration, or unproven historical content
+            // must never complete the dialog over missing, unreadable or truncated bytes.
+            // The completion validates readability and completeness against the retained
+            // generation's available evidence (an unknown row size stays conservative);
+            // otherwise the data is retained and the transfer defers through the
+            // coordinated publication (null progress, bytes kept).
+            val retainedUsable = outputFile.exists() &&
+                UploadFile.sha256OrNull(outputFile) != null &&
+                (file.size == null || outputFile.length() == file.size)
+            if ((file.isOffline || file.isInOfflineFolder) && retainedUsable &&
                 OfflineFolderController.decisionForReplacingOwnedCopy(file, outputFile, userDrive) ==
                 OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL
             ) {

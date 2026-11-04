@@ -396,7 +396,15 @@ open class File(
         // becoming unusable.
         val ownGeneration = provenance?.lastModifiedAt ?: effectivePublishedBaseline
         if ((offlineFile.lastModified() / 1_000L) != ownGeneration) return StoredOfflineCopyState.ABSENT_OR_STALE
-        if (provenance == null) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (provenance == null) {
+            // COMPLETENESS BEFORE READABILITY (issue: round 22 #7): a truncated legacy copy
+            // matching its recorded generation is INCOMPLETE — the same known-truncation
+            // rule as the certified path applies before any readable status, or the dialog
+            // reports 100% over truncated bytes. An unknown row size stays
+            // conservative-readable: it cannot prove truncation.
+            if (size != null && !isIntactFile(offlineFile)) return StoredOfflineCopyState.ABSENT_OR_STALE
+            return StoredOfflineCopyState.READABLE_UNVERIFIED
+        }
         // STRICT OWNER IDENTITY (issue: round 20 #11): CURRENTNESS requires the caller's
         // CAPTURED ACCOUNT — the scope is a required parameter, so remaining omissions
         // fail statically (issue: round 21 #25).
@@ -418,7 +426,13 @@ open class File(
         // classification follow from it). Such a copy keeps its historical
         // READABILITY_UNVERIFIED status; only a republished record carrying a content
         // hash can certify the generation.
-        if (provenance.contentHash == null) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (provenance.contentHash == null) {
+            // COMPLETENESS BEFORE READABILITY (issue: round 22 #7): a hashless record
+            // proves nothing about content — a truncated copy under it is incomplete,
+            // never readable. Same known-truncation rule as above.
+            if (size != null && !isIntactFile(offlineFile)) return StoredOfflineCopyState.ABSENT_OR_STALE
+            return StoredOfflineCopyState.READABLE_UNVERIFIED
+        }
         // CURRENTNESS still requires the copy to be INTACT against the row's accepted size
         // (issue: round 19 #13); KNOWN TRUNCATION IS NOT EVEN READABLE (issue: round 21
         // #12) — a copy whose length differs from the row's KNOWN accepted size is
