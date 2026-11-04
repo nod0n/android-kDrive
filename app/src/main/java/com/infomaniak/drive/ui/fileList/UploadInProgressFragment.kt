@@ -213,28 +213,25 @@ class UploadInProgressFragment : FileListFragment() {
                 UploadFile.deleteAll(listOf(it))
             }
             folderId?.let {
-                // Cancel/remove the SAME captured set, grouped by each record's actual owner,
-                // drive and folder (issue: round 7 #13): the folders view's sentinel (-1)
-                // never reaches a server-folder filter, and removal no longer sweeps a whole
-                // drive beyond the folders actually displayed. The folders view shows one
-                // representative per pending folder, so each (owner, drive, folder) group
-                // scopes the session cancellation and the fresh per-folder removal that
-                // captures that folder's records when cancellation starts.
-                displayedUploadRecords.toList()
+                // The EXACT intended set is captured once, from fresh per-group queries that
+                // include every pending member represented by the displayed folder rows
+                // (issue: round 8 #10): the same captured records drive both the session
+                // cancellations and the removal, so a record registered between the two
+                // operations can neither be removed without cancelling its session nor be
+                // cancelled by one query and removed by a different, broader one. The
+                // folders-view sentinel (-1) never reaches a folder filter.
+                val capturedRecords = displayedUploadRecords.toList()
                     .map { uploadRecord -> Triple(uploadRecord.userId, uploadRecord.driveId, uploadRecord.remoteFolder) }
                     .toSet()
-                    .forEach { (recordUserId, recordDriveId, recordFolder) ->
-                        UploadFile.cancelAllPendingFilesSessions(
-                            folderId = recordFolder,
+                    .flatMap { (recordUserId, recordDriveId, recordFolder) ->
+                        UploadFile.getPendingRecordsFor(
                             userId = recordUserId,
                             driveId = recordDriveId,
-                        )
-                        UploadFile.deleteAll(
-                            folderId = recordFolder,
-                            userId = recordUserId,
-                            driveId = recordDriveId,
+                            remoteFolder = recordFolder,
                         )
                     }
+                capturedRecords.forEach { record -> UploadFile.cancelSessionOf(record) }
+                UploadFile.deleteAll(capturedRecords)
 
                 fileRecyclerView?.post { fileAdapter.setFiles(listOf()) }
 

@@ -314,6 +314,11 @@ open class UploadFile(
         fun uploadFinished(uri: Uri) {
             getRealmInstance().use { realm ->
                 uploadFileByUriQuery(realm, uri.toString()).findFirst()?.let { uploadFile ->
+                    // Cancellation propagation by the exact identity (issue: round 8 #11): a
+                    // record cancelled while its transfer was executing — its soft delete
+                    // landed after the session was created — is NOT un-cancelled by the late
+                    // completion; it stays the retained owner of its unsent snapshot bytes.
+                    if (uploadFile.deletedAt != null) return@let
                     val isOwnedSnapshot = isDurableOfflineSnapshot(uploadFile.uri)
                     realm.executeTransaction {
                         uploadFile.uploadToken = null
@@ -543,6 +548,45 @@ open class UploadFile(
          * missing one. Each record is cancelled against its OWN drive identity — the drive the
          * session was actually created on — and its own captured-account client.
          */
+        /**
+         * Cancels ONE record's in-flight session against its own drive identity and captured
+         * client (issues: round 6 #9, round 8 #10): the exact captured set drives the per-record
+         * cancellations, so no second, broader folder query can cancel a different set than
+         * the one being removed.
+         */
+        fun cancelSessionOf(uploadFile: UploadFile) {
+            uploadFile.uploadToken?.let { token ->
+                ApiRepository.cancelSession(
+                    driveId = uploadFile.driveId,
+                    uploadToken = token,
+                    okHttpClient = uploadFile.okHttpClient,
+                )
+            }
+        }
+
+        /**
+         * Detached copies of the CURRENT pending records of one (owner, drive, folder) group,
+         * captured ONCE for a cancellation pass (issue: round 8 #10): the same captured records
+         * feed both the session cancellations and the removal, so a record registered between
+         * the two operations can neither be removed without cancelling its session nor
+         * cancelled by one query and removed by a different, broader one. Folder views
+         * represent many records per displayed row — this returns ALL of the folder's pending
+         * members, not just the representative.
+         */
+        fun getPendingRecordsFor(userId: Int, driveId: Int, remoteFolder: Int): List<UploadFile> {
+            return getRealmInstance().use { realm ->
+                realm.uploadTable
+                    .equalTo(UploadFile::userId.name, userId)
+                    .equalTo(UploadFile::driveId.name, driveId)
+                    .equalTo(UploadFile::remoteFolder.name, remoteFolder)
+                    .isNull(UploadFile::uploadAt.name)
+                    .isNull(UploadFile::deletedAt.name)
+                    .findAll()
+                    ?.let { realm.copyFromRealm(it, 0) }
+                    ?: emptyList()
+            }
+        }
+
         fun cancelAllPendingFilesSessions(folderId: Int, userId: Int, driveId: Int) {
             getRealmInstance().use { realm ->
                 realm.uploadTable

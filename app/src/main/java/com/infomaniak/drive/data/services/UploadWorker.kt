@@ -199,6 +199,15 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
             for ((index, fileToUpload) in uploadFiles.withIndex()) {
                 val isLastFile = index == uploadFiles.lastIndex
+                // Live revalidation by the EXACT captured uri, immediately before the upload
+                // starts (issue: round 8 #11): the capture is detached, and a cancellation
+                // that landed after the capture — token-less, so only the record's soft
+                // delete — must not be uploaded anyway just because its snapshot file still
+                // exists. Records completed in the meantime are skipped as well.
+                if (!UploadFile.hasPendingUpload(fileToUpload.uri)) {
+                    pendingUploadCounter.dec()
+                    continue
+                }
                 if (fileToUpload.canUpload()) {
                     uploadFile(fileToUpload, isLastFile)
                 } else {
