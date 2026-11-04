@@ -1775,16 +1775,16 @@ object FileController {
             // ancestry decision. The realm is refreshed first, and every media row's
             // COMPLETE destination ancestry is validated BEFORE the preservation boundary —
             // media-file reparenting included, not only directory payloads.
-            // OWNED-MOVE CLASSIFICATION (issue: round 19 #27) — a lock-free HINT read: a
-            // row whose destination chain is broken and which carries durable offline
-            // state requires ancestry; a NEW UNCACHED payload defers harmlessly. The
-            // committing section below revalidates everything under the full protocol.
+            // ANCESTRY-REQUIRING CLASSIFICATION (issues: round 19 #27, round 21 #23) — a
+            // lock-free HINT read: any payload whose destination chain is broken requires
+            // ancestry — an owned move (durable offline state) AND a new uncached payload
+            // alike (the uncached media's chain previously never grew, and its row was
+            // silently dropped from the cache). The committing section below revalidates
+            // everything under the full protocol; ordinary new-media caching with a
+            // COMPLETE chain is untouched.
             runCatching { currentRealm.refresh() }
             val ownedMovesRequiringAncestry = mediaList.filter { media ->
-                media.parentId > 0 && !destinationChainExists(currentRealm, media.parentId) &&
-                    getFileById(currentRealm, media.id)?.let { existing ->
-                        existing.isOffline || existing.isInOfflineFolder || existing.isMarkedAsOffline
-                    } == true
+                media.parentId > 0 && !destinationChainExists(currentRealm, media.parentId)
             }
             // EXPLICIT ANCESTRY RESOLUTION for owned-move payloads (issues: round 19 #27,
             // round 17 #5 doctrine) — OUTSIDE the intent monitor and file locks: the
@@ -1812,7 +1812,13 @@ object FileController {
                     userDrive,
                 ).first()
                 if (committableAncestor === ancestorDetails) {
-                    updateExistingFileIfNotOlder(committableAncestor, currentRealm, userDrive)
+                    // ABSENCE-AWARE ANCESTOR INSERT (issue: round 21 #23): the fetched
+                    // MISSING ancestor previously entered the must-exist updater, whose
+                    // live-row requirement rejected it — ancestry progress stayed at zero
+                    // forever. The upsert INSERTS the absent ancestor (with its
+                    // authoritative membership reconciliation) and conditionally updates a
+                    // present one; the fair per-pass budget keeps growing each chain.
+                    upsertFetchedFileIfNotOlder(committableAncestor, currentRealm, userDrive)
                 }
             }
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
@@ -1837,13 +1843,22 @@ object FileController {
                         galleryFolder.children.addAll(realm, committableMedia)
                         val chainOkIds = chainOkMedia.map { media -> media.id }.toSet()
                         mediaList.filter { media -> media.id !in chainOkIds }.forEach { deferred ->
-                            // Harmless new-uncached payloads have no row to re-link; an
-                            // unresolved owned move re-links its EXISTING row so its
-                            // identity and gallery presence survive to the next refresh.
-                            realm.where(File::class.java).equalTo(File::id.name, deferred.id).findFirst()?.let { existing ->
+                            // Harmless new-uncached payloads ARE CACHED (issue: round 21 #23):
+                            // the harmless-deferred classification previously dropped them
+                            // entirely when no row existed — online results masked the
+                            // missing offline fallback. The row is inserted and linked into
+                            // the Gallery presentation list (no offline state is
+                            // manufactured — the uncached row carries none); the ancestry
+                            // resolution above keeps growing its chain, and an unresolved
+                            // owned move re-links its EXISTING row so its identity and
+                            // gallery presence survive to the next refresh.
+                            val existing = realm.where(File::class.java).equalTo(File::id.name, deferred.id).findFirst()
+                            if (existing != null) {
                                 if (galleryFolder.children.none { child -> child.id == existing.id }) {
                                     galleryFolder.children.add(existing)
                                 }
+                            } else {
+                                galleryFolder.children.add(realm.copyToRealm(deferred))
                             }
                         }
                     }
