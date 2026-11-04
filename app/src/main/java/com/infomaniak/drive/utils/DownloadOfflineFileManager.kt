@@ -1132,17 +1132,43 @@ class DownloadOfflineFileManager(
          * destination's record and the move fails, instead of reporting success for moving
          * nothing. True only when a verified record now names [target].
          */
+        /**
+         * Durable RELOCATION RECOVERY STATE (issue: round 23 #14): the original proof text
+         * and the exact destination path, written BEFORE the destination proof is
+         * attempted — a failed relocation leaves the state on disk and the reconciliation
+         * sweep re-attempts the destination proof (the bytes are already at the target);
+         * a verified destination proof disposes it. The old proof is never destroyed
+         * without recoverable relocation state.
+         */
+        private fun proofRelocationRecordFile(context: Context, target: IOFile): IOFile =
+            IOFile(stagingDirectory(context), "proofmove_${target.absolutePath.hashCode()}.recovery")
+
+        private fun writeProofRelocationRecord(context: Context, target: IOFile, proofText: String): Boolean = runCatching {
+            proofRelocationRecordFile(context, target).writeText(
+                listOf("1", target.absolutePath, proofText).joinToString("\n")
+            )
+            true
+        }.getOrDefault(false)
+
         internal fun movePublishedProvenance(context: Context, source: IOFile, target: IOFile): Boolean {
             val provenance = readPublishedProvenance(context, source)
             if (provenance == null) {
                 deletePublishedProvenance(context, target)
                 return false
             }
+            // THE RELOCATION STATE EXISTS BEFORE THE DESTINATION WRITE IS ATTEMPTED
+            // (issue: round 23 #14): every failure path below leaves a durable record of
+            // the original proof and its exact destination; only a VERIFIED destination
+            // proof disposes it.
+            val relocationStateWritten = writeProofRelocationRecord(context, target, provenance.recordText(target))
+            if (!relocationStateWritten) {
+                // Without recoverable state the source proof is NOT destroyed: the old
+                // record stays at the source path (the caller's bytes have not moved yet
+                // in every current caller that reaches this branch — the destination
+                // registry could not even be established).
+                return false
+            }
             val recordFile = verifiedProvenanceFileFor(context, target) ?: run {
-                // The source record is still invalidated when the target cannot even be
-                // established (issue: round 22 #12): a record at a path whose bytes moved
-                // away must never lend its generation to later bytes there.
-                deletePublishedProvenance(context, source)
                 return false
             }
             val written = runCatching {
@@ -1150,18 +1176,24 @@ class DownloadOfflineFileManager(
                 true
             }.getOrDefault(false)
             if (!written) {
-                // PROOF-FAILURE RECOVERY STATE (issue: round 22 #12): the previous order
-                // deleted the SOURCE record BEFORE writing the target, so a failed write
-                // destroyed the only copy of the proof and a partial write could lend a
-                // truncated generation at the target. The partial target record is
-                // removed, the source record is invalidated (a record at the vacated
-                // path must never survive), and the moved bytes stay UNPROVEN — the
-                // walk's verification re-establishes the proof.
+                // A partial write must never lend a truncated generation (issue: round 22
+                // #12). The relocation state RETAINS the original proof for the sweep; the
+                // source record is invalidated only when the relocation state exists (the
+                // sweep re-writes the destination proof — a record at the vacated source
+                // path must never survive to lend its generation).
+                runCatching { recordFile.delete() }
+                deletePublishedProvenance(context, source)
+                return false
+            }
+            // VERIFIED DESTINATION PROOF (issue: round 23 #14): the written record must
+            // read back before any state is disposed.
+            if (readPublishedProvenance(context, target) == null) {
                 runCatching { recordFile.delete() }
                 deletePublishedProvenance(context, source)
                 return false
             }
             deletePublishedProvenance(context, source)
+            runCatching { proofRelocationRecordFile(context, target).delete() }
             return true
         }
 
@@ -1457,6 +1489,29 @@ class DownloadOfflineFileManager(
             }.getOrDefault(emptyList())
             var allResolved = true
             for (recordFile in records) {
+                // PROOF-RELOCATION RECOVERY (issue: round 23 #14): a proofmove record
+                // holds the original proof and its exact destination — the destination
+                // proof write is re-attempted and VERIFIED before the state is disposed;
+                // a failure keeps the state (and reports the sweep unresolved).
+                if (recordFile.name.startsWith("proofmove_")) {
+                    val proofMoveResolved = runCatching {
+                        val parts = recordFile.readText().split("\n", limit = 3)
+                        if (parts.size == 3 && parts[0].trim() == "1") {
+                            val target = IOFile(parts[1])
+                            val recordTarget = verifiedProvenanceFileFor(context, target)
+                            val written = recordTarget != null && runCatching {
+                                recordTarget.writeText(parts[2])
+                                true
+                            }.getOrDefault(false)
+                            if (written && readPublishedProvenance(context, target) != null) {
+                                runCatching { recordFile.delete() }
+                                true
+                            } else false
+                        } else false
+                    }.getOrDefault(false)
+                    if (!proofMoveResolved) allResolved = false
+                    continue
+                }
                 val record = readRecoveryRecord(recordFile)
                 if (record == null) {
                     // An unparseable (or legacy-format) record is never deleted: it may

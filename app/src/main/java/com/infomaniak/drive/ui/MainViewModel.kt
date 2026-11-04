@@ -762,8 +762,11 @@ class MainViewModel(
                                                     if (!transferSeen.add(node.id)) continue
                                                     node.children.forEach { transferStack.add(it) }
                                                     if (node.isFolder() || !(node.isOffline || node.isInOfflineFolder)) continue
-                                                    val destinationBytes = node.getOfflineFile(application, sharedScope.userId)
-                                                    if (destinationBytes != null && destinationBytes.exists()) continue
+                                                    val destinationBytes = sharedRealmOfflineFile(application, node, sharedScope)
+                                                    if (destinationBytes != null && destinationBytes.exists() &&
+                                                        (DownloadOfflineFileManager.readPublishedProvenance(application, destinationBytes)
+                                                            ?.identifies(node, sharedScope) == true || node.isMarkedAsOffline)
+                                                    ) continue
                                                     val sourceRow = FileController.getFileById(currentDriveRealm, node.id)
                                                     val sourceBytes = sourceRow
                                                         ?.getOfflineFile(application, userDrive.userId)
@@ -773,14 +776,53 @@ class MainViewModel(
                                                         UploadFile.hasPendingUpload(uri = sourceUri) ||
                                                             UploadFile.hasRetainedUnsentUpload(uri = sourceUri)
                                                     }.getOrDefault(true)
+                                                    val destinationBytesVerified = destinationBytes != null &&
+                                                        destinationBytes.exists() && (
+                                                        DownloadOfflineFileManager.readPublishedProvenance(application, destinationBytes)
+                                                            ?.identifies(node, sharedScope) == true ||
+                                                            node.isMarkedAsOffline
+                                                        )
+                                                    // STAGED, VERIFIED TRANSFER (issue: round 23 #13): the
+                                                    // previous direct copyTo(overwrite = true) could leave a
+                                                    // PARTIAL destination that passed existence-only
+                                                    // verification and was followed by source removal; no
+                                                    // provenance travelled and no mtime was preserved, and no
+                                                    // replacement work was enqueued. The copy is STAGED,
+                                                    // verified against the source's complete size and hash,
+                                                    // the mtime and the non-foreign source proof travel onto
+                                                    // the destination, and only then is the destination
+                                                    // published by an atomic rename. A present-but-unproven
+                                                    // destination also gets the durable replacement marker.
                                                     val transferred = sourceBytes != null && !sourceClaimed &&
                                                         destinationBytes != null && runCatching {
-                                                        destinationBytes.parentFile?.mkdirs()
-                                                        sourceBytes.copyTo(destinationBytes, overwrite = true)
-                                                        destinationBytes.exists() &&
-                                                            destinationBytes.length() == sourceBytes.length()
+                                                        val sourceHash = UploadFile.sha256OrNull(sourceBytes) ?: return@runCatching false
+                                                        val stagedTransfer = DownloadOfflineFileManager.newStagedFile(application, node)
+                                                        try {
+                                                            sourceBytes.copyTo(stagedTransfer, overwrite = true)
+                                                            val stagedHash = UploadFile.sha256OrNull(stagedTransfer)
+                                                            val stagedOk = stagedTransfer.exists() &&
+                                                                stagedTransfer.length() == sourceBytes.length() &&
+                                                                stagedHash != null && stagedHash == sourceHash
+                                                            if (!stagedOk) return@runCatching false
+                                                            stagedTransfer.setLastModified(sourceBytes.lastModified())
+                                                            destinationBytes.parentFile?.mkdirs()
+                                                            if (!stagedTransfer.renameTo(destinationBytes)) return@runCatching false
+                                                            val sourceProof = DownloadOfflineFileManager.readPublishedProvenance(application, sourceBytes)
+                                                            if (sourceProof != null &&
+                                                                !sourceProof.positivelyForeignTo(node, sharedScope)
+                                                            ) {
+                                                                DownloadOfflineFileManager.movePublishedProvenance(
+                                                                    application,
+                                                                    sourceBytes,
+                                                                    destinationBytes,
+                                                                )
+                                                            }
+                                                            true
+                                                        } finally {
+                                                            runCatching { if (stagedTransfer.exists()) stagedTransfer.delete() }
+                                                        }
                                                     }.getOrDefault(false)
-                                                    if (!transferred) {
+                                                    if (!transferred && !destinationBytesVerified) {
                                                         FileController.markFileAsOffline(
                                                             customRealm = sharedRealm,
                                                             fileId = node.id,
@@ -837,16 +879,21 @@ class MainViewModel(
                                                 node.children.createSnapshot().forEach { child ->
                                                     if (child.parentId == node.id) relationWalker.add(child)
                                                 }
-                                                // OWNED-COPY OUTCOMES (issue: round 22 #13): every
-                                                // flagged file row in the committed tree must hold
-                                                // its bytes at the destination-derived path OR carry
-                                                // the durable download intent — the destination must
-                                                // never appear offline with neither.
+                                                // OWNED-COPY OUTCOMES (issues: round 22 #13, round
+                                                // 23 #12/#13): every flagged file row in the
+                                                // committed tree must hold VERIFIED content at its
+                                                // ACTUAL-SHARED-REALM destination path — bytes whose
+                                                // provenance identifies the row, or the durable
+                                                // replacement intent. Existence alone (a partial copy,
+                                                // or bytes resolved from the wrong realm) is not
+                                                // authority to remove the source.
                                                 if (!node.isFolder() && (node.isOffline || node.isInOfflineFolder)) {
-                                                    val nodeBytes = node.getOfflineFile(application, sharedScope.userId)
-                                                    if (!(nodeBytes != null && nodeBytes.exists()) && !node.isMarkedAsOffline) {
-                                                        ownedCopiesOk = false
-                                                    }
+                                                    val nodeBytes = sharedRealmOfflineFile(application, node, sharedScope)
+                                                    val nodeVerified = nodeBytes != null && nodeBytes.exists() && (
+                                                        DownloadOfflineFileManager.readPublishedProvenance(application, nodeBytes)
+                                                            ?.identifies(node, sharedScope) == true || node.isMarkedAsOffline
+                                                        )
+                                                    if (!nodeVerified) ownedCopiesOk = false
                                                 }
                                             }
                                         }
@@ -1363,6 +1410,26 @@ class MainViewModel(
             AccountUtils.updateCurrentUserAndDrives(this@MainViewModel.getContext())
             restartUploadWorkerIfNeeded()
         }
+    }
+
+    /**
+     * Resolves a shared row's offline file through the ACTUAL SHARED REALM (issue: round
+     * 23 #12): [File.getOfflineFile] builds `UserDrive(userId, driveId)` with
+     * sharedWithMe = false, so path generation for a shared row reads the ORDINARY
+     * realm's ancestry — while the ordinary source row still exists, destination
+     * verification resolved the SOURCE path, saw the source bytes, skipped the transfer
+     * and the source removal then deleted them. The base directory layout is identical;
+     * only the ancestry realm differs.
+     */
+    private fun sharedRealmOfflineFile(context: Context, row: File, scope: UserDrive): IOFile? {
+        val sharedUserDrive = UserDrive(userId = scope.userId, driveId = row.driveId, sharedWithMe = true)
+        val remotePath = FileController.generateAndSavePath(row.id, sharedUserDrive)
+        if (remotePath.isEmpty()) return null
+        val rootFolder = IOFile(File.getOfflineFolder(context), "${scope.userId}/${row.driveId}")
+        val child = if (row.isFolder()) remotePath else remotePath.substringBeforeLast("/")
+        val folder = IOFile(rootFolder, child)
+        if (!folder.exists()) folder.mkdirs()
+        return if (row.isFolder()) folder else IOFile(folder, row.name)
     }
 
     /**
