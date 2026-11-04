@@ -117,6 +117,9 @@ object FolderFilesProvider {
         with(folderFilesProviderArgs) {
             val rootFolder = File(id = SharedWithMe.id, name = "/")
             val okHttpClient = AccountUtils.getHttpClient(userDrive.userId)
+            // The cancellation callback runs inside the non-suspending walk code, so the
+            // suspend caller's context is captured here once and checked through it.
+            val executingContext = coroutineContext
 
             FileController.getRealmInstance(userDrive).use { realm ->
                 loadSharedWithMeFilesRec(
@@ -129,7 +132,7 @@ object FolderFilesProvider {
                     // CANCELLATION AFTER EACH RESOLVING HTTP (issue: round 20 #22): the
                     // suspend caller's job is checked between the resolving responses and
                     // the side effects.
-                    checkCancelled = { coroutineContext.ensureActive() },
+                    checkCancelled = { executingContext.ensureActive() },
                 )
             }
         }

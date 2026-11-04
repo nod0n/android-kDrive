@@ -1244,8 +1244,11 @@ class DownloadOfflineFileManager(
             // until the operation commits; every post-rename failure restores them with
             // their retained proof.
             val recoveryFile = if (target.exists()) newStagedFile(provenanceContext, file) else null
+            // copyTo returns the DESTINATION file, not a success flag — the backup is
+            // validated explicitly (complete bytes) after the copy (issue: round 21 #1).
             val recoveryOk = recoveryFile == null || runCatching {
-                target.copyTo(recoveryFile, overwrite = true) && recoveryFile.exists()
+                target.copyTo(recoveryFile, overwrite = true)
+                recoveryFile.exists() && recoveryFile.length() == target.length()
             }.getOrDefault(false)
             if (!recoveryOk) {
                 runCatching { recoveryFile?.delete() }
@@ -1452,14 +1455,18 @@ class DownloadOfflineFileManager(
                         // publication: the rename replaces the old bytes — a post-rename
                         // proof-move failure restores them with their retained proof.
                         val recoveryFile = if (target.exists()) newStagedFile(context, file) else null
+                        // copyTo returns the DESTINATION file, not a success flag — the
+                        // backup is validated explicitly (complete bytes) after the copy
+                        // (issue: round 21 #1).
                         val recoveryOk = recoveryFile == null || runCatching {
-                            target.copyTo(recoveryFile, overwrite = true) && recoveryFile.exists()
+                            target.copyTo(recoveryFile, overwrite = true)
+                            recoveryFile.exists() && recoveryFile.length() == target.length()
                         }.getOrDefault(false)
                         if (!recoveryOk) {
                             runCatching { recoveryFile?.delete() }
                             runCatching { staged.delete() }
                             PublicationOutcome.FAILED
-                        } else runCatching@{
+                        } else {
                             deletePublishedProvenance(context, target)
                             when {
                                 staged.renameTo(target) && movePublishedProvenance(context, staged, target) -> {
