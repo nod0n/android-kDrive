@@ -179,7 +179,7 @@ private fun Context.printPdf(
     }
 }
 
-suspend fun downloadFile(
+internal suspend fun downloadFile(
     externalOutputFile: IOFile,
     file: File,
     shouldBePdf: Boolean,

@@ -78,7 +78,7 @@ class HomeViewModel : ViewModel() {
         }
     }
 
-    private fun getLastActivities(
+    private suspend fun getLastActivities(
         driveId: Int,
         forceDownload: Boolean,
         isFirstPage: Boolean,
@@ -87,13 +87,19 @@ class HomeViewModel : ViewModel() {
 
         fun isDownloadIntervalShort(): Boolean = (Date().time - lastActivitiesTime) < DOWNLOAD_INTERVAL
 
-        fun lastActivityResultFromRemote(data: ArrayList<FileActivity>, isComplete: Boolean): LastActivityResult {
+        fun lastActivityResultFromRemote(
+            data: ArrayList<FileActivity>,
+            isComplete: Boolean,
+            capturedUserDrive: UserDrive,
+        ): LastActivityResult {
             val mergeAndCleanActivities = mergeAndCleanActivities(data)
             lastActivities.addAll(data)
             lastMergedActivities.addAll(mergeAndCleanActivities)
             // The request's COMPLETE captured scope (captured before the call, issue: round 9
             // #4) scopes the persistence: resolving the account after the response would
-            // store one account's activities into another account's realm.
+            // store one account's activities into another account's realm. The scope passes
+            // as a parameter because it is captured at the request, after this local
+            // function's declaration (round-9 compile fix).
             FileController.storeFileActivities(data, capturedUserDrive)
 
             return LastActivityResult(
@@ -144,7 +150,11 @@ class HomeViewModel : ViewModel() {
         }
 
         return when {
-            apiResponseData != null -> lastActivityResultFromRemote(apiResponseData, isComplete = apiResponse.cursor == null)
+            apiResponseData != null -> lastActivityResultFromRemote(
+                data = apiResponseData,
+                isComplete = apiResponse.cursor == null,
+                capturedUserDrive = capturedUserDrive,
+            )
             !apiResponse.isSuccess() && isFirstPage -> lastActivityResultFromLocal()
             else -> null
         }

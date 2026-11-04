@@ -19,6 +19,7 @@ package com.infomaniak.drive.utils
 
 import android.content.Context
 import android.net.Uri
+import androidx.concurrent.futures.await
 import androidx.work.Operation
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.R
