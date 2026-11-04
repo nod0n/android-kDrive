@@ -406,7 +406,7 @@ class FileInfoActionsView @JvmOverloads constructor(
         // publication must name this row's authoritative version and baseline; missing or
         // mismatched provenance routes to the pending-download path below, which fetches the
         // current identity.
-        if (path.isNotEmpty() && DownloadOfflineFileManager.cacheBytesProvenCurrent(context, cacheFile, this)) {
+        if (path.isNotEmpty() && DownloadOfflineFileManager.cacheBytesProvenCurrent(context, cacheFile, this, capturedUserDrive)) {
             offlineFile?.let { target ->
                 val file = this
                 // UI promotion routes through the same protected, coordinated publication as the

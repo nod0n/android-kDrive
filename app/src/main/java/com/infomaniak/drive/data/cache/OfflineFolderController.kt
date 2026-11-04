@@ -639,6 +639,8 @@ object OfflineFolderController {
                     fileModifiedAt = fileModifiedAt,
                     pendingOnly = false,
                 ) -> {
+                    // Every byte deletion clears matching provenance (issue: round 18 #12).
+                    DownloadOfflineFileManager.deletePublishedProvenance(context, oldOfflineFile)
                     runCatching { oldOfflineFile.delete() }.isSuccess
                 }
                 OfflineFolderPolicy.isLocallyModified(
@@ -646,7 +648,11 @@ object OfflineFolderController {
                     remoteLastModifiedAtSeconds = oldLastModifiedAt,
                 ) -> {
                     val registered = registerDirtySnapshot(context, newIdentity, oldOfflineFile, userDrive)
-                    if (registered) runCatching { oldOfflineFile.delete() }.isSuccess else false
+                    if (registered) {
+                        // Every byte deletion clears matching provenance (issue: round 18 #12).
+                        DownloadOfflineFileManager.deletePublishedProvenance(context, oldOfflineFile)
+                        runCatching { oldOfflineFile.delete() }.isSuccess
+                    } else false
                 }
                 else -> {
                     // An explicit target is used by callers whose new location cannot be

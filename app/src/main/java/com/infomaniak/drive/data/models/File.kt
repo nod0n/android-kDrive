@@ -330,7 +330,7 @@ open class File(
      *    verification is scheduled instead.
      *  - [StoredOfflineCopyState.ABSENT_OR_STALE]: nothing usable at the path.
      */
-    fun storedOfflineCopyState(context: Context, offlineFile: IOFile): StoredOfflineCopyState {
+    fun storedOfflineCopyState(context: Context, offlineFile: IOFile, userDrive: UserDrive? = null): StoredOfflineCopyState {
         if (!(isOffline || isInOfflineFolder)) return StoredOfflineCopyState.ABSENT_OR_STALE
         if (!((offlineFile.lastModified() / 1_000L) == lastModifiedAt && isIntactFile(offlineFile))) {
             return StoredOfflineCopyState.ABSENT_OR_STALE
@@ -338,10 +338,14 @@ open class File(
         // GENERATION PROVENANCE of the published bytes (issues: round 16 #13, round 17 #13):
         // coarse mtime and size cannot distinguish two same-second, same-size revisions, and
         // an UNKNOWN row version is not equality with an arbitrary published generation — the
-        // sidecar's COMPLETE recorded baseline (version, modification time) AND its accepted
-        // revision identity (revisedAt, updatedAt) must match the row's accepted metadata.
+        // record's COMPLETE baseline (version, modification time) AND its accepted revision
+        // identity (revisedAt, updatedAt) must match the row's accepted metadata.
         val provenance = DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile)
             ?: return StoredOfflineCopyState.READABLE_UNVERIFIED
+        // OWNER identity (issue: round 18 #12): a record inherited across a path reuse by
+        // another row (or, when the caller's account scope is known, published by another
+        // account on a shared drive) is not provenance for these bytes.
+        if (!provenance.identifies(this, userDrive)) return StoredOfflineCopyState.READABLE_UNVERIFIED
         if (provenance.lastModifiedAt != lastModifiedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
         val rowVersion = version?.number ?: 0
         if (rowVersion > 0 && provenance.version != rowVersion) return StoredOfflineCopyState.READABLE_UNVERIFIED
@@ -355,8 +359,8 @@ open class File(
      * the current-content proof used by completeness decisions (walk scheduling, worker fast
      * paths, completion validation). Never confers mere readability (issue: round 17 #15).
      */
-    fun isOfflineAndProvenCurrent(context: Context, offlineFile: IOFile): Boolean =
-        storedOfflineCopyState(context, offlineFile) == StoredOfflineCopyState.PROVEN_CURRENT
+    fun isOfflineAndProvenCurrent(context: Context, offlineFile: IOFile, userDrive: UserDrive? = null): Boolean =
+        storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.PROVEN_CURRENT
 
     /**
      * Whether a complete, readable offline copy exists WITHOUT proving its generation —
@@ -399,10 +403,21 @@ open class File(
             getOfflineFile(context, userId)?.apply {
                 // Never drop the bytes backing a pending upload when the cache row goes away
                 // (issue #1902); the upload still reads from this file.
-                if (exists() && !UploadFile.hasPendingUpload(uri = Uri.fromFile(this).toString())) delete()
+                if (exists() && !UploadFile.hasPendingUpload(uri = Uri.fromFile(this).toString())) {
+                    // The published generation's record dies with the bytes (issue: round 18
+                    // #12): every byte-deletion path clears matching provenance — an orphaned
+                    // record must never lend its generation to bytes later published here.
+                    DownloadOfflineFileManager.deletePublishedProvenance(context, this)
+                    delete()
+                }
             }
         } else {
-            getCacheFile(context).apply { if (exists()) delete() }
+            getCacheFile(context).apply {
+                if (exists()) {
+                    DownloadOfflineFileManager.deletePublishedProvenance(context, this)
+                    delete()
+                }
+            }
         }
     }
 
@@ -674,7 +689,7 @@ open class File(
                                     // and the mutating decision would register an upload
                                     // that can restore old content over the newer
                                     // generation — no snapshot is manufactured here.
-                                    (liveRow.isOfflineAndProvenCurrent(context, cacheFile) ||
+                                    (liveRow.isOfflineAndProvenCurrent(context, cacheFile, userDrive) ||
                                         UploadFile.hasPendingUpload(uri = targetUri) ||
                                         UploadFile.hasRetainedUnsentUpload(uri = targetUri) ||
                                         // Durable SNAPSHOT registrations own the original

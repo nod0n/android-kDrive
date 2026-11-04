@@ -62,6 +62,8 @@ import kotlinx.coroutines.invoke
 import kotlinx.coroutines.withContext
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import kotlin.coroutines.cancellation.CancellationException
+import kotlin.coroutines.coroutineContext
 import okhttp3.Request
 import okhttp3.Response
 import java.util.UUID
@@ -332,7 +334,7 @@ class DownloadOfflineFileManager(
                 // cached bytes are — the sidecar written at cache publication must match
                 // this transfer's authoritative (details-sourced) version and baseline.
                 // Unavailable or mismatched provenance downloads the current revision.
-                if (!cacheBytesProvenCurrent(context, cacheFile, file)) {
+                if (!cacheBytesProvenCurrent(context, cacheFile, file, userDrive)) {
                     null
                 } else {
                     val candidate = newStagedFile(context, file)
@@ -658,38 +660,103 @@ class DownloadOfflineFileManager(
             return IOFile(IOFile(provenanceRoot(context), hex.substring(0, 2)), "$hex.gen")
         }
 
-        /** The generation identity recorded with published bytes (issues: round 16 #12/#13, round 17 #13). */
+        /**
+         * The registry directories are CREATED AND VERIFIED before any record write (issue:
+         * round 18 #2): neither the registry root nor the two-character fan-out prefix exists
+         * on a normal first use — an unchecked `writeText` at a missing directory fails
+         * silently, so writes verify the prefix directory and readers/writers both treat an
+         * unverifiable registry as "no provenance". Returns the record file, or null when the
+         * directories cannot be established.
+         */
+        private fun verifiedProvenanceFileFor(context: Context, publishedFile: IOFile): IOFile? = runCatching {
+            val recordFile = provenanceFileFor(context, publishedFile)
+            val prefixDir = recordFile.parentFile
+            if (prefixDir == null || (!prefixDir.exists() && !prefixDir.mkdirs())) return null
+            recordFile
+        }.getOrNull()
+
+        /**
+         * The identity recorded with published bytes (issues: round 16 #12/#13, round 17 #13,
+         * round 18 #2/#12): the FULL owner and generation identity — producing version,
+         * modification baseline and the accepted revision identity (revisedAt, updatedAt), the
+         * owning ACCOUNT, drive and file row, and the exact published location. A record that
+         * does not name this owner at this location is not provenance for these bytes.
+         */
         internal data class PublishedProvenance(
             val version: Int,
             val lastModifiedAt: Long,
             val revisedAt: Long,
             val updatedAt: Long,
-        )
+            val userId: Int,
+            val driveId: Int,
+            val fileId: Int,
+            val absolutePath: String,
+        ) {
+            /** Owner identity (issue: round 18 #12): the record must name THIS row — and, when
+             * the caller's account scope is known, THIS account — as the bytes' owner. A
+             * path-reused record inherited from another file (or another account's shared-drive
+             * row matching on coarse metadata) is not provenance. */
+            internal fun identifies(file: File, userDrive: UserDrive?): Boolean =
+                fileId == file.id && driveId == file.driveId && (userDrive == null || userId == userDrive.userId)
+        }
+
+        private fun PublishedProvenance.recordText(target: IOFile): String =
+            "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${target.absolutePath}"
 
         /**
          * Associates PUBLISHED bytes (cache or offline destination) with the content generation
-         * that produced them: exact mtime and size cannot establish the generation — two
-         * same-sized revisions can share the preserved client mtime with different server
-         * identities. The record names the producing version, its modification baseline AND
-         * the accepted revision identity (revisedAt, updatedAt) every current-content decision
-         * validates.
+         * that produced them and the owner that published them. The registry directories are
+         * created and verified first; a failed write is reported, never silently ignored.
          */
-        private fun writePublishedProvenance(context: Context, target: IOFile, file: File): Boolean = runCatching {
-            provenanceFileFor(context, target).writeText(
-                "${file.version?.number ?: 0}|${file.lastModifiedAt}|${file.revisedAt}|${file.updatedAt}",
-            )
-            true
-        }.getOrDefault(false)
+        private fun writePublishedProvenance(context: Context, target: IOFile, file: File, userDrive: UserDrive): Boolean {
+            val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
+            return runCatching {
+                val provenance = PublishedProvenance(
+                    version = file.version?.number ?: 0,
+                    lastModifiedAt = file.lastModifiedAt,
+                    revisedAt = file.revisedAt,
+                    updatedAt = file.updatedAt,
+                    userId = userDrive.userId,
+                    driveId = userDrive.driveId,
+                    fileId = file.id,
+                    absolutePath = target.absolutePath,
+                )
+                recordFile.writeText(provenance.recordText(target))
+                true
+            }.getOrDefault(false)
+        }
+
+        /**
+         * PREPARES the staged record and reads it back BEFORE any byte is replaced (issue:
+         * round 18 #2): a publication proceeds only when its provenance is established and
+         * verifiable at the staged path — a missing staged record is failure, never a
+         * successful movement of "nothing", on BOTH the offline and the plain-cache paths.
+         */
+        private fun prepareStagedProvenance(context: Context, staged: IOFile, file: File, userDrive: UserDrive): Boolean {
+            if (!writePublishedProvenance(context, staged, file, userDrive)) return false
+            return readPublishedProvenance(context, staged) != null
+        }
 
         internal fun readPublishedProvenance(context: Context, publishedFile: IOFile): PublishedProvenance? = runCatching {
             val parts = provenanceFileFor(context, publishedFile).readText().trim().split("|")
-            require(parts.size == 4)
-            PublishedProvenance(
+            require(parts.size >= 8)
+            val provenance = PublishedProvenance(
                 version = parts[0].trim().toInt(),
                 lastModifiedAt = parts[1].trim().toLong(),
                 revisedAt = parts[2].trim().toLong(),
                 updatedAt = parts[3].trim().toLong(),
+                userId = parts[4].trim().toInt(),
+                driveId = parts[5].trim().toInt(),
+                fileId = parts[6].trim().toInt(),
+                // The location is the LAST field and re-joins any '|' inside it.
+                absolutePath = parts.drop(7).joinToString("|"),
             )
+            // LOCATION identity (issue: round 18 #12): a record read at a different absolute
+            // path than the one it names describes bytes elsewhere — never proof here. Legacy
+            // 4-field records (pre-owner-identity) fail the size requirement and read as no
+            // provenance: their generation is unverified, their copy stays READABLE.
+            require(provenance.absolutePath == publishedFile.absolutePath)
+            provenance
         }.getOrNull()
 
         internal fun deletePublishedProvenance(context: Context, publishedFile: IOFile) {
@@ -697,19 +764,22 @@ class DownloadOfflineFileManager(
         }
 
         /**
-         * Moves the provenance record of [source]'s published bytes onto [target] (issue:
-         * round 16 #12): a byte migration (move reconciliation) keeps its generation record,
-         * and no orphan is left at the source path. True when there was nothing to move or
-         * the move succeeded.
+         * Moves the provenance record of [source]'s published bytes onto [target], rewriting
+         * the record's location identity (issue: round 18 #12). An UNPROVEN source never
+         * confirms — or leaves — a target record: provenance-less bytes INVALIDATE the
+         * destination's record and the move fails, instead of reporting success for moving
+         * nothing. True only when a verified record now names [target].
          */
         internal fun movePublishedProvenance(context: Context, source: IOFile, target: IOFile): Boolean {
             val provenance = readPublishedProvenance(context, source)
             deletePublishedProvenance(context, source)
-            if (provenance == null) return true
+            if (provenance == null) {
+                deletePublishedProvenance(context, target)
+                return false
+            }
+            val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
             return runCatching {
-                provenanceFileFor(context, target).writeText(
-                    "${provenance.version}|${provenance.lastModifiedAt}|${provenance.revisedAt}|${provenance.updatedAt}",
-                )
+                recordFile.writeText(provenance.recordText(target))
                 true
             }.getOrDefault(false)
         }
@@ -717,18 +787,24 @@ class DownloadOfflineFileManager(
         /**
          * Whether [cacheFile]'s bytes are PROVEN to be the current content generation of [file]
          * (issues: round 15 #9, round 16 #11): exact size, exact modification baseline, and the
-         * generation provenance sidecar matching the row's authoritative version and baseline.
-         * EVERY cache promotion — worker and UI alike — requires this; missing or mismatched
-         * provenance must enqueue a fresh download instead of publishing unknown-generation
-         * bytes under current metadata.
+         * generation provenance record matching the row's authoritative version and baseline —
+         * AND naming THIS row (and the caller's account, when known) as the bytes' owner
+         * (issue: round 18 #12). EVERY cache promotion — worker and UI alike — requires this;
+         * missing, mismatched or foreign provenance must enqueue a fresh download instead of
+         * publishing unknown-generation bytes under current metadata.
          */
-        internal fun cacheBytesProvenCurrent(context: Context, cacheFile: IOFile, file: File): Boolean {
+        internal fun cacheBytesProvenCurrent(
+            context: Context,
+            cacheFile: IOFile,
+            file: File,
+            userDrive: UserDrive? = null,
+        ): Boolean {
             if (!(cacheFile.exists() && file.isIntactFile(cacheFile) && (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt)) {
                 return false
             }
             val provenance = readPublishedProvenance(context, cacheFile)
             val transferVersion = file.version?.number ?: 0
-            return transferVersion > 0 && provenance != null &&
+            return transferVersion > 0 && provenance != null && provenance.identifies(file, userDrive) &&
                 provenance.version == transferVersion && provenance.lastModifiedAt == file.lastModifiedAt
         }
 
@@ -957,13 +1033,20 @@ class DownloadOfflineFileManager(
                 return PublicationOutcome.FAILED
             }
             deletePublishedProvenance(provenanceContext, target)
+            // PREPARE the staged record BEFORE the bytes are replaced (issue: round 18 #2):
+            // the registry directories are created and verified and the staged record reads
+            // back — a publication whose provenance cannot be established never moves its
+            // bytes, instead of replacing the target first and deleting it afterwards.
+            if (!prepareStagedProvenance(provenanceContext, staged, file, userDrive)) {
+                runCatching { staged.delete() }
+                return PublicationOutcome.FAILED
+            }
             if (staged.renameTo(target)) {
-                // The published generation's provenance sidecar is written FAIL-CLOSED
-                // (issue: round 16 #12): bytes without provenance are never accepted as the
-                // current generation by the intact/promotion decisions (issue: round 16 #13),
-                // so a failed write must discard the publication rather than leave
+                // The staged record travels onto the target with the rename (issue: round 18
+                // #2): provenance and bytes are published together — a failed move FAILS
+                // CLOSED and discards the newly published bytes rather than leaving
                 // unproven bytes at the destination.
-                if (!writePublishedProvenance(provenanceContext, target, file)) {
+                if (!movePublishedProvenance(provenanceContext, staged, target)) {
                     runCatching { target.delete() }
                     return PublicationOutcome.FAILED
                 }
@@ -1030,7 +1113,7 @@ class DownloadOfflineFileManager(
                     // EXPLICIT Boolean success AFTER the actual copy (round-16 compile fix
                     // #2), as in moveCacheFileIfIntact: File.copyTo's File return must not
                     // merge with the failure default into a non-Boolean condition.
-                    cacheBytesProvenCurrent(context, cacheFile, authoritativeFile) && runCatching {
+                    cacheBytesProvenCurrent(context, cacheFile, authoritativeFile, userDrive) && runCatching {
                         cacheFile.copyTo(staged, overwrite = true)
                         true
                     }.getOrDefault(false)
@@ -1112,24 +1195,45 @@ class DownloadOfflineFileManager(
                     runCatching { if (staged.exists()) staged.delete() }
                     return PublicationOutcome.FAILED
                 }
-                val outcome = OfflineFileCoordination.withFileLock(userDrive, file.id) {
-                    runCatching {
-                        staged.setLastModified(file.getLastModifiedInMilliSecond())
-                        writePublishedProvenance(context, staged, file)
-                        deletePublishedProvenance(context, target)
-                        if (staged.renameTo(target) && movePublishedProvenance(context, staged, target)) {
-                            PublicationOutcome.PUBLISHED
-                        } else {
-                            // Fail closed: no unproven bytes at the destination.
-                            runCatching { target.delete() }
-                            SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
-                            PublicationOutcome.FAILED
-                        }
-                    }.onFailure { exception ->
-                        SentryLog.e(TAG, "Staged cache publication failed for ${target.path}", exception)
-                    }.getOrDefault(PublicationOutcome.FAILED)
+                val outcome = try {
+                    OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                        // Cancellation re-check AFTER the blocking lock (issue: round 18 #23):
+                        // lock acquisition does not respond to coroutine cancellation — a
+                        // cancelled transfer that waited here must not replace a newer cache
+                        // and report PUBLISHED. The exception PROPAGATES (never converted
+                        // into an ordinary outcome) and the staged bytes are cleaned up in
+                        // the finally below.
+                        coroutineContext.ensureActive()
+                        runCatching {
+                            staged.setLastModified(file.getLastModifiedInMilliSecond())
+                            // PREPARE the staged record BEFORE the bytes are replaced (issue:
+                            // round 18 #2): the registry directories are created and verified
+                            // and the staged record reads back — the previous flow wrote the
+                            // record and IGNORED the result, then reported PUBLISHED through
+                            // a move that succeeds for a missing record. A missing staged
+                            // record is failure, never a successful move of "nothing".
+                            if (!prepareStagedProvenance(context, staged, file, userDrive)) {
+                                PublicationOutcome.FAILED
+                            } else {
+                                deletePublishedProvenance(context, target)
+                                if (staged.renameTo(target) && movePublishedProvenance(context, staged, target)) {
+                                    PublicationOutcome.PUBLISHED
+                                } else {
+                                    // Fail closed: no unproven bytes at the destination.
+                                    runCatching { target.delete() }
+                                    SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                                    PublicationOutcome.FAILED
+                                }
+                            }
+                        }.onFailure { exception ->
+                            if (exception is CancellationException) throw exception
+                            SentryLog.e(TAG, "Staged cache publication failed for ${target.path}", exception)
+                        }.getOrDefault(PublicationOutcome.FAILED)
+                    }
+                } finally {
+                    // Staging cleanup on EVERY path, cancellation included (issue: round 18 #23).
+                    runCatching { if (staged.exists()) staged.delete() }
                 }
-                runCatching { if (staged.exists()) staged.delete() }
                 outcome
             } else {
                 val appContext = Realm.getApplicationContext()

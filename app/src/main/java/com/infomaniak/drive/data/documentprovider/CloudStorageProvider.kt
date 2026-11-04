@@ -838,7 +838,7 @@ class CloudStorageProvider : DocumentsProvider() {
                 // READABLE retained copy (issue: round 17 #15): legacy pre-provenance bytes
                 // stay available; their generation is unverified — schedule verification so
                 // the walk/worker proves or refreshes them without blocking this read.
-                if (file.storedOfflineCopyState(context, offlineFile) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
+                if (file.storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
                     OfflineFolderController.scheduleOfflineVerification(
                         fileId = file.id,
                         userDrive = UserDrive(userId = userDrive.userId, driveId = userDrive.driveId),

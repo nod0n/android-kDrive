@@ -62,7 +62,7 @@ class DownloadProgressViewModel : ViewModel() {
         // PROVEN current completes, READABLE-but-unverified completes with verification
         // scheduled (legacy access preserved, never falsely current), ABSENT/STALE downloads.
         if (file.isOffline || file.isInOfflineFolder) {
-            when (file.storedOfflineCopyState(context, outputFile)) {
+            when (file.storedOfflineCopyState(context, outputFile, userDrive)) {
                 StoredOfflineCopyState.PROVEN_CURRENT -> {
                     downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
                     return@launch
@@ -171,7 +171,7 @@ class DownloadProgressViewModel : ViewModel() {
                                 // old generation's clean bytes as an edit against the
                                 // replacement baseline and manufacture an upload that can
                                 // restore old content over the newer generation.
-                                (liveRow.isOfflineAndProvenCurrent(context, outputFile) ||
+                                (liveRow.isOfflineAndProvenCurrent(context, outputFile, userDrive) ||
                                     UploadFile.hasPendingUpload(uri = targetUri) ||
                                     UploadFile.hasRetainedUnsentUpload(uri = targetUri) ||
                                     // Durable SNAPSHOT registrations own the original
