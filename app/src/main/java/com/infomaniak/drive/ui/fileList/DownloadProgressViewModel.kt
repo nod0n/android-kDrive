@@ -184,6 +184,7 @@ class DownloadProgressViewModel : ViewModel() {
                                         userId = userDrive.userId,
                                         fileModifiedAt = Date(outputFile.lastModified()),
                                         fileSize = outputFile.length(),
+                                        contentHash = UploadFile.sha256OrNull(outputFile),
                                     ))
                         }
                     }

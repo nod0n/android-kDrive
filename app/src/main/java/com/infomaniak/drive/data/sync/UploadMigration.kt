@@ -125,9 +125,19 @@ class UploadMigration : RealmMigration {
             }
         }
 
+        // Migrate to version 10: EXACT snapshot content identity (issue: round 18 #7) —
+        // nullable SHA-256 of the snapshot bytes, recorded at registration and re-verified in
+        // dedup, cancellation retention, protection and reconciliation. Nullable by design:
+        // legacy records carry no hash and fall back to their retained snapshot bytes.
+        if (oldVersionTemp < 10L) {
+            schema[UploadFile::class.java.simpleName]?.apply {
+                addField(UploadFile::contentHash.name, String::class.java)
+            }
+        }
+
     }
 
     companion object {
-        const val DB_VERSION = 9L // Must be bumped when the schema changes
+        const val DB_VERSION = 10L // Must be bumped when the schema changes
     }
 }

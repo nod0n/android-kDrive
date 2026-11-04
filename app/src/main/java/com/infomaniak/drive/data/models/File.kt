@@ -705,6 +705,7 @@ open class File(
                                             userId = userDrive.userId,
                                             fileModifiedAt = Date(cacheFile.lastModified()),
                                             fileSize = cacheFile.length(),
+                                            contentHash = UploadFile.sha256OrNull(cacheFile),
                                         ))
                             }
                         }

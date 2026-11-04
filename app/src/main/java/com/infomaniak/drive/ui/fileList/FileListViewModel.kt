@@ -318,6 +318,7 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                                                 userId = userDrive.userId,
                                                 fileModifiedAt = java.util.Date(original.lastModified()),
                                                 fileSize = original.length(),
+                                                contentHash = UploadFile.sha256OrNull(original),
                                             )
                                         if (!uploadOwned) liveRow.isOffline = true
                                     }

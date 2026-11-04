@@ -623,22 +623,28 @@ object OfflineFolderController {
                 // the upload finished.
                 UploadFile.hasPendingUpload(uri = Uri.fromFile(oldOfflineFile).toString()) ||
                     UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(oldOfflineFile).toString()) ||
+                    contentHashOf(oldOfflineFile)?.let { hash ->
+                        UploadFile.hasUploadRecordFor(
+                            fileName = oldIdentityName,
+                            remoteFolder = oldIdentityParentId,
+                            driveId = userDrive.driveId,
+                            userId = userDrive.userId,
+                            fileModifiedAt = fileModifiedAt,
+                            pendingOnly = true,
+                            contentHash = hash,
+                        )
+                    } == true -> false
+                contentHashOf(oldOfflineFile)?.let { hash ->
                     UploadFile.hasUploadRecordFor(
                         fileName = oldIdentityName,
                         remoteFolder = oldIdentityParentId,
                         driveId = userDrive.driveId,
                         userId = userDrive.userId,
                         fileModifiedAt = fileModifiedAt,
-                        pendingOnly = true,
-                    ) -> false
-                UploadFile.hasUploadRecordFor(
-                    fileName = oldIdentityName,
-                    remoteFolder = oldIdentityParentId,
-                    driveId = userDrive.driveId,
-                    userId = userDrive.userId,
-                    fileModifiedAt = fileModifiedAt,
-                    pendingOnly = false,
-                ) -> {
+                        pendingOnly = false,
+                        contentHash = hash,
+                    )
+                } == true -> {
                     // Every byte deletion clears matching provenance (issue: round 18 #12).
                     DownloadOfflineFileManager.deletePublishedProvenance(context, oldOfflineFile)
                     runCatching { oldOfflineFile.delete() }.isSuccess
@@ -1283,27 +1289,34 @@ object OfflineFolderController {
      */
     internal fun protectionStateOf(file: File, offlineFile: IOFile, userDrive: UserDrive): CopyProtection {
         val fileModifiedAt = Date(offlineFile.lastModified())
+        // EXACT content identity (issue: round 18 #7): a record matching the destination
+        // identity and modification date owns these bytes only when it provably holds THEIR
+        // content — a same-mtime record of a different revision (an edit that retained the
+        // mtime) must not certify protection for bytes it never held.
+        val contentHash = UploadFile.sha256OrNull(offlineFile)
         return when {
             // A pending upload owns the bytes; so does an UNSENT record retained after a
             // failure or cancellation (soft-deleted): it is still the only copy of the edit,
             // regardless of the row's advanced clean baseline (issue: round 6 #1).
             UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) ||
                 UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(offlineFile).toString()) -> CopyProtection.PENDING_UPLOAD
-            UploadFile.hasUploadRecordFor(
+            contentHash != null && UploadFile.hasUploadRecordFor(
                 fileName = file.name,
                 remoteFolder = file.parentId,
                 driveId = userDrive.driveId,
                 userId = userDrive.userId,
                 fileModifiedAt = fileModifiedAt,
                 pendingOnly = true,
+                contentHash = contentHash,
             ) -> CopyProtection.PENDING_UPLOAD
-            UploadFile.hasUploadRecordFor(
+            contentHash != null && UploadFile.hasUploadRecordFor(
                 fileName = file.name,
                 remoteFolder = file.parentId,
                 driveId = userDrive.driveId,
                 userId = userDrive.userId,
                 fileModifiedAt = fileModifiedAt,
                 pendingOnly = false,
+                contentHash = contentHash,
             ) -> CopyProtection.UPLOADED
             OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
@@ -1337,12 +1350,21 @@ object OfflineFolderController {
         }
     }
 
+    /** EXACT content identity of [file]'s bytes (issue: round 18 #7), or null when unreadable. */
+    private fun contentHashOf(file: IOFile): String? = UploadFile.sha256OrNull(file)
+
     internal fun registerDirtySnapshot(context: Context, file: File, offlineFile: IOFile, userDrive: UserDrive): Boolean {
         // Upload-source registration competes with publication and cleanup for these bytes
         // (issue: round 4 #4).
         return OfflineFileCoordination.withFileLock(userDrive, file.id) {
             runCatching {
                 val fileModifiedAt = Date(offlineFile.lastModified())
+                // EXACT content identity (issue: round 18 #7): the dedup and cancellation
+                // checks must compare BYTES, not metadata — a cancelled snapshot of revision
+                // A is not ownership of revision B that retained A's mtime. A source whose
+                // hash cannot be read cannot be registered under an exact identity: defer
+                // (the caller keeps the copy unregistered).
+                val contentHash = UploadFile.sha256OrNull(offlineFile) ?: return@withFileLock false
                 // Revision dedup under the file lock (issue: round 8 #7): this exact revision
                 // may already be registered — live (pending or sent), or retained after a
                 // cancellation. Re-snapshotting would duplicate the pending work or silently
@@ -1355,12 +1377,14 @@ object OfflineFolderController {
                         userId = userDrive.userId,
                         fileModifiedAt = fileModifiedAt,
                         pendingOnly = false,
+                        contentHash = contentHash,
                     ) || UploadFile.hasCancelledUploadRecordFor(
                         fileName = file.name,
                         remoteFolder = file.parentId,
                         driveId = userDrive.driveId,
                         userId = userDrive.userId,
                         fileModifiedAt = fileModifiedAt,
+                        contentHash = contentHash,
                     )
                 ) {
                     return@withFileLock true
@@ -1382,6 +1406,8 @@ object OfflineFolderController {
                     // Stable ORIGINAL identity for completion reconciliation (issue: round
                     // 17 #4).
                     originalFileId = file.id,
+                    // EXACT content identity of the snapshot (issue: round 18 #7).
+                    contentHash = contentHash,
                     type = UploadFile.Type.SYNC_OFFLINE.name,
                     userId = userDrive.userId,
                 ).store()

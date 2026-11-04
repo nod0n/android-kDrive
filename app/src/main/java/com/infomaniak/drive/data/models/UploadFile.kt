@@ -141,6 +141,14 @@ open class UploadFile(
     // snapshot is disposed only AFTER this is recorded, so a crash between the upload
     // completion and the baseline advance leaves the snapshot owned and retryable.
     var reconciliationDone: Boolean = false,
+    // EXACT content identity of the snapshot's bytes (issue: round 18 #7): name, destination,
+    // scope and modification date do not distinguish two same-mtime revisions — a cancelled
+    // snapshot of revision A must never be treated as ownership of a later revision B that
+    // merely retained A's mtime (and even size). The SHA-256 of the snapshot bytes is
+    // recorded at registration and re-verified in dedup, cancellation retention, protection
+    // and reconciliation; legacy records without it fall back to their retained snapshot
+    // bytes' hash, and to by-identity matching only when no content proof exists.
+    var contentHash: String? = null,
 ) : RealmObject() {
 
     @delegate:Ignore
@@ -270,6 +278,25 @@ open class UploadFile(
 
         /** Durable (filesDir) folder holding per-revision offline folder upload snapshots. */
         const val OFFLINE_SNAPSHOTS_FOLDER = "offline_snapshots"
+
+        /**
+         * SHA-256 content identity of [file]'s bytes, or null when it cannot be read (issue:
+         * round 18 #7): modification date and size do not distinguish two same-second,
+         * same-size revisions — the exact content identity does.
+         */
+        fun sha256OrNull(file: IOFile): String? = runCatching {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }.getOrNull()
+
         private var realmConfiguration: RealmConfiguration = RealmConfiguration.Builder().name(DB_NAME)
             .schemaVersion(UploadMigration.DB_VERSION)
             .modules(RealmModules.SyncFilesModule())
@@ -432,35 +459,34 @@ open class UploadFile(
         /**
          * Advances the ORIGINAL copy's clean provenance to the revision its completed upload
          * carried (issue: round 16 #14), under the intent/file coordination. The advance
-         * happens ONLY when the live row still holds the snapshot's identity AND the bytes at
-         * its current path still ARE the uploaded revision (same modification date AND
-         * recorded size) — a newer intervening edit is never relabeled as clean, and a
+         * happens ONLY when the live row still holds the snapshot's STABLE id AND the bytes at
+         * its current path still ARE the uploaded revision — same modification date, recorded
+         * size (exactly, zero included, issue: round 18 #7) and EXACT CONTENT (the snapshot's
+         * recorded SHA-256) — a newer intervening edit is never relabeled as clean, and a
          * renamed/moved row keeps its own provenance story.
          *
+         * Legacy records (originalFileId == 0) NEVER advance a baseline (issue: round 18 #7):
+         * their name+parent lookup is an arbitrary row selection — a record without
+         * trustworthy ownership proof must not relabel another row's bytes as published. They
+         * conclude durably (the upload completed; the snapshot's retained revision is on the
+         * server and is disposed), leaving the original's provenance to the ordinary
+         * verification/rewrite paths.
+         *
          * Returns TRUE when reconciliation CONCLUDED durably (baseline advanced, already
-         * current, or a terminal no-advance such as a vanished row or a superseded revision):
-         * the caller may record completion and dispose the snapshot. Returns FALSE only when
-         * the verdict is DEFERRED — a transiently ambiguous or foreign source ownership, which
-         * a later move reconciliation may still resolve: record and snapshot stay intact for
-         * [retryUnreconciledOriginals] (issue: round 17 #4).
+         * current, or a terminal no-advance such as a vanished row, a superseded revision or
+         * the legacy rule above): the caller may record completion and dispose the snapshot.
+         * Returns FALSE only when the verdict is DEFERRED — a transiently ambiguous or foreign
+         * source ownership, or a content identity that could not be read: record and snapshot
+         * stay intact for [retryUnreconciledOriginals] (issue: round 17 #4).
          */
         private fun reconcileOriginalCopyCleanBaseline(record: UploadFile): Boolean {
             val context = Realm.getApplicationContext() ?: return false
+            // LEGACY rule (issue: round 18 #7): no trustworthy ownership/content proof —
+            // conclude without advancing ANY row's baseline, and without selecting an
+            // arbitrary name+parent match.
+            if (record.originalFileId <= 0) return true
             val userDrive = UserDrive(userId = record.userId, driveId = record.driveId)
-            // Stable ORIGINAL id (issue: round 17 #4): reconciliation is keyed by the row id
-            // captured at registration, never by a name+parent first-match — a concurrent
-            // rename/move or same-name sibling would anchor the wrong row. Legacy records
-            // (originalFileId == 0) keep the historical lookup as their fallback.
-            val candidateId = if (record.originalFileId > 0) {
-                record.originalFileId
-            } else {
-                FileController.getRealmInstance(userDrive).use { realm ->
-                    realm.where(File::class.java)
-                        .equalTo(File::name.name, record.fileName)
-                        .equalTo(File::parentId.name, record.remoteFolder)
-                        .findFirst()?.id
-                } ?: return true // row gone: nothing to advance — a durable terminal conclusion
-            }
+            val candidateId = record.originalFileId
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 var deferred = false
                 OfflineFileCoordination.withFileLock(userDrive, candidateId) {
@@ -469,11 +495,6 @@ open class UploadFile(
                         val liveRow = realm.where(File::class.java)
                             .equalTo(File::id.name, candidateId)
                             .findFirst() ?: return@withFileLock
-                        // Identity must still match the completed snapshot (legacy fallback
-                        // rows only: stable-id records tolerate renames/moves by design).
-                        if (record.originalFileId == 0 &&
-                            (liveRow.name != record.fileName || liveRow.parentId != record.remoteFolder)
-                        ) return@withFileLock
                         val original = liveRow.getOfflineFile(context, userDrive.userId)
                             ?: return@withFileLock
                         if (!original.exists()) return@withFileLock
@@ -486,13 +507,24 @@ open class UploadFile(
                             deferred = true
                             return@withFileLock
                         }
-                        // Only the EXACT uploaded revision is advanced: same modification date
-                        // AND recorded size (issue: round 17 #4) — never a newer or edited
-                        // revision relabeled as clean.
+                        // Only the EXACT uploaded revision is advanced: same modification date,
+                        // recorded size (zero bytes compared exactly — issue: round 18 #7) and
+                        // EXACT CONTENT (issue: round 18 #7) — a same-second same-size edit is
+                        // not the uploaded revision. A content identity that cannot be read
+                        // defers to the retry pass instead of guessing.
                         if (original.lastModified() != record.fileModifiedAt.time ||
-                            (record.fileSize > 0L && original.length() != record.fileSize)
+                            original.length() != record.fileSize
                         ) {
                             return@withFileLock
+                        }
+                        val uploadedHash = record.contentHash
+                        if (uploadedHash != null) {
+                            val actualHash = UploadFile.sha256OrNull(original)
+                            if (actualHash == null) {
+                                deferred = true
+                                return@withFileLock
+                            }
+                            if (actualHash != uploadedHash) return@withFileLock
                         }
                         val uploadedBaselineSeconds = record.fileModifiedAt.time / 1_000L
                         if (liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds) return@withFileLock
@@ -594,12 +626,27 @@ open class UploadFile(
         }
 
         /**
+         * Whether a candidate record provably holds [contentHash]'s bytes (issue: round 18 #7):
+         * the record's stored identity when present, else its RETAINED SNAPSHOT bytes' hash
+         * (legacy records registered before the field existed — their snapshot is the only
+         * content proof they carry). A record whose content cannot be proven is never treated
+         * as ownership of [contentHash]'s revision.
+         */
+        private fun recordProvesContent(record: UploadFile, contentHash: String): Boolean {
+            val recorded = record.contentHash
+                ?: record.uri.takeIf { it.isNotEmpty() }?.let { snapshotUri -> sha256OrNull(IOFile(snapshotUri)) }
+            return recorded == contentHash
+        }
+
+        /**
          * READ-ONLY ownership check for the ORIGINAL revision at a destination (issue: round
          * 15 #7): durable offline revisions are registered under unique SNAPSHOT uris, so the
          * destination-uri queries cannot see their ownership of the original revision.
          * Matches the destination identity, modification date and RECORDED size, covering
          * pending AND retained-unsent records, and creates no snapshot — a record for this
-         * exact revision means the destination bytes are durably owned local content.
+         * exact revision means the destination bytes are durably owned local content. When
+         * [contentHash] is provided, a candidate must also PROVE those bytes (issue: round 18
+         * #7) — a same-mtime, same-size record of different content is not ownership.
          */
         fun hasDurableOriginalRevisionOwnership(
             fileName: String,
@@ -608,10 +655,11 @@ open class UploadFile(
             userId: Int,
             fileModifiedAt: Date,
             fileSize: Long,
+            contentHash: String? = null,
             customRealm: Realm? = null,
         ): Boolean {
             val block: (Realm) -> Boolean = { realm ->
-                realm.uploadTable
+                val candidates = realm.uploadTable
                     .equalTo(UploadFile::fileName.name, fileName)
                     .equalTo(UploadFile::remoteFolder.name, remoteFolder)
                     .equalTo(UploadFile::driveId.name, driveId)
@@ -620,7 +668,14 @@ open class UploadFile(
                     .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
                     .equalTo(UploadFile::fileSize.name, fileSize)
                     .isNull(UploadFile::uploadAt.name)
-                    .count() > 0
+                    .findAll()
+                if (candidates.isEmpty()) {
+                    false
+                } else if (contentHash == null) {
+                    true
+                } else {
+                    candidates.any { recordProvesContent(it, contentHash) }
+                }
             }
             return customRealm?.let(block) ?: getRealmInstance().use(block)
         }
@@ -629,7 +684,8 @@ open class UploadFile(
          * Whether an upload record already exists for this exact content revision (identified by
          * file name, target folder, drive, user and modification date). Distinct from
          * [hasPendingUpload]: the uri of an offline folder snapshot changes per revision, so the
-         * identity check must not rely on the uri alone.
+         * identity check must not rely on the uri alone. When [contentHash] is provided, a
+         * candidate must also PROVE those bytes (issue: round 18 #7).
          */
         fun hasUploadRecordFor(
             fileName: String,
@@ -638,10 +694,11 @@ open class UploadFile(
             userId: Int,
             fileModifiedAt: Date,
             pendingOnly: Boolean,
+            contentHash: String? = null,
             customRealm: Realm? = null,
         ): Boolean {
             val block: (Realm) -> Boolean = { realm ->
-                realm.uploadTable
+                val candidates = realm.uploadTable
                     .equalTo(UploadFile::fileName.name, fileName)
                     .equalTo(UploadFile::remoteFolder.name, remoteFolder)
                     .equalTo(UploadFile::driveId.name, driveId)
@@ -649,7 +706,14 @@ open class UploadFile(
                     .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
                     .isNull(UploadFile::deletedAt.name)
                     .apply { if (pendingOnly) isNull(UploadFile::uploadAt.name) }
-                    .count() > 0
+                    .findAll()
+                if (candidates.isEmpty()) {
+                    false
+                } else if (contentHash == null) {
+                    true
+                } else {
+                    candidates.any { recordProvesContent(it, contentHash) }
+                }
             }
             return customRealm?.let(block) ?: getRealmInstance().use(block)
         }
@@ -659,7 +723,10 @@ open class UploadFile(
          * content revision (owner, destination identity and modification date — issue: round 8
          * #7). Such a record retains its snapshot bytes AND the user's cancellation decision:
          * re-registering the same revision would silently reactivate the cancelled upload, so
-         * registration callers treat the revision as already-owned content instead.
+         * registration callers treat the revision as already-owned content instead. When
+         * [contentHash] is provided, a candidate must PROVE those bytes (issue: round 18 #7):
+         * a cancelled snapshot of revision A is NOT ownership of a later revision B that
+         * merely retained A's modification date — B registers normally, and A stays cancelled.
          */
         fun hasCancelledUploadRecordFor(
             fileName: String,
@@ -667,10 +734,11 @@ open class UploadFile(
             driveId: Int,
             userId: Int,
             fileModifiedAt: Date,
+            contentHash: String? = null,
             customRealm: Realm? = null,
         ): Boolean {
             val block: (Realm) -> Boolean = { realm ->
-                realm.uploadTable
+                val candidates = realm.uploadTable
                     .equalTo(UploadFile::fileName.name, fileName)
                     .equalTo(UploadFile::remoteFolder.name, remoteFolder)
                     .equalTo(UploadFile::driveId.name, driveId)
@@ -678,7 +746,14 @@ open class UploadFile(
                     .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
                     .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
                     .isNotNull(UploadFile::deletedAt.name)
-                    .count() > 0
+                    .findAll()
+                if (candidates.isEmpty()) {
+                    false
+                } else if (contentHash == null) {
+                    true
+                } else {
+                    candidates.any { recordProvesContent(it, contentHash) }
+                }
             }
             return customRealm?.let(block) ?: getRealmInstance().use(block)
         }

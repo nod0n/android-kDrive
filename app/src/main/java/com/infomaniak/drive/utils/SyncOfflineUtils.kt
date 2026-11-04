@@ -569,9 +569,12 @@ object SyncOfflineUtils {
             // stores a fresh snapshot URI the legacy lookup above can never find. Without
             // this gate every no-action sync re-registered the same pending revision as a
             // new full snapshot, and a cancelled revision was silently reactivated on the
-            // next sync.
+            // next sync. The candidate must also PROVE the content (issue: round 18 #7):
+            // a cancelled snapshot of revision A is not ownership of revision B that merely
+            // retained A's modification date — B registers normally.
             val registrationName = remoteFile?.name ?: liveRow.name
             val registrationFolder = remoteFile?.parentId ?: liveRow.parentId
+            val registrationHash = UploadFile.sha256OrNull(freshSource) ?: return true
             if (UploadFile.hasUploadRecordFor(
                     fileName = registrationName,
                     remoteFolder = registrationFolder,
@@ -579,12 +582,14 @@ object SyncOfflineUtils {
                     userId = userDrive.userId,
                     fileModifiedAt = fileModifiedAt,
                     pendingOnly = false,
+                    contentHash = registrationHash,
                 ) || UploadFile.hasCancelledUploadRecordFor(
                     fileName = registrationName,
                     remoteFolder = registrationFolder,
                     driveId = userDrive.driveId,
                     userId = userDrive.userId,
                     fileModifiedAt = fileModifiedAt,
+                    contentHash = registrationHash,
                 )
             ) {
                 // The revision is already registered — live (pending or sent) or retained
@@ -623,6 +628,8 @@ object SyncOfflineUtils {
                 remoteFolder = remoteFile?.parentId ?: liveRow.parentId,
                 // Stable ORIGINAL identity for completion reconciliation (issue: round 17 #4).
                 originalFileId = liveRow.id,
+                // EXACT content identity of the snapshot (issue: round 18 #7).
+                contentHash = registrationHash,
                 type = UploadFile.Type.SYNC_OFFLINE.name,
                 userId = userDrive.userId,
             ).store()
