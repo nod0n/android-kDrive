@@ -1024,16 +1024,35 @@ class DownloadOfflineFileManager(
          */
         internal fun movePublishedProvenance(context: Context, source: IOFile, target: IOFile): Boolean {
             val provenance = readPublishedProvenance(context, source)
-            deletePublishedProvenance(context, source)
             if (provenance == null) {
                 deletePublishedProvenance(context, target)
                 return false
             }
-            val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
-            return runCatching {
+            val recordFile = verifiedProvenanceFileFor(context, target) ?: run {
+                // The source record is still invalidated when the target cannot even be
+                // established (issue: round 22 #12): a record at a path whose bytes moved
+                // away must never lend its generation to later bytes there.
+                deletePublishedProvenance(context, source)
+                return false
+            }
+            val written = runCatching {
                 recordFile.writeText(provenance.recordText(target))
                 true
             }.getOrDefault(false)
+            if (!written) {
+                // PROOF-FAILURE RECOVERY STATE (issue: round 22 #12): the previous order
+                // deleted the SOURCE record BEFORE writing the target, so a failed write
+                // destroyed the only copy of the proof and a partial write could lend a
+                // truncated generation at the target. The partial target record is
+                // removed, the source record is invalidated (a record at the vacated
+                // path must never survive), and the moved bytes stay UNPROVEN — the
+                // walk's verification re-establishes the proof.
+                runCatching { recordFile.delete() }
+                deletePublishedProvenance(context, source)
+                return false
+            }
+            deletePublishedProvenance(context, source)
+            return true
         }
 
         /**

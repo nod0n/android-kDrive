@@ -431,7 +431,16 @@ class MainViewModel(
                                 parentId = newParent.id
                                 path = ""
                             }
-                            val sharedScope = UserDrive(userId = presentationScope.userId, sharedWithMe = true)
+                            // THE ACTUAL DRIVE IN THE LOCK SCOPE (issue: round 22 #12): the
+                            // scope previously omitted the driveId, so the merge's descendant
+                            // lock keys differed from the coordinated byte workers' keys for
+                            // the same rows — two lock key-spaces serialized nothing against
+                            // each other. The moved file's own drive qualifies every key.
+                            val sharedScope = UserDrive(
+                                userId = presentationScope.userId,
+                                driveId = file.driveId,
+                                sharedWithMe = true,
+                            )
                             var destinationVerified = false
                             FileController.getRealmInstance(sharedScope).use { sharedRealm ->
                                 // EVERY affected identity locked (issue: round 18 #10): the
@@ -478,6 +487,31 @@ class MainViewModel(
                                     // an ancestor row missing in the shared realm yields a
                                     // wrong path; the merge defers and the sync retries.
                                     var mergeAllowed = FileController.destinationChainExists(sharedRealm, newParent.id)
+                                    // PRE-LOCK GRAPH REVALIDATION (issue: round 22 #12): the
+                                    // destination tree was walked BEFORE the locks — a row
+                                    // inserted beneath it since (an ancestor writer that takes
+                                    // neither the intent monitor nor these per-row locks) is
+                                    // neither locked nor merged, and the tree rename below
+                                    // would relocate its bytes without its lock. The fresh
+                                    // walk must not exceed the locked id set; otherwise the
+                                    // merge defers and the sync retries with the fresh graph.
+                                    runCatching {
+                                        sharedRealm.where(File::class.java)
+                                            .equalTo(File::id.name, file.id)
+                                            .findFirst()?.let { lockTimeTreeRoot ->
+                                                val walker = ArrayDeque<File>().apply { add(lockTimeTreeRoot) }
+                                                val seen = mutableSetOf<Int>()
+                                                while (walker.isNotEmpty()) {
+                                                    val node = walker.removeFirst()
+                                                    if (!seen.add(node.id)) continue
+                                                    if (node.id !in graphIds) {
+                                                        mergeAllowed = false
+                                                        break
+                                                    }
+                                                    node.children.forEach { walker.add(it) }
+                                                }
+                                            }
+                                    }.onFailure(Sentry::captureException)
                                     // DESTINATION BYTES ON IDENTITY CHANGE (issue: round 19
                                     // #10): an existing destination root keeps its OWN local
                                     // copy — the identity re-point changes its derived offline
@@ -547,11 +581,29 @@ class MainViewModel(
                                                                     if (renamed) {
                                                                         relocatedPairs.forEach { (oldCopy, newCopy) ->
                                                                             if (oldCopy.path != newCopy.path) {
-                                                                                runCatching {
+                                                                                val proofMoved = runCatching {
                                                                                     DownloadOfflineFileManager.movePublishedProvenance(
                                                                                         application,
                                                                                         oldCopy,
                                                                                         newCopy,
+                                                                                    )
+                                                                                }.getOrDefault(false)
+                                                                                if (!proofMoved) {
+                                                                                    // PROOF-FAILURE RECOVERY STATE
+                                                                                    // (issue: round 22 #12): the
+                                                                                    // rename already moved the bytes —
+                                                                                    // the failed relocation leaves the
+                                                                                    // copy UNPROVEN at the new path
+                                                                                    // (never falsely proven, and no
+                                                                                    // stranded old-path record:
+                                                                                    // movePublishedProvenance
+                                                                                    // invalidates the source record in
+                                                                                    // every outcome), and the walk's
+                                                                                    // verification re-establishes the
+                                                                                    // proof.
+                                                                                    SentryLog.i(
+                                                                                        TAG,
+                                                                                        "Provenance relocation failed during shared tree rename; ${oldCopy.name} stays unproven",
                                                                                     )
                                                                                 }
                                                                             }
@@ -657,6 +709,31 @@ class MainViewModel(
                                             } else {
                                                 mergeChild(destinationProxy.children, newParent.id, movedChild)
                                             }
+                                            // PERSISTED-PATH INVALIDATION ACROSS THE WHOLE
+                                            // RELOCATED TREE (issue: round 22 #12): the tree
+                                            // rename relocated every descendant's bytes, but only
+                                            // the moved root's persisted path was cleared — every
+                                            // descendant row (destination-existing rows pointing at
+                                            // the old destination location, and inserted rows
+                                            // carrying their SOURCE persisted paths) kept a path
+                                            // that no longer holds its bytes, and getRemotePath
+                                            // PREFERS a non-blank persisted path — destination-only
+                                            // unregistered edits became inaccessible at their
+                                            // recorded paths. Every row in the committed tree is
+                                            // invalidated (path = ""); the path regenerates from
+                                            // the live parent chain on next use.
+                                            runCatching {
+                                                FileController.getFileById(sharedRealm, file.id)?.let { committedTreeRoot ->
+                                                    val pathStack = ArrayDeque<File>().apply { add(committedTreeRoot) }
+                                                    val pathSeen = mutableSetOf<Int>()
+                                                    while (pathStack.isNotEmpty()) {
+                                                        val node = pathStack.removeFirst()
+                                                        if (!pathSeen.add(node.id)) continue
+                                                        node.path = ""
+                                                        node.children.forEach { pathStack.add(it) }
+                                                    }
+                                                }
+                                            }.onFailure(Sentry::captureException)
                                         }
                                     }.onFailure(Sentry::captureException).isSuccess
                                     // COMMITTED VERIFICATION BEFORE SOURCE REMOVAL (issues:
