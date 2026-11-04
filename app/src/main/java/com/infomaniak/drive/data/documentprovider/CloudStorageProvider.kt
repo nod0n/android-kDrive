@@ -59,6 +59,7 @@ import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.NotificationUtils.buildGeneralNotification
 import com.infomaniak.drive.utils.OfflineFileCoordination
@@ -890,16 +891,18 @@ class CloudStorageProvider : DocumentsProvider() {
                     cacheFile.parentFile,
                     "${cacheFile.name}.${java.util.UUID.randomUUID()}.part",
                 )
-                val stagedOk = runCatching {
-                    DownloadOfflineFileManager.saveRemoteData(TAG, response, staged)
-                }.onFailure { exception ->
-                    SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
-                }.isSuccess
+                val stagedOk = runBlocking {
+                    runCatching {
+                        DownloadOfflineFileManager.saveRemoteData(TAG, response, staged)
+                    }.onFailure { exception ->
+                        SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
+                    }.isSuccess
+                }
                 if (stagedOk) {
                     val outcome = runBlocking {
                         DownloadOfflineFileManager.publishStagedCacheCopy(context, file, cacheFile, userDrive, staged)
                     }
-                    if (outcome == DownloadOfflineFileManager.PublicationOutcome.PUBLISHED) {
+                    if (outcome == PublicationOutcome.PUBLISHED) {
                         return ParcelFileDescriptor.open(cacheFile, accessMode)
                     }
                 }

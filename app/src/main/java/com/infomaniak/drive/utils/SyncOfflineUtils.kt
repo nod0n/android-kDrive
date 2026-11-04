@@ -47,6 +47,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runBlocking
+import kotlin.coroutines.coroutineContext
 import java.util.Date
 
 object SyncOfflineUtils {
@@ -176,7 +177,7 @@ object SyncOfflineUtils {
      * proven-current copies never match), so the re-drive is bounded by unfinished work.
      * The row's scope is the record's own account/drive — never the active account.
      */
-    private fun redriveUnverifiedPins(context: Context, userDrive: UserDrive) {
+    private suspend fun redriveUnverifiedPins(context: Context, userDrive: UserDrive) {
         runCatching {
             FileController.getRealmInstance(userDrive).use { realm ->
                 realm.where(File::class.java)
@@ -190,7 +191,7 @@ object SyncOfflineUtils {
             SentryLog.e("SyncOffline", "Failed to collect unverified pins for re-drive", exception)
         }.getOrDefault(emptyList())
             .forEach { pinnedRow ->
-                ensureActive()
+                coroutineContext.ensureActive()
                 val offlineFile = pinnedRow.getOfflineFile(context, userDrive.userId) ?: return@forEach
                 if (offlineFile.exists() && pinnedRow.isOfflineAndProvenCurrent(context, offlineFile, userDrive)) {
                     return@forEach
