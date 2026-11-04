@@ -106,7 +106,10 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             if (readable && file.storedOfflineCopyState(getApplication(), stored) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
                 OfflineFolderController.scheduleOfflineVerification(
                     fileId = file.id,
-                    userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId),
+                    // The model's CAPTURED scope (issue: round 18 #16): every other read of
+                    // this playback session uses it — rederiving the active account here
+                    // could mark/pin another account's matching row on a shared drive.
+                    userDrive = userDrive,
                     observedGeneration = stored.lastModified() / 1_000L,
                 )
             }

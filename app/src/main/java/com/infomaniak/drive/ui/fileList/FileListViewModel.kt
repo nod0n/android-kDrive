@@ -263,7 +263,7 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun updateOfflineFilesIfNeeded(folder: File, files: List<File>) {
+    fun updateOfflineFilesIfNeeded(folder: File, files: List<File>, userDrive: UserDrive? = null) {
         // Offline folder roots (issue #1902) manage their children's state themselves; this
         // crash-recovery heuristic must not convert covered files into explicit pins.
         if (folder.isInOfflineFolder) return
@@ -271,11 +271,12 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
             checkOfflineFilesJob.cancel()
             checkOfflineFilesJob = Job()
 
-            // The originating listing's account scope is captured BEFORE the coroutine is
-            // launched (issue: round 17 #19): reading the active account at execution time
-            // lets an account switch between capture and dispatch inspect and pin matching
-            // rows in another realm.
-            val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = folder.driveId)
+            // The ORIGINATING LISTING's scope is passed by the caller (issue: round 18 #16):
+            // the previous capture ran when the ALREADY-COMPLETED listing callback invoked
+            // this function — an account switch between the listing and the callback let the
+            // recovery inspect and pin matching rows in another realm's shared drive. The
+            // fallback covers callers with no listing scope of their own.
+            val effectiveUserDrive = userDrive ?: UserDrive(userId = AccountUtils.currentUserId, driveId = folder.driveId)
             viewModelScope.launch(Dispatchers.IO + checkOfflineFilesJob) {
                 files.filterNot { file -> file.isFolder() }.forEach { file ->
                     // ONE intent → file-lock → fresh-Realm transaction per candidate (issue:
@@ -286,13 +287,24 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                     // the file. The decision now reads the FRESH row and the CURRENT root
                     // ancestry inside the transaction; stale flags never create a pin.
                     synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                        OfflineFileCoordination.withFileLock(userDrive, file.id) {
-                            FileController.getRealmInstance(userDrive).use { realm ->
+                        OfflineFileCoordination.withFileLock(effectiveUserDrive, file.id) {
+                            FileController.getRealmInstance(effectiveUserDrive).use { realm ->
                                 runCatching { realm.refresh() }
                                 realm.executeTransaction {
                                     if (!isActive) return@executeTransaction
                                     val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
-                                    if (liveRow.isOffline || liveRow.isInOfflineFolder || liveRow.isMarkedAsOffline) {
+                                    // AFFIRMATIVE durable intent only (issues: round 17 #20,
+                                    // round 18 #22): recovery completes PREVIOUSLY PERSISTED
+                                    // pin/download intent — the row's own pending marker,
+                                    // which an unpin always clears together with the flag, so
+                                    // a surviving marker is intent no unpin removed. Residual
+                                    // bytes are NOT authorization: an unpin deliberately
+                                    // retains bytes when snapshot registration failed or
+                                    // ownership was ambiguous — no upload record exists in
+                                    // exactly those cases, so "bytes without an upload
+                                    // record" recreated the removed pin on every listing
+                                    // pass.
+                                    if (liveRow.isOffline || liveRow.isInOfflineFolder || !liveRow.isMarkedAsOffline) {
                                         return@executeTransaction
                                     }
                                     // Current durable ancestry, not the captured flags: any
@@ -300,28 +312,8 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                                     if (OfflineFolderController.isInsideActiveRoot(realm, liveRow.id)) {
                                         return@executeTransaction
                                     }
-                                    val original = liveRow.getOfflineFile(context, userDrive.userId)
-                                    if (original?.exists() == true) {
-                                        // NEVER infer pin intent from retained bytes (issue:
-                                        // round 17 #20): an unpin keeps a pending or
-                                        // retained-unsent original on disk by design —
-                                        // recovery must not resurrect the removed pin from
-                                        // file existence. Only bytes no upload record owns
-                                        // are treated as the durable intent a pin restores.
-                                        val originalUri = android.net.Uri.fromFile(original).toString()
-                                        val uploadOwned = UploadFile.hasPendingUpload(uri = originalUri) ||
-                                            UploadFile.hasRetainedUnsentUpload(uri = originalUri) ||
-                                            UploadFile.hasDurableOriginalRevisionOwnership(
-                                                fileName = liveRow.name,
-                                                remoteFolder = liveRow.parentId,
-                                                driveId = userDrive.driveId,
-                                                userId = userDrive.userId,
-                                                fileModifiedAt = java.util.Date(original.lastModified()),
-                                                fileSize = original.length(),
-                                                contentHash = UploadFile.sha256OrNull(original),
-                                            )
-                                        if (!uploadOwned) liveRow.isOffline = true
-                                    }
+                                    liveRow.isOffline = true
+                                    liveRow.isMarkedAsOffline = false
                                 }
                             }
                         }

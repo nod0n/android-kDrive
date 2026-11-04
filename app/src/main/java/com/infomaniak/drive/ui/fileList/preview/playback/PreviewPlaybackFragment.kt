@@ -257,7 +257,7 @@ open class PreviewPlaybackFragment : PreviewFragment() {
         if (readable && file.storedOfflineCopyState(requireContext(), it) == StoredOfflineCopyState.READABLE_UNVERIFIED) {
             OfflineFolderController.scheduleOfflineVerification(
         fileId = file.id,
-        userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId),
+        userDrive = previewSliderViewModel.userDrive,
         observedGeneration = it.lastModified() / 1_000L,
     )
         }

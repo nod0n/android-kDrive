@@ -899,7 +899,7 @@ open class FileListFragment : MultiSelectFragment(
                     fileAdapter.isComplete = result.isComplete
                     fileAdapter.hideLoading()
                     refreshActivities()
-                    result.parentFolder?.let { folder -> fileListViewModel.updateOfflineFilesIfNeeded(folder, result.files) }
+                    result.parentFolder?.let { folder -> fileListViewModel.updateOfflineFilesIfNeeded(folder, result.files, userDrive) }
 
                 } ?: run {
                     changeNoFilesLayoutVisibility(
