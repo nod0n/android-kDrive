@@ -269,10 +269,11 @@ class DownloadOfflineFileManager(
         }.onFailure { exception ->
             SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
         }.getOrDefault(PublicationOutcome.FAILED)
-        // Cache promotion is a transfer path too: its superseded outcome must reach the bulk
-        // caller like the network branch's (issue: round 10 #7), or the batch clears a newer
-        // generation's pending marker and reports the root synchronized.
-        lastTransferSuperseded = published == PublicationOutcome.SKIPPED_SUPERSEDED
+        // Cache promotion is a transfer path too: its superseded/conflict outcomes must reach
+        // the bulk caller like the network branch's (issues: round 10 #7, round 14 #13), or
+        // the batch clears pending work and reports the root synchronized.
+        lastTransferSuperseded =
+            published == PublicationOutcome.SKIPPED_SUPERSEDED || published == PublicationOutcome.SKIPPED_CONFLICT
 
         runCatching { if (staged.exists()) staged.delete() }
         when (published) {
@@ -285,6 +286,12 @@ class DownloadOfflineFileManager(
             PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
                 filesDownloaded += 1
                 clearPendingMarker(file.id)
+                true
+            }
+            PublicationOutcome.SKIPPED_CONFLICT -> {
+                // The destination holds protected content owned by another row (issue: round
+                // 14 #13): deferred — the pending marker stays so the work and the root's
+                // incompleteness are retained until the conflict resolves.
                 true
             }
             PublicationOutcome.SKIPPED_SUPERSEDED -> {
@@ -419,8 +426,10 @@ class DownloadOfflineFileManager(
             val sizeIsValidated = file.size == null || file.isIntactFile(staged)
             if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated) {
                 val outcome = publishStagedOfflineFile(context, file, offlineFile, staged)
-                // Public superseded status for the bulk caller (issue: round 9 #8).
-                lastTransferSuperseded = outcome == PublicationOutcome.SKIPPED_SUPERSEDED
+                // Public superseded/conflict status for the bulk caller (issues: round 9 #8,
+                // round 14 #13).
+                lastTransferSuperseded =
+                    outcome == PublicationOutcome.SKIPPED_SUPERSEDED || outcome == PublicationOutcome.SKIPPED_CONFLICT
                 when (outcome) {
                     PublicationOutcome.FAILED -> return@withContext ListenableWorker.Result.failure()
                     // Completion (flag writes, timestamp, media scan) only runs for bytes this
@@ -429,6 +438,10 @@ class DownloadOfflineFileManager(
                     PublicationOutcome.PUBLISHED -> onProgress(100, file.id)
                     PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
                         clearPendingMarker(file.id)
+                    }
+                    PublicationOutcome.SKIPPED_CONFLICT -> {
+                        // A protected destination owned by another row defers (issue: round
+                        // 14 #13): the pending marker stays so the work is retained.
                     }
                     PublicationOutcome.SKIPPED_SUPERSEDED -> {
                         // A newer generation owns the file's pending state and completion
@@ -521,7 +534,7 @@ class DownloadOfflineFileManager(
 
         private const val STAGING_FOLDER = "offline_staging"
 
-        internal enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_INVALIDATED, SKIPPED_SUPERSEDED, FAILED }
+        internal enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_CONFLICT, SKIPPED_INVALIDATED, SKIPPED_SUPERSEDED, FAILED }
 
         /**
          * App-owned staging directory on the SAME volume as the offline storage (so publication
@@ -709,7 +722,19 @@ class DownloadOfflineFileManager(
 
                 if (targetProtected) {
                     runCatching { staged.delete() }
-                    return PublicationOutcome.SKIPPED_PROTECTED
+                    // Usable protected content FOR THIS FILE vs a destination conflict
+                    // (issue: round 14 #13): the protection proves F's own usable content
+                    // only when the destination's owner row is F itself — its pending
+                    // upload, retained unsent edit, or a local modification against its own
+                    // baseline. Unknown ownership and a CHANGED owner are preservation
+                    // reasons for OTHER content, not proof that F has usable local content:
+                    // they defer as a conflict, with pending and root work retained.
+                    val ownedByThisFile = liveOwner != null && liveOwner.id == lockedOwnerId
+                    return if (ownedByThisFile) {
+                        PublicationOutcome.SKIPPED_PROTECTED
+                    } else {
+                        PublicationOutcome.SKIPPED_CONFLICT
+                    }
                 }
             }
 

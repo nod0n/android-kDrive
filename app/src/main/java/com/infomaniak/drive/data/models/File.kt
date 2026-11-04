@@ -623,6 +623,11 @@ open class File(
                     }
                     onProgress(PROGRESS_COMPLETE)
                 }
+                PublicationOutcome.SKIPPED_CONFLICT ->
+                    // The destination holds protected content owned by another row (issue:
+                    // round 14 #13): deferred — never a success over content this preview
+                    // cannot establish as F's own.
+                    throw java.io.IOException("Preview destination conflict for $name")
                 PublicationOutcome.SKIPPED_INVALIDATED ->
                     // The offline intent or destination disappeared mid-download (root
                     // removal): error/deferred — never a success naming a possibly deleted file.

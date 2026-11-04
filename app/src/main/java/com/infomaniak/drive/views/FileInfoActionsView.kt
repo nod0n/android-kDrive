@@ -433,15 +433,19 @@ class FileInfoActionsView @JvmOverloads constructor(
                                 file.isOffline = true
                                 onItemClickListener.onCacheAddedToOffline()
                             }
-                            PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                            PublicationOutcome.SKIPPED_SUPERSEDED,
+                            PublicationOutcome.SKIPPED_CONFLICT,
+                            -> {
                                 // The cached copy's generation was superseded before
-                                // publication: announcing success would leave the pin over a
-                                // destination that may hold no usable bytes for the current
-                                // identity. The user's intent is still on (the same
-                                // coordinated publication verified it immediately before the
-                                // supersession check), so the pin stays and pending work is
-                                // persisted: the pending-download marker plus a refresh of
-                                // the current identity through the offline worker.
+                                // publication, or the destination holds protected content
+                                // owned by another row (issue: round 14 #13): announcing
+                                // success would leave the pin over a destination that may
+                                // hold no usable bytes for the current identity. The user's
+                                // intent is still on (the same coordinated publication
+                                // verified it immediately before the skip), so the pin stays
+                                // and pending work is persisted: the pending-download marker
+                                // plus a refresh of the current identity through the offline
+                                // worker.
                                 file.isOffline = true
                                 CoroutineScope(Dispatchers.IO).launch {
                                     FileController.markFilesAsOffline(

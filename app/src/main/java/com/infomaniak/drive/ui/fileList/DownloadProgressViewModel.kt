@@ -115,7 +115,7 @@ class DownloadProgressViewModel : ViewModel() {
         // invalidated intent.
         downloadProgressLiveData.postValue(
             when (outcome) {
-                PublicationOutcome.SKIPPED_INVALIDATED, PublicationOutcome.FAILED -> null
+                PublicationOutcome.SKIPPED_INVALIDATED, PublicationOutcome.FAILED, PublicationOutcome.SKIPPED_CONFLICT -> null
                 PublicationOutcome.SKIPPED_SUPERSEDED -> {
                     // Supersession is completion only when the CURRENT row still owns the
                     // scoped destination AND that destination holds usable content (issue:
