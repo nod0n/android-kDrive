@@ -427,27 +427,94 @@ class MainViewModel(
                             val sharedScope = UserDrive(userId = presentationScope.userId, sharedWithMe = true)
                             var destinationVerified = false
                             FileController.getRealmInstance(sharedScope).use { sharedRealm ->
-                                // Every affected identity in the ACTUAL realm's captured scope
-                                // (issue: round 11 #3): the parent lock used to be scope-less
-                                // while the child's identity changed inside the transaction —
-                                // both the destination folder and the moved child are locked
-                                // here, ascending, before the transaction.
-                                OfflineFileCoordination.withLocksFor(sharedScope, listOf(newParent.id, file.id)) {
-                                    FileController.updateFile(newParent.id, sharedRealm, userDrive = sharedScope) { localFolder ->
-                                        runCatching {
-                                            localFolder.children.add(movedChild)
-                                        }.onFailure(Sentry::captureException)
+                                // EVERY affected identity locked (issue: round 18 #10): the
+                                // destination root, the moved root and every id the deep graph
+                                // carries — one ascending, constant-stack acquisition — so a
+                                // destination writer cannot interleave between the merge's
+                                // per-row decisions and its commit.
+                                val graphIds = sortedSetOf(newParent.id, file.id)
+                                runCatching {
+                                    val pending = ArrayDeque<File>().apply { add(movedChild) }
+                                    val visited = mutableSetOf<Int>()
+                                    while (pending.isNotEmpty()) {
+                                        val node = pending.removeFirst()
+                                        if (!visited.add(node.id)) continue
+                                        graphIds.add(node.id)
+                                        node.children.forEach { pending.add(it) }
                                     }
-                                    // DESTINATION VERIFIED BEFORE SOURCE REMOVAL (issue: round
-                                    // 17 #16): the source row is deleted only after the
-                                    // inserted row is re-read from the committed destination
-                                    // transaction. A failed or silently dropped insertion used
-                                    // to leave the file in NO realm — its cached graph (and an
-                                    // offline copy's metadata anchor) lost while the UI
-                                    // reported success.
-                                    destinationVerified = sharedRealm.where(File::class.java)
-                                        .equalTo(File::id.name, file.id)
-                                        .findFirst() != null
+                                }.onFailure(Sentry::captureException)
+                                OfflineFileCoordination.withLocksFor(sharedScope, graphIds) {
+                                    // PER-ROW DESTINATION MERGE (issue: round 18 #10): the
+                                    // previous insert added the UNMANAGED deep graph whole —
+                                    // Realm's primary-key upsert OVERWROTE every destination
+                                    // descendant that already existed, replacing newer
+                                    // identity, local flags and edited-copy provenance with
+                                    // the source snapshot. The merge keeps an EXISTING
+                                    // destination row authoritative (untouched, including its
+                                    // own subtree) and supplies only the rows the destination
+                                    // lacks; the moved root's identity (parentId/path) is the
+                                    // one field an existing row takes, with its destination-
+                                    // local state preserved.
+                                    val insertedIds = mutableSetOf<Int>()
+                                    val mergeOk = runCatching {
+                                        sharedRealm.executeTransaction {
+                                            val destinationProxy = FileController.getFileById(sharedRealm, newParent.id)
+                                                ?: return@executeTransaction
+                                            fun mergeChild(parentList: io.realm.RealmList<File>, copy: File) {
+                                                val existing = sharedRealm.where(File::class.java)
+                                                    .equalTo(File::id.name, copy.id)
+                                                    .findFirst()
+                                                if (existing != null) {
+                                                    // Destination row wins: link (if absent), keep its subtree.
+                                                    if (parentList.none { it.id == copy.id }) parentList.add(existing)
+                                                    return
+                                                }
+                                                val detachedChildren = copy.children.toList()
+                                                copy.children.clear()
+                                                val inserted = sharedRealm.copyToRealm(copy)
+                                                insertedIds.add(inserted.id)
+                                                for (childCopy in detachedChildren) mergeChild(inserted.children, childCopy)
+                                            }
+                                            val existingRoot = sharedRealm.where(File::class.java)
+                                                .equalTo(File::id.name, file.id)
+                                                .findFirst()
+                                            if (existingRoot != null) {
+                                                // Identity moves; destination-local state preserved;
+                                                // the destination subtree stays authoritative.
+                                                val previousParentId = existingRoot.parentId
+                                                existingRoot.parentId = newParent.id
+                                                existingRoot.path = ""
+                                                if (destinationProxy.children.none { it.id == file.id }) {
+                                                    destinationProxy.children.add(existingRoot)
+                                                }
+                                                if (previousParentId != newParent.id && previousParentId > 0) {
+                                                    FileController.getFileById(sharedRealm, previousParentId)?.children
+                                                        ?.removeAll { it.id == file.id }
+                                                }
+                                            } else {
+                                                mergeChild(destinationProxy.children, movedChild)
+                                            }
+                                        }
+                                    }.onFailure(Sentry::captureException).isSuccess
+                                    // COMMITTED VERIFICATION BEFORE SOURCE REMOVAL (issues:
+                                    // round 17 #16, round 18 #10): the root's COMMITTED
+                                    // identity AND destination membership, plus every row the
+                                    // merge actually inserted — mere existence of SOME row
+                                    // with the id never certified a failed or skipped
+                                    // insertion, and a pre-existing row never certified a
+                                    // missing one.
+                                    destinationVerified = mergeOk && runCatching {
+                                        val committedRoot = sharedRealm.where(File::class.java)
+                                            .equalTo(File::id.name, file.id)
+                                            .equalTo(File::parentId.name, newParent.id)
+                                            .findFirst()
+                                        val membershipOk = committedRoot != null && FileController.getFileById(sharedRealm, newParent.id)
+                                            ?.children?.any { it.id == file.id } == true
+                                        val descendantsOk = insertedIds.all { id ->
+                                            sharedRealm.where(File::class.java).equalTo(File::id.name, id).findFirst() != null
+                                        }
+                                        membershipOk && descendantsOk
+                                    }.getOrDefault(false)
                                 }
                             }
                             if (destinationVerified) {
