@@ -862,6 +862,13 @@ object FileController {
     }
 
     fun addChild(localFolderId: Int, newFile: File, realm: Realm, userDrive: UserDrive? = null) {
+        // Authoritative-parent membership (issue: round 13 #12): a real-folder child addition
+        // links a row only when the row's own parent relationship names THIS folder — the
+        // linking caller's basis can be stale (the child may have moved while an ancestor
+        // HTTP fetch was pending, after the child's lock was released), and a wrong backlink
+        // would re-attach an abandoned location. The move caller sets parentId before
+        // calling; the chain resolvers defer the link instead of forcing it.
+        if (newFile.parentId != localFolderId) return
         getFileById(realm, localFolderId)?.let { localFolder ->
             if (!localFolder.children.contains(newFile)) {
                 // The child-add is an identity mutation of the new child (the UI move calls
@@ -1047,7 +1054,15 @@ object FileController {
                         remoteFiles = listOf(remoteFile),
                         userDrive = userDrive,
                     ).first()
-                    parentResponse.children = RealmList(preservedFile)
+                    // Authoritative-parent membership (issue: round 13 #12): the cascade may
+                    // attach the child to A's children list only when the child's live
+                    // authoritative parent still IS A — a row that moved away while the parent
+                    // HTTP response was in flight must not gain a second, wrong backlink
+                    // through the cascade (the same rule the folder listing's substitution
+                    // applies). The narrowing to the single cascaded child is the established
+                    // base design of this path.
+                    parentResponse.children =
+                        if (preservedFile.parentId == parentResponse.id) RealmList(preservedFile) else RealmList()
                     // The parent upsert CASCADES the embedded child row (issues: round 11 #3,
                     // round 13 #4): the PARENT's acceptance is also checked against the
                     // transaction-fresh row (another writer can commit its newer location while
@@ -1066,8 +1081,15 @@ object FileController {
                         moreTransaction = {
                             val liveChild = getFileById(realm, preservedFile.id)
                             if (liveChild != null && isStaleReplacement(liveChild, preservedFile)) {
-                                val index = parentResponse.children.indexOfFirst { child -> child.id == preservedFile.id }
-                                if (index >= 0) parentResponse.children[index] = liveChild
+                                // Membership re-derived from the LIVE row: substitute only
+                                // when it still hangs from this parent; otherwise the cascade
+                                // carries no link for it at all.
+                                if (liveChild.parentId == parentResponse.id) {
+                                    val index = parentResponse.children.indexOfFirst { child -> child.id == preservedFile.id }
+                                    if (index >= 0) parentResponse.children[index] = liveChild
+                                } else {
+                                    parentResponse.children.removeAll { it.id == preservedFile.id }
+                                }
                             }
                         },
                     )
