@@ -74,6 +74,9 @@ object FileController {
     /** Ancestry resolutions per gallery pass (issue: round 19 #27) — bounded, retried next refresh. */
     private const val GALLERY_ANCESTRY_RESOLUTION_BUDGET = 4
 
+    /** Parent hops inspected by one resolved-ancestry validation (issue: round 23 #15) — bounds pathological chains/cycles. */
+    private const val ANCESTRY_VALIDATION_DEPTH_BUDGET = 32
+
     /**
      * Fair rotating start offset for the gallery ancestry work set (issue: round 22 #16): each
      * pass starts its bounded budget at the next rotation position, so a persistently failing
@@ -1204,8 +1207,11 @@ object FileController {
             if (live != null && isStaleReplacement(live, newFile, observed)) return@executeTransaction
             // RESOLVED-ANCESTRY ACCEPTANCE (issue: round 22 #15): a missing parent row
             // defers the operation (the cursor stays) instead of consuming an
-            // authoritative event for a row whose ancestry cannot be used.
-            if (requireResolvedParent && newFile.parentId > 0 && getFileById(realm, newFile.parentId) == null) {
+            // authoritative event for a row whose ancestry cannot be used. COMPLETE
+            // USABLE CHAIN (issue: round 23 #15): the previous check validated only the
+            // IMMEDIATE parent, so a row could commit over an interior hole (a cached
+            // parent whose own ancestry is absent) and present unusable ancestry.
+            if (requireResolvedParent && newFile.parentId > 0 && !usableAncestryChain(realm, newFile.parentId)) {
                 return@executeTransaction
             }
             if (live?.isUsable() == true) newFile.keepOldLocalFilesData(live)
@@ -1240,6 +1246,21 @@ object FileController {
             accepted = true
         }
         return accepted
+    }
+
+    /**
+     * The COMPLETE usable ancestry check for resolved-parent acceptance (issue: round 23
+     * #15): climbs parent ids from [startParentId] to the usable boundary — a zero parent
+     * or the depth budget — and requires EVERY hop to be a cached row. Bounded against
+     * pathological chains; a budget exhaustion with all rows present is a usable chain.
+     */
+    private fun usableAncestryChain(realm: Realm, startParentId: Int): Boolean {
+        var parentId = startParentId
+        var depth = 0
+        while (parentId > 0 && depth++ < ANCESTRY_VALIDATION_DEPTH_BUDGET) {
+            parentId = getFileById(realm, parentId)?.parentId ?: return false
+        }
+        return true
     }
 
     /**

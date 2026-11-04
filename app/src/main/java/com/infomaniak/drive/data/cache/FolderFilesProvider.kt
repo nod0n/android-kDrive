@@ -61,6 +61,9 @@ object FolderFilesProvider {
     // Example: We did it when we added Categories & Colored folders, to automatically display them when updating the app.
     private const val MIN_VERSION_CODE = 5_00_010_01
 
+    /** Missing-ancestor details requests per activity resolution pass (issue: round 23 #15) — bounded, retried next pass. */
+    private const val MISSING_ANCESTRY_RESOLUTION_BUDGET = 8
+
     private val minDateToIgnoreCache = Calendar.getInstance().apply { add(Calendar.MONTH, -2) }.timeInMillis / 1000 // 3 month
 
     fun getFiles(
@@ -997,6 +1000,24 @@ object FolderFilesProvider {
             val details = probe?.data?.takeIf { it.id == fileId }
             return when {
                 details != null -> {
+                    // MISSING-ANCESTRY RESOLUTION, BOUNDED AND FAIR (issue: round 23 #15):
+                    // the activity path previously fetched only the event's own file and
+                    // deferred on a missing parent FOREVER — nothing in the retry ever
+                    // fetched the parent, so the same immutable activity blocked the
+                    // cursor indefinitely. The fetched row's ancestry is resolved here,
+                    // OUTSIDE the coordination section: each missing ancestor gets ONE
+                    // details request (no retry loop), and the fetched ancestors are
+                    // committed TOP-DOWN through the coordinated upsert, each requiring
+                    // its own resolved chain — an interior fetch failure defers that
+                    // ancestor and everything below it, and the event stays deferred,
+                    // never consumed. The child commit below re-validates the complete
+                    // usable chain (the strengthened resolved-parent acceptance).
+                    resolveMissingAncestryOutsideLocks(
+                        realm = realm,
+                        fetchedFile = details,
+                        okHttpClient = okHttpClient,
+                        userDrive = userDrive,
+                    )
                     // COMPLETE ASCENDING LOCK SET ONCE (issue: round 22 #14): the previous
                     // withFileLock(file) pre-held the CHILD lock while the upsert then
                     // requested lower-ID parent locks — a concrete lock-order deadlock
@@ -1048,6 +1069,60 @@ object FolderFilesProvider {
         } else {
             if (actionFile.isImporting()) MqttClientWrapper.start(actionFile.externalImport?.id)
             return FileController.upsertActionFile(realm, currentFolder.id, actionFile, userDrive, observed = observed)
+        }
+    }
+
+    /**
+     * ONE bounded, fair pass resolving a fetched row's missing ancestry (issue: round 23
+     * #15): climbs the parent chain to its usable boundary — a cached ancestor, a zero
+     * parent or the budget — fetching each MISSING ancestor with a single details request
+     * OUTSIDE any lock, then committing the fetched ancestors TOP-DOWN through the
+     * coordinated upsert (whose resolved-parent acceptance validates each ancestor's own
+     * complete chain, so an interior failure defers that ancestor and everything below
+     * it). No retry loop: ancestors beyond the budget or with indeterminate fetches wait
+     * for the next activity pass, exactly like the event they unblock.
+     */
+    private fun resolveMissingAncestryOutsideLocks(
+        realm: Realm,
+        fetchedFile: File,
+        okHttpClient: OkHttpClient,
+        userDrive: UserDrive,
+    ) {
+        val fetchedAncestors = ArrayDeque<File>()
+        var cursorRow: File = fetchedFile
+        for (_hop in 0 until MISSING_ANCESTRY_RESOLUTION_BUDGET) {
+            val parentId = cursorRow.parentId.takeIf { it > 0 } ?: break
+            if (FileController.getFileById(realm, parentId) != null) break // usable boundary
+            val parent = runCatching {
+                ApiRepository.getFileDetails(
+                    file = File(
+                        id = parentId,
+                        driveId = cursorRow.driveId.takeIf { it > 0 } ?: userDrive.driveId,
+                    ),
+                    okHttpClient = okHttpClient,
+                )
+            }.getOrNull()?.data?.takeIf { it.id == parentId } ?: break // indeterminate: defer as before
+            fetchedAncestors.addFirst(parent) // top-down commit order
+            cursorRow = parent
+        }
+        for (ancestor in fetchedAncestors) {
+            val committed = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withLocksFor(
+                    userDrive,
+                    buildList {
+                        add(ancestor.id)
+                        ancestor.parentId.takeIf { it > 0 }?.let(::add)
+                    }.distinct(),
+                ) {
+                    FileController.upsertFetchedFileIfNotOlderInCoordinatedSection(
+                        newFile = ancestor,
+                        realm = realm,
+                        userDrive = userDrive,
+                        observed = null,
+                    )
+                }
+            }
+            if (!committed) break
         }
     }
 
