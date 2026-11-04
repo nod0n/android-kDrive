@@ -774,6 +774,13 @@ object FileController {
                     val destinationRow = getFileById(realm, destinationContainerId ?: return@withLocksFor)
                     if (destinationRow == null) {
                         handled = false
+                    } else if (!destinationChainExists(realm, destinationContainerId ?: return@withLocksFor)) {
+                        // COMPLETE FRESH ANCESTRY before the link (issue: round 19 #8): the
+                        // container exists but an ancestor row does not — linking here
+                        // strands the row's traversal (offline path resolution, deferred
+                        // cleanup, orphan sweeps all walk parentId). Defer WITHOUT side
+                        // effects; a later pass with the resolved ancestry re-applies.
+                        handled = false
                     } else {
                         realm.executeTransaction {
                             val freshRow = getFileById(realm, actionFile.id)
@@ -799,6 +806,14 @@ object FileController {
                         }
                     }
                 } else if (handled) realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
+                    // COMPLETE FRESH ANCESTRY before the insert (issue: round 19 #8): the
+                    // same-container path derives the bytes' location from THIS folder's
+                    // chain — a missing ancestor yields a wrong derived path for the
+                    // committed identity, and the row would strand beneath a broken
+                    // traversal. Defer WITHOUT side effects.
+                    if (!destinationChainExists(realm, folderId)) {
+                        handled = false
+                    } else
                     if (!realmFolder.children.contains(preservedActionFile) &&
                         // Parent-consistent membership (issue: round 13 #12): a
                         // boundary-substituted MANAGED row whose authoritative parent is NOT

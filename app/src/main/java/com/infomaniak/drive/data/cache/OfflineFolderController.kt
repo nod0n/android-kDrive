@@ -829,6 +829,17 @@ object OfflineFolderController {
                     }
                     return@withFileLock remoteFile
                 }
+                // COMPLETE FRESH DESTINATION ANCESTRY BEFORE PRESERVATION (issue: round 19
+                // #8): the move's destination path derives from the incoming payload's parent
+                // chain — an ancestor row missing locally yields a WRONG path, and
+                // preservation would move or snapshot bytes there. Every shared-boundary
+                // consumer (activity events, details cascades, ordinary listings) defers
+                // SIDE-EFFECT-FREE here (the OLD row is returned; nothing on disk, in the
+                // upload queue or in provenance was touched); a later pass with the resolved
+                // ancestry re-applies the payload.
+                if (!FileController.destinationChainExists(realm, remoteFile.parentId)) {
+                    return@withFileLock oldRow
+                }
                 if (reconcileMovedInheritedCopy(
                         context = context,
                         oldOfflineFile = oldOffline,
