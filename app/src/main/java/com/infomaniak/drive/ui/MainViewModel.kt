@@ -409,26 +409,23 @@ class MainViewModel(
                             // capture) — with the complete post-move identity applied: the
                             // stale source parent/path must not survive, or uploads keep
                             // targeting the old location (issue: round 8 #5).
-                            // CROSS-REALM transfer copy is DEPTH ONE (issue: round 16 #10): a
-                            // depth-zero copy would upsert a truncated observation into the
-                            // shares realm — embedded rights/version dropped and the child
-                            // ownership graph nulled while isComplete stays true. The depth-one
-                            // copy carries the embedded metadata and the direct children's
-                            // primitives into the destination realm; the accepted managed
-                            // identity still provides the committed local fields.
-                            val movedChild = freshRow?.let { currentDriveRealm.copyFromRealm(it, 1) }?.apply {
+                            // CROSS-REALM transfer (issue: round 17 #16): the copy is DEEP —
+                            // the complete cached ownership graph travels with the row. A
+                            // depth-one copy truncated each child's own children while their
+                            // isComplete flag survived, so the shares realm would believe it
+                            // holds complete (empty) folders and an offline walk or root
+                            // removal inside the shared scope would treat loaded descendants
+                            // as never having existed. Embedded metadata (rights, version,
+                            // external import) rides the same deep copy.
+                            val movedChild = freshRow?.let { currentDriveRealm.copyFromRealm(it, Int.MAX_VALUE) }?.apply {
                                 parentId = newParent.id
                                 path = ""
                             } ?: file.apply {
                                 parentId = newParent.id
                                 path = ""
                             }
-                            FileController.removeFile(
-                                fileId = file.id,
-                                customRealm = currentDriveRealm,
-                                userDrive = userDrive,
-                            )
                             val sharedScope = UserDrive(userId = presentationScope.userId, sharedWithMe = true)
+                            var destinationVerified = false
                             FileController.getRealmInstance(sharedScope).use { sharedRealm ->
                                 // Every affected identity in the ACTUAL realm's captured scope
                                 // (issue: round 11 #3): the parent lock used to be scope-less
@@ -441,7 +438,29 @@ class MainViewModel(
                                             localFolder.children.add(movedChild)
                                         }.onFailure(Sentry::captureException)
                                     }
+                                    // DESTINATION VERIFIED BEFORE SOURCE REMOVAL (issue: round
+                                    // 17 #16): the source row is deleted only after the
+                                    // inserted row is re-read from the committed destination
+                                    // transaction. A failed or silently dropped insertion used
+                                    // to leave the file in NO realm — its cached graph (and an
+                                    // offline copy's metadata anchor) lost while the UI
+                                    // reported success.
+                                    destinationVerified = sharedRealm.where(File::class.java)
+                                        .equalTo(File::id.name, file.id)
+                                        .findFirst() != null
                                 }
+                            }
+                            if (destinationVerified) {
+                                FileController.removeFile(
+                                    fileId = file.id,
+                                    customRealm = currentDriveRealm,
+                                    userDrive = userDrive,
+                                )
+                            } else {
+                                // The row keeps its OLD identity and location in this realm;
+                                // the offline sync re-processes the move until the shared
+                                // destination accepts it (issues: round 8 #5, round 17 #16).
+                                SentryLog.i("MainViewModel", "Deferred shared move of ${file.id}: destination insertion was not verified")
                             }
                         } else {
                             // Preservation incomplete or a newer committed identity won

@@ -283,12 +283,57 @@ object OfflineFolderUtils {
         val deferredMoveIds = commitOutcomes.deferredIds
 
         if (deferredMoveIds.isNotEmpty()) {
-            // The reconciliation is incomplete: the affected files keep their old metadata
-            // and location this round, and the root stays incomplete for retry (issue: round
-            // 5 #8/#9). The folder itself WAS fully listed — independent folders keep walking
-            // so one occupied destination cannot starve the whole root (issue: round 6 #10).
-            SentryLog.i(TAG, "Deferred ${deferredMoveIds.size} file(s) whose old copies are not safely preserved yet")
-            return FolderWalkOutcome.DEFERRED_MOVES
+            // ANCHORED RESOLUTION for deferred tie-ids (issue: round 17 #17): a deferral
+            // relative to a MISSING observation is this listing's permanent blind spot — a
+            // move-in candidate's old row lives in ANOTHER folder, so every future listing
+            // of this folder would defer it the same way (a livelock until some other pass
+            // relocates the old row). The candidate's CURRENT LOCAL ROW, detached before
+            // any further mutation, is the missing anchor: re-committing the SAME fully
+            // aggregated page — a partial page would replace the folder's whole membership
+            // (the commit clears children on the first page) — with the completed
+            // observation map re-runs the exact acceptance the next listing would have
+            // performed, through the same identity and preservation gates, this pass. No
+            // additional request is needed; the anchor is the pre-commit row state itself.
+            // BOUNDED: only the first candidates are anchored per pass; the rest stay
+            // deferred exactly as before.
+            val anchoredObservations = buildMap<Int, File> {
+                putAll(observedById)
+                for (deferredId in deferredMoveIds.sorted().take(ANCHORED_RESOLUTION_BUDGET)) {
+                    ensureActive()
+                    FileController.getFileById(realm, deferredId)?.let { row ->
+                        put(deferredId, realm.copyFromRealm(row, 1))
+                    }
+                }
+            }
+            val fileIdsBefore = fileIds.size
+            val retryOutcomes = processPage(
+                context = context,
+                realm = realm,
+                rootFolderId = rootFolderId,
+                folderId = folderId,
+                userDrive = userDrive,
+                apiResponse = completeResponse,
+                isCompleteFolder = true,
+                fileIds = fileIds,
+                folderQueue = folderQueue,
+                visitedFolderIds = visitedFolderIds,
+                observedById = anchoredObservations,
+            )
+            // The bounded re-commit may have collected duplicate file ids (the same
+            // children committed twice); keep the collected list a set-like progression.
+            if (fileIds.size > fileIdsBefore) {
+                val deduplicated = fileIds.distinct()
+                fileIds.clear()
+                fileIds.addAll(deduplicated)
+            }
+            if (retryOutcomes.deferredIds.isNotEmpty()) {
+                // The reconciliation is incomplete: the affected files keep their old metadata
+                // and location this round, and the root stays incomplete for retry (issue: round
+                // 5 #8/#9). The folder itself WAS fully listed — independent folders keep walking
+                // so one occupied destination cannot starve the whole root (issue: round 6 #10).
+                SentryLog.i(TAG, "Deferred ${retryOutcomes.deferredIds.size} file(s) whose old copies are not safely preserved yet")
+                return FolderWalkOutcome.DEFERRED_MOVES
+            }
         }
 
         return FolderWalkOutcome.COMPLETED
@@ -718,4 +763,11 @@ object OfflineFolderUtils {
     }
 
     private val TAG = OfflineFolderUtils::class.java.simpleName
+
+    /**
+     * Bounded authoritative re-fetches per folder pass for deferred move ties (issue: round
+     * 17 #17): one pathological folder cannot spin the walk into an unbounded request loop;
+     * the remainder stays deferred for the next listing.
+     */
+    private const val ANCHORED_RESOLUTION_BUDGET = 4
 }
