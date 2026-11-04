@@ -163,20 +163,46 @@ class DownloadOfflineFileManager(
                     SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its destination chain is incomplete")
                     return@withFileLock false
                 }
+                var skipMetadataCommit = false
                 val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
                     // The transfer's basis [file] is the request-observed state (issue: round 13
                     // #1): a tied-timestamp identity change is accepted only while the live row
-                    // still matches it.
-                    OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                    // still matches it. The boundary result is DETACHED before the block closes
+                    // (issue: round 22 #1 pattern) — a managed old row read after `use` would
+                    // hit a closed realm.
+                    val boundaryResult = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                         realm = realm,
                         remoteFiles = listOf(remoteFile),
                         userDrive = userDrive,
                         observedById = mapOf(remoteFile.id to file),
                     ).first()
+                    if (boundaryResult === remoteFile) remoteFile else realm.copyFromRealm(boundaryResult, 1)
                 }
                 if (commitFile !== remoteFile) {
-                    SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
-                    return@withFileLock false
+                    // NON-DESTRUCTIVE VERIFICATION DOWNLOAD (issue: round 22 #6): a
+                    // boundary substitution for an UNCHANGED identity is the
+                    // unproven-historical preservation defer — the verification may still
+                    // fetch a SEPARATE staged copy and compare it against the retained
+                    // bytes at the (non-destructive) publication: equal bytes certify the
+                    // retained generation, different bytes are retained. The historical
+                    // row and bytes are never replaced first, and the metadata commit is
+                    // skipped (the row stays as-is). Any OTHER substitution still defers.
+                    // Compared on the SERVER-OBSERVED fields only: publishedCleanBaseline
+                    // is a local materialized field the API payload never carries — its
+                    // presence must not block the non-destructive verification, whose
+                    // authority is the byte comparison at the publication.
+                    val unchangedIdentity = commitFile.revisedAt == remoteFile.revisedAt &&
+                        commitFile.updatedAt == remoteFile.updatedAt &&
+                        (commitFile.version?.number ?: 0) == (remoteFile.version?.number ?: 0) &&
+                        commitFile.parentId == remoteFile.parentId &&
+                        commitFile.name == remoteFile.name &&
+                        commitFile.lastModifiedAt == remoteFile.lastModifiedAt &&
+                        commitFile.size == remoteFile.size
+                    if (!unchangedIdentity) {
+                        SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
+                        return@withFileLock false
+                    }
+                    skipMetadataCommit = true
                 }
                 // The SAME complete-chain validation holds THROUGH the commit (issue: round
                 // 17 #8): a chain broken during preservation defers without the metadata
@@ -197,7 +223,14 @@ class DownloadOfflineFileManager(
                 // acceptance decision reads the live row INSIDE the committing transaction
                 // (issue: round 11 #5) against the request-observed basis (issue: round 13 #1).
                 FileController.getRealmInstance(userDrive).use { realm ->
-                    FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive, observed = file)
+                    if (skipMetadataCommit) {
+                        // Non-destructive verification (issue: round 22 #6): the historical
+                        // row stays AS-IS — no metadata commit — while the transfer fetches
+                        // its separate staged copy for the publication-time comparison.
+                        true
+                    } else {
+                        FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive, observed = file)
+                    }
                 }
             }
         }
@@ -1445,6 +1478,10 @@ class DownloadOfflineFileManager(
                 // (SKIPPED_CONFLICT below never clears the marker).
                 val pendingRecoveryExcludes = appContext != null &&
                     pendingRecoveryFileIds(appContext, userDrive).contains(file.id)
+                // NON-DESTRUCTIVE STAGED COMPARISON ELIGIBILITY (issue: round 22 #6): set by
+                // the classification below when the retained bytes carry no content proof —
+                // the freshly staged copy may then CERTIFY them without replacing them first.
+                var targetContentUnproven = false
                 val targetProtected = UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
                         UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(target).toString()) ||
                         registryConflict || pendingRecoveryExcludes || when {
@@ -1463,33 +1500,55 @@ class DownloadOfflineFileManager(
                     // its sole edit, and accepted metadata alone must not reclassify
                     // retained old-clean bytes as an edit.
                     else -> run {
-                        // SAME-MTIME CONTENT DRIFT IS PROTECTED (issue: round 21 #2): the
-                        // owner's own provenance record whose hash does NOT match the
-                        // current bytes is a proven same-mtime edit (or unknown content) —
-                        // the metadata-only mtime comparison alone previously let the
-                        // fresh publication overwrite it. FRESH EXACT OWNER ROW, CLOSED
-                        // OVER THE REALM (issue: round 22 #1): the ownership comparison is
-                        // computed INSIDE the scoped-realm block and the Boolean (never the
-                        // managed row) escapes it — reading the managed row after the block
-                        // closed threw on the UI-promotion path. A REFRESH FAILURE DEFERS
-                        // the decision to the protected side: the stale view never decides
-                        // a destructive replacement.
+                        // ONE COMPLETE CONTENT CLASSIFICATION, CLOSED OVER THE REALM
+                        // (issues: round 22 #1, round 22 #5): the ownership comparison is
+                        // computed INSIDE the scoped-realm block and only the Boolean
+                        // escapes; a REFRESH FAILURE defers to the protected side. The
+                        // classification matches preservation's:
+                        //  - CERTIFIED clean bytes (the owner's record certifies them) are
+                        //    the published generation — replaceable regardless of mtime (a
+                        //    stale baseline COMMIT no longer blocks the requested refresh
+                        //    with a false SKIPPED_PROTECTED);
+                        //  - PROVEN hash drift (the owner's record, different content) is an
+                        //    edit — protected;
+                        //  - a HASHLESS record identifying the owner proves nothing about
+                        //    content: unproven historical — RETAINED (a same-size same-mtime
+                        //    historical edit was previously considered replaceable);
+                        //  - NO identifying record at all: unknown historical — RETAINED.
                         val currentTargetHash = UploadFile.sha256OrNull(target)
-                        val driftProtected = currentTargetHash != null &&
-                            readPublishedProvenance(appContext, target)?.let { record ->
-                                record.contentHash != null && record.contentHash != currentTargetHash &&
-                                    runCatching {
-                                        FileController.getRealmInstance(userDrive).use { ownerRealm ->
-                                            ownerRealm.refresh()
-                                            val ownerRow = FileController.getFileById(ownerRealm, liveOwner.id)
-                                            ownerRow != null && record.identifies(ownerRow, userDrive)
-                                        }
-                                    }.getOrDefault(true)
-                            } == true
-                        OfflineFolderPolicy.isLocallyModified(
-                            offlineFileLastModifiedMillis = target.lastModified(),
-                            remoteLastModifiedAtSeconds = liveOwner.effectivePublishedBaseline,
-                        ) || driftProtected
+                        val ownerProof = readPublishedProvenance(appContext, target)
+                        val ownerRowIdentifies = runCatching {
+                            FileController.getRealmInstance(userDrive).use { ownerRealm ->
+                                ownerRealm.refresh()
+                                val ownerRow = FileController.getFileById(ownerRealm, liveOwner.id)
+                                ownerRow != null && ownerProof?.identifies(ownerRow, userDrive) == true
+                            }
+                        }.getOrDefault(false)
+                        var classified = when {
+                            currentTargetHash == null -> true
+                            ownerProof != null && ownerRowIdentifies && ownerProof.certifiesBytes(target) -> false
+                            ownerRowIdentifies && ownerProof.contentHash != null &&
+                                ownerProof.contentHash != currentTargetHash -> true
+                            else -> true
+                        }
+                        // STAGED COMPARISON (issue: round 22 #6): only UNPROVEN
+                        // destinations (no identifying record, or a hashless identifying
+                        // record) converge through the staged copy — positively foreign
+                        // records and proven drift never do. When the freshly staged copy is
+                        // byte-identical to the retained bytes, the retained generation IS
+                        // the fetched one: the publication proceeds and its certifying
+                        // record replaces the hashless one (convergence). Different or
+                        // unreadable bytes stay protected.
+                        targetContentUnproven = classified &&
+                            (ownerProof == null || (ownerRowIdentifies && ownerProof.contentHash == null))
+                        if (targetContentUnproven && currentTargetHash != null) {
+                            val stagedHash = UploadFile.sha256OrNull(staged)
+                            if (stagedHash != null && stagedHash == currentTargetHash) {
+                                classified = false
+                                targetContentUnproven = false
+                            }
+                        }
+                        classified
                     }
                 }
 

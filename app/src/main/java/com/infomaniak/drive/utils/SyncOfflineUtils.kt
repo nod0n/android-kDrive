@@ -521,12 +521,21 @@ object SyncOfflineUtils {
                     val durablePublication = freshIoFile != null && liveRow != null &&
                         DownloadOfflineFileManager.readPublishedProvenance(context, freshIoFile)
                             ?.let { it.identifies(liveRow, userDrive) && it.certifiesBytes(freshIoFile) } == true
+                    // PROVEN SAME-MTIME DRIFT IS AN EDIT (issue: round 22 #4): the row's own
+                    // record whose content hash does NOT match the bytes is an edit
+                    // REGARDLESS of the mtime test — the mtime-only upload predicate
+                    // previously missed the same-mtime drift entirely.
+                    val provenHashDrift = freshIoFile != null && liveRow != null &&
+                        DownloadOfflineFileManager.readPublishedProvenance(context, freshIoFile)?.let {
+                            it.identifies(liveRow, userDrive) && it.contentHash != null &&
+                                UploadFile.sha256OrNull(freshIoFile) != it.contentHash
+                        } == true
                     // Operation selection from PUBLISHED-BYTE provenance (issue: round 17 #3):
                     // bytes are an edit iff NEWER THAN THEIR OWN published baseline — a clean
                     // copy with a preserved future mtime is never uploaded over a newer server
                     // revision; remote REVISION ordering separately selects reconciliation.
-                    val bytesEdited = freshSourceModifiedSeconds > (liveRow?.effectivePublishedBaseline ?: 0L) &&
-                        !durablePublication
+                    val bytesEdited = (freshSourceModifiedSeconds > (liveRow?.effectivePublishedBaseline ?: 0L) &&
+                        !durablePublication) || provenHashDrift
                     val remoteNewer = remoteFile.revisedAt > (liveRow?.revisedAt ?: 0L)
                     when {
                         bytesEdited ->
@@ -805,7 +814,14 @@ object SyncOfflineUtils {
             val publishedProof = DownloadOfflineFileManager.readPublishedProvenance(context, freshSource)
             val durablePublication = publishedProof?.identifies(liveRow, userDrive) == true &&
                 publishedProof.certifiesBytes(freshSource)
-            val uploadStillNeeded = freshModifiedSeconds > liveRow.effectivePublishedBaseline && !durablePublication
+            // PROVEN SAME-MTIME DRIFT IS AN EDIT (issue: round 22 #4): the mtime-only
+            // upload-need test previously missed a same-mtime edit whose hash mismatches
+            // the row's own record.
+            val provenHashDrift = publishedProof?.identifies(liveRow, userDrive) == true &&
+                publishedProof.contentHash != null &&
+                UploadFile.sha256OrNull(freshSource) != publishedProof.contentHash
+            val uploadStillNeeded = (freshModifiedSeconds > liveRow.effectivePublishedBaseline && !durablePublication) ||
+                provenHashDrift
             if (!uploadStillNeeded) return true
             val uri = Uri.fromFile(freshSource)
             val fileModifiedAt = Date(freshSource.lastModified())

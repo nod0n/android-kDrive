@@ -662,10 +662,31 @@ object OfflineFolderController {
                     DownloadOfflineFileManager.deletePublishedProvenance(context, oldOfflineFile)
                     runCatching { oldOfflineFile.delete() }.isSuccess
                 }
-                OfflineFolderPolicy.isLocallyModified(
-                    offlineFileLastModifiedMillis = oldOfflineFile.lastModified(),
-                    remoteLastModifiedAtSeconds = oldLastModifiedAt,
-                ) -> {
+                // ONE FRESH SCOPE+OWNERSHIP+CONTENT CLASSIFICATION decides the destructive
+                // arms (issue: round 22 #4):
+                //  - a positively foreign record on the old path DEFERS — the bytes are
+                //    another identity's content: never snapshotted under this identity,
+                //    never deleted, never renamed;
+                //  - a KNOWN record whose hash MISMATCHES the bytes is a PROVEN same-mtime
+                //    edit: snapshotted before the relocation (the mtime test alone missed
+                //    it);
+                //  - a genuine edit against the record-identified generation is snapshotted
+                //    as before;
+                //  - UNPROVEN historical bytes (no identifying record — an unset baseline a
+                //    backward-dated revision re-labels through the fallback, or a hashless
+                //    legacy record) DEFER: never auto-uploaded, never deleted; verification
+                //    resolves their generation.
+                DownloadOfflineFileManager.readPublishedProvenance(context, oldOfflineFile)
+                    ?.positivelyForeignTo(newIdentity, userDrive) == true -> false
+                DownloadOfflineFileManager.readPublishedProvenance(context, oldOfflineFile)?.let { record ->
+                    record.identifies(newIdentity, userDrive) && (
+                        (record.contentHash != null && UploadFile.sha256OrNull(oldOfflineFile) != record.contentHash) ||
+                            OfflineFolderPolicy.isLocallyModified(
+                                offlineFileLastModifiedMillis = oldOfflineFile.lastModified(),
+                                remoteLastModifiedAtSeconds = oldLastModifiedAt,
+                            )
+                        )
+                } == true -> {
                     val registered = registerDirtySnapshot(context, newIdentity, oldOfflineFile, userDrive)
                     if (registered) {
                         // Every byte deletion clears matching provenance (issue: round 18 #12).
@@ -673,6 +694,10 @@ object OfflineFolderController {
                         runCatching { oldOfflineFile.delete() }.isSuccess
                     } else false
                 }
+                OfflineFolderPolicy.isLocallyModified(
+                    offlineFileLastModifiedMillis = oldOfflineFile.lastModified(),
+                    remoteLastModifiedAtSeconds = oldLastModifiedAt,
+                ) -> false
                 else -> {
                     // An explicit target is used by callers whose new location cannot be
                     // derived from [newIdentity]'s not-yet-committed metadata (UI move/rename
@@ -1486,13 +1511,25 @@ object OfflineFolderController {
             // resolves (a fresh publication SKIPPED_CONFLICTs).
             file.storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.FOREIGN_CONFLICT ->
                 CopyProtection.UNPROVEN_HISTORICAL
+            // PROVEN SAME-MTIME DRIFT (issue: round 22 #4): the row's own record whose
+            // content hash does NOT match the bytes is a proven edit REGARDLESS of mtime —
+            // selected for snapshot, never classified unproven-historical (the seconds-
+            // resolution mtime test alone missed the same-mtime case).
+            DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile)?.takeIf {
+                it.identifies(file, userDrive) && it.contentHash != null &&
+                    UploadFile.sha256OrNull(offlineFile) != it.contentHash
+            } != null -> CopyProtection.DIRTY
             OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
                 // The PUBLISHED byte baseline, not accepted server metadata (issue: round
                 // 15 #6) — retained old-clean bytes after a backward-dated newer
-                // generation commits are not a local edit.
+                // generation commits are not a local edit. The baseline must also be
+                // ANCHORED (issue: round 22 #4): a historical copy whose baseline is UNSET
+                // falls back to accepted remote metadata, which a backward-dated newer
+                // revision re-labels — unproven historical bytes are never auto-uploaded
+                // through that fallback.
                 remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
-            ) -> CopyProtection.DIRTY
+            ) && (file.publishedCleanBaseline ?: 0L) > 0L -> CopyProtection.DIRTY
             // Unproven historical bytes (issue: round 19 #2): not proven as the published
             // generation, not newer than their baseline — an ambiguous retained copy (or a
             // same-mtime edit). PRESERVED: destructive operations keep the bytes and the
