@@ -680,14 +680,20 @@ object FolderFilesProvider {
             // block the folder cursor forever on an immutable event that will never grow
             // its missing payload.
             if (FileController.getFileById(realm, fileId) == null) return true
+            // FRESH OBSERVATION IMMEDIATELY BEFORE THE PROBE (issue: round 19 #21): the
+            // caller's children-map observation can be stale — or ABSENT, in which case
+            // the previous null guard SKIPPED the freshness check entirely and the
+            // probe's absence could erase a row restored or moved since. The observation
+            // is the row's identity captured HERE, immediately before the probe.
+            val preProbeObservation = FileController.getFileById(realm, fileId)?.let { realm.copyFromRealm(it, 1) }
             // NEW AUTHORITATIVE RESOLVING PATH (issue: round 18 #18): the resolving probe
-            // answers CURRENT (a live remote row — the event is stale or misattributed:
-            // defer, copy and cursor retained), VERIFIED MISSING (the explicit
-            // OBJECT_NOT_FOUND code — the same missing-object authority every other route
-            // uses: deletion authority is ESTABLISHED and the coordinated section runs), or
-            // INDETERMINATE (transport and other errors — defer). The previous behavior
-            // rejected every payload-less destructive activity unconditionally, so a
-            // verified-absent object deferred forever.
+            // answers CURRENT (a live remote row — the event is stale or misattributed),
+            // VERIFIED MISSING (the explicit OBJECT_NOT_FOUND code — the same
+            // missing-object authority every other route uses: deletion authority is
+            // ESTABLISHED and the coordinated section runs), or INDETERMINATE (transport
+            // and other errors — defer). The previous behavior rejected every payload-less
+            // destructive activity unconditionally, so a verified-absent object deferred
+            // forever.
             val okHttpClient = runCatching {
                 runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
             }.getOrNull() ?: return false
@@ -699,7 +705,14 @@ object FolderFilesProvider {
             }.getOrNull()
             when {
                 probe == null -> return false
-                probe.data != null -> return false
+                probe.data != null -> {
+                    // VERIFIED CURRENT OBJECT CONSUMES THE STALE DELETION (issue: round
+                    // 19 #21): the object exists server-side — this deletion event is
+                    // stale or misattributed and is consumed WITHOUT any delete; the
+                    // retained row is the current state, and the cursor moves past an
+                    // event that can never grow its payload.
+                    return true
+                }
                 probe.error?.code == ErrorCode.OBJECT_NOT_FOUND -> Unit
                 else -> return false
             }
@@ -718,12 +731,15 @@ object FolderFilesProvider {
                 runCatching { realm.refresh() }
                 val liveRow = FileController.getFileById(realm, fileId) ?: return@withLocksFor true
                 if (actionFile == null) {
-                    // VERIFIED-MISSING authority, freshness still required (issue: round 18
-                    // #18): the fresh row must still match the detached PRE-PROBE
-                    // observation — a restore or move committed since the probe defers; the
-                    // probe's server absence applies only to the row the probe was issued
-                    // against.
-                    if (observed != null && !FileController.isSameObservation(liveRow, observed)) {
+                    // VERIFIED-MISSING authority, freshness still required (issues: round 18
+                    // #18, round 19 #21): the fresh row must still match the FRESH
+                    // PRE-PROBE observation — a restore or move committed since the probe
+                    // defers; the probe's server absence applies only to the row the probe
+                    // was issued against. A null observation can no longer SKIP this
+                    // check: the capture above guarantees one for any row that existed
+                    // before the probe, and a row that vanished since defers to the
+                    // section's own null-row consumption below.
+                    if (preProbeObservation != null && !FileController.isSameObservation(liveRow, preProbeObservation)) {
                         return@withLocksFor false
                     }
                 } else if (FileController.isStaleForAuthoritativeAction(liveRow, actionFile, null, observed)) {
@@ -773,12 +789,51 @@ object FolderFilesProvider {
         observed: File?,
     ): Boolean {
         if (actionFile == null) {
-            // CONSISTENT safe resolution (issue: round 17 #11): a missing payload for an
-            // update/unknown activity has NO deletion authority — the row and the cursor are
-            // retained, never removed by an absent payload. The authoritative resolution is
-            // the retained cursor's next activities pass and the periodic folder walk, both
-            // of which this deferral keeps reachable.
-            return false
+            // SCOPED RESOLVING FETCH (issue: round 19 #21): a payload-less update/unknown
+            // activity previously deferred forever on an immutable event that will never
+            // grow its missing payload, blocking the folder cursor. The scoped details
+            // fetch answers like the removal probe: a live object is committed from the
+            // fetched AUTHORITATIVE current state (the event's intent — refresh this row —
+            // is thereby satisfied) with the pre-fetch observation resolving ties, a
+            // verified-missing object CONSUMES the event (nothing left to update), and an
+            // indeterminate transport defers with the cursor retained.
+            val preFetchObservation = FileController.getFileById(realm, fileId)?.let { realm.copyFromRealm(it, 1) }
+            val okHttpClient = runCatching {
+                runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+            }.getOrNull() ?: return false
+            val probe = runCatching {
+                ApiRepository.getFileDetails(
+                    file = File(id = fileId, driveId = userDrive.driveId),
+                    okHttpClient = okHttpClient,
+                )
+            }.getOrNull()
+            val details = probe?.data?.takeIf { it.id == fileId }
+            return when {
+                details != null -> synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withFileLock(userDrive, fileId) {
+                        val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                            realm = realm,
+                            remoteFiles = listOf(details),
+                            userDrive = userDrive,
+                            observedById = fileId.let { id ->
+                                preFetchObservation?.let { obs -> mapOf(id to obs) } ?: emptyMap()
+                            },
+                        ).first()
+                        if (committable !== details) {
+                            false
+                        } else {
+                            FileController.updateExistingFileIfNotOlder(
+                                newFile = committable,
+                                realm = realm,
+                                userDrive = userDrive,
+                                observed = preFetchObservation,
+                            )
+                        }
+                    }
+                }
+                probe?.error?.code == ErrorCode.OBJECT_NOT_FOUND -> true
+                else -> false
+            }
         } else {
             if (actionFile.isImporting()) MqttClientWrapper.start(actionFile.externalImport?.id)
             return FileController.upsertActionFile(realm, currentFolder.id, actionFile, userDrive, observed = observed)
