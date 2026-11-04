@@ -1233,6 +1233,12 @@ class MainViewModel(
         }
         val offlineFile = newParent.getOfflineFile(application, userDrive.userId) ?: return false
         val destinationFile = IOFile(offlineFile, file.name)
+        // COMPLETE FRESH DESTINATION ANCESTRY BEFORE THE FIRST PRESERVATION EFFECT
+        // (issue: round 22 #9): the relocation below anchors and moves/snapshots bytes
+        // beneath the destination's parent chain — a locally missing ancestor strands
+        // them there when the metadata commit later fails. Returning false keeps the
+        // old bytes and metadata; the move retries once the chain resolves.
+        if (!FileController.destinationChainExists(realm, newParent.id)) return false
         // The snapshot registers under the POST-MOVE identity (issue: round 7 #5): the edit
         // belongs to the moved file, and registering the source parent would queue the upload
         // for the old location while the caller commits the new one. Protection queries keep

@@ -805,6 +805,19 @@ object OfflineFolderController {
                 // touched) and a later pass retries once the duplicate resolves.
                 val pathOwnerId = exclusivePathOwner(realm, context, userDrive, oldOffline.path)
                 if (pathOwnerId != oldRow.id) return@withFileLock oldRow
+                // COMPLETE FRESH DESTINATION ANCESTRY BEFORE THE FIRST PRESERVATION EFFECT
+                // (issue: round 22 #9): the anchor below and every preservation arm after it
+                // run only once the INCOMING payload's parent chain is complete and fresh —
+                // otherwise a payload with a populated destination path anchors, snapshots or
+                // moves bytes beneath locally missing ancestors and the metadata commit then
+                // fails, stranding them. The deferral is side-effect-free; missing ancestors
+                // resolve outside coordination (listings/details/firstMissingAncestorId) and
+                // a later pass retries the whole decision. The location-changed branch
+                // REVALIDATES the chain after the unchanged-path arms (continuously through
+                // commit) below.
+                if (remoteFile.parentId > 0 && !FileController.destinationChainExists(realm, remoteFile.parentId)) {
+                    return@withFileLock oldRow
+                }
                 // Historical baseline ANCHOR (issues: round 16 #2, round 18 #6, round 19 #2):
                 // a row whose bytes were published before the baseline field existed carries
                 // UNSET (null — and, consistently, a non-positive repaired value). The anchor
@@ -891,14 +904,13 @@ object OfflineFolderController {
                     }
                     return@withFileLock remoteFile
                 }
-                // COMPLETE FRESH DESTINATION ANCESTRY BEFORE PRESERVATION (issue: round 19
-                // #8): the move's destination path derives from the incoming payload's parent
-                // chain — an ancestor row missing locally yields a WRONG path, and
-                // preservation would move or snapshot bytes there. Every shared-boundary
-                // consumer (activity events, details cascades, ordinary listings) defers
-                // SIDE-EFFECT-FREE here (the OLD row is returned; nothing on disk, in the
-                // upload queue or in provenance was touched); a later pass with the resolved
-                // ancestry re-applies the payload.
+                // CONTINUOUS ANCESTRY REVALIDATION (issues: round 19 #8, round 22 #9): the
+                // unchanged-path arms above perform durable snapshot registrations (file I/O
+                // and upload-queue writes) during which an ancestor can be deleted locally —
+                // the move's destination chain is validated AGAIN immediately before the
+                // relocation, so no preservation effect ever runs against a chain that went
+                // missing mid-section. The deferral stays side-effect-free; a later pass with
+                // the resolved ancestry re-applies the payload.
                 if (!FileController.destinationChainExists(realm, remoteFile.parentId)) {
                     return@withFileLock oldRow
                 }

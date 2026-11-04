@@ -1039,6 +1039,16 @@ object SyncOfflineUtils {
             // its own protection checks: moving or deleting the bytes here would race it. The
             // action stays pending for a later sync (issue: round 6 #11).
             if (liveRow.isMarkedAsOffline) return DownloadActionOutcome(handled = false)
+            // COMPLETE FRESH DESTINATION ANCESTRY BEFORE THE FIRST PRESERVATION EFFECT
+            // (issue: round 22 #9): the relocation below anchors and moves/snapshots bytes
+            // beneath the INCOMING payload's parent chain — an ancestor missing locally
+            // yields a wrong destination path and the bytes are stranded there when the
+            // metadata commit later fails. The chain is validated fresh BEFORE the anchor
+            // and the move; the action stays pending (side-effect-free) for a later sync
+            // once listings/details have resolved the missing ancestors.
+            if (!FileController.destinationChainExists(realm, remoteFile.parentId)) {
+                return DownloadActionOutcome(handled = false)
+            }
             if (freshOffline.exists() && run {
                 // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
                 OfflineFolderController.anchorHistoricalBaseline(context, realm, liveRow, freshOffline, userDrive)
