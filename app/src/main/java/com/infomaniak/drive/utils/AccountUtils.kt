@@ -312,7 +312,8 @@ object AccountUtils : CredentialManager(
 
                     // Reconcile cache and pending denial with the state future durable reads
                     // will actually present (an absent store reads as the default disabled
-                    // value); an unreadable store retains the fail-closed denial.
+                    // value); an unreadable store retains the fail-closed denial, and a failed
+                    // publication retains it inside the admission boundary (R7-1).
                     cleanupComplete = settingsReset && lockResetPersisted && filesDeleted && cacheDeleted
                     when (val durableEnabled = AppLockState.readDurableAppLockEnabled()) {
                         null -> {
@@ -320,7 +321,9 @@ object AccountUtils : CredentialManager(
                             AppLockState.markMaintenanceUnresolved()
                             SentryLog.w("AccountUtils", "resetApp> settings store unreadable after deletion")
                         }
-                        else -> AppLockState.reconcileAfterMaintenance(durableEnabled = durableEnabled)
+                        else -> if (!AppLockState.reconcileAfterMaintenance(durableEnabled = durableEnabled)) {
+                            cleanupComplete = false
+                        }
                     }
                 } catch (throwable: Throwable) {
                     AppLockState.markMaintenanceUnresolved()

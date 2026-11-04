@@ -153,16 +153,23 @@ class AppLockTransitions(
             }
 
             val persisted = persist(enabled)
+            var published = false
             if (persisted) {
-                // The committed write is the durable verification: publish the matching cache
-                // and clear any unresolved-maintenance denial inside this same admission
-                // boundary, so a successful request is a reachable recovery path (R6-3).
+                // The committed write is the durable verification. Publication happens BEFORE
+                // any denial clear, inside this same admission boundary: if publication throws,
+                // the unresolved-maintenance denial is retained here — it is never cleared
+                // without a successful publication (R7-1). A newer pending generation is
+                // preserved; only this request's own marker is cleared.
                 admission.write {
                     policyGeneration += 1
                     if (pendingGeneration == generation) pendingGeneration = null
-                    if (unresolvedMaintenanceDenial) {
-                        unresolvedMaintenanceDenial = false
+                    published = try {
                         publish(enabled)
+                        unresolvedMaintenanceDenial = false
+                        true
+                    } catch (publishFailure: Throwable) {
+                        unresolvedMaintenanceDenial = true
+                        false
                     }
                 }
             } else {
@@ -170,7 +177,10 @@ class AppLockTransitions(
             }
             cancelAdmittedWork()
             onTransition()
-            onResult?.invoke(persisted)
+            // Exactly one result per request, also when publication failed (R7-1): the change
+            // is durable but was not fully acknowledged, so the caller sees a failure and can
+            // reconcile or retry.
+            onResult?.invoke(persisted && published)
         } finally {
             admission.write {
                 outstandingTasks -= 1
@@ -246,20 +256,29 @@ class AppLockTransitions(
     }
 
     /**
-     * Maintenance reconcile (R5-3/R6-3): clears the pending denial and the
-     * unresolved-maintenance state and publishes [durableEnabled] — the value future durable
-     * reads will actually present (an absent store reads as the default disabled value) — all
-     * inside one admission boundary so read-verification, publication and clearing complete
-     * together.
+     * Maintenance reconcile (R5-3/R6-3/R7-1): publishes [durableEnabled] — the value future
+     * durable reads will actually present (an absent store reads as the default disabled
+     * value) — and clears the pending denial and the unresolved-maintenance state, all inside
+     * one admission boundary. Publication happens before the denial clear: on publication
+     * failure the denial is retained in this same boundary and false is returned, so no
+     * admission window exists with a cleared denial and failed publication.
      */
-    fun reconcileAfterMaintenance(durableEnabled: Boolean) {
+    fun reconcileAfterMaintenance(durableEnabled: Boolean): Boolean {
+        var published = false
         admission.write {
             policyGeneration += 1
             pendingGeneration = null
-            unresolvedMaintenanceDenial = false
-            publish(durableEnabled)
+            published = try {
+                publish(durableEnabled)
+                unresolvedMaintenanceDenial = false
+                true
+            } catch (publishFailure: Throwable) {
+                unresolvedMaintenanceDenial = true
+                false
+            }
         }
         onTransition()
+        return published
     }
 
     /**

@@ -84,8 +84,9 @@ object AppLockState {
     /** Maintenance-only reset; see [AppLockTransitions.resetToDisabledInternal]. */
     fun resetToDisabledInternal(): Boolean = transitions.resetToDisabledInternal()
 
-    /** Maintenance reconcile; see [AppLockTransitions.reconcileAfterMaintenance]. */
-    fun reconcileAfterMaintenance(durableEnabled: Boolean) = transitions.reconcileAfterMaintenance(durableEnabled)
+    /** Maintenance reconcile; see [AppLockTransitions.reconcileAfterMaintenance]. Returns false
+     * when publication failed and the unresolved-maintenance denial was retained. */
+    fun reconcileAfterMaintenance(durableEnabled: Boolean): Boolean = transitions.reconcileAfterMaintenance(durableEnabled)
 
     /** Retains the unresolved-maintenance denial; see [AppLockTransitions.markMaintenanceUnresolved]. */
     fun markMaintenanceUnresolved() = transitions.markMaintenanceUnresolved()
