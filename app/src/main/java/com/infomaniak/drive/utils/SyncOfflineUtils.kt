@@ -274,7 +274,11 @@ object SyncOfflineUtils {
                 downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm)
                 downloadOutcome.handled
             }
-            fileAction.lastAction in renameActions -> {
+            fileAction.lastAction in renameActions -> synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                // Ancestry-changing writers participate in the ROOT-INTENT protocol (issue:
+                // round 11 #7): the move's commit can re-parent a folder, changing the
+                // ancestry that coverage resolution walks — it serializes with root removal's
+                // coverage decisions, taken BEFORE the file locks below.
                 // Conditional acceptance BEFORE preservation side effects (issues: round 11
                 // #2/#4): an action superseded by an already-committed NEWER GENERATION of the
                 // file must not move the bytes to its obsolete target or relabel the live row;

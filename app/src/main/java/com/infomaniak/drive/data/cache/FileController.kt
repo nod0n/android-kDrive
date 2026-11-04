@@ -135,8 +135,20 @@ object FileController {
     private fun savePath(userDrive: UserDrive, fileId: Int, generatedPath: String) {
         getRealmInstance(userDrive).use { realm ->
             getFileById(realm, fileId)?.let { file ->
-                realm.executeTransaction {
-                    if (file.isValid) file.path = generatedPath
+                // Coordinated AND conditional on the ancestry the path was computed from
+                // (issue: round 11 #3): the async save used to land unconditionally, so a move
+                // between path generation and persistence would persist a chain the row no
+                // longer hangs from — poisoning offline path resolution. The per-file
+                // coordination spans the re-derivation and the write, so an identity writer
+                // cannot interleave, and the write happens only when the CURRENT ancestry
+                // still generates the same path.
+                OfflineFileCoordination.withFileLock(userDrive, fileId) {
+                    val currentPath = generatePath(file, userDrive)
+                    if (currentPath == generatedPath) {
+                        realm.executeTransaction {
+                            if (file.isValid) file.path = generatedPath
+                        }
+                    }
                 }
             }
         }
@@ -590,7 +602,16 @@ object FileController {
         ).first()
         realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
             if (!realmFolder.children.contains(preservedActionFile)) {
-                realm.executeTransaction { realmFolder.children.add(preservedActionFile) }
+                // Coordinated child-add (issue: round 11 #3): the add mutates the new child's
+                // graph identity (it gains its parent) and the container's children list, so
+                // both locks precede the transaction — under the root-intent monitor, since
+                // the add establishes ancestry that coverage resolution walks (issue: round
+                // 11 #7). Order: intent monitor → file locks → transaction.
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, preservedActionFile.id)) {
+                        realm.executeTransaction { realmFolder.children.add(preservedActionFile) }
+                    }
+                }
             } else {
                 updateFileFromActivity(realm, preservedActionFile, realmFolder.id, userDrive)
             }
@@ -745,10 +766,19 @@ object FileController {
         }
     }
 
-    fun addChild(localFolderId: Int, newFile: File, realm: Realm) {
+    fun addChild(localFolderId: Int, newFile: File, realm: Realm, userDrive: UserDrive? = null) {
         getFileById(realm, localFolderId)?.let { localFolder ->
             if (!localFolder.children.contains(newFile)) {
-                realm.executeTransaction { runCatching { localFolder.children.add(newFile) } }
+                // The child-add is an identity mutation of the new child (the UI move calls
+                // this with a changed parent/path) and of the container's children list
+                // (issue: round 11 #3): both coordination locks precede the transaction, in
+                // the captured scope of the ACTUAL realm.
+                OfflineFileCoordination.withLocksFor(
+                    userDrive ?: UserDrive(),
+                    listOf(localFolderId, newFile.id),
+                ) {
+                    realm.executeTransaction { runCatching { localFolder.children.add(newFile) } }
+                }
             }
         }
     }
@@ -908,7 +938,15 @@ object FileController {
             ).first()
             ApiRepository.getFileDetails(File(id = remoteFile.parentId, driveId = userDrive.driveId)).data?.let {
                 it.children = RealmList(preservedFile)
-                insertOrUpdateFile(realm, it, userDrive = userDrive)
+                // The parent upsert CASCADES the embedded child row (issue: round 11 #3):
+                // both affected identities are locked before the transaction — under the
+                // root-intent monitor, since the parent row's commit can re-parent a folder
+                // (issue: round 11 #7). Order: intent monitor → file locks → transaction.
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withLocksFor(userDrive, listOf(it.id, preservedFile.id)) {
+                        insertOrUpdateFile(realm, it, userDrive = userDrive)
+                    }
+                }
             }
         }
 
@@ -1081,8 +1119,12 @@ object FileController {
             // round 10 #3, round 11 #2): the activity rows cascade their embedded file rows,
             // so every affected file id joins the lock set across the shared upsert
             // boundary's validation/preservation AND the commit — one coordinated operation.
+            // The ROOT-INTENT monitor precedes the lock set (issue: round 11 #7): an activity
+            // can carry a folder rename/move, changing ancestry that coverage resolution
+            // walks. Order: intent monitor → ascending file locks → transaction.
             val affectedFileIds = fileActivities.mapNotNull { fileActivity -> fileActivity.file?.id }
-            OfflineFileCoordination.withLocksFor(userDrive, affectedFileIds) {
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withLocksFor(userDrive, affectedFileIds) {
                 // Shared upsert boundary OUTSIDE the transaction (issue: round 7 #6): activity
                 // files are upserted recursively; an owned copy at a renamed/moved old location
                 // is preserved first, and a deferred activity keeps its OLD row. The request's
@@ -1113,6 +1155,7 @@ object FileController {
                     }
                 }
                 realm.commitTransaction()
+                }
             }
         }
     }
@@ -1258,10 +1301,16 @@ object FileController {
         // identity-adjacent state) and every incoming child, ascending — one coordinated
         // operation spans the shared boundary's validation/preservation and the commit, so no
         // identity writer can interleave between a file's freshness validation and its commit.
-        OfflineFileCoordination.withLocksFor(
-            userDrive,
-            listOfNotNull(localFolderProxy?.id, remoteFolder?.id) + remoteFiles.map { file -> file.id },
-        ) {
+        // The ROOT-INTENT monitor precedes the lock set (issue: round 11 #7): a listing can
+        // re-parent a folder row (a subfolder moved into this folder), which changes the
+        // ancestry that coverage resolution walks — the same intent protocol as cleanup, so
+        // an ancestor move cannot commit between a coverage decision and a deletion. Order:
+        // intent monitor → ascending file locks → transaction.
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withLocksFor(
+                userDrive,
+                listOfNotNull(localFolderProxy?.id, remoteFolder?.id) + remoteFiles.map { file -> file.id },
+            ) {
             // Shared upsert boundary (issue: round 5 #5): owned copies at renamed/moved locations
             // are preserved BEFORE any metadata replacement — ordinary listings included, not only
             // the walk. Deferred files keep their OLD row in the commit list; a stale response is
@@ -1289,6 +1338,7 @@ object FileController {
                     folderProxy.versionCode = BuildConfig.VERSION_CODE
                 }
             }
+        }
         }
     }
 
@@ -1409,11 +1459,14 @@ object FileController {
                 acceptIf = { live -> !isSupersededGeneration(live, remoteFile) },
             )
         } else {
-            // Coordinated commit boundary (issue: round 10 #3): the child-add is an identity
-            // mutation of the new child and of the container's children list.
-            OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, remoteFile.id)) {
-                realm.executeTransaction {
-                    realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
+            // Coordinated commit boundary (issues: round 10 #3, round 11 #3/#7): the child-add
+            // is an identity mutation of the new child and of the container's children list,
+            // and it establishes ancestry — the root-intent monitor precedes the file locks.
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, remoteFile.id)) {
+                    realm.executeTransaction {
+                        realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
+                    }
                 }
             }
         }
