@@ -205,7 +205,11 @@ internal suspend fun downloadFile(
     val downloadProgressInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor(onProgress = onProgress)
     val okHttpClient = when {
         isPublicShared -> unauthenticatedHttpClient
-        else -> AuthHttpClientProvider.authOkHttpClient
+        // The SUPPLIED scope's account client (issue: round 22 #19): the globally active
+        // authenticated client authenticated the download against whichever account was
+        // current while the publication ran in the supplied userDrive — an account switch
+        // mid-preview downloaded another account's bytes into this scope's destination.
+        else -> AccountUtils.getHttpClient(userDrive.userId)
     }
 
     DownloadOfflineFileManager.downloadFileResponseAsync(

@@ -1806,7 +1806,14 @@ class DownloadOfflineFileManager(
             // row under the publication locks anyway).
             val authoritativeFile = if ((file.version?.number ?: 0) > 0) file else {
                 runCatching {
-                    ApiRepository.getFileDetails(File(id = file.id, driveId = userDrive.driveId)).data
+                    // The SUPPLIED scope's account client (issue: round 22 #19): the
+                    // promotion's resolving details request previously used the default
+                    // client — the globally active account — while the publication ran in
+                    // the supplied userDrive.
+                    ApiRepository.getFileDetails(
+                        File(id = file.id, driveId = userDrive.driveId),
+                        AccountUtils.getHttpClient(userDrive.userId),
+                    ).data
                 }.getOrNull()?.takeIf { details -> details.id == file.id } ?: file
             }
             // HELD-STAGING / SUSPEND-PUBLICATION split (round-16 compile correction): the

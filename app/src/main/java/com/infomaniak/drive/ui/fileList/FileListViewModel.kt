@@ -276,16 +276,20 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
         // Offline folder roots (issue #1902) manage their children's state themselves; this
         // crash-recovery heuristic must not convert covered files into explicit pins.
         if (folder.isInOfflineFolder) return
-        if (folder.getOfflineFile(context)?.exists() == true && FileController.getFolderOfflineFilesCount(folder.id) == 0L) {
+        // CAPTURED SCOPE THROUGH THE PRELIMINARY CHECKS (issue: round 22 #19): the
+        // directory-existence check previously used the GLOBALLY ACTIVE account's offline
+        // base and the count read the default-scope realm — an account switch between the
+        // listing and this recovery inspected another account's filesystem and realm. The
+        // effective scope is derived BEFORE the checks (the ORIGINATING LISTING's scope is
+        // passed by the caller — issue: round 18 #16; the fallback covers callers with no
+        // listing scope of their own).
+        val effectiveUserDrive = userDrive ?: UserDrive(userId = AccountUtils.currentUserId, driveId = folder.driveId)
+        if (folder.getOfflineFile(context, effectiveUserDrive.userId)?.exists() == true &&
+            FileController.getFolderOfflineFilesCount(folder.id, effectiveUserDrive) == 0L
+        ) {
             checkOfflineFilesJob.cancel()
             checkOfflineFilesJob = Job()
 
-            // The ORIGINATING LISTING's scope is passed by the caller (issue: round 18 #16):
-            // the previous capture ran when the ALREADY-COMPLETED listing callback invoked
-            // this function — an account switch between the listing and the callback let the
-            // recovery inspect and pin matching rows in another realm's shared drive. The
-            // fallback covers callers with no listing scope of their own.
-            val effectiveUserDrive = userDrive ?: UserDrive(userId = AccountUtils.currentUserId, driveId = folder.driveId)
             viewModelScope.launch(Dispatchers.IO + checkOfflineFilesJob) {
                 files.filterNot { file -> file.isFolder() }.forEach { file ->
                     // ONE intent → file-lock → fresh-Realm transaction per candidate (issue:
@@ -299,6 +303,7 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                         OfflineFileCoordination.withFileLock(effectiveUserDrive, file.id) {
                             FileController.getRealmInstance(effectiveUserDrive).use { realm ->
                                 runCatching { realm.refresh() }
+                                var reenqueueVerification = false
                                 realm.executeTransaction {
                                     if (!isActive) return@executeTransaction
                                     val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
@@ -321,8 +326,25 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                                     if (OfflineFolderController.isInsideActiveRoot(realm, liveRow.id)) {
                                         return@executeTransaction
                                     }
-                                    liveRow.isOffline = true
-                                    liveRow.isMarkedAsOffline = false
+                                    reenqueueVerification = true
+                                }
+                                if (reenqueueVerification) {
+                                    // RE-ENQUEUE, NEVER MANUFACTURE A PIN (issue: round 22
+                                    // #22): the previous arm flipped the row to an explicit
+                                    // pin (isOffline = true) and consumed the marker on the
+                                    // folder DIRECTORY's existence alone — the individual
+                                    // file may never have downloaded, an enqueue/process
+                                    // failure erased the durable retry intent, and the pin
+                                    // looked complete with no bytes. The surviving marker
+                                    // RE-ENQUEUES a captured-scope verification/download
+                                    // instead (the schedule keeps the marker); the worker's
+                                    // own coordinated success path consumes the marker only
+                                    // on proof of usable content or a successful
+                                    // publication — a failed attempt retains it.
+                                    OfflineFolderController.scheduleOfflineVerification(
+                                        fileId = file.id,
+                                        userDrive = effectiveUserDrive,
+                                    )
                                 }
                             }
                         }

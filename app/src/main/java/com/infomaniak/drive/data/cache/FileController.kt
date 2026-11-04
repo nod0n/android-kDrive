@@ -243,8 +243,11 @@ object FileController {
         getRealmInstance(userDrive).use(block)
     }
 
-    fun getFolderOfflineFilesCount(folderId: Int): Long {
-        return getRealmInstance().use { realm ->
+    fun getFolderOfflineFilesCount(folderId: Int, userDrive: UserDrive? = null): Long {
+        // The caller's CAPTURED scope is honored (issue: round 22 #19): the count previously
+        // always read the default (globally active) realm — an account switch between the
+        // listing and the recovery inspected another account's drive.
+        return getRealmInstance(userDrive).use { realm ->
             realm.where(File::class.java)
                 .equalTo(File::parentId.name, folderId)
                 .equalTo(File::isOffline.name, true)

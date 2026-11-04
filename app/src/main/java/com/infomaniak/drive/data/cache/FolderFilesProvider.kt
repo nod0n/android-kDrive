@@ -509,7 +509,17 @@ object FolderFilesProvider {
 
         ensureActive()
 
-        handleRemoteFiles(realm, apiResponse, folderFilesProviderArgs, folderProxy, observedById = observedById)
+        // The CAPTURED account client rides the shared resolution (issue: round 22 #19):
+        // the default-parameter client authenticated details resolution against the
+        // GLOBALLY ACTIVE account instead of the listing's captured one.
+        handleRemoteFiles(
+            realm,
+            apiResponse,
+            folderFilesProviderArgs,
+            folderProxy,
+            okHttpClient = okHttpClient,
+            observedById = observedById,
+        )
     }
 
     private fun handleRemoteFiles(
