@@ -556,12 +556,11 @@ object FolderFilesProvider {
 
     /**
      * Destructive folder-activity removal with complete request authority (issue: round 16
-     * #15): the removal applies only against the FRESH live row — a payload-bearing action
-     * through the complete action predicate (the request observation resolves ties), a
-     * payload-less action only when a timestamp exists, the row still matches the request
-     * observation's identity, and no newer non-Sync metadata committed over it. A legacy
-     * action without any timestamp has no deletion authority at all. Returns false when
-     * deferred: the copy and the unresolved cursor are retained.
+     * #15): the removal applies only against the FRESH live row through the complete action
+     * predicate — the request observation resolves identity ties. A payload-less folder
+     * activity carries NO timestamp at all ([FileAction] has none): no deletion authority can
+     * be established for it, so it defers — the copy and the unresolved cursor are retained
+     * for a payload-bearing retry. Returns false when deferred.
      */
     private fun FileAction.removeAction(
         realm: Realm,
@@ -572,16 +571,12 @@ object FolderFilesProvider {
     ): Boolean {
         val liveRow = FileController.getFileById(realm, fileId)
         if (liveRow == null) return true // nothing left to remove: consume
-        val actionAt = createdAt?.time
+        // [FileAction] carries no timestamp: the cursor bound of
+        // [FileController.isStaleForAuthoritativeAction] applies nothing here; the generation,
+        // updatedAt and observation gates carry the authority.
         val stale = when {
-            actionFile != null -> FileController.isStaleForAuthoritativeAction(liveRow, actionFile, actionAt, observed)
-            else ->
-                actionAt == null || actionAt <= 0 ||
-                    liveRow.lastActionAt >= actionAt / 1_000L ||
-                    observed == null ||
-                    liveRow.parentId != observed.parentId ||
-                    liveRow.name != observed.name ||
-                    liveRow.updatedAt > observed.updatedAt
+            actionFile != null -> FileController.isStaleForAuthoritativeAction(liveRow, actionFile, null, observed)
+            else -> true
         }
         if (stale) return false
 

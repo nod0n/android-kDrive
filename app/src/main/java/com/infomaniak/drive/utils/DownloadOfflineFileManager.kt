@@ -287,7 +287,10 @@ class DownloadOfflineFileManager(
         // SHARED provenance validation (issue: round 16 #11) under the file's coordination
         // (issue: round 16 #12): the validate-to-staging read and the copy are serialized
         // with cache publications and the UI promotion for the same file, so the bytes and
-        // their provenance sidecar cannot change between validation and staging.
+        // their provenance sidecar cannot change between validation and staging. The
+        // ROOT-INTENT monitor precedes the file lock — the global order (the staged
+        // publication inside reenters both) so no lock cycle is possible.
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
         OfflineFileCoordination.withFileLock(userDrive, file.id) {
             // EXACT current generation provenance (issues: round 14 #14, round 15 #9, round
             // 16 #11): "not older" accepts cache bytes whose timestamp is NEWER than a
@@ -341,6 +344,7 @@ class DownloadOfflineFileManager(
                 }
                 PublicationOutcome.FAILED -> false
             }
+        }
         }
     }
 
@@ -924,14 +928,18 @@ class DownloadOfflineFileManager(
             // The validate-to-stage read and the copy are serialized under the file's
             // coordination (issue: round 16 #12): the cache bytes and their provenance
             // sidecar cannot change between validation and staging, and concurrent
-            // publications to the same cache cannot interleave their sidecar writes.
-            val outcome = OfflineFileCoordination.withFileLock(userDrive, file.id) {
-                runCatching {
-                    cacheFile.copyTo(staged, overwrite = true)
-                    publishStagedOfflineFile(userDrive, isInheritedDownload = false, authoritativeFile, offlineFile, staged)
-                }.onFailure { exception ->
-                    SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
-                }.getOrDefault(PublicationOutcome.FAILED)
+            // publications to the same cache cannot interleave their sidecar writes. The
+            // ROOT-INTENT monitor precedes the file lock (the global order — the staged
+            // publication inside reenters both).
+            val outcome = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                    runCatching {
+                        cacheFile.copyTo(staged, overwrite = true)
+                        publishStagedOfflineFile(userDrive, isInheritedDownload = false, authoritativeFile, offlineFile, staged)
+                    }.onFailure { exception ->
+                        SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
+                    }.getOrDefault(PublicationOutcome.FAILED)
+                }
             }
 
             runCatching { if (staged.exists()) staged.delete() }
