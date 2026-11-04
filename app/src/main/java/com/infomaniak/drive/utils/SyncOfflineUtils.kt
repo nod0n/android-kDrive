@@ -719,6 +719,23 @@ object SyncOfflineUtils {
                 fileId = localFile.id,
                 driveId = userDrive.driveId,
             ) ?: return false
+            // EXACT content identity of the COMPLETED IMMUTABLE SNAPSHOT (issue: round 19
+            // #4): the record must describe the bytes it will actually upload — the
+            // completed snapshot is hashed (and sized) itself, never the mutable original
+            // an external editor can change between hashing and copying.
+            val snapshotFile = UploadFile.durableSnapshotFileOf(snapshotUri)
+            val snapshotHash = snapshotFile?.let { UploadFile.sha256OrNull(it) } ?: run {
+                runCatching { IOFile(snapshotUri.path ?: "").delete() }
+                return false
+            }
+            // REVALIDATION of the ORIGINAL against the captured revision (issue: round 19
+            // #4): when the original's bytes are no longer the snapshotted revision (an
+            // edit raced the copy), the record registers the snapshot's revision alone —
+            // the caller's original is NOT treated as owned by this registration.
+            val originalStillRevision = freshSource.exists() &&
+                freshSource.lastModified() == fileModifiedAt.time &&
+                freshSource.length() == snapshotFile.length() &&
+                (UploadFile.sha256OrNull(freshSource) ?: snapshotHash) == snapshotHash
 
             UploadFile(
                 uri = snapshotUri.toString(),
@@ -729,15 +746,21 @@ object SyncOfflineUtils {
                 // would recreate the old location remotely. The sweep path uses the FRESH
                 // row's identity (issue: round 14 #1), not the pre-pass map's snapshot.
                 fileName = remoteFile?.name ?: liveRow.name,
-                fileSize = freshSource.length(),
+                fileSize = snapshotFile.length(),
                 remoteFolder = remoteFile?.parentId ?: liveRow.parentId,
                 // Stable ORIGINAL identity for completion reconciliation (issue: round 17 #4).
                 originalFileId = liveRow.id,
-                // EXACT content identity of the snapshot (issue: round 18 #7).
-                contentHash = registrationHash,
+                // EXACT content identity of the snapshot (issues: round 18 #7, round 19 #4).
+                contentHash = snapshotHash,
                 type = UploadFile.Type.SYNC_OFFLINE.name,
                 userId = userDrive.userId,
             ).store()
+
+            if (!originalStillRevision) {
+                // The registration owns the captured revision only; the caller's current
+                // bytes are a NEWER edit that a later pass re-registers.
+                return false
+            }
 
             if (remoteFile != null) {
                 remoteFile.lastModifiedAt = freshSource.lastModified() / 1000

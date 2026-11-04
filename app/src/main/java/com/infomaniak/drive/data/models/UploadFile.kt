@@ -531,15 +531,28 @@ open class UploadFile(
                         ) {
                             return@withFileLock
                         }
+                        // EXACT CONTENT of the UPLOADED revision (issues: round 18 #7, round
+                        // 19 #3): the stored hash when present; otherwise — a v9-migrated
+                        // record with a positive originalFileId but no hash — the hash is
+                        // derived from the OWNED IMMUTABLE SNAPSHOT (still on disk: this
+                        // reconciliation runs BEFORE disposal). Without that proof the
+                        // baseline is NEVER advanced: a same-size, same-mtime original B
+                        // would otherwise be relabeled clean while the snapshot actually
+                        // uploaded A.
                         val uploadedHash = record.contentHash
-                        if (uploadedHash != null) {
-                            val actualHash = UploadFile.sha256OrNull(original)
-                            if (actualHash == null) {
-                                deferred = true
-                                return@withFileLock
+                            ?: record.uri.takeIf { it.isNotEmpty() }?.let { snapshotUri ->
+                                durableSnapshotFile(snapshotUri)?.let { snapshotFile -> sha256OrNull(snapshotFile) }
                             }
-                            if (actualHash != uploadedHash) return@withFileLock
+                        if (uploadedHash == null) {
+                            deferred = true
+                            return@withFileLock
                         }
+                        val actualHash = UploadFile.sha256OrNull(original)
+                        if (actualHash == null) {
+                            deferred = true
+                            return@withFileLock
+                        }
+                        if (actualHash != uploadedHash) return@withFileLock
                         val uploadedBaselineSeconds = record.fileModifiedAt.time / 1_000L
                         if (liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds) return@withFileLock
                         realm.executeTransaction { liveRow.publishedCleanBaseline = uploadedBaselineSeconds }
@@ -825,6 +838,9 @@ open class UploadFile(
             val path = uri.toUri().path ?: return null
             return IOFile(path)
         }
+
+        /** The verified owned snapshot file of a freshly created snapshot [uri] (issue: round 19 #4). */
+        fun durableSnapshotFileOf(uri: Uri): IOFile? = durableSnapshotFile(uri.toString())
 
         /**
          * Disposes a verified owned snapshot together with its upload record; ordinary offline

@@ -1437,12 +1437,35 @@ object OfflineFolderController {
         return OfflineFileCoordination.withFileLock(userDrive, file.id) {
             runCatching {
                 val fileModifiedAt = Date(offlineFile.lastModified())
-                // EXACT content identity (issue: round 18 #7): the dedup and cancellation
-                // checks must compare BYTES, not metadata — a cancelled snapshot of revision
-                // A is not ownership of revision B that retained A's mtime. A source whose
-                // hash cannot be read cannot be registered under an exact identity: defer
-                // (the caller keeps the copy unregistered).
-                val contentHash = UploadFile.sha256OrNull(offlineFile) ?: return@withFileLock false
+                val snapshotUri = UploadFile.createDurableOfflineSnapshot(
+                    context = context,
+                    source = offlineFile,
+                    fileModifiedAt = fileModifiedAt,
+                    fileId = file.id,
+                    driveId = userDrive.driveId,
+                ) ?: return@withFileLock false
+                // EXACT content identity of the COMPLETED IMMUTABLE SNAPSHOT (issue: round
+                // 19 #4): the previous order hashed the MUTABLE original and stored that
+                // hash beside the later copy — an external editor holding write permission
+                // (Utils.openWithIntentExceptkDrive does not take this lock) could change
+                // the bytes between hashing and copying, producing a record that claims
+                // content A while uploading B, and dedup/completion would trust the false
+                // identity. The completed snapshot is hashed (and sized) itself; the record
+                // therefore describes the bytes it will actually upload.
+                val snapshotFile = UploadFile.durableSnapshotFileOf(snapshotUri)
+                val contentHash = snapshotFile?.let { UploadFile.sha256OrNull(it) } ?: run {
+                    runCatching { IOFile(snapshotUri.path ?: "").delete() }
+                    return@withFileLock false
+                }
+                // REVALIDATION of the ORIGINAL against the captured revision (issue: round
+                // 19 #4): registration certifies ownership of the original's CURRENT bytes
+                // only when they still are the snapshotted revision — an edit that raced
+                // the copy leaves the original's bytes unowned by this record, which
+                // registers the snapshot's revision alone.
+                val originalStillRevision = offlineFile.exists() &&
+                    offlineFile.lastModified() == fileModifiedAt.time &&
+                    offlineFile.length() == snapshotFile.length() &&
+                    (UploadFile.sha256OrNull(offlineFile) ?: contentHash) == contentHash
                 // Revision dedup under the file lock (issue: round 8 #7): this exact revision
                 // may already be registered — live (pending or sent), or retained after a
                 // cancellation. Re-snapshotting would duplicate the pending work or silently
@@ -1465,32 +1488,28 @@ object OfflineFolderController {
                         contentHash = contentHash,
                     )
                 ) {
+                    // A duplicate registration adds nothing; the fresh snapshot copy is
+                    // redundant residue either way.
+                    runCatching { IOFile(snapshotUri.path ?: "").delete() }
                     return@withFileLock true
                 }
-                val snapshotUri = UploadFile.createDurableOfflineSnapshot(
-                    context = context,
-                    source = offlineFile,
-                    fileModifiedAt = fileModifiedAt,
-                    fileId = file.id,
-                    driveId = userDrive.driveId,
-                ) ?: return@withFileLock false
                 UploadFile(
                     uri = snapshotUri.toString(),
                     driveId = userDrive.driveId,
                     fileModifiedAt = fileModifiedAt,
                     fileName = file.name,
-                    fileSize = offlineFile.length(),
+                    fileSize = snapshotFile.length(),
                     remoteFolder = file.parentId,
                     // Stable ORIGINAL identity for completion reconciliation (issue: round
                     // 17 #4).
                     originalFileId = file.id,
-                    // EXACT content identity of the snapshot (issue: round 18 #7).
+                    // EXACT content identity of the snapshot (issues: round 18 #7, round 19 #4).
                     contentHash = contentHash,
                     type = UploadFile.Type.SYNC_OFFLINE.name,
                     userId = userDrive.userId,
                 ).store()
                 context.syncImmediately(isAutomaticTrigger = false)
-                true
+                originalStillRevision
             }.onFailure { exception ->
                 SentryLog.e(TAG, "Failed to snapshot a locally modified offline file", exception)
             }.getOrDefault(false)
