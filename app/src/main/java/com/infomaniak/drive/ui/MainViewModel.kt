@@ -906,7 +906,9 @@ class MainViewModel(
             oldOfflineFile = ioFile,
             oldIdentityName = file.name,
             oldIdentityParentId = file.parentId,
-            oldLastModifiedAt = file.lastModifiedAt,
+            // The bytes' provenance baseline (issue: round 16 #2), never bare server metadata
+            // that a backward-dated replacement may have moved away from the bytes.
+            oldLastModifiedAt = file.publishedCleanBaseline ?: file.lastModifiedAt,
             newIdentity = postMoveIdentity,
             userDrive = userDrive,
             newOfflineTarget = destinationFile,

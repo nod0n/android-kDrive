@@ -350,7 +350,9 @@ object SyncOfflineUtils {
                                         oldOfflineFile = freshSource,
                                         oldIdentityName = localFile.name,
                                         oldIdentityParentId = localFile.parentId,
-                                        oldLastModifiedAt = localFile.lastModifiedAt,
+                                        // The live bytes' provenance baseline (issue: round 16 #2),
+                                        // never the possibly-replaced server metadata.
+                                        oldLastModifiedAt = liveRow.publishedCleanBaseline ?: liveRow.lastModifiedAt,
                                         newIdentity = remoteFile,
                                         userDrive = userDrive,
                                     )
@@ -613,7 +615,9 @@ object SyncOfflineUtils {
                     oldOfflineFile = freshOffline,
                     oldIdentityName = file.name,
                     oldIdentityParentId = file.parentId,
-                    oldLastModifiedAt = file.lastModifiedAt,
+                    // The live bytes' provenance baseline (issue: round 16 #2), never the
+                    // detached observation's (possibly stale) metadata.
+                    oldLastModifiedAt = liveRow.publishedCleanBaseline ?: liveRow.lastModifiedAt,
                     newIdentity = remoteFile,
                     userDrive = userDrive,
                 )

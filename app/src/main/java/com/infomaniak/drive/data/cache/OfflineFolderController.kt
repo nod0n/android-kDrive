@@ -537,8 +537,10 @@ object OfflineFolderController {
      * metadata; false means preservation is incomplete and committing would strand the old copy.
      *
      * [oldIdentityName]/[oldIdentityParentId]/[oldLastModifiedAt] describe the OLD row (the only
-     * reliable identity for the old bytes); [newIdentity] is the fresh remote File. Directory
-     * rows are not file content and must not be passed here (issue: round 4 #12).
+     * reliable identity for the old bytes); [oldLastModifiedAt] is the PUBLISHED byte-provenance
+     * baseline of those bytes — callers pass `publishedCleanBaseline ?: lastModifiedAt`, never
+     * bare replacement metadata (issue: round 16 #2); [newIdentity] is the fresh remote File.
+     * Directory rows are not file content and must not be passed here (issue: round 4 #12).
      */
     fun reconcileMovedInheritedCopy(
         context: Context,
@@ -670,6 +672,25 @@ object OfflineFolderController {
                 if (isStale(oldRow, remoteFile, observedById[remoteFile.id])) return@withFileLock oldRow
                 val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
                     ?: return@withFileLock remoteFile
+                // Historical baseline ANCHOR (issue: round 16 #2): a row whose bytes were
+                // published before the baseline field existed carries null. While those bytes
+                // still verify against the row's CURRENT metadata (the metadata they were
+                // published under, absent any replacement), that metadata IS their provable
+                // baseline — persist it NOW, before this replacement can change the metadata,
+                // or a later pass would compare the bytes against the REPLACEMENT's
+                // modification time and reclassify the old-clean copy as a local edit. An
+                // unprovable historical copy keeps null and is snapshotted below like an
+                // edit — preservation, not classification against replacement metadata.
+                if (oldRow.publishedCleanBaseline == null &&
+                    !OfflineFolderPolicy.isLocallyModified(
+                        offlineFileLastModifiedMillis = oldOffline.lastModified(),
+                        remoteLastModifiedAtSeconds = oldRow.lastModifiedAt,
+                    )
+                ) {
+                    runCatching {
+                        realm.executeTransaction { oldRow.publishedCleanBaseline = oldRow.lastModifiedAt }
+                    }
+                }
                 // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7).
                 val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
                 val locationChanged = newOffline == null || newOffline.path != oldOffline.path
@@ -681,7 +702,9 @@ object OfflineFolderController {
                     // T2 edit as clean and let publication or root removal destroy it. A pending
                     // or retained-unsent record already owns the copy; a dirty copy is snapshotted
                     // against the OLD baseline first, and a failed registration defers the whole
-                    // commit so the edit is never replaced unowned.
+                    // commit so the edit is never replaced unowned. The PUBLISHED byte baseline
+                    // — not the (possibly replaced) server metadata — is the comparison basis
+                    // (issue: round 16 #2).
                     val targetUri = Uri.fromFile(oldOffline).toString()
                     if (UploadFile.hasPendingUpload(uri = targetUri) ||
                         UploadFile.hasRetainedUnsentUpload(uri = targetUri)
@@ -690,7 +713,7 @@ object OfflineFolderController {
                     }
                     if (OfflineFolderPolicy.isLocallyModified(
                             offlineFileLastModifiedMillis = oldOffline.lastModified(),
-                            remoteLastModifiedAtSeconds = oldRow.lastModifiedAt,
+                            remoteLastModifiedAtSeconds = oldRow.publishedCleanBaseline ?: oldRow.lastModifiedAt,
                         )
                     ) {
                         val registered = registerDirtySnapshot(context, oldRow, oldOffline, userDrive)
@@ -703,7 +726,9 @@ object OfflineFolderController {
                         oldOfflineFile = oldOffline,
                         oldIdentityName = oldRow.name,
                         oldIdentityParentId = oldRow.parentId,
-                        oldLastModifiedAt = oldRow.lastModifiedAt,
+                        // The OLD bytes' provenance baseline (issue: round 16 #2), not the
+                        // possibly-replaced server metadata.
+                        oldLastModifiedAt = oldRow.publishedCleanBaseline ?: oldRow.lastModifiedAt,
                         newIdentity = remoteFile,
                         userDrive = userDrive,
                     )

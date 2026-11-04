@@ -498,7 +498,9 @@ object FileController {
                 oldOfflineFile = oldOffline,
                 oldIdentityName = liveRow.name,
                 oldIdentityParentId = liveRow.parentId,
-                oldLastModifiedAt = liveRow.lastModifiedAt,
+                // The bytes' provenance baseline (issue: round 16 #2), never bare server
+                // metadata a replacement may have moved away from the bytes.
+                oldLastModifiedAt = liveRow.publishedCleanBaseline ?: liveRow.lastModifiedAt,
                 newIdentity = snapshotIdentity,
                 userDrive = scope,
                 newOfflineTarget = newOffline,
