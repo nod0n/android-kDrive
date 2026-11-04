@@ -1296,13 +1296,16 @@ object OfflineFolderController {
      * verification, so a legacy copy is neither blocked behind its missing provenance nor
      * silently treated as current. Coordinated like every intent write, idempotent.
      *
-     * CONDITIONAL (issue: round 18 #15): the marker is written only when the CURRENT row
-     * still carries the durable intent that authorizes retention — an explicit pin, or
-     * inherited coverage by a still-active root matching the inherited flag — and only for
-     * the generation the caller observed; a row that has since advanced to newer work is
-     * not marked for the old request. Verification never CREATES offline authorization:
-     * the delayed call of a preview whose copy was unpinned meanwhile (or whose root was
-     * removed) is a no-op and cannot resurrect the removed intent.
+     * CONDITIONAL (issue: round 18 #15, round 19 #16): the marker is written only when the
+     * CURRENT row still carries the durable intent that authorizes retention — an explicit
+     * pin, or inherited coverage by a still-active root matching the inherited flag. The
+     * write is NOT gated on the caller's retained-BYTE mtime (the previous
+     * observed-generation gate): a row whose accepted metadata advanced past the retained
+     * copy is exactly the stale-copy case that needs verification, the marker carries no
+     * generation, and the worker's redrive verifies against the CURRENT generation.
+     * Verification never CREATES offline authorization: the delayed call of a preview
+     * whose copy was unpinned meanwhile (or whose root was removed) is a no-op and cannot
+     * resurrect the removed intent.
      *
      * DURABLE ENQUEUE (issue: round 18 #17): after the conditional commit the scoped
      * verification/download work is enqueued — a marker alone guarantees no worker when an
@@ -1323,15 +1326,22 @@ object OfflineFolderController {
                             marked = true
                             return@executeTransaction
                         }
-                        // CURRENT durable intent only (issue: round 18 #15).
+                        // CURRENT durable intent only (issue: round 18 #15) — this ROW +
+                        // INTENT identity check is the write's whole authorization (issue:
+                        // round 19 #16).
                         val hasDurableIntent = liveRow.isOffline ||
                             (liveRow.isInOfflineFolder && isInsideActiveRoot(realm, fileId))
+                        // The previous OBSERVED-GENERATION gate rejected the
+                        // marker whenever the row's accepted metadata was NEWER than the
+                        // caller's retained-BYTE mtime — exactly the normal
+                        // newer-metadata case that NEEDS verification (the retained copy
+                        // is stale). The marker carries no generation: the worker's
+                        // redrive re-fetches the authoritative details and verifies
+                        // against the CURRENT generation regardless of what the caller
+                        // observed; a row with newer pending work is already marked (the
+                        // early return above), and a delayed caller cannot resurrect a
+                        // removed intent (the durable-intent check).
                         if (!hasDurableIntent) return@executeTransaction
-                        // OBSERVED generation (issue: round 18 #15): a caller that observed a
-                        // copy's generation requests verification FOR THAT GENERATION.
-                        if (observedGeneration != null && observedGeneration > 0 &&
-                            liveRow.lastModifiedAt > observedGeneration
-                        ) return@executeTransaction
                         liveRow.isMarkedAsOffline = true
                         marked = true
                     }
