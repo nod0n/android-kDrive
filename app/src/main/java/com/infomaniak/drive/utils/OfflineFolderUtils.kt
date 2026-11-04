@@ -109,6 +109,13 @@ object OfflineFolderUtils {
             // location either.
             val subtreeObservedById = run {
                 val map = HashMap<Int, File>()
+                // THE WALK ROOT'S OWN REQUEST-TIME ROW (issue: round 23 #11): the map
+                // previously held descendants only — the root itself was absent, so the
+                // reconstructed request ancestry stopped at the root and the root's own
+                // relocation/publication since the request was invisible to the tokens.
+                FileController.getFileById(realm, rootFolderId)?.let { rootRow ->
+                    map.putIfAbsent(rootRow.id, realm.copyFromRealm(rootRow, 1))
+                }
                 val folderStack = ArrayDeque(listOf(rootFolderId))
                 val visitedFolders = mutableSetOf<Int>()
                 while (folderStack.isNotEmpty()) {
@@ -124,6 +131,20 @@ object OfflineFolderUtils {
                         }
                 }
                 map
+            }
+            // PER-CANDIDATE PUBLICATION/INTENT TOKENS (issue: round 23 #11): the request-
+            // time provenance record's (version, content hash) and the row's intent flag —
+            // a new publication, a restoration, or a re-pin since the request changes the
+            // current token, and the old absence authority no longer clears the candidate.
+            val subtreeRecordTokensById = run {
+                val tokens = HashMap<Int, Pair<Int, String?>>()
+                subtreeObservedById.values.forEach { observed ->
+                    if (!observed.isFolder()) {
+                        val record = DownloadOfflineFileManager.readPublishedProvenance(context, observed)
+                        tokens[observed.id] = (record?.version ?: 0) to record?.contentHash
+                    }
+                }
+                tokens
             }
 
             val fileIds = mutableListOf<Int>()
@@ -159,6 +180,7 @@ object OfflineFolderUtils {
                     folderQueue = folderQueue,
                     visitedFolderIds = visitedFolderIds,
                     subtreeObservedById = subtreeObservedById,
+                    subtreeRecordTokensById = subtreeRecordTokensById,
                 )) {
                     FolderWalkOutcome.INCOMPLETE -> {
                         // The folder's membership is unknown: leave its coverage untouched,
@@ -219,6 +241,7 @@ object OfflineFolderUtils {
         folderQueue: ArrayDeque<Int>,
         visitedFolderIds: MutableSet<Int>,
         subtreeObservedById: Map<Int, File>,
+        subtreeRecordTokensById: Map<Int, Pair<Int, String?>>,
     ): FolderWalkOutcome {
         val allPages = mutableListOf<File>()
         var lastResponse: CursorApiResponse<List<File>>? = null
@@ -354,7 +377,8 @@ object OfflineFolderUtils {
         // walk or move) while the response was in flight predates this stamp and is never
         // cleared by it.
         cleanupConfirmedAbsentChildren(
-            context, realm, folderId, userDrive, remoteIds, requestGeneration, observedById, subtreeObservedById,
+            context, realm, folderId, userDrive, remoteIds, requestGeneration, observedById,
+            subtreeObservedById, subtreeRecordTokensById,
         )
 
         // DEFERRALS keep the walk incomplete (issue: round 14 #8): an ambiguous identity tie
@@ -672,6 +696,9 @@ object OfflineFolderUtils {
         traversalStartedGeneration: Long,
         boundaryObservation: File?,
         subtreeObservedById: Map<Int, File>,
+        subtreeRecordTokensById: Map<Int, Pair<Int, String?>>,
+        predicateContext: Context,
+        predicateUserDrive: UserDrive,
     ): (Realm, File) -> Boolean = { currentRealm, candidate ->
         val liveBoundary = FileController.getFileById(currentRealm, boundaryFolderId)
         // RESOLVED-LOCATION AUTHORITY (issue: round 22 #11): the boundary's request-time
@@ -718,9 +745,49 @@ object OfflineFolderUtils {
         // differs from its current one); a newer generation (publication, restore) fails
         // the full observation comparison.
         val requestObservation = subtreeObservedById[candidate.id]
+        // THE COMPLETE CANDIDATE-TO-BOUNDARY REQUEST CHAIN (issue: round 23 #11): the
+        // immediate-parent match alone let a candidate whose ANCESTORS moved since the
+        // request pass — the request-time chain (reconstructed from the map's parent
+        // links) must equal the live chain up to the boundary.
+        val requestChainToBoundary = run {
+            val chain = mutableListOf<Int>()
+            var current: Int? = requestObservation?.parentId
+            while (current != null && current > 0) {
+                chain.add(current)
+                if (current == boundaryFolderId) break
+                current = subtreeObservedById[current]?.parentId
+            }
+            chain
+        }
+        val liveChainToBoundary = run {
+            val chain = mutableListOf<Int>()
+            var current: Int? = FileController.getFileById(currentRealm, candidate.id)?.parentId
+            val visitedIds = mutableSetOf<Int>()
+            while (current != null && current > 0 && visitedIds.add(current)) {
+                chain.add(current)
+                if (current == boundaryFolderId) break
+                current = FileController.getFileById(currentRealm, current)?.parentId
+            }
+            chain
+        }
+        // PUBLICATION/RESTORATION AND INTENT TOKENS (issue: round 23 #11): the current
+        // record's (version, content hash) must equal the request-time token — a new
+        // publication or a restoration since the request changes it — and the intent
+        // flag must be unchanged (a re-pin after the request is newer work's business).
+        val currentRecordToken = runCatching {
+            candidate.getOfflineFile(predicateContext, predicateUserDrive.userId)
+                ?.let { DownloadOfflineFileManager.readPublishedProvenance(predicateContext, it) }
+        }.getOrNull()
+        val requestRecordToken = subtreeRecordTokensById[candidate.id]
+        val recordTokenHolds = requestRecordToken == null || (
+            currentRecordToken?.let { (it.version ?: 0) to it.contentHash } == requestRecordToken
+            )
         val candidateTokenHolds = requestObservation != null &&
             requestObservation.parentId == candidate.parentId &&
-            FileController.isSameObservation(candidate, requestObservation)
+            FileController.isSameObservation(candidate, requestObservation) &&
+            requestChainToBoundary == liveChainToBoundary &&
+            requestObservation.isMarkedAsOffline == candidate.isMarkedAsOffline &&
+            recordTokenHolds
         var reachesBoundary = candidate.id == boundaryFolderId
         var currentId: Int? = FileController.getFileById(currentRealm, candidate.id)?.parentId
         val visited = mutableSetOf(candidate.id)
@@ -756,6 +823,7 @@ object OfflineFolderUtils {
         requestGeneration: Long,
         observedById: Map<Int, File>,
         subtreeObservedById: Map<Int, File>,
+        subtreeRecordTokensById: Map<Int, Pair<Int, String?>>,
     ) {
         val result = OfflineFolderController.RemovalResult()
         // REQUEST-TIME freshness horizon (issues: round 11 #8, round 12 #9, round 18 #25):
@@ -805,6 +873,7 @@ object OfflineFolderUtils {
                     traversalStartedGeneration,
                     boundaryObservation = observedChild,
                     subtreeObservedById = subtreeObservedById,
+                    subtreeRecordTokensById = subtreeRecordTokensById,
                 )
             } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
                     isOffline = child.isOffline,
@@ -854,6 +923,7 @@ object OfflineFolderUtils {
         traversalStartedGeneration: Long,
         boundaryObservation: File?,
         subtreeObservedById: Map<Int, File>,
+        subtreeRecordTokensById: Map<Int, Pair<Int, String?>>,
     ) {
         val visited = mutableSetOf(rootFolderId)
         // folderId to the parent the traversal reached it from — the only parent relationship
@@ -889,6 +959,9 @@ object OfflineFolderUtils {
                     traversalStartedGeneration,
                     boundaryObservation,
                     subtreeObservedById,
+                    subtreeRecordTokensById,
+                    context,
+                    userDrive,
                 ),
             )
             // The subtree's original listing authority dies with the folder's rejection
@@ -925,6 +998,9 @@ object OfflineFolderUtils {
                                 traversalStartedGeneration,
                                 boundaryObservation,
                                 subtreeObservedById,
+                                subtreeRecordTokensById,
+                                context,
+                                userDrive,
                             ),
                         )
                     }
