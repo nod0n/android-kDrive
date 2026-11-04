@@ -2174,22 +2174,72 @@ object FileController {
         // scope, filled inside the section and returned after it (issue: round 13 #8).
         val substitutedOrDroppedIds = mutableSetOf<Int>()
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
-            OfflineFileCoordination.withLocksFor(
-                userDrive,
-                listOfNotNull(localFolderProxy?.id, remoteFolder?.id) + remoteFiles.map { file -> file.id },
-            ) {
-            // Shared upsert boundary (issue: round 5 #5): owned copies at renamed/moved locations
-            // are preserved BEFORE any metadata replacement — ordinary listings included, not only
-            // the walk. Deferred files keep their OLD row in the commit list; a stale response is
-            // rejected before any preservation side effect (issue: round 11 #4). This runs OUTSIDE
-            // the write transaction below: reconciliation coordinates per-file ownership and
-            // performs file I/O.
-            val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                realm = realm,
-                remoteFiles = remoteFiles,
-                userDrive = userDrive,
-                observedById = observedById,
-            )
+            // PARTITIONED PRESERVATION SCOPES, CONSISTENT COMBINED LOCK ORDER (issue: round
+            // 23 #17): the initial shared page's locks and preservation previously ran
+            // under the single CONTAINER scope — a shared F from D2 displayed under D1
+            // entered snapshot/preservation under D1 (wrong path base, D1-keyed locks no
+            // D2 worker serializes with) before the corrected deferred resolver ran. Rows
+            // are partitioned by their captured ACTUAL drive (the pre-request
+            // observation's drive when known, else the payload's); the combined lock set
+            // is acquired row-scopes-first (drives ascending, ids ascending within each)
+            // and the container's presentation set last — the same row-then-container
+            // nesting the deferred resolver uses, so no cross-scope lock cycle is possible.
+            val observedDriveById = observedById.mapValues { it.value.driveId }
+            val rowsByDrive = remoteFiles
+                .groupBy { file ->
+                    (observedDriveById[file.id]?.takeIf { it > 0 } ?: file.driveId)
+                        .takeIf { it > 0 } ?: 0
+                }
+                .toSortedMap()
+            // Constant-stack acquisition (the withLocksFor shape), manually staged across
+            // the two key-spaces: ReentrantLock.lock() cannot throw, so the releases in
+            // the finally below always pair the acquisitions.
+            val heldLocks = mutableListOf<java.util.concurrent.locks.ReentrantLock>()
+            rowsByDrive.forEach { (driveId, rows) ->
+                val rowScope =
+                    if (driveId > 0) UserDrive(userId = userDrive.userId, driveId = driveId) else userDrive
+                rows.map { it.id }.distinct().sorted()
+                    .map { OfflineFileCoordination.lockFor(rowScope, it) }
+                    .forEach { lock ->
+                        lock.lock()
+                        heldLocks.add(lock)
+                    }
+            }
+            (listOfNotNull(localFolderProxy?.id, remoteFolder?.id) + remoteFiles.map { file -> file.id })
+                .distinct().sorted()
+                .map { OfflineFileCoordination.lockFor(userDrive, it) }
+                .forEach { lock ->
+                    lock.lock()
+                    heldLocks.add(lock)
+                }
+            try {
+                run {
+            // Shared upsert boundary, PARTITIONED by each candidate's actual drive (issue:
+            // round 5 #5, round 23 #17): owned copies at renamed/moved locations are
+            // preserved BEFORE any metadata replacement — ordinary listings included, not
+            // only the walk. Deferred files keep their OLD row in the commit list; a stale
+            // response is rejected before any preservation side effect (issue: round 11
+            // #4). This runs OUTSIDE the write transaction below: reconciliation
+            // coordinates per-file ownership and performs file I/O. The positional 1:1
+            // results are reassembled for the commit.
+            val committableFiles = run {
+                val positional = arrayOfNulls<File>(remoteFiles.size)
+                rowsByDrive.forEach { (driveId, rows) ->
+                    val rowScope =
+                        if (driveId > 0) UserDrive(userId = userDrive.userId, driveId = driveId) else userDrive
+                    val partitionOutcome = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                        realm = realm,
+                        remoteFiles = rows,
+                        userDrive = rowScope,
+                        observedById = observedById,
+                    )
+                    val indexedRows = remoteFiles.withIndex().filter { it.value in rows }
+                    partitionOutcome.forEachIndexed { partitionIndex, committable ->
+                        positional[indexedRows[partitionIndex].index] = committable
+                    }
+                }
+                positional.mapIndexed { index, committable -> committable ?: remoteFiles[index] }
+            }
             // Explicit per-file outcomes (issue: round 13 #8), part 1 — the shared boundary:
             // it maps the incoming list 1:1 and returns the OLD row in place of an entry it
             // deferred (stale gate or unfinished preservation), the SAME reference otherwise,
@@ -2222,7 +2272,10 @@ object FileController {
                     folderProxy.versionCode = BuildConfig.VERSION_CODE
                 }
             }
-        }
+            }
+            } finally {
+                heldLocks.reversed().forEach { it.unlock() }
+            }
         }
         // Explicit outcome classification (issue: round 14 #8): each non-accepted id is
         // judged from the committed live row against the LISTED row — a PROVEN newer
