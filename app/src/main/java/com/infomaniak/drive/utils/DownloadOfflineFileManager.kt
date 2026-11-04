@@ -507,16 +507,22 @@ class DownloadOfflineFileManager(
 
             when {
                 ownerLock == null -> synchronized(incomingLock) {
-                    publishLockedCore(userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId)
+                    publishLockedCore(
+                        userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
+                    ) { coroutineContext.ensureActive() }
                 }
                 file.id < (preLockOwner?.id ?: file.id) -> synchronized(incomingLock) {
                     synchronized(ownerLock) {
-                        publishLockedCore(userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId)
+                        publishLockedCore(
+                            userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
+                        ) { coroutineContext.ensureActive() }
                     }
                 }
                 else -> synchronized(ownerLock) {
                     synchronized(incomingLock) {
-                        publishLockedCore(userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId)
+                        publishLockedCore(
+                            userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
+                        ) { coroutineContext.ensureActive() }
                     }
                 }
             }
@@ -524,7 +530,11 @@ class DownloadOfflineFileManager(
 
         /**
          * Publication body, executed while the coordination locks of the incoming file (and of
-         * the established destination owner, if any) are held.
+         * the established destination owner, if any) are held. [checkCancelled] restores the
+         * final cancellation check inside the locks (issue: round 7 #11): Java monitor
+         * acquisition does not respond to coroutine cancellation, so a cancelled transfer
+         * waiting for an ownership lock must re-check after acquiring them and immediately
+         * before the publication.
          */
         private fun publishLockedCore(
             userDrive: UserDrive,
@@ -534,7 +544,9 @@ class DownloadOfflineFileManager(
             staged: IOFile,
             onPublishedLocked: (() -> Unit)?,
             lockedOwnerId: Int?,
+            checkCancelled: () -> Unit,
         ): PublicationOutcome {
+            checkCancelled()
             // Live intent: an inherited download requires a current pin or durable root
             // ancestry (a materialized inherited flag alone never authorizes retention); a
             // pin download accepts its own pending marker or explicit pin as the user's
@@ -593,6 +605,8 @@ class DownloadOfflineFileManager(
             }
 
             staged.setLastModified(file.getLastModifiedInMilliSecond())
+            // Final cancellation check immediately before the atomic replace (issue: round 7 #11).
+            checkCancelled()
             if (staged.renameTo(target)) {
                 // Run the owner's completion while the per-file lock is still held
                 // (issue: round 5 #2).

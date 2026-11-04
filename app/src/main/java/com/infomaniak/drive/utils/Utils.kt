@@ -76,6 +76,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.Date
 import kotlin.math.pow
 
@@ -403,6 +405,13 @@ object Utils {
     private val reconfigurationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
+     * Serializes successive reconfigurations (issue: round 7 #12): two overlapping runs would
+     * otherwise interleave cancellation and re-enqueue, and the second run's cancellation could
+     * destroy the chains the first run had just rebuilt.
+     */
+    private val reconfigurationMutex = Mutex()
+
+    /**
      * Cancels all offline folder download chains and re-enqueues their durable work with the
      * current constraint settings (issue: round 4 #14, round 5 #17): a Wi-Fi-only change must
      * not leave a mobile-data job running, nor an unmetered job blocked — and cancellation
@@ -410,11 +419,15 @@ object Utils {
      * never unfinished pin requests. Durable root intent, coverage flags, explicit pins and
      * pending markers live in Realm and are unaffected by the cancellation.
      */
-    suspend fun reconfigureOfflineFolderWork(context: Context) {
+    suspend fun reconfigureOfflineFolderWork(context: Context) = reconfigurationMutex.withLock {
         val workManager = WorkManager.getInstance(context)
         // Await the cancellation before re-enqueueing: a still-propagating cancel could
-        // otherwise swallow the replacement chains (issue: round 5 #17).
+        // otherwise swallow the replacement chains (issue: round 5 #17). Both worker classes
+        // carry offline download chains (issue: round 7 #12): the single-file
+        // [DownloadWorker] chain is cancelled too — only offline downloads use that tag —
+        // and unfinished single-file pins are re-driven below by their folder pin batches.
         workManager.cancelAllWorkByTag(BulkDownloadWorker::class.java.toString()).result.await()
+        workManager.cancelAllWorkByTag(DownloadWorker.TAG).result.await()
 
         // Every durable root re-drives its walk in its own captured scope (issue: round 5 #17).
         AccountUtils.getAllUsersSync().forEach { user ->
