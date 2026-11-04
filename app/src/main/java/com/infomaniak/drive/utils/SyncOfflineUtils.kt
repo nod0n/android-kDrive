@@ -566,8 +566,8 @@ object SyncOfflineUtils {
                                 // versions classify the incoming generation FIRST: the
                                 // scoped download branch runs for it.
                                 ((remoteFile.version?.number ?: 0) > 0) &&
-                                    ((liveRow.version?.number ?: 0) > 0) &&
-                                    (remoteFile.version?.number ?: 0) > (liveRow.version?.number ?: 0) -> {
+                                    ((liveRow?.version?.number ?: 0) > 0) &&
+                                    (remoteFile.version?.number ?: 0) > (liveRow?.version?.number ?: 0) -> {
                                     downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                                     downloadOutcome.handled
                                 }
