@@ -748,7 +748,10 @@ open class File(
             // is never silently reported as a fresh download of a valid destination.
             when (outcome) {
                 PublicationOutcome.PUBLISHED, PublicationOutcome.SKIPPED_PROTECTED -> Unit
-                PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                // UNRESOLVED generation (issue: round 20 #14): bytes were published but no
+                // generation proof exists — the same usable-destination validation as a
+                // supersession decides whether the copy may serve.
+                PublicationOutcome.SKIPPED_SUPERSEDED, PublicationOutcome.PUBLISHED_UNRESOLVED -> {
                     // Usable only when the CURRENT row still owns the named destination AND
                     // that destination holds usable content (issue: round 12 #11): metadata
                     // ownership alone reports completion over a missing or obsolete retained

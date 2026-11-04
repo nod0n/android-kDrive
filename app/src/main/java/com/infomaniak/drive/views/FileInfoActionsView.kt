@@ -437,6 +437,10 @@ class FileInfoActionsView @JvmOverloads constructor(
                             PublicationOutcome.SKIPPED_SUPERSEDED,
                             PublicationOutcome.SKIPPED_CONFLICT,
                             PublicationOutcome.SKIPPED_INVALIDATED,
+                            // UNRESOLVED generation (issue: round 20 #14): the bytes were
+                            // published but no generation proof exists — never a pin
+                            // confirmation over unproven content.
+                            PublicationOutcome.PUBLISHED_UNRESOLVED,
                             PublicationOutcome.FAILED,
                             -> {
                                 // Every non-published outcome re-reads the CURRENT scoped
