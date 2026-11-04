@@ -651,9 +651,12 @@ object FileController {
                     },
                 ).first()
                 // A boundary substitution means the activity's own identity did not take —
-                // preservation or an ambiguous tie deferred it (issue: round 15 #10).
+                // preservation or an ambiguous tie deferred it (issue: round 15 #10). The
+                // deferred action performs NO further write (issue: round 16 #4): the raw
+                // payload must not be inserted past a rejected/substituted boundary — the
+                // original payload describes the revision the boundary refused to apply.
                 if (preservedActionFile !== actionFile) handled = false
-                realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
+                if (handled) realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
                     if (!realmFolder.children.contains(preservedActionFile) &&
                         // Parent-consistent membership (issue: round 13 #12): a
                         // boundary-substituted MANAGED row whose authoritative parent is NOT
@@ -665,18 +668,19 @@ object FileController {
                         // mutates the new child's graph identity and the container's children
                         // list; the locks are already held by this section. BOTH commit
                         // branches apply the complete fresh action predicate and membership
-                        // INSIDE the adding transaction (issue: round 15 #4) — the shared
-                        // boundary returns directory rows before its predicate, so an
-                        // unmanaged delayed D-at-A payload must not overwrite D's current
-                        // parent or restore obsolete ancestry — and preserve the current
-                        // row's local fields when accepting over it.
+                        // INSIDE the adding transaction (issues: round 15 #4, round 16 #4) —
+                        // the shared boundary returns directory rows before its predicate, so
+                        // an unmanaged delayed D-at-A payload must not overwrite D's current
+                        // parent or restore obsolete ancestry, and an existing row in THIS
+                        // parent is NOT exempt from the freshness predicate: a stale child
+                        // update must be rejected like any other (no same-parent bypass). The
+                        // predicate itself authorizes a strictly-newer move-in; the current
+                        // row's local fields are preserved when accepting over it.
                         realm.executeTransaction {
                             val freshRow = getFileById(realm, actionFile.id)
                             val accepted = when {
                                 freshRow == null -> actionFile.parentId == folderId
-                                else ->
-                                    freshRow.parentId == folderId ||
-                                        !FileController.isStaleForAuthoritativeAction(freshRow, actionFile, actionAt, observed)
+                                else -> !FileController.isStaleForAuthoritativeAction(freshRow, actionFile, actionAt, observed)
                             }
                             if (accepted) {
                                 if (freshRow != null) actionFile.keepOldLocalFilesData(freshRow)
@@ -1850,11 +1854,12 @@ object FileController {
                 OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, remoteFile.id)) {
                     realm.executeTransaction {
                         val freshRow = getFileById(realm, remoteFile.id)
+                        // No same-parent bypass (issue: round 16 #4): an existing row already
+                        // in this container still passes the COMPLETE freshness predicate —
+                        // a stale child payload must not overwrite its current identity.
                         accepted = when {
                             freshRow == null -> remoteFile.parentId == folderId
-                            else ->
-                                freshRow.parentId == folderId ||
-                                    !isStaleForAuthoritativeAction(freshRow, remoteFile, actionAt, observed)
+                            else -> !isStaleForAuthoritativeAction(freshRow, remoteFile, actionAt, observed)
                         }
                         if (accepted) {
                             if (freshRow != null) remoteFile.keepOldLocalFilesData(freshRow)

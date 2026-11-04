@@ -389,12 +389,16 @@ object FolderFilesProvider {
     ): Map<out Int, FileAction> {
         SentryLog.i(TAG, "loadActivitiesFromFolderRec with folderId ${folderProxy.id} cursor: ${cursor != null}")
         val realm = folderProxy.realm
-        // DETACHED pre-request observations (issue: round 15 #10): the container's children
-        // as they stood when the listing/activities request was issued — managed objects
-        // would refresh together with the rows inside each activity's coordination and
-        // defeat tie resolution, leaving tied directory changes deferred forever.
+        // DETACHED pre-request observations (issues: round 15 #10, round 16 #9): the
+        // container's children as they stood when the listing/activities request was issued —
+        // managed objects would refresh together with the rows inside each activity's
+        // coordination and defeat tie resolution, leaving tied directory changes deferred
+        // forever. The copy is DEPTH ONE (issue: round 16 #9): a depth-zero copy drops the
+        // embedded FileVersion, and the tie-resolution observation comparison needs the
+        // version identifier the live row carries — an observation missing its own version
+        // defers every legitimate tied rename.
         val observedChildren = folderProxy.children.associateBy({ child -> child.id }) { child ->
-            realm.copyFromRealm(child, 0)
+            realm.copyFromRealm(child, 1)
         }
         val apiResponse = ApiRepository.getListingFiles(
             okHttpClient = okHttpClient,

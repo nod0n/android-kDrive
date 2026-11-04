@@ -95,13 +95,18 @@ object SyncOfflineUtils {
                         context = context,
                         coroutineScope = this,
                         userDrive = userDrive,
-                        // IMMUTABLE DETACHED observations (issue: round 15 #1): the map rows
-                        // are the request anchors — managed objects would be refreshed
-                        // together with the live rows inside the per-action coordination,
-                        // collapsing the historical state into the current one and defeating
-                        // the stale-action gate's tie resolution.
+                        // IMMUTABLE DETACHED observations (issues: round 15 #1, round 16 #9):
+                        // the map rows are the request anchors — managed objects would be
+                        // refreshed together with the live rows inside the per-action
+                        // coordination, collapsing the historical state into the current one
+                        // and defeating the stale-action gate's tie resolution. The copy is
+                        // DEPTH ONE (issue: round 16 #9): a depth-zero copy drops the embedded
+                        // FileVersion, and [FileController.isSameObservation] compares version
+                        // numbers — an unchanged live row with version N would fail against
+                        // its own observation's unknown version, deferring every legitimate
+                        // tied rename and letting Sync consume the rejected action as handled.
                         localFilesMap = it.associateBy({ file -> file.id }) { file ->
-                            realm.copyFromRealm(file, 0)
+                            realm.copyFromRealm(file, 1)
                         },
                         realm = realm,
                         pendingAdvances = pendingAdvances,
