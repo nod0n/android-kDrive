@@ -783,14 +783,51 @@ object SyncOfflineUtils {
                 runCatching { IOFile(snapshotUri.path ?: "").delete() }
                 return false
             }
-            // REVALIDATION of the ORIGINAL against the captured revision (issue: round 19
-            // #4): when the original's bytes are no longer the snapshotted revision (an
-            // edit raced the copy), the record registers the snapshot's revision alone —
-            // the caller's original is NOT treated as owned by this registration.
+            // REVALIDATION of the ORIGINAL against the captured revision (issues: round 19
+            // #4, round 20 #4): when the original's bytes are no longer the snapshotted
+            // revision (an edit raced the copy), the record registers the snapshot's
+            // revision alone — the caller's original is NOT treated as owned by this
+            // registration. An UNREADABLE original never substitutes the snapshot's hash:
+            // unreadability is not equality.
             val originalStillRevision = freshSource.exists() &&
                 freshSource.lastModified() == fileModifiedAt.time &&
                 freshSource.length() == snapshotFile.length() &&
-                (UploadFile.sha256OrNull(freshSource) ?: snapshotHash) == snapshotHash
+                UploadFile.sha256OrNull(freshSource) == snapshotHash
+            // Revision dedup and ID-LESS CANCELLATION PROTECTION (issues: round 8 #7,
+            // round 20 #4/#5): an already-registered revision (live, cancelled, or
+            // retained by an ID-less cancelled legacy record) is never re-registered —
+            // re-snapshotting duplicates pending work or silently reactivates a cancelled
+            // upload. The dedup hit defers like a raced original: the caller's current
+            // bytes are not certified by this registration.
+            if (UploadFile.hasUploadRecordFor(
+                    fileName = remoteFile?.name ?: liveRow.name,
+                    remoteFolder = remoteFile?.parentId ?: liveRow.parentId,
+                    driveId = userDrive.driveId,
+                    userId = userDrive.userId,
+                    fileModifiedAt = fileModifiedAt,
+                    pendingOnly = false,
+                    contentHash = snapshotHash,
+                    originalFileId = liveRow.id,
+                ) || UploadFile.hasCancelledUploadRecordFor(
+                    fileName = remoteFile?.name ?: liveRow.name,
+                    remoteFolder = remoteFile?.parentId ?: liveRow.parentId,
+                    driveId = userDrive.driveId,
+                    userId = userDrive.userId,
+                    fileModifiedAt = fileModifiedAt,
+                    contentHash = snapshotHash,
+                    originalFileId = liveRow.id,
+                ) || UploadFile.hasLegacyCancelledUploadRecordFor(
+                    fileName = remoteFile?.name ?: liveRow.name,
+                    remoteFolder = remoteFile?.parentId ?: liveRow.parentId,
+                    driveId = userDrive.driveId,
+                    userId = userDrive.userId,
+                    fileModifiedAt = fileModifiedAt,
+                    contentHash = snapshotHash,
+                )
+            ) {
+                runCatching { IOFile(snapshotUri.path ?: "").delete() }
+                return false
+            }
 
             UploadFile(
                 uri = snapshotUri.toString(),

@@ -1510,20 +1510,25 @@ object OfflineFolderController {
                     runCatching { IOFile(snapshotUri.path ?: "").delete() }
                     return@withFileLock false
                 }
-                // REVALIDATION of the ORIGINAL against the captured revision (issue: round
-                // 19 #4): registration certifies ownership of the original's CURRENT bytes
-                // only when they still are the snapshotted revision — an edit that raced
-                // the copy leaves the original's bytes unowned by this record, which
-                // registers the snapshot's revision alone.
+                // REVALIDATION of the ORIGINAL against the captured revision (issues: round
+                // 19 #4, round 20 #4): registration certifies ownership of the original's
+                // CURRENT bytes only when they still are the snapshotted revision — an
+                // edit that raced the copy leaves the original's bytes unowned by this
+                // record. An UNREADABLE original never substitutes the snapshot's hash for
+                // itself: unreadability is not equality, so revalidation fails.
                 val originalStillRevision = offlineFile.exists() &&
                     offlineFile.lastModified() == fileModifiedAt.time &&
                     offlineFile.length() == snapshotFile.length() &&
-                    (UploadFile.sha256OrNull(offlineFile) ?: contentHash) == contentHash
-                // Revision dedup under the file lock (issue: round 8 #7): this exact revision
-                // may already be registered — live (pending or sent), or retained after a
-                // cancellation. Re-snapshotting would duplicate the pending work or silently
-                // reactivate the cancelled upload; the existing record already owns these
-                // bytes, which is what this registration exists to guarantee.
+                    UploadFile.sha256OrNull(offlineFile) == contentHash
+                // Revision dedup under the file lock (issues: round 8 #7, round 20 #4/#5):
+                // this exact revision may already be registered — live (pending or sent),
+                // retained after a cancellation, or retained by an ID-LESS cancelled legacy
+                // record. Re-snapshotting would duplicate the pending work or silently
+                // reactivate the cancelled upload; the dedup hit reports the ORIGINAL's
+                // revalidation state, never blanket success — "snapshot A is durable" is
+                // distinct from "the original still contains A", and a raced original
+                // (now B, owned by no record) defers the caller instead of certifying its
+                // deletion.
                 if (UploadFile.hasUploadRecordFor(
                         fileName = file.name,
                         remoteFolder = file.parentId,
@@ -1541,12 +1546,19 @@ object OfflineFolderController {
                         fileModifiedAt = fileModifiedAt,
                         contentHash = contentHash,
                         originalFileId = file.id,
+                    ) || UploadFile.hasLegacyCancelledUploadRecordFor(
+                        fileName = file.name,
+                        remoteFolder = file.parentId,
+                        driveId = userDrive.driveId,
+                        userId = userDrive.userId,
+                        fileModifiedAt = fileModifiedAt,
+                        contentHash = contentHash,
                     )
                 ) {
                     // A duplicate registration adds nothing; the fresh snapshot copy is
                     // redundant residue either way.
                     runCatching { IOFile(snapshotUri.path ?: "").delete() }
-                    return@withFileLock true
+                    return@withFileLock originalStillRevision
                 }
                 UploadFile(
                     uri = snapshotUri.toString(),

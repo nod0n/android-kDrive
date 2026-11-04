@@ -842,6 +842,49 @@ open class UploadFile(
         }
 
         /**
+         * Whether a RETAINED CANCELLED SYNC_OFFLINE record WITHOUT a stable original identity
+         * (originalFileId <= 0, pre-migration) matches [fileName]/[remoteFolder]/scope and
+         * provably holds [contentHash]'s bytes (issue: round 20 #5): the ID-less
+         * cancellation protection. Such a record IS the cancellation decision for that
+         * revision, but its ID-less ownership must never CERTIFY ownership for a
+         * replacement file — the match BLOCKS automatic re-registration pending identity
+         * reconciliation only, granting ownership nowhere.
+         */
+        fun hasLegacyCancelledUploadRecordFor(
+            fileName: String,
+            remoteFolder: Int,
+            driveId: Int,
+            userId: Int,
+            fileModifiedAt: Date,
+            contentHash: String?,
+            customRealm: Realm? = null,
+        ): Boolean {
+            val block: (Realm) -> Boolean = { realm ->
+                val candidates = realm.uploadTable
+                    .equalTo(UploadFile::fileName.name, fileName)
+                    .equalTo(UploadFile::remoteFolder.name, remoteFolder)
+                    .equalTo(UploadFile::driveId.name, driveId)
+                    .equalTo(UploadFile::userId.name, userId)
+                    .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
+                    .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
+                    .isNotNull(UploadFile::deletedAt.name)
+                    .lessThanOrEqualTo(UploadFile::originalFileId.name, 0)
+                    .findAll()
+                if (candidates.isEmpty()) {
+                    false
+                } else if (contentHash == null) {
+                    // Without a content claim, an exact scope/destination/mtime match is
+                    // enough to refuse automatic re-registration (conservative; no
+                    // ownership granted to any row).
+                    true
+                } else {
+                    candidates.any { recordProvesContent(it, contentHash) }
+                }
+            }
+            return customRealm?.let(block) ?: getRealmInstance().use(block)
+        }
+
+        /**
          * Allocates a unique, durable snapshot file for one upload revision of an offline copy.
          * Unlike the shared upload cache (hash-named, evictable), each snapshot is a distinct
          * file under filesDir, so a later revision can never overwrite a still-pending one.
