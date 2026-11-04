@@ -536,27 +536,38 @@ class DownloadOfflineFileManager(
             staged: IOFile,
             onPublishedLocked: (() -> Unit)? = null,
         ): PublicationOutcome = withContext(Dispatchers.IO) {
-            // Destination ownership (issue: round 6 #3): the row owning the existing bytes at
-            // [target] is resolved BEFORE locking, then this publication holds BOTH the
-            // incoming file's and the owner's coordination locks in a stable ascending-id
-            // order, so the owner's mutators (cleanup, reconciliation, its own publications)
-            // are serialized with it and no lock ordering can deadlock.
-            val appContext = Realm.getApplicationContext()
-            val preLockOwner = appContext?.let { ctx ->
-                FileController.getRealmInstance(userDrive).use { realm ->
-                    OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)
+            // ROOT-INTENT coordination for publication (issue: round 12 #8): an ancestry-
+            // dependent publication must serialize with ancestry-changing writers (folder
+            // moves take the monitor before their locks) — a monitored UI folder move could
+            // otherwise change ancestry after this publication validates its destination,
+            // because it locks the ancestor rather than this publishing leaf. The monitor is
+            // acquired BEFORE the ordered file locks and retained through the destination
+            // ownership read, the final supersession decision and the filesystem rename
+            // inside publishLockedCore. Order: intent monitor → ascending file locks →
+            // Realm/FS mutation.
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                // Destination ownership (issue: round 6 #3): the row owning the existing bytes at
+                // [target] is resolved BEFORE locking, then this publication holds BOTH the
+                // incoming file's and the owner's coordination locks in a stable ascending-id
+                // order, so the owner's mutators (cleanup, reconciliation, its own publications)
+                // are serialized with it and no lock ordering can deadlock.
+                val appContext = Realm.getApplicationContext()
+                val preLockOwner = appContext?.let { ctx ->
+                    FileController.getRealmInstance(userDrive).use { realm ->
+                        OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)
+                    }
                 }
-            }
-            val lockedOwnerId: Int? = preLockOwner?.id
+                val lockedOwnerId: Int? = preLockOwner?.id
 
-            // Both locks (incoming + established owner) in ONE ascending-id acquisition,
-            // constant stack (issues: round 11 #1, round 11 #12): the same ordered protocol as
-            // every graph commit and cleanup acquisition, so no lock cycle is possible, and
-            // the explicit-lock loop cannot overflow the stack the way nested monitors did.
-            OfflineFileCoordination.withLocksFor(userDrive, listOfNotNull(file.id, preLockOwner?.id)) {
-                publishLockedCore(
-                    userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
-                ) { coroutineContext.ensureActive() }
+                // Both locks (incoming + established owner) in ONE ascending-id acquisition,
+                // constant stack (issues: round 11 #1, round 11 #12): the same ordered protocol as
+                // every graph commit and cleanup acquisition, so no lock cycle is possible, and
+                // the explicit-lock loop cannot overflow the stack the way nested monitors did.
+                OfflineFileCoordination.withLocksFor(userDrive, listOfNotNull(file.id, preLockOwner?.id)) {
+                    publishLockedCore(
+                        userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
+                    ) { coroutineContext.ensureActive() }
+                }
             }
         }
 
