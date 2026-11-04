@@ -285,21 +285,35 @@ object SyncOfflineUtils {
         val fileModifiedAt = Date(ioFile.lastModified())
 
         if (!UploadFile.canUpload(uri, fileModifiedAt)) {
-            // Not schedulable right now: the action stays pending for a later sync
-            // (issue: round 6 #11).
+            // Not schedulable right now: the action stays pending for a later sync (issues:
+            // round 6 #11, round 7 #4). With per-revision snapshot registration this only
+            // trips for a legacy record still keyed by the original URI with the same
+            // modification date.
             return false
         }
         // Upload-source registration is a mutation owner of these bytes: it holds the shared
         // per-file coordination so a publication or cleanup cannot interleave (issue:
         // round 4 #4).
         synchronized(OfflineFileCoordination.lockFor(userDrive, localFile.id)) {
-            // Registration FIRST (issue: round 6 #4): if the upload record cannot be created,
-            // the replacement metadata must not be committed — a committed clean baseline
-            // without a durable owner would leave the copy reading as clean and unprotected.
-            // If the metadata write fails after a successful registration, the record still
-            // owns the source and the next sync retries.
+            // Immutable per-revision source (issue: round 7 #4): ordinary offline edits used to
+            // register the MUTABLE original URI as their primary identity — store() replaces
+            // the row with that key, and an older upload finishing later marked and removed
+            // whichever revision then occupied the URI, erasing the newer revision's durable
+            // ownership without uploading it. Each registration now copies the bytes to a
+            // unique durable snapshot and owns THAT identity, exactly like removal-time
+            // snapshots: completion, error and cancellation all target the exact registered
+            // generation, and the original-path copy stays protected through the record's
+            // content identity (fileName, folder, modification date).
+            val snapshotUri = UploadFile.createDurableOfflineSnapshot(
+                context = context,
+                source = ioFile,
+                fileModifiedAt = fileModifiedAt,
+                fileId = localFile.id,
+                driveId = userDrive.driveId,
+            ) ?: return false
+
             UploadFile(
-                uri = uri.toString(),
+                uri = snapshotUri.toString(),
                 driveId = userDrive.driveId,
                 fileModifiedAt = fileModifiedAt,
                 fileName = localFile.name,
