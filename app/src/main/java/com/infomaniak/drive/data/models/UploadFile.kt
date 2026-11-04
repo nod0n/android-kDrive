@@ -555,28 +555,56 @@ open class UploadFile(
                         }
                         if (actualHash != uploadedHash) return@withFileLock
                         val uploadedBaselineSeconds = record.fileModifiedAt.time / 1_000L
-                        if (liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds) return@withFileLock
+                        // PROOF REPAIR (issue: round 20 #13): the baseline-already-advanced
+                        // early return previously prevented subsequent proof repair — a pass
+                        // that advanced the baseline but failed its provenance write could
+                        // never be repaired, yet the record still concluded and the snapshot
+                        // was disposed. The early return applies only when the proof is
+                        // COMPLETE: a record exists whose IMMUTABLE byte identity certifies
+                        // these bytes.
+                        val provenanceContext = Realm.getApplicationContext()
+                        val existingProof = provenanceContext?.let {
+                            DownloadOfflineFileManager.readPublishedProvenance(it, original)
+                        }
+                        if (existingProof?.certifiesBytes(original) == true &&
+                            liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds
+                        ) {
+                            return@withFileLock
+                        }
+                        // VERIFIED-UPLOADED-BUT-NOT-CURRENT IDENTITY (issue: round 20 #13):
+                        // the record binds the BYTE IDENTITY and the VERIFIED byte baseline —
+                        // the row's CURRENT version/revision fields are NOT the uploaded
+                        // revision's server result (newer remote B metadata can commit while
+                        // uploaded A remains local; a tied size/mtime would label A as B).
+                        // The record is written WITHOUT generation claims (a detached
+                        // identity row: version 0, no revisedAt/updatedAt), so it can never
+                        // prove currentness by itself; the authoritative version-bearing
+                        // request resolves it.
+                        val provenanceWritten = provenanceContext != null && DownloadOfflineFileManager
+                            .writeVerifiedRevisionProvenance(
+                                context = provenanceContext,
+                                target = original,
+                                row = File(id = liveRow.id, driveId = liveRow.driveId).apply {
+                                    parentId = liveRow.parentId
+                                    name = liveRow.name
+                                },
+                                userDrive = userDrive,
+                                verifiedLastModifiedAt = uploadedBaselineSeconds,
+                            )
+                        // DURABLE PROOF BEFORE CONCLUSION (issue: round 20 #13): a failed
+                        // provenance write DEFERS — the baseline does not advance, the
+                        // record does not conclude, and the snapshot stays owned for the
+                        // retry (the writer's false result and exceptions are no longer
+                        // ignored).
+                        if (!provenanceWritten) {
+                            deferred = true
+                            return@withFileLock
+                        }
                         // FULL PROVENANCE AND BASELINE ADVANCE TOGETHER (issue: round 19
                         // #13): the hash proof above established these bytes as the uploaded
                         // revision — the copy's provenance record is written from that
                         // VERIFIED byte baseline in the same coordinated section as the
-                        // baseline advance. A baseline without its record left the copy's
-                        // readability story incoherent until a later redrive re-published
-                        // it; the row's lagging version/revision identity in the record
-                        // can never falsely prove currentness (the generation comparisons
-                        // reject it).
-                        val provenanceContext = Realm.getApplicationContext()
-                        if (provenanceContext != null) {
-                            runCatching {
-                                DownloadOfflineFileManager.writeVerifiedRevisionProvenance(
-                                    context = provenanceContext,
-                                    target = original,
-                                    row = liveRow,
-                                    userDrive = userDrive,
-                                    verifiedLastModifiedAt = uploadedBaselineSeconds,
-                                )
-                            }
-                        }
+                        // baseline advance.
                         realm.executeTransaction { liveRow.publishedCleanBaseline = uploadedBaselineSeconds }
                     }
                 }
