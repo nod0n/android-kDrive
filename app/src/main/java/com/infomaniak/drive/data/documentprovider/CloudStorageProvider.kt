@@ -257,7 +257,10 @@ class CloudStorageProvider : DocumentsProvider() {
                             folderId = Utils.ROOT_ID,
                             userDrive = UserDrive(AccountUtils.currentUserId, AccountUtils.currentDriveId, sharedWithMe = true),
                             sortType = sortType,
-                            transaction = cursor.addFiles(parentDocumentId, uri, isSharedWithMeFolder = true)
+                            transaction = cursor.addFiles(parentDocumentId, uri, isSharedWithMeFolder = true),
+                            // The captured executing context (issue: round 22 #20): the
+                            // resolver's post-HTTP/post-lock checks ride the cursor's job.
+                            checkCancelled = { cursor.job.ensureActive() },
                         )
                     }
                 }
@@ -279,7 +282,8 @@ class CloudStorageProvider : DocumentsProvider() {
                             folderId = fileFolderId,
                             userDrive = userDrive,
                             sortType = sortType,
-                            transaction = cursor.addFiles(parentDocumentId, uri)
+                            transaction = cursor.addFiles(parentDocumentId, uri),
+                            checkCancelled = { cursor.job.ensureActive() },
                         )
                     }
                 }

@@ -63,7 +63,10 @@ object FolderFilesProvider {
 
     private val minDateToIgnoreCache = Calendar.getInstance().apply { add(Calendar.MONTH, -2) }.timeInMillis / 1000 // 3 month
 
-    fun getFiles(folderFilesProviderArgs: FolderFilesProviderArgs): FolderFilesProviderResult? {
+    fun getFiles(
+        folderFilesProviderArgs: FolderFilesProviderArgs,
+        checkCancelled: () -> Unit = {},
+    ): FolderFilesProviderResult? {
         val realm = folderFilesProviderArgs.realm ?: FileController.getRealmInstance(folderFilesProviderArgs.userDrive)
         try {
             val folderProxy = FileController.getFileById(realm, folderFilesProviderArgs.folderId)
@@ -75,7 +78,7 @@ object FolderFilesProvider {
             )
             val files = when {
                 needToLoadFromRemote && sourceRestrictionType != SourceRestrictionType.ONLY_FROM_LOCAL -> {
-                    loadFromRemote(realm, folderProxy, folderFilesProviderArgs)
+                    loadFromRemote(realm, folderProxy, folderFilesProviderArgs, checkCancelled)
                 }
                 folderFilesProviderArgs.isFirstPage -> {
                     loadFromLocal(realm, folderProxy, folderFilesProviderArgs.withChildren, folderFilesProviderArgs.order)
@@ -102,7 +105,9 @@ object FolderFilesProvider {
                         order = SortType.NAME_AZ,
                         sourceRestrictionType = ONLY_FROM_REMOTE,
                         userDrive = userDrive,
-                    )
+                    ),
+                    // The suspend caller's captured executing context (issue: round 22 #20).
+                    checkCancelled = { coroutineContext.ensureActive() },
                 )
             }.cancellable().onFailure { throwable ->
                 SentryLog.e(TAG, "recursiveDownload failed", throwable)
@@ -201,6 +206,12 @@ object FolderFilesProvider {
             )
         }
         val folderProxy = FileController.getFileById(realm, folderId)
+
+        // POST-HTTP CHECK (issue: round 22 #20): the initial shared-page handling previously
+        // proceeded from the response straight to the save — a cancellation while the HTTP
+        // blocked was followed by commits. The executing-context check runs here and before
+        // every effect below.
+        checkCancelled()
 
         fun saveFiles() = saveRemoteFiles(
             realm = realm,
@@ -376,6 +387,7 @@ object FolderFilesProvider {
         isFirstPage: Boolean = true,
         transaction: (files: ArrayList<File>) -> Unit,
         okHttpClient: OkHttpClient? = null,
+        checkCancelled: () -> Unit = {},
     ) {
         val folderProxy = FileController.getFileById(realm, folderId)
         val folderFilesProviderArgs = FolderFilesProviderArgs(
@@ -392,6 +404,7 @@ object FolderFilesProvider {
             folderProxy = folderProxy,
             folderFilesProviderArgs = folderFilesProviderArgs,
             okHttpClient = currentOkHttpClient,
+            checkCancelled = checkCancelled,
         )
 
         transaction(folderFilesProviderResult?.folderFiles ?: arrayListOf())
@@ -404,6 +417,7 @@ object FolderFilesProvider {
             isFirstPage = false,
             transaction = transaction,
             okHttpClient = currentOkHttpClient,
+            checkCancelled = checkCancelled,
         )
     }
 
@@ -424,6 +438,7 @@ object FolderFilesProvider {
         realm: Realm,
         folderProxy: File?,
         folderFilesProviderArgs: FolderFilesProviderArgs,
+        checkCancelled: () -> Unit = {},
     ): FolderFilesProviderResult? = with(Dispatchers.IO) {
 
         SentryLog.i(TAG, "loadFromRemote")
@@ -472,7 +487,7 @@ object FolderFilesProvider {
 
         ensureActive()
 
-        handleRemoteFiles(realm, apiResponse, folderFilesProviderArgs, folderProxy, okHttpClient, observedById)
+        handleRemoteFiles(realm, apiResponse, folderFilesProviderArgs, folderProxy, okHttpClient, observedById, checkCancelled)
     }
 
     private fun loadCloudStorageFromRemote(
@@ -480,6 +495,7 @@ object FolderFilesProvider {
         folderProxy: File?,
         folderFilesProviderArgs: FolderFilesProviderArgs,
         okHttpClient: OkHttpClient,
+        checkCancelled: () -> Unit = {},
     ): FolderFilesProviderResult? = with(Dispatchers.IO) {
         val userDrive = folderFilesProviderArgs.userDrive
 
@@ -507,7 +523,11 @@ object FolderFilesProvider {
             }
         }
 
-        ensureActive()
+        // POST-HTTP CHECK (issue: round 22 #20): the caller's captured executing context
+        // (the SAF cursor's job, the suspend listing's job) — the previous bare
+        // ensureActive() ran against the with-block's Job-LESS dispatcher receiver and
+        // therefore checked nothing.
+        checkCancelled()
 
         // The CAPTURED account client rides the shared resolution (issue: round 22 #19):
         // the default-parameter client authenticated details resolution against the
@@ -519,6 +539,7 @@ object FolderFilesProvider {
             folderProxy,
             okHttpClient = okHttpClient,
             observedById = observedById,
+            checkCancelled = checkCancelled,
         )
     }
 
@@ -529,6 +550,7 @@ object FolderFilesProvider {
         folderProxy: File?,
         okHttpClient: OkHttpClient = DefaultHttpClientProvider.okHttpClient,
         observedById: Map<Int, File> = emptyMap(),
+        checkCancelled: () -> Unit = {},
     ): FolderFilesProviderResult? {
         val userDrive = folderFilesProviderArgs.userDrive
         val apiResponseData = apiResponse.data
@@ -566,6 +588,7 @@ object FolderFilesProvider {
                         folderId = folderFilesProviderArgs.folderId,
                         userDrive = userDrive,
                         deferredIds = commitOutcomes.deferredIds,
+                        checkCancelled = checkCancelled,
                     )
                     if (unresolvedCount > 0) {
                         // INCOMPLETE RECONCILIATION OUTLIVES PAGINATION (issue: round 22 #17):
