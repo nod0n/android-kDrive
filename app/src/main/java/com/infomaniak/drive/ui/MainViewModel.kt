@@ -381,7 +381,10 @@ class MainViewModel(
     }
 
     fun renameFile(file: File, newName: String) = liveData(Dispatchers.IO) {
-        emit(FileController.renameFile(file, newName))
+        // The viewed file's account scope is captured for the rename preservation and the
+        // metadata write (issue: round 6 #4).
+        val userDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = file.driveId)
+        emit(FileController.renameFile(file, newName, userDrive = userDrive))
     }
 
     fun updateFolderColor(file: File, color: String, userDrive: UserDrive) = liveData(Dispatchers.IO) {

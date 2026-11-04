@@ -44,6 +44,7 @@ import com.infomaniak.drive.data.models.file.SpecialFolder.RecentChanges
 import com.infomaniak.drive.data.models.file.SpecialFolder.SharedWithMe
 import com.infomaniak.drive.data.services.MqttClientWrapper
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.RealmModules
 import com.infomaniak.drive.utils.Utils.ROOT_ID
@@ -374,14 +375,70 @@ object FileController {
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
-    fun renameFile(file: File, newName: String, realm: Realm? = null): ApiResponse<CancellableAction> {
+    fun renameFile(
+        file: File,
+        newName: String,
+        realm: Realm? = null,
+        userDrive: UserDrive? = null,
+    ): ApiResponse<CancellableAction> {
         val apiResponse = ApiRepository.renameFile(file, newName)
         if (apiResponse.isSuccess()) {
-            updateFile(file.id, realm) { localFile ->
-                localFile.name = newName
+            // Preservation BEFORE the identity replacement (issue: round 6 #4): the owned copy
+            // at the old name's path is reconciled to the new name first, and an incomplete
+            // reconciliation keeps the OLD name until a later pass retries.
+            val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm)
+            if (preserved) {
+                updateFile(file.id, realm, userDrive = userDrive) { localFile ->
+                    localFile.name = newName
+                }
             }
         }
         return apiResponse
+    }
+
+    /**
+     * Reconciles the owned copy of [file] at its OLD name's path to [newName], BEFORE the row's
+     * name is replaced (issue: round 6 #4). The offline path's file component is always the
+     * row's name, so the post-commit location is the same directory with the new name, for
+     * rows with a stored path and for derived ones alike. Returns true when the old location
+     * is fully handled (or nothing owned exists there); false means the caller must NOT
+     * replace the identity yet.
+     */
+    private fun preserveRenameBeforeMetadataChange(
+        file: File,
+        newName: String,
+        userDrive: UserDrive?,
+        customRealm: Realm?,
+    ): Boolean {
+        val context = Realm.getApplicationContext() ?: return false
+        val scope = userDrive ?: UserDrive()
+        val block: (Realm) -> Boolean = { realm ->
+            val liveRow = getFileProxyById(file.id, customRealm = realm) ?: return@block true
+            if (liveRow.isFolder()) return@block true
+            val oldOffline = liveRow.getOfflineFile(context, scope.userId)?.takeIf { it.exists() }
+                ?: return@block true
+            val newOffline = oldOffline.parentFile?.let { parent -> IOFile(parent, newName) }
+                ?: return@block false
+            if (newOffline.path == oldOffline.path) return@block true
+            // The dirty-copy snapshot registers under the NEW name: the edit belongs to the
+            // renamed file, and uploading it under the old name would recreate that name
+            // remotely.
+            val snapshotIdentity = File(id = liveRow.id, driveId = scope.driveId).apply {
+                parentId = liveRow.parentId
+                name = newName
+            }
+            OfflineFolderController.reconcileMovedInheritedCopy(
+                context = context,
+                oldOfflineFile = oldOffline,
+                oldIdentityName = liveRow.name,
+                oldIdentityParentId = liveRow.parentId,
+                oldLastModifiedAt = liveRow.lastModifiedAt,
+                newIdentity = snapshotIdentity,
+                userDrive = scope,
+                newOfflineTarget = newOffline,
+            )
+        }
+        return customRealm?.let(block) ?: getRealmInstance(scope).use(block)
     }
 
     fun updateFolderColor(file: File, color: String, userDrive: UserDrive): ApiResponse<Boolean> {
@@ -670,8 +727,15 @@ object FileController {
 
     fun getFileDetails(fileId: Int, userDrive: UserDrive = UserDrive()): File? {
         fun getRemoteParentDetails(remoteFile: File, userDrive: UserDrive, realm: Realm) {
+            // Shared upsert boundary (issue: round 6 #4): the details cascade can also replace
+            // the file's identity; preserve the owned copy at the old location first.
+            val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                realm = realm,
+                remoteFiles = listOf(remoteFile),
+                userDrive = userDrive,
+            ).first()
             ApiRepository.getFileDetails(File(id = remoteFile.parentId, driveId = userDrive.driveId)).data?.let {
-                it.children = RealmList(remoteFile)
+                it.children = RealmList(preservedFile)
                 insertOrUpdateFile(realm, it)
             }
         }
@@ -684,7 +748,15 @@ object FileController {
                     if (localParentProxy == null) {
                         getRemoteParentDetails(remoteFile, userDrive, realm)
                     } else {
-                        insertOrUpdateFile(realm, remoteFile, getFileProxyById(fileId, customRealm = realm))
+                        // Shared upsert boundary (issue: round 6 #4): details responses carry
+                        // name/path metadata that would replace the old identity without
+                        // preserving the owned copy at its old location.
+                        val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                            realm = realm,
+                            remoteFiles = listOf(remoteFile),
+                            userDrive = userDrive,
+                        ).first()
+                        insertOrUpdateFile(realm, preservedFile, getFileProxyById(fileId, customRealm = realm))
                     }
                 }
                 remoteFile
@@ -1087,11 +1159,19 @@ object FileController {
         okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
     ) = Dispatchers.IO {
         getRealmInstance(userDrive).use { realm ->
-            val localFile = getFileById(realm, remoteFile.id)
-            insertOrUpdateFile(realm, remoteFile, localFile)
+            // Shared upsert boundary (issue: round 6 #4): preserve the owned copy at the old
+            // location before the metadata replacement; a deferred reconciliation commits the
+            // OLD row instead of the new identity.
+            val preservedFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                realm = realm,
+                remoteFiles = listOf(remoteFile),
+                userDrive = userDrive,
+            ).first()
+            val localFile = getFileById(realm, preservedFile.id)
+            insertOrUpdateFile(realm, preservedFile, localFile)
 
             val driveId = userDrive.driveId
-            resolveAndLinkFileAncestorsChain(realm, remoteFile.parentId, remoteFile.id, driveId, okHttpClient)
+            resolveAndLinkFileAncestorsChain(realm, preservedFile.parentId, preservedFile.id, driveId, okHttpClient)
         }
     }
 

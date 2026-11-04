@@ -538,8 +538,8 @@ class CloudStorageProvider : DocumentsProvider() {
         FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
-                // Rename
-                val apiResponse = FileController.renameFile(file, displayName, realm)
+                // Rename (the document's scope drives the copy preservation, issue: round 6 #4)
+                val apiResponse = FileController.renameFile(file, displayName, realm, createUserDrive(documentId))
 
                 if (apiResponse.isSuccess()) {
                     // Refresh
