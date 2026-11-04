@@ -264,7 +264,7 @@ class DownloadOfflineFileManager(
             CachePromotionOutcome.FAILED -> Unit
         }
 
-        if (file.isOfflineAndProvenCurrent(context, offlineFile)) {
+        if (file.isOfflineAndProvenCurrent(context, offlineFile, userDrive)) {
             // We can have this case for example when we try to put a lot of files at once in offline mode
             // and for some reason, the worker is cancelled after a long time, the worker is restarted
             filesDownloaded += 1

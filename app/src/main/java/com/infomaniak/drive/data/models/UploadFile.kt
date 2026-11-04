@@ -739,9 +739,12 @@ open class UploadFile(
          * destination-uri queries cannot see their ownership of the original revision.
          * Matches the destination identity, modification date and RECORDED size, covering
          * pending AND retained-unsent records, and creates no snapshot — a record for this
-         * exact revision means the destination bytes are durably owned local content. When
-         * [contentHash] is provided, a candidate must also PROVE those bytes (issue: round 18
-         * #7) — a same-mtime, same-size record of different content is not ownership.
+         * exact revision means the destination bytes are durably owned local content. The
+         * caller's successful content hash is REQUIRED (issues: round 18 #7, round 21 #12):
+         * a candidate must PROVE those bytes — a same-mtime, same-size record of different
+         * content is not ownership, and a FAILED hash/read is unresolved, never ownership
+         * (metadata alone no longer grants the durable-ownership answer; callers hash the
+         * copy first and skip the query when hashing failed).
          */
         fun hasDurableOriginalRevisionOwnership(
             fileName: String,
@@ -750,7 +753,7 @@ open class UploadFile(
             userId: Int,
             fileModifiedAt: Date,
             fileSize: Long,
-            contentHash: String? = null,
+            contentHash: String,
             originalFileId: Int? = null,
             customRealm: Realm? = null,
         ): Boolean {
@@ -766,13 +769,7 @@ open class UploadFile(
                     .isNull(UploadFile::uploadAt.name)
                     .apply { if (originalFileId != null && originalFileId > 0) equalTo(UploadFile::originalFileId.name, originalFileId) }
                     .findAll()
-                if (candidates.isEmpty()) {
-                    false
-                } else if (contentHash == null) {
-                    true
-                } else {
-                    candidates.any { recordProvesContent(it, contentHash) }
-                }
+                candidates.any { recordProvesContent(it, contentHash) }
             }
             return customRealm?.let(block) ?: getRealmInstance().use(block)
         }

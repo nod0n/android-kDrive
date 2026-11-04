@@ -190,17 +190,20 @@ class DownloadProgressViewModel : ViewModel() {
                                     UploadFile.hasRetainedUnsentUpload(uri = targetUri) ||
                                     // Durable SNAPSHOT registrations own the original
                                     // revision under unique uris the uri queries cannot
-                                    // see (issue: round 15 #7).
-                                    UploadFile.hasDurableOriginalRevisionOwnership(
-                                        fileName = liveRow.name,
-                                        remoteFolder = liveRow.parentId,
-                                        driveId = userDrive.driveId,
-                                        userId = userDrive.userId,
-                                        fileModifiedAt = Date(outputFile.lastModified()),
-                                        fileSize = outputFile.length(),
-                                        contentHash = UploadFile.sha256OrNull(outputFile),
-                                        originalFileId = liveRow.id,
-                                    ))
+                                    // see (issue: round 15 #7). A FAILED hash/read is
+                                    // unresolved, not ownership (issue: round 21 #12).
+                                    UploadFile.sha256OrNull(outputFile)?.let { currentHash ->
+                                        UploadFile.hasDurableOriginalRevisionOwnership(
+                                            fileName = liveRow.name,
+                                            remoteFolder = liveRow.parentId,
+                                            driveId = userDrive.driveId,
+                                            userId = userDrive.userId,
+                                            fileModifiedAt = Date(outputFile.lastModified()),
+                                            fileSize = outputFile.length(),
+                                            contentHash = currentHash,
+                                            originalFileId = liveRow.id,
+                                        )
+                                    } == true)
                         }
                     }
                     if (usable) PROGRESS_COMPLETE else null
