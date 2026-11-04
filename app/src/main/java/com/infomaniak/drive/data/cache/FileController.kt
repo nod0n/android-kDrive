@@ -225,11 +225,18 @@ object FileController {
     }
 
     //region isMarkedAsOffline
-    fun hasFilesMarkedAsOffline(folderId: Int): Boolean {
+    fun hasOfflineIntentFiles(folderId: Int): Boolean {
+        // Explicit pins carry durable download intent too (issue: round 5 #15): the enqueue
+        // gate must not drop a selection whose pending markers an overlapping inherited walk
+        // already cleared.
         return getRealmInstance().use { realm ->
             realm.where(File::class.java)
                 .equalTo(File::parentId.name, folderId)
+                .beginGroup()
                 .equalTo(File::isMarkedAsOffline.name, true)
+                .or()
+                .equalTo(File::isOffline.name, true)
+                .endGroup()
                 .notEqualTo(File::type.name, Type.DIRECTORY.value)
                 .count() > 0
         }
@@ -239,20 +246,33 @@ object FileController {
         // Enumerate in the caller's captured account scope, not the currently active one
         // (issue: round 5 #16).
         return getRealmInstance(userDrive).use { realm ->
+            // Durable explicit-pin intent (issue: round 5 #15) is enumerated alongside the
+            // shared pending marker: a concurrent inherited walk can clear the markers while
+            // this batch loads, and an explicitly pinned file must still be downloaded. Files
+            // whose offline copy is already intact are skipped inside the transfer.
             val realmFiles = realm.where(File::class.java)
                 .equalTo(File::parentId.name, folderId)
+                .beginGroup()
                 .equalTo(File::isMarkedAsOffline.name, true)
+                .or()
+                .equalTo(File::isOffline.name, true)
+                .endGroup()
                 .getSortQueryByOrder(sortType)
                 .findAll()
             realmFiles.filter { !it.isFolder() }.map { it.id }
         }
     }
 
-    private fun markFileAsOfflineQuery(realm: Realm, fileId: Int, isMarkedAsOffline: Boolean) {
+    private fun markFileAsOfflineQuery(realm: Realm, fileId: Int, isMarkedAsOffline: Boolean, setExplicitPin: Boolean) {
         realm.where(File::class.java)
             .equalTo(File::id.name, fileId)
             .findFirst()?.let { file ->
                 file.isMarkedAsOffline = isMarkedAsOffline
+                // Durable explicit-pin intent (issue: round 5 #15): the user's request must not
+                // depend on the shared pending marker, which an overlapping inherited walk can
+                // clear. Inherited completion neither consumes nor suppresses this flag, and
+                // root removal never strips explicitly pinned files.
+                if (setExplicitPin && isMarkedAsOffline) file.isOffline = true
             }
     }
 
@@ -261,10 +281,13 @@ object FileController {
         filesId: List<Int>,
         isMarkedAsOffline: Boolean,
         userDrive: UserDrive? = null,
+        setExplicitPin: Boolean = false,
     ) {
         val block: (Realm) -> Unit? = { realm ->
             realm.executeTransaction {
-                filesId.forEach { fileId -> markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline) }
+                filesId.forEach { fileId ->
+                    markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin)
+                }
             }
         }
 
@@ -274,7 +297,7 @@ object FileController {
     fun markFileAsOffline(customRealm: Realm? = null, fileId: Int, isMarkedAsOffline: Boolean, userDrive: UserDrive? = null) {
         val block: (Realm) -> Unit? = { realm ->
             realm.executeTransaction {
-                markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline)
+                markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin = false)
             }
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
@@ -307,6 +330,16 @@ object FileController {
                     // Row removal is a mutation owner of the offline copy: preservation, cache
                     // deletion and row deletion are one coordinated section (issue: round 4 #4).
                     synchronized(OfflineFileCoordination.lockFor(resolvedUserDrive, fileId)) {
+                        // Required ancestry (issue: round 5 #10): a folder row whose descendants
+                        // remain locally owned must survive — deleting it strands the preserved
+                        // copies' metadata and breaks every parentId traversal (deferred
+                        // cleanup, orphan sweep, offline path resolution). Applies to both the
+                        // recursive and the nonrecursive removal paths.
+                        val folderStillNeeded = file.isFolder() &&
+                                OfflineFolderController.hasLocallyOwnedDescendant(
+                                    folderId = fileId,
+                                    realm = realm,
+                                )
                         if (!keepFileCaches.contains(fileId)) {
                             // Inherited copies are preserved before any deletion (issue: round 3 #6):
                             // a pending upload keeps its bytes, a dirty copy is snapshotted first.
@@ -316,7 +349,7 @@ object FileController {
                                     if (!keepFileCaches.contains(fileId)) {
                                         file.deleteCaches(Realm.getApplicationContext()!!, resolvedUserDrive.userId)
                                     }
-                                    if (!keepFiles.contains(fileId)) {
+                                    if (!keepFiles.contains(fileId) && !folderStillNeeded) {
                                         realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                                     }
                                 }
@@ -325,7 +358,7 @@ object FileController {
                                 // re-processes the remote deletion then (issue: round 4 #6).
                                 OfflineFolderController.PreservationOutcome.PRESERVED -> Unit
                             }
-                        } else if (!keepFiles.contains(fileId)) {
+                        } else if (!keepFiles.contains(fileId) && !folderStillNeeded) {
                             realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                         }
                     }
@@ -407,12 +440,38 @@ object FileController {
                             // inherited state (even when the pin was the only flag so far),
                             // while an uncovered file loses any stale inherited flag.
                             file.isInOfflineFolder = OfflineFolderController.isInsideActiveRoot(currentRealm, fileId)
+                            // The pending download marker is part of the removed intent
+                            // (issue: round 5 #15): a stale marker would otherwise resurrect
+                            // the pin through the sync's intent check after the next download.
+                            file.isMarkedAsOffline = false
                         }
                     }
                 }
             }
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
+    }
+
+    /**
+     * Folders that still hold durable offline download intent in [userDrive]'s scope — an
+     * explicit pin or a pending download marker (issue: round 5 #15/#17): used to re-drive
+     * unfinished pin batches after a constraint reconfiguration or an app restart. Intact
+     * copies are skipped inside the worker, so re-driving an already-satisfied intent is cheap.
+     */
+    fun getFoldersWithOfflineIntent(userDrive: UserDrive? = null, customRealm: Realm? = null): List<Int> {
+        val block: (Realm) -> List<Int> = { realm ->
+            realm.where(File::class.java)
+                .beginGroup()
+                .equalTo(File::isMarkedAsOffline.name, true)
+                .or()
+                .equalTo(File::isOffline.name, true)
+                .endGroup()
+                .notEqualTo(File::type.name, Type.DIRECTORY.value)
+                .distinct(File::parentId.name)
+                .findAll()
+                .map { it.parentId }
+        }
+        return customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
     fun updateFile(fileId: Int, realm: Realm? = null, userDrive: UserDrive? = null, transaction: (file: File) -> Unit) {
@@ -465,8 +524,10 @@ object FileController {
         }
     }
 
-    fun updateOfflineStatus(fileId: Int, isOffline: Boolean) {
-        updateFile(fileId) { file ->
+    fun updateOfflineStatus(fileId: Int, isOffline: Boolean, userDrive: UserDrive? = null) {
+        // The pin write runs in the caller's captured account scope (issue: round 5 #13);
+        // without it the active account's Realm would be written.
+        updateFile(fileId, userDrive = userDrive) { file ->
             file.isOffline = isOffline
         }
     }

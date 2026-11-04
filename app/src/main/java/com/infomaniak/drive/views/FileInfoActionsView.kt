@@ -388,23 +388,30 @@ class FileInfoActionsView @JvmOverloads constructor(
     fun downloadAsOfflineFile(): Boolean = with(currentFile) {
         if (Utils.getInvalidFileNameCharacter(name) != null) return@with false
 
-        val cacheFile = getCacheFile(context)
+        // Immutable identity and captured account scope BEFORE dispatch (issue: round 5 #13):
+        // an account switch mid-promotion must not write the pin into another account's Realm
+        // or publish into another account's path, and the rollback stays scoped to the same
+        // request.
+        val fileId = id
+        val capturedUserDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = driveId)
+        val cacheFile = getCacheFile(context, capturedUserDrive)
+        val offlineFile = getOfflineFile(context, capturedUserDrive.userId)
 
         if (cacheFile.exists() && path.isNotEmpty() && !isObsoleteOrNotIntact(cacheFile)) {
-            getOfflineFile(context)?.let { offlineFile ->
+            offlineFile?.let { target ->
                 val file = this
                 // UI promotion routes through the same protected, coordinated publication as the
                 // workers (issue: round 4 #8): the explicit pin is set first so the publication
                 // intent check sees the user's request; the cache source is deleted and the
                 // offline state kept only after a confirmed publication.
                 CoroutineScope(Dispatchers.IO).launch {
-                    FileController.updateOfflineStatus(id, isOffline = true)
+                    FileController.updateOfflineStatus(fileId, isOffline = true, userDrive = capturedUserDrive)
                     val published = DownloadOfflineFileManager.promoteCacheToOffline(
                         context = context,
                         file = file,
                         cacheFile = cacheFile,
-                        offlineFile = offlineFile,
-                        userDrive = UserDrive(driveId = driveId),
+                        offlineFile = target,
+                        userDrive = capturedUserDrive,
                     )
                     CoroutineScope(Dispatchers.Main).launch {
                         if (published) {
@@ -412,7 +419,7 @@ class FileInfoActionsView @JvmOverloads constructor(
                             onItemClickListener.onCacheAddedToOffline()
                         } else {
                             CoroutineScope(Dispatchers.IO).launch {
-                                FileController.updateOfflineStatus(id, isOffline = false)
+                                FileController.updateOfflineStatus(fileId, isOffline = false, userDrive = capturedUserDrive)
                             }
                             file.isOffline = false
                         }

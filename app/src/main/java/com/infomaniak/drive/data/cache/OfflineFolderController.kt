@@ -315,6 +315,33 @@ object OfflineFolderController {
     }
 
     /**
+     * Whether any descendant of [folderId] (durable parentId traversal, directories excluded)
+     * still holds offline state (issue: round 5 #10): an explicit pin, a pending download
+     * marker, or inherited coverage. While that is true the folder row is REQUIRED ancestry —
+     * deleting it would strand the descendants' metadata and break every traversal (deferred
+     * cleanup, orphan sweep, offline path resolution) that walks parentId chains.
+     */
+    fun hasLocallyOwnedDescendant(folderId: Int, realm: Realm): Boolean {
+        val visited = mutableSetOf(folderId)
+        val queue = ArrayDeque(listOf(folderId))
+        while (queue.isNotEmpty()) {
+            val currentId = queue.removeFirst()
+            val children = realm.where(File::class.java)
+                .equalTo(File::parentId.name, currentId)
+                .findAll()
+                .createSnapshot()
+            for (child in children) {
+                if (child.isFolder()) {
+                    if (visited.add(child.id)) queue.add(child.id)
+                    continue
+                }
+                if (child.isOffline || child.isMarkedAsOffline || child.isInOfflineFolder) return true
+            }
+        }
+        return false
+    }
+
+    /**
      * Revisit of roots whose removal was deferred because protected copies remained: re-run the
      * coverage clearing, then delete the record once nothing protected is left. Called by the
      * offline sync so the deferred intent always has a durable owner (issue #1902).
@@ -336,7 +363,12 @@ object OfflineFolderController {
                     ?.takeIf { it.isValid && it.isPendingRemoval } == null
             }
 
-            // Delete only the still-pending generation: a revived root keeps its record.
+            // Delete only the still-pending generation, and only once nothing protected remains
+            // (issue: round 5 #11): pending uploads or snapshot failures retain bytes and flags,
+            // and the pending record is the durable owner that schedules their eventual cleanup.
+            // A revived root keeps its record through the same live re-check.
+            if (hasProtectedFilesRecursively(root.folderId, context, userDrive, customRealm)) return@forEach
+
             customRealm.executeTransaction {
                 customRealm.where(OfflineRoot::class.java)
                     .equalTo(OfflineRoot::folderId.name, root.folderId)
@@ -355,9 +387,10 @@ object OfflineFolderController {
      *    the old bytes are deleted ONLY after that durable registration succeeded — on failure
      *    the caller must keep the old location (issue: round 4 #2);
      *  - an already-uploaded revision's stale local duplicate is deleted (content is on server);
-     *  - a clean copy is migrated by ATOMIC rename, never over a protected destination (an
-     *    existing target with a pending upload or a newer revision keeps its bytes, and both
-     *    sources are retained by deferring the commit — issue: round 4 #5).
+     *  - a clean copy is migrated by ATOMIC rename, never over an EXISTING destination: any
+     *    existing target is ambiguously owned (its owning file and baseline revision are not
+     *    establishable here) and keeps its bytes, and both sources are retained by deferring
+     *    the commit — issues: round 4 #5, round 5 #3.
      *
      * Returns true when the old location is fully handled and the caller may commit the new
      * metadata; false means preservation is incomplete and committing would strand the old copy.
@@ -415,16 +448,20 @@ object OfflineFolderController {
                     if (target == null) {
                         false
                     } else {
-                        val targetProtected = target.exists() && (
-                            UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
-                                OfflineFolderPolicy.isLocallyModified(
-                                    offlineFileLastModifiedMillis = target.lastModified(),
-                                    remoteLastModifiedAtSeconds = newIdentity.lastModifiedAt,
-                                )
-                            )
-                        when {
-                            targetProtected -> false
-                            else -> runCatching {
+                        // The destination is preserved whenever it exists (issue: round 5 #3):
+                        // from here its owning file and baseline revision cannot be established
+                        // — the row→path mapping is derived from metadata this caller has not
+                        // committed yet — so an existing target is ambiguously owned and must
+                        // never be replaced. The previous baseline compared its timestamp
+                        // against the INCOMING file's revision, which declared another file's
+                        // older dirty copy unprotected and overwrote its sole edit. The
+                        // destination's own owner resolves the path independently (its own
+                        // reconciliation, the stale cleanup, or its upload completion), and a
+                        // later walk retries this move once the path is free.
+                        if (target.exists()) {
+                            false
+                        } else {
+                            runCatching {
                                 target.parentFile?.mkdirs()
                                 oldOfflineFile.renameTo(target)
                             }.getOrDefault(false)
@@ -554,24 +591,28 @@ object OfflineFolderController {
                 return result
             }
 
-            val folder = FileController.getFileById(realm, folderId)
-            if (folder == null || !folder.isUsable()) continue
-
+            // Subtree covered by another remaining root: skip it entirely. Checked BEFORE the
+            // row lookup so a missing folder row cannot bypass the protection.
             if (folderId != rootFolderId && getOfflineRoot(folderId, customRealm = realm) != null) {
-                // Subtree covered by another remaining root: skip it entirely.
                 skippedSubtreeIds.add(folderId)
                 continue
             }
 
-            clearFileCoverage(
-                context = context,
-                realm = realm,
-                file = folder,
-                userDrive = userDrive,
-                result = result,
-                isFolder = true,
-                isAborted = isAborted,
-            )
+            val folder = FileController.getFileById(realm, folderId)
+            // A missing folder row no longer drops the whole subtree (issue: round 5 #10): the
+            // children are enumerated through the durable parentId relationships below, so their
+            // coverage cleanup and preserved-copy handling still run.
+            if (folder != null && folder.isUsable()) {
+                clearFileCoverage(
+                    context = context,
+                    realm = realm,
+                    file = folder,
+                    userDrive = userDrive,
+                    result = result,
+                    isFolder = true,
+                    isAborted = isAborted,
+                )
+            }
 
             realm.where(File::class.java)
                 .equalTo(File::parentId.name, folderId)

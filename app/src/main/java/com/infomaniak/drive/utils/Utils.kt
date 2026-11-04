@@ -43,11 +43,15 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
+import androidx.concurrent.futures.await
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.infomaniak.core.common.utils.DownloadManagerUtils
 import com.infomaniak.core.legacy.utils.showKeyboard
 import com.infomaniak.core.legacy.utils.showToast
 import com.infomaniak.drive.R
+import com.infomaniak.drive.data.cache.DriveInfosController
+import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.BulkOperationType
 import com.infomaniak.drive.data.models.File
@@ -390,12 +394,34 @@ object Utils {
     }
 
     /**
-     * Cancels all offline folder download chains so they are re-created with the current
-     * constraint settings (issue: round 4 #14). Durable root intent, coverage flags and pending
-     * markers live in Realm and are unaffected; the offline sync re-enqueues what is needed.
+     * Cancels all offline folder download chains and re-enqueues their durable work with the
+     * current constraint settings (issue: round 4 #14, round 5 #17): a Wi-Fi-only change must
+     * not leave a mobile-data job running, nor an unmetered job blocked — and cancellation
+     * alone would lose the cancelled work, because the offline sync only re-drives roots,
+     * never unfinished pin requests. Durable root intent, coverage flags, explicit pins and
+     * pending markers live in Realm and are unaffected by the cancellation.
      */
-    fun reconfigureOfflineFolderWork(context: Context) {
-        WorkManager.getInstance(context).cancelAllWorkByTag(BulkDownloadWorker::class.java.toString())
+    suspend fun reconfigureOfflineFolderWork(context: Context) {
+        val workManager = WorkManager.getInstance(context)
+        // Await the cancellation before re-enqueueing: a still-propagating cancel could
+        // otherwise swallow the replacement chains (issue: round 5 #17).
+        workManager.cancelAllWorkByTag(BulkDownloadWorker::class.java.toString()).result.await()
+
+        // Every durable root re-drives its walk in its own captured scope (issue: round 5 #17).
+        AccountUtils.getAllUsersSync().forEach { user ->
+            DriveInfosController.getDrives(userId = user.id, maintenance = false).forEach { drive ->
+                val userDrive = UserDrive(userId = user.id, driveId = drive.id)
+                OfflineFolderController.getOfflineRoots(userDrive).forEach { root ->
+                    enqueueBulkDownloadWorker(context, root.folderId, userDrive, recursive = true)
+                }
+                // Unfinished pin requests: every folder holding an explicit pin or a pending
+                // download marker re-drives its batch with the new constraints; intact copies
+                // are skipped inside the worker (issue: round 5 #17).
+                FileController.getFoldersWithOfflineIntent(userDrive).forEach { folderId ->
+                    enqueueBulkDownloadWorker(context, folderId, userDrive, recursive = false)
+                }
+            }
+        }
     }
 
     fun getInvalidFileNameCharacter(fileName: String): String? = DownloadManagerUtils.regexInvalidSystemChar.find(fileName)?.value

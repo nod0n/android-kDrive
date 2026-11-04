@@ -18,6 +18,7 @@
 package com.infomaniak.drive.views
 
 import android.content.DialogInterface
+import androidx.lifecycle.lifecycleScope
 import com.infomaniak.core.legacy.utils.setBackNavigationResult
 import com.infomaniak.drive.MatomoDrive
 import com.infomaniak.drive.MatomoDrive.trackSettingsEvent
@@ -25,6 +26,8 @@ import com.infomaniak.drive.R
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.ui.menu.settings.SettingsFragment.Companion.KEY_BACK_ACTION_BOTTOM_SHEET
 import com.infomaniak.drive.utils.Utils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class SyncOfflineSelectBottomSheetDialog : SyncSelectBottomSheetDialog() {
 
@@ -37,10 +40,14 @@ class SyncOfflineSelectBottomSheetDialog : SyncSelectBottomSheetDialog() {
             AppSettings.onlyWifiSyncOffline = value
             // WorkManager constraints are captured at enqueue time (issue: round 4 #14):
             // reconfigure existing offline folder chains so a Wi-Fi-only change cannot leave a
-            // mobile-data job running, nor an unmetered job blocked. Durable root intent and
-            // pending markers live in Realm; the offline sync re-enqueues them with the fresh
-            // constraints (its observers fire when the cancelled chains finish).
-            Utils.reconfigureOfflineFolderWork(requireContext())
+            // mobile-data job running, nor an unmetered job blocked. The reconfiguration AWAITS
+            // the cancellations and explicitly re-enqueues the durable roots and unfinished pin
+            // requests with the fresh constraints (issue: round 5 #17) — cancellation alone
+            // would lose them.
+            val context = requireContext()
+            lifecycleScope.launch(Dispatchers.IO) {
+                Utils.reconfigureOfflineFolderWork(context)
+            }
         }
 
     override fun trackEvent(name: MatomoDrive.MatomoName) = trackSettingsEvent(name)

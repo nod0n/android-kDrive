@@ -691,7 +691,15 @@ class MainViewModel(
 
     fun markFilesAsOffline(filesId: List<Int>, isMarkedAsOffline: Boolean) = viewModelScope.launch(Dispatchers.IO) {
         FileController.getRealmInstance().use { realm ->
-            FileController.markFilesAsOffline(customRealm = realm, filesId = filesId, isMarkedAsOffline = isMarkedAsOffline)
+            // The selection also persists the durable explicit-pin intent (issue: round 5 #15):
+            // the shared pending marker alone can be cleared by an overlapping inherited walk
+            // before the pin batch ever loads its files.
+            FileController.markFilesAsOffline(
+                customRealm = realm,
+                filesId = filesId,
+                isMarkedAsOffline = isMarkedAsOffline,
+                setExplicitPin = true,
+            )
         }
     }
 

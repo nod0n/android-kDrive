@@ -353,7 +353,7 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
 
     fun enqueueBulkDownloadWorker(folderId: Int) {
         viewModelScope.launch(Dispatchers.IO) {
-            if (FileController.hasFilesMarkedAsOffline(folderId)) {
+            if (FileController.hasOfflineIntentFiles(folderId)) {
                 Utils.enqueueBulkDownloadWorker(context, folderId)
             }
         }
