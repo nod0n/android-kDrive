@@ -1587,23 +1587,63 @@ object FileController {
         customRealm: Realm? = null,
     ) {
         val block: (Realm) -> Unit = { currentRealm ->
-            // Coordinated commit boundary BEFORE the boundary AND the transaction (issues:
-            // round 10 #3, round 11 #2): the Gallery container and every incoming media row,
-            // ascending, share the lock set across the shared upsert boundary's
-            // validation/preservation AND the commit — one coordinated operation.
-            OfflineFileCoordination.withLocksFor(userDrive, listOf(Gallery.id) + mediaList.map { media -> media.id }) {
-                // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6). The
-                // request's captured scope flows through realm and preservation (issue: round 8 #4).
-                val committableMedia = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(currentRealm, mediaList, userDrive)
-                currentRealm.executeTransaction { realm ->
-                    val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
-                        ?: realm.copyToRealm(Gallery.file)
-                    if (isFirstPage) galleryFolder.children = RealmList()
-                    galleryFolder.children.addAll(realm, committableMedia)
+            // COMPLETE PROTOCOL for the Gallery commit (issue: round 18 #24): the ROOT-INTENT
+            // monitor precedes the ordered lock set and holds through validation,
+            // preservation and commit — the previous section took only file locks, so a
+            // monitored ancestry decision (SAF holding the intent monitor, checking that D
+            // has no owned descendants and deleting D) could interleave between this
+            // section's reads and its commit, and the Gallery transaction then committed F
+            // beneath the missing ancestor: its file lock does not serialize with the
+            // ancestry decision. The realm is refreshed first, and every media row's
+            // COMPLETE destination ancestry is validated BEFORE the preservation boundary —
+            // media-file reparenting included, not only directory payloads.
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withLocksFor(userDrive, listOf(Gallery.id) + mediaList.map { media -> media.id }) {
+                    runCatching { currentRealm.refresh() }
+                    // DESTINATION ANCESTRY BEFORE PRESERVATION (issue: round 18 #24): a row
+                    // whose destination chain is broken is not committed this pass — its
+                    // existing identity and gallery backlink survive below, and a later
+                    // gallery refresh retries the payload once the ancestor exists.
+                    val chainOkMedia = mediaList.filter { media ->
+                        media.parentId <= 0 || destinationChainExists(currentRealm, media.parentId)
+                    }
+                    // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6). The
+                    // request's captured scope flows through realm and preservation (issue: round 8 #4).
+                    val committableMedia = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(currentRealm, chainOkMedia, userDrive)
+                    currentRealm.executeTransaction { realm ->
+                        val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
+                            ?: realm.copyToRealm(Gallery.file)
+                        if (isFirstPage) galleryFolder.children = RealmList()
+                        galleryFolder.children.addAll(realm, committableMedia)
+                        val chainOkIds = chainOkMedia.map { media -> media.id }.toSet()
+                        mediaList.filter { media -> media.id !in chainOkIds }.forEach { broken ->
+                            realm.where(File::class.java).equalTo(File::id.name, broken.id).findFirst()?.let { existing ->
+                                if (galleryFolder.children.none { child -> child.id == existing.id }) {
+                                    galleryFolder.children.add(existing)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
+    }
+
+    /**
+     * Whether [parentId]'s COMPLETE ancestor chain currently exists (issue: round 18 #24):
+     * every ancestor of a destination — not just the immediate parent, whose own ancestry
+     * could be missing — must be present before a commit may link rows beneath it.
+     */
+    internal fun destinationChainExists(realm: Realm, parentId: Int): Boolean {
+        var currentId: Int? = parentId
+        val visited = mutableSetOf<Int>()
+        while (currentId != null && currentId > 0) {
+            if (!visited.add(currentId)) return false
+            val row = getFileById(realm, currentId) ?: return false
+            currentId = row.parentId
+        }
+        return true
     }
 
     private fun RealmList<File>.addAll(realm: Realm, files: List<File>) {

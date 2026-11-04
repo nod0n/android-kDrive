@@ -188,12 +188,21 @@ object OfflineFolderUtils {
         var lastResponse: CursorApiResponse<List<File>>? = null
         var cursor: String? = null
 
+        // REQUEST-TIME ROOT GENERATION (issue: round 18 #25): captured BEFORE the first
+        // listing request — the absent-child cleanup's freshness horizon is the REQUEST's,
+        // not the cleanup's; a root removed and revived (or a newer walk started) while the
+        // response was in flight predates this stamp.
+        val requestGeneration = OfflineFolderController.rootIntentGeneration(rootFolderId)
+
         // COMPLETE PRE-REQUEST OBSERVATIONS (issue: round 16 #16): the folder's children as
         // they stood before the FIRST listing request — detached at depth one, so the
         // embedded version survives (issue: round 16 #9). They anchor tied identity changes
         // through the shared boundary and the committing transaction: without them a
         // legitimate same-second directory rename was rejected on every pass, and the
-        // offline sync (which excludes directories) provided no recovery route.
+        // offline sync (which excludes directories) provided no recovery route. They are
+        // ALSO the cleanup's candidate authority (issue: round 18 #25): a child whose
+        // membership was established AFTER the request (a move-in, or a newer walk's
+        // publication) is not in this map and is never cleared by this response.
         val observedById = FileController.getFileById(realm, folderId)?.children
             ?.associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
             ?: emptyMap()
@@ -287,7 +296,16 @@ object OfflineFolderUtils {
         // (issue #1902). The FULL membership set is passed (issue: round 5 #8): deferred moves
         // are remotely PRESENT files whose reconciliation is unfinished — subtracting them would
         // classify retained sources as confirmed deletions and clear their coverage.
-        cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds)
+        // CANCELLATION BEFORE POST-RESPONSE MUTATION (issue: round 18 #25): the destructive
+        // cleanup never runs for a cancelled walk.
+        coroutineContext.ensureActive()
+        // REQUEST-TIME AUTHORITY (issue: round 18 #25): the cleanup's freshness horizon and
+        // its candidate observations are the REQUEST's, not the cleanup's — the root
+        // generation and the pre-request children were captured BEFORE the listing, so a
+        // root removed and revived (or a child whose membership was established by a newer
+        // walk or move) while the response was in flight predates this stamp and is never
+        // cleared by it.
+        cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds, requestGeneration, observedById)
 
         // DEFERRALS keep the walk incomplete (issue: round 14 #8): an ambiguous identity tie
         // rejected for a missing observation is NOT a completed reconciliation — its retained
@@ -580,13 +598,18 @@ object OfflineFolderUtils {
         folderId: Int,
         userDrive: UserDrive,
         remoteFileIds: Set<Int>,
+        requestGeneration: Long,
+        observedById: Map<Int, File>,
     ) {
         val result = OfflineFolderController.RemovalResult()
-        // The traversal's freshness horizon (issues: round 11 #8, round 12 #9): a root whose
-        // intent changed AFTER this generation stamp — created, revived or removed — is a
-        // newly authoritative owner the collection checks never saw, and every destructive
-        // decision below revalidates against it.
-        val traversalStartedGeneration = OfflineFolderController.currentRootIntentGeneration()
+        // REQUEST-TIME freshness horizon (issues: round 11 #8, round 12 #9, round 18 #25):
+        // the stamp is the LISTING REQUEST's — a root whose intent changed after the
+        // request (created, revived or removed) is a newly authoritative owner the request
+        // never saw, and every destructive decision below revalidates against it. The
+        // previous capture ran when the cleanup BEGAN — after the listing and the commit —
+        // so a revived root whose change predated the late stamp passed the check while an
+        // old in-flight response cleared its newly published children.
+        val traversalStartedGeneration = requestGeneration
         val children = realm.where(File::class.java)
             .equalTo(File::parentId.name, folderId)
             .findAll()
@@ -594,6 +617,11 @@ object OfflineFolderUtils {
 
         children.forEach { child ->
             if (child.id in remoteFileIds) return@forEach
+            // CANDIDATE AUTHORITY IS THE REQUEST'S (issue: round 18 #25): a child absent
+            // from the pre-request observations had its membership established AFTER the
+            // request — a move-in, or a newer walk's publication — and this older response
+            // is not its listing authority; it is never cleared here.
+            if (child.id !in observedById) return@forEach
 
             if (child.isFolder()) {
                 if (OfflineFolderController.isOfflineRoot(child.id, customRealm = realm)) return@forEach
@@ -611,7 +639,7 @@ object OfflineFolderUtils {
                     result = result,
                     isFolder = false,
                     // The listing of [folderId] is this cleanup's authority (issue: round 9 #6),
-                    // revalidated against roots committed after collection (issue: round 11 #8).
+                    // revalidated against roots changed after the REQUEST (issue: round 18 #25).
                     isStillClearable = listingAbsentClearable(folderId, traversalStartedGeneration),
                 )
             }
