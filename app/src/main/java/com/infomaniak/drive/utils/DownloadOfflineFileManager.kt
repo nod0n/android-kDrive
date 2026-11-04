@@ -638,6 +638,44 @@ class DownloadOfflineFileManager(
             // over to the final coordinated publication (intent, pending uploads, target
             // revision, atomic replace).
             val sizeIsValidated = file.size == null || file.isIntactFile(staged)
+            // GENERATION-BOUND RESPONSE VALIDATION (issue: round 22 #23): the download route
+            // carries no revision token — the staged bytes are whatever the server served at
+            // request time, while the staged record would claim the METADATA fetch's
+            // generation; a server advance between the two would record R2 bytes as R1, and
+            // equal-size content could then satisfy PROVEN_CURRENT and root completion.
+            // Hashing the bytes proves byte stability, not the asserted server generation.
+            // The version-carrying details route is therefore re-fetched AFTER the download
+            // (OUTSIDE every lock): a generation that no longer matches — or a validation
+            // that cannot complete — leaves the bytes' generation UNKNOWABLE. The staged
+            // copy is discarded and the intent retained (the pending marker stays for the
+            // re-drive); the next pass re-fetches the metadata and re-downloads. No
+            // known-version proof is manufactured from an unbound response.
+            val generationEstablished = runCatching {
+                val postDownload = ApiRepository.getFileDetails(
+                    file = File(id = file.id, driveId = userDrive.driveId),
+                    okHttpClient = okHttpClient,
+                )
+                postDownload.data?.takeIf { postDownload.isSuccess() && it.id == file.id }?.let { fresh ->
+                    val freshVersion = fresh.version?.number ?: 0
+                    val claimedVersion = file.version?.number ?: 0
+                    when {
+                        freshVersion > 0 && claimedVersion > 0 ->
+                            freshVersion == claimedVersion && fresh.revisedAt == file.revisedAt
+                        else ->
+                            fresh.revisedAt == file.revisedAt &&
+                                fresh.lastModifiedAt == file.lastModifiedAt &&
+                                fresh.size == file.size
+                    }
+                } == true
+            }.getOrDefault(false)
+            if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated && !generationEstablished) {
+                runCatching { staged.delete() }
+                SentryLog.i(
+                    downloadWorker.workerTag(),
+                    "Download of ${file.id} discarded: its generation could not be established against the server",
+                )
+                return@withContext ListenableWorker.Result.failure()
+            }
             if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated) {
                 val outcome = publishStagedOfflineFile(context, file, offlineFile, staged)
                 // Public superseded/conflict status for the bulk caller (issues: round 9 #8,
