@@ -417,6 +417,35 @@ open class UploadFile(
         }
 
         /**
+         * Whether a CANCELLED (soft-deleted) offline upload record still exists for this exact
+         * content revision (owner, destination identity and modification date — issue: round 8
+         * #7). Such a record retains its snapshot bytes AND the user's cancellation decision:
+         * re-registering the same revision would silently reactivate the cancelled upload, so
+         * registration callers treat the revision as already-owned content instead.
+         */
+        fun hasCancelledUploadRecordFor(
+            fileName: String,
+            remoteFolder: Int,
+            driveId: Int,
+            userId: Int,
+            fileModifiedAt: Date,
+            customRealm: Realm? = null,
+        ): Boolean {
+            val block: (Realm) -> Boolean = { realm ->
+                realm.uploadTable
+                    .equalTo(UploadFile::fileName.name, fileName)
+                    .equalTo(UploadFile::remoteFolder.name, remoteFolder)
+                    .equalTo(UploadFile::driveId.name, driveId)
+                    .equalTo(UploadFile::userId.name, userId)
+                    .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
+                    .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
+                    .isNotNull(UploadFile::deletedAt.name)
+                    .count() > 0
+            }
+            return customRealm?.let(block) ?: getRealmInstance().use(block)
+        }
+
+        /**
          * Allocates a unique, durable snapshot file for one upload revision of an offline copy.
          * Unlike the shared upload cache (hash-named, evictable), each snapshot is a distinct
          * file under filesDir, so a later revision can never overwrite a still-pending one.

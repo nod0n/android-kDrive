@@ -295,6 +295,36 @@ object SyncOfflineUtils {
         // per-file coordination so a publication or cleanup cannot interleave (issue:
         // round 4 #4).
         synchronized(OfflineFileCoordination.lockFor(userDrive, localFile.id)) {
+            // Revision dedup under the file lock (issue: round 8 #7): the identity of a
+            // registration is the captured owner + content revision + destination (name,
+            // folder, drive, user, modification date) — NOT the uri, since each registration
+            // stores a fresh snapshot URI the legacy lookup above can never find. Without
+            // this gate every no-action sync re-registered the same pending revision as a
+            // new full snapshot, and a cancelled revision was silently reactivated on the
+            // next sync.
+            val registrationName = remoteFile?.name ?: localFile.name
+            val registrationFolder = remoteFile?.parentId ?: localFile.parentId
+            if (UploadFile.hasUploadRecordFor(
+                    fileName = registrationName,
+                    remoteFolder = registrationFolder,
+                    driveId = userDrive.driveId,
+                    userId = userDrive.userId,
+                    fileModifiedAt = fileModifiedAt,
+                    pendingOnly = false,
+                ) || UploadFile.hasCancelledUploadRecordFor(
+                    fileName = registrationName,
+                    remoteFolder = registrationFolder,
+                    driveId = userDrive.driveId,
+                    userId = userDrive.userId,
+                    fileModifiedAt = fileModifiedAt,
+                )
+            ) {
+                // The revision is already registered — live (pending or sent) or retained
+                // after a cancellation. The existing record keeps owning the snapshot bytes;
+                // registering again would duplicate pending work or reactivate the
+                // cancellation. The action is handled: durable ownership exists either way.
+                return true
+            }
             // Immutable per-revision source (issue: round 7 #4): ordinary offline edits used to
             // register the MUTABLE original URI as their primary identity — store() replaces
             // the row with that key, and an older upload finishing later marked and removed

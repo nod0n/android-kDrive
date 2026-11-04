@@ -895,6 +895,28 @@ object OfflineFolderController {
         return synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
             runCatching {
                 val fileModifiedAt = Date(offlineFile.lastModified())
+                // Revision dedup under the file lock (issue: round 8 #7): this exact revision
+                // may already be registered — live (pending or sent), or retained after a
+                // cancellation. Re-snapshotting would duplicate the pending work or silently
+                // reactivate the cancelled upload; the existing record already owns these
+                // bytes, which is what this registration exists to guarantee.
+                if (UploadFile.hasUploadRecordFor(
+                        fileName = file.name,
+                        remoteFolder = file.parentId,
+                        driveId = userDrive.driveId,
+                        userId = userDrive.userId,
+                        fileModifiedAt = fileModifiedAt,
+                        pendingOnly = false,
+                    ) || UploadFile.hasCancelledUploadRecordFor(
+                        fileName = file.name,
+                        remoteFolder = file.parentId,
+                        driveId = userDrive.driveId,
+                        userId = userDrive.userId,
+                        fileModifiedAt = fileModifiedAt,
+                    )
+                ) {
+                    return@synchronized true
+                }
                 val snapshotUri = UploadFile.createDurableOfflineSnapshot(
                     context = context,
                     source = offlineFile,
