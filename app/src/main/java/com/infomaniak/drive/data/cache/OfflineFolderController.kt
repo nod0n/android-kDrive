@@ -487,7 +487,14 @@ object OfflineFolderController {
         // #6): edit detection against the owned bytes judges this, not accepted server
         // metadata — the DTO must not lose the field the row carries.
         val publishedCleanBaseline: Long? = null,
-    )
+    ) {
+        // The SAME computed baseline rule as [File.effectivePublishedBaseline] (issue: round
+        // 18 compile corrections): the DTO must expose the effective value itself — zero is
+        // not provenance and must fall back to the accepted metadata exactly like an unset
+        // baseline, instead of every consumer re-deriving (or forgetting) the rule.
+        val effectivePublishedBaseline: Long
+            get() = publishedCleanBaseline?.takeIf { it > 0 } ?: lastModifiedAt
+    }
 
     /**
      * The id of the row that EXCLUSIVELY claims [claimedPath] as its derived offline path, or

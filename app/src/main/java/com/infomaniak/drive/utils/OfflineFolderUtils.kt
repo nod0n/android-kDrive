@@ -299,7 +299,7 @@ object OfflineFolderUtils {
             val anchoredObservations = buildMap<Int, File> {
                 putAll(observedById)
                 for (deferredId in deferredMoveIds.sorted().take(ANCHORED_RESOLUTION_BUDGET)) {
-                    ensureActive()
+                    coroutineContext.ensureActive()
                     FileController.getFileById(realm, deferredId)?.let { row ->
                         put(deferredId, realm.copyFromRealm(row, 1))
                     }

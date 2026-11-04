@@ -180,6 +180,7 @@ private fun Context.printPdf(
 }
 
 internal suspend fun downloadFile(
+    context: Context,
     externalOutputFile: IOFile,
     file: File,
     shouldBePdf: Boolean,

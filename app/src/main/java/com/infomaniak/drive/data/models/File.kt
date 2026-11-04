@@ -342,11 +342,11 @@ open class File(
         // revision identity (revisedAt, updatedAt) must match the row's accepted metadata.
         val provenance = DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile)
             ?: return StoredOfflineCopyState.READABLE_UNVERIFIED
-        if (provenance.second != lastModifiedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (provenance.lastModifiedAt != lastModifiedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
         val rowVersion = version?.number ?: 0
-        if (rowVersion > 0 && provenance.first != rowVersion) return StoredOfflineCopyState.READABLE_UNVERIFIED
-        if (revisedAt > 0 && provenance.third > 0 && provenance.third != revisedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
-        if (provenance.fourth > 0 && provenance.fourth != updatedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (rowVersion > 0 && provenance.version != rowVersion) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (revisedAt > 0 && provenance.revisedAt > 0 && provenance.revisedAt != revisedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        if (provenance.updatedAt > 0 && provenance.updatedAt != updatedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
         return StoredOfflineCopyState.PROVEN_CURRENT
     }
 
@@ -623,6 +623,7 @@ open class File(
             }
             navigateToDownloadDialog?.invoke()
             val outcome = downloadFile(
+                context,
                 cacheFile,
                 file = this,
                 shouldBePdf,

@@ -54,6 +54,7 @@ import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FolderFilesProvider
 import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
+import com.infomaniak.drive.data.models.StoredOfflineCopyState
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.AccountUtils

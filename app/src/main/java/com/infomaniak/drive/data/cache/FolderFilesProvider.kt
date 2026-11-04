@@ -37,6 +37,7 @@ import com.infomaniak.drive.data.models.file.SpecialFolder.SharedWithMe
 import com.infomaniak.drive.data.services.MqttClientWrapper
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.FileId
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
 import io.realm.RealmQuery
@@ -578,7 +579,10 @@ object FolderFilesProvider {
         // pre-gate read defers the deletion), preservation runs before any byte or row
         // deletion, and a directory's descendant-ownership revalidates INSIDE the deleting
         // transaction.
-        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+        // The section's outcome is the function's outcome (issue: round 18 compile
+        // corrections): the synchronized block's value must be RETURNED — an unreturned
+        // last expression leaves the Boolean function without a return statement.
+        return synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withLocksFor(userDrive, listOf(currentFolder.id, fileId)) {
                 runCatching { realm.refresh() }
                 val liveRow = FileController.getFileById(realm, fileId) ?: return@withLocksFor true
