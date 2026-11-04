@@ -618,13 +618,22 @@ object FileController {
         }
     }
 
-    fun upsertActionFile(realm: Realm, folderId: Int, actionFile: File, userDrive: UserDrive, actionAt: Long? = null) {
+    fun upsertActionFile(
+        realm: Realm,
+        folderId: Int,
+        actionFile: File,
+        userDrive: UserDrive,
+        actionAt: Long? = null,
+        observed: File? = null,
+    ): Boolean {
         // ONE caller-level coordinated operation (issue: round 13 #2): the intent monitor
         // precedes the ordered lock set, and the shared boundary's validation/preservation
         // runs INSIDE it — reentrant — immediately before the commit, with no lock release
         // between them. Authoritative-change flow (the activity event IS the change): the
         // action gate — newer generations AND newer non-Sync metadata reject the activity,
-        // and its nullable timestamp bounds the row's activity cursor (issue: round 13 #3).
+        // and its nullable timestamp bounds the row's activity cursor (issue: round 13 #3);
+        // the request-observed anchor resolves ordering ties (issue: round 15 #10).
+        var handled = true
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, actionFile.id)) {
                 val preservedActionFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
@@ -632,9 +641,12 @@ object FileController {
                     remoteFiles = listOf(actionFile),
                     userDrive = userDrive,
                     isStale = { live, incoming, _ ->
-                        FileController.isStaleForAuthoritativeAction(live, incoming, actionAt)
+                        FileController.isStaleForAuthoritativeAction(live, incoming, actionAt, observed)
                     },
                 ).first()
+                // A boundary substitution means the activity's own identity did not take —
+                // preservation or an ambiguous tie deferred it (issue: round 15 #10).
+                if (preservedActionFile !== actionFile) handled = false
                 realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
                     if (!realmFolder.children.contains(preservedActionFile) &&
                         // Parent-consistent membership (issue: round 13 #12): a
@@ -645,14 +657,35 @@ object FileController {
                     ) {
                         // Coordinated child-add (issues: round 11 #3, round 12 #12): the add
                         // mutates the new child's graph identity and the container's children
-                        // list; the locks are already held by this section.
-                        realm.executeTransaction { realmFolder.children.add(preservedActionFile) }
+                        // list; the locks are already held by this section. BOTH commit
+                        // branches apply the complete fresh action predicate and membership
+                        // INSIDE the adding transaction (issue: round 15 #4) — the shared
+                        // boundary returns directory rows before its predicate, so an
+                        // unmanaged delayed D-at-A payload must not overwrite D's current
+                        // parent or restore obsolete ancestry — and preserve the current
+                        // row's local fields when accepting over it.
+                        realm.executeTransaction {
+                            val freshRow = getFileById(realm, actionFile.id)
+                            val accepted = when {
+                                freshRow == null -> actionFile.parentId == folderId
+                                else ->
+                                    freshRow.parentId == folderId ||
+                                        !FileController.isStaleForAuthoritativeAction(freshRow, actionFile, actionAt, observed)
+                            }
+                            if (accepted) {
+                                if (freshRow != null) actionFile.keepOldLocalFilesData(freshRow)
+                                realmFolder.children.add(actionFile)
+                            } else {
+                                handled = false
+                            }
+                        }
                     } else if (realmFolder.children.contains(preservedActionFile)) {
-                        updateFileFromActivity(realm, preservedActionFile, realmFolder.id, userDrive, actionAt)
+                        handled = updateFileFromActivity(realm, preservedActionFile, realmFolder.id, userDrive, actionAt, observed) && handled
                     }
                 }
             }
         }
+        return handled
     }
 
     fun updateShareLinkWithRemote(fileId: Int) {
@@ -1749,7 +1782,14 @@ object FileController {
         return customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
-    private fun updateFileFromActivity(realm: Realm, remoteFile: File, folderId: Int, userDrive: UserDrive, actionAt: Long? = null) {
+    private fun updateFileFromActivity(
+        realm: Realm,
+        remoteFile: File,
+        folderId: Int,
+        userDrive: UserDrive,
+        actionAt: Long? = null,
+        observed: File? = null,
+    ): Boolean {
         // Branch split on row EXISTENCE only (the conditional commit's result must not select
         // the child-add path): a stale response keeps the live row and must not re-add it as a
         // child of the container.
@@ -1757,35 +1797,51 @@ object FileController {
         if (localFile != null) {
             // Authoritative-change commit (activity event): the COMPLETE action predicate
             // (issue: round 14 #2) — generation AND newer non-Sync metadata AND the nullable
-            // cursor bound gate BOTH branches, including DIRECTORY rows the shared boundary
-            // skips (a stale directory response must not restore obsolete ancestry). The
-            // commit can REPARENT a folder (issue: round 12 #8), so the root-intent monitor
-            // precedes the file lock. No request anchor exists for MQTT activities — an
-            // identity tie rejects.
+            // cursor bound, with the request anchor resolving ties (issue: round 15 #10) —
+            // gates BOTH branches, including DIRECTORY rows the shared boundary skips (a
+            // stale directory response must not restore obsolete ancestry). The commit can
+            // REPARENT a folder (issue: round 12 #8), so the root-intent monitor precedes
+            // the file lock.
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                insertOrUpdateFile(
+                return insertOrUpdateFile(
                     realm,
                     remoteFile,
                     localFile,
                     userDrive,
                     // Must exist — this branch already resolved the live row (issue: round 12 #2).
-                    acceptIf = { live -> live != null && !isStaleForAuthoritativeAction(live, remoteFile, actionAt) },
+                    acceptIf = { live ->
+                        live != null && !isStaleForAuthoritativeAction(live, remoteFile, actionAt, observed)
+                    },
                 )
             }
         } else {
             // Coordinated commit boundary (issues: round 10 #3, round 11 #3/#7): the child-add
             // is an identity mutation of the new child and of the container's children list,
             // and it establishes ancestry — the root-intent monitor precedes the file locks.
-            // Parent-consistent membership (issue: round 14 #2): a stale activity naming a
-            // moved identity must not gain a wrong backlink here either.
-            if (remoteFile.parentId != folderId) return
+            // Parent-consistent membership (issue: round 14 #2) and the complete fresh action
+            // predicate apply INSIDE the adding transaction (issue: round 15 #4): an
+            // unmanaged response must not bypass them, and the current row's local fields
+            // are preserved when accepting over it.
+            if (remoteFile.parentId != folderId) return false
+            var accepted = false
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, remoteFile.id)) {
                     realm.executeTransaction {
-                        realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
+                        val freshRow = getFileById(realm, remoteFile.id)
+                        accepted = when {
+                            freshRow == null -> remoteFile.parentId == folderId
+                            else ->
+                                freshRow.parentId == folderId ||
+                                    !isStaleForAuthoritativeAction(freshRow, remoteFile, actionAt, observed)
+                        }
+                        if (accepted) {
+                            if (freshRow != null) remoteFile.keepOldLocalFilesData(freshRow)
+                            realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
+                        }
                     }
                 }
             }
+            return accepted
         }
     }
 

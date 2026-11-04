@@ -389,6 +389,13 @@ object FolderFilesProvider {
     ): Map<out Int, FileAction> {
         SentryLog.i(TAG, "loadActivitiesFromFolderRec with folderId ${folderProxy.id} cursor: ${cursor != null}")
         val realm = folderProxy.realm
+        // DETACHED pre-request observations (issue: round 15 #10): the container's children
+        // as they stood when the listing/activities request was issued — managed objects
+        // would refresh together with the rows inside each activity's coordination and
+        // defeat tie resolution, leaving tied directory changes deferred forever.
+        val observedChildren = folderProxy.children.associateBy({ child -> child.id }) { child ->
+            realm.copyFromRealm(child, 0)
+        }
         val apiResponse = ApiRepository.getListingFiles(
             okHttpClient = okHttpClient,
             driveId = userDrive.driveId,
@@ -403,21 +410,41 @@ object FolderFilesProvider {
 
         val apiResponseData = apiResponse.data
 
+        var allActivitiesHandled = true
         if (apiResponseData != null && apiResponseData.actions.isNotEmpty()) {
             val actionsFiles = apiResponseData.actionsFiles.associateBy(File::id)
             SentryLog.i(TAG, "loadActivitiesFromFolderRec: actions ${apiResponseData.actions.count()}")
             apiResponseData.actions.asReversed().forEach { fileActivity ->
-                fileActivity.applyFileAction(realm, actionsFiles, returnResponse, folderProxy, userDrive)
+                allActivitiesHandled = fileActivity.applyFileAction(
+                    realm,
+                    actionsFiles,
+                    returnResponse,
+                    folderProxy,
+                    userDrive,
+                    observedChildren,
+                ) && allActivitiesHandled
             }
         }
 
-        if (apiResponse.responseAt > 0L) {
-            FileController.updateFile(folderProxy.id, realm) { file ->
-                file.responseAt = apiResponse.responseAt
-                apiResponse.cursor?.let { file.cursor = it }
+        // The folder cursor advances ONLY when every activity was applied (issue: round 15
+        // #10): a deferred tied change retains unresolved work — the next activities fetch
+        // re-runs from the retained cursor and the periodic folder walk is the resolving
+        // refresh. Consuming the cursor over a deferral would advance it past unfinished
+        // work permanently.
+        if (allActivitiesHandled) {
+            if (apiResponse.responseAt > 0L) {
+                FileController.updateFile(folderProxy.id, realm) { file ->
+                    file.responseAt = apiResponse.responseAt
+                    apiResponse.cursor?.let { file.cursor = it }
+                }
+            } else {
+                Sentry.captureMessage("response at is null") { scope -> scope.setExtra("data", apiResponse.toString()) }
             }
         } else {
-            Sentry.captureMessage("response at is null") { scope -> scope.setExtra("data", apiResponse.toString()) }
+            SentryLog.i(
+                TAG,
+                "loadActivitiesFromFolderRec: deferred folder ${folderProxy.id} activities; cursor retained for fair retry"
+            )
         }
 
         return if (apiResponse.hasMoreAndCursorExists) {
@@ -437,16 +464,18 @@ object FolderFilesProvider {
         }
     }
 
+    /** Returns whether the activity was fully applied — a deferral retains the folder cursor (round 15 #10). */
     private fun FileAction.applyFileAction(
         realm: Realm,
         actionFiles: Map<Int, File>,
         returnResponse: ArrayMap<Int, FileAction>,
         currentFolder: File,
         userDrive: UserDrive,
-    ) {
+        observedChildren: Map<Int, File>,
+    ): Boolean {
         val actionFile = actionFiles[fileId]
 
-        when (actionType) {
+        return when (actionType) {
             FileActivityType.FILE_DELETE,
             FileActivityType.FILE_MOVE_OUT,
             FileActivityType.FILE_TRASH -> {
@@ -456,6 +485,7 @@ object FolderFilesProvider {
                     removeAction(realm, currentFolder, actionFile, userDrive)
                     returnResponse[fileId] = this
                 }
+                true
             }
             else -> {
                 if (actionType == null) {
@@ -463,8 +493,11 @@ object FolderFilesProvider {
                 }
                 // The file has not yet been managed and is not the parent folder.
                 if (returnResponse[fileId] == null && actionFile?.id != currentFolder.id) {
-                    upsertAction(realm, currentFolder, actionFile, userDrive)
+                    val handled = upsertAction(realm, currentFolder, actionFile, userDrive, observedChildren[fileId])
                     returnResponse[fileId] = this
+                    handled
+                } else {
+                    true
                 }
             }
         }
@@ -482,12 +515,19 @@ object FolderFilesProvider {
         }
     }
 
-    private fun FileAction.upsertAction(realm: Realm, currentFolder: File, actionFile: File?, userDrive: UserDrive) {
+    private fun FileAction.upsertAction(
+        realm: Realm,
+        currentFolder: File,
+        actionFile: File?,
+        userDrive: UserDrive,
+        observed: File?,
+    ): Boolean {
         if (actionFile == null) {
             FileController.removeFile(fileId, customRealm = realm, recursive = false, userDrive = userDrive)
+            return true
         } else {
             if (actionFile.isImporting()) MqttClientWrapper.start(actionFile.externalImport?.id)
-            FileController.upsertActionFile(realm, currentFolder.id, actionFile, userDrive)
+            return FileController.upsertActionFile(realm, currentFolder.id, actionFile, userDrive, observed = observed)
         }
     }
 
