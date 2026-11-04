@@ -1644,6 +1644,11 @@ object FileController {
         isFirstPage: Boolean = false,
         userDrive: UserDrive,
         customRealm: Realm? = null,
+        // SUSPEND CLIENT ACQUISITION (round-19 build fix): the ancestor-resolution fetch
+        // needs the account's HTTP client, whose lookup is suspending — the SUSPEND caller
+        // acquires it once (outside every coordinated scope) and hands it in; this
+        // non-suspend writer never bridges into a coroutine itself.
+        okHttpClient: OkHttpClient,
     ) {
         val block: (Realm) -> Unit = { currentRealm ->
             // COMPLETE PROTOCOL for the Gallery commit (issue: round 18 #24): the ROOT-INTENT
@@ -1684,7 +1689,7 @@ object FileController {
                 val ancestorDetails = runCatching {
                     ApiRepository.getFileDetails(
                         file = File(id = missingAncestorId, driveId = userDrive.driveId),
-                        okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
+                        okHttpClient = okHttpClient,
                     )
                 }.getOrNull()?.data?.takeIf { it.id == missingAncestorId } ?: return@forEach
                 val committableAncestor = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(

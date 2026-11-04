@@ -1054,11 +1054,6 @@ class DownloadOfflineFileManager(
                             livePath == null || livePath != target.path
                         }
                     )
-                if (isInheritedDownload) {
-                    pinned || ancestryCovers
-                } else {
-                    pinned || live?.isMarkedAsOffline == true || ancestryCovers
-                }
                 // UNRESOLVED GENERATION (issue: round 19 #14): when NEITHER side carries a
                 // version, the coarse baseline tie is the only generation evidence — the
                 // publication may still proceed (the bytes were fetched fresh from the
@@ -1066,8 +1061,15 @@ class DownloadOfflineFileManager(
                 // copy non-current), but it is UNRESOLVED, NOT current: the file/root
                 // completion callbacks assert a generation identity both-unknown cannot
                 // prove, so they are skipped and a later details-resolved pass completes.
+                // The assignment precedes the conditional so the lambda's TAIL stays the
+                // Boolean the caller's `if (!intentOk)` needs (round-19 build fix).
                 unresolvedGeneration = live != null &&
                     (live.version?.number ?: 0) <= 0 && (file.version?.number ?: 0) <= 0
+                if (isInheritedDownload) {
+                    pinned || ancestryCovers
+                } else {
+                    pinned || live?.isMarkedAsOffline == true || ancestryCovers
+                }
             }
 
             if (!intentOk) {

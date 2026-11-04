@@ -355,7 +355,10 @@ open class File(
         // retained copy of an older generation became "absent" the moment a
         // differently-sized newer revision committed. Presence here is the copy's OWN:
         // non-empty bytes for a non-empty row (an empty copy of an empty row is intact).
-        if (!offlineFile.exists() || (offlineFile.length() <= 0L && size > 0L)) return StoredOfflineCopyState.ABSENT_OR_STALE
+        // UNKNOWN size is conservative (round-19 build fix): a null row size cannot prove
+        // the row non-empty, so the empty-copy clause never fires on it — the copy stays
+        // readable and verification resolves the generation.
+        if (!offlineFile.exists() || (offlineFile.length() <= 0L && (size ?: 0L) > 0L)) return StoredOfflineCopyState.ABSENT_OR_STALE
         // OWN-GENERATION coherence (issue: round 18 #14): the copy's usability is judged
         // against the generation it was published under — never against current remote
         // metadata alone, which a backward-dated newer revision changes without the bytes

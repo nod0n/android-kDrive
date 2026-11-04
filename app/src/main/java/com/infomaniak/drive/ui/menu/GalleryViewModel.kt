@@ -107,14 +107,18 @@ class GalleryViewModel : ViewModel() {
         // realm and its cleanup inspected the wrong filesystem. Gallery's write has no
         // cancellation check that would prevent it.
         val capturedUserDrive = UserDrive(userId = AccountUtils.currentUserId, driveId = driveId)
+        // The client is acquired ONCE in this suspend context and rides BOTH the request
+        // and the persistence (round-19 build fix): the suspend lookup must not be
+        // re-run inside the non-suspend writer.
+        val okHttpClient = AccountUtils.getHttpClient(capturedUserDrive.userId)
         val apiResponse = ApiRepository.getLastGallery(
             driveId = driveId,
             cursor = cursor,
-            okHttpClient = AccountUtils.getHttpClient(capturedUserDrive.userId),
+            okHttpClient = okHttpClient,
         )
         return if (apiResponse.isSuccess()) {
             currentCursor = apiResponse.cursor
-            emitApiGallery(apiResponse, isFirstPage, capturedUserDrive)
+            emitApiGallery(apiResponse, isFirstPage, capturedUserDrive, okHttpClient)
         } else {
             emitRealmGallery()
         }
@@ -124,6 +128,7 @@ class GalleryViewModel : ViewModel() {
         apiResponse: CursorApiResponse<ArrayList<File>>,
         isFirstPage: Boolean,
         capturedUserDrive: UserDrive,
+        okHttpClient: OkHttpClient,
     ): Pair<ArrayList<File>, Boolean> {
         val data = apiResponse.data
 
@@ -131,7 +136,7 @@ class GalleryViewModel : ViewModel() {
             arrayListOf<File>() to true
         } else {
             // The request's captured scope scopes the persistence (issue: round 9 #4).
-            FileController.storeGalleryDrive(data, isFirstPage, capturedUserDrive)
+            FileController.storeGalleryDrive(data, isFirstPage, capturedUserDrive, okHttpClient = okHttpClient)
             val isComplete = !apiResponse.hasMore
             data to isComplete
         }

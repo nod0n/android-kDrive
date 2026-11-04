@@ -164,7 +164,14 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                                     val root = FileController.getFileById(realm, folderId)
                                     if (root != null && root.isValid) {
                                         if (root.isMarkedAsOffline) root.isMarkedAsOffline = false
-                                        if (walkCompleted) root.lastSyncedAt = Date()
+                                    }
+                                    // ACTUAL MODEL IDENTITY (round-19 build fix): lastSyncedAt
+                                    // lives on the DURABLE OfflineRoot record, not on the File
+                                    // row — updateLastSyncedAt's own implementation reads it
+                                    // through getOfflineRoot in this same realm.
+                                    if (walkCompleted) {
+                                        val rootRecord = OfflineFolderController.getOfflineRoot(folderId, customRealm = realm)
+                                        if (rootRecord != null && rootRecord.isValid) rootRecord.lastSyncedAt = Date()
                                     }
                                 }
                             } else {
