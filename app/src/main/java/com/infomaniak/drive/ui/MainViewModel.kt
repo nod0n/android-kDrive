@@ -736,6 +736,61 @@ class MainViewModel(
                                             }.onFailure(Sentry::captureException)
                                         }
                                     }.onFailure(Sentry::captureException).isSuccess
+                                    // REQUIRED-CONTENT TRANSFER OR DURABLE REPLACEMENT WORK
+                                    // (issue: round 22 #13): merged descendants carry their
+                                    // offline flags, but their bytes remain at the SOURCE-derived
+                                    // paths (a different drive base) — source cleanup would
+                                    // delete the clean copies and the destination would appear
+                                    // offline while its bytes are absent. Every committed
+                                    // flagged file copy whose destination-derived bytes are
+                                    // absent gets its source bytes TRANSFERRED (a copy — the
+                                    // source removal owns deletion; copies backing pending or
+                                    // retained-unsent uploads are never duplicated) or, when
+                                    // no transferable source bytes exist, the DURABLE download
+                                    // intent (isMarkedAsOffline) — the worker establishes the
+                                    // bytes at the destination path. The verification below
+                                    // then requires, for every required flagged row, bytes OR
+                                    // the durable intent before the source metadata is
+                                    // removed.
+                                    if (mergeOk) {
+                                        runCatching {
+                                            FileController.getFileById(sharedRealm, file.id)?.let { transferredTreeRoot ->
+                                                val transferStack = ArrayDeque<File>().apply { add(transferredTreeRoot) }
+                                                val transferSeen = mutableSetOf<Int>()
+                                                while (transferStack.isNotEmpty()) {
+                                                    val node = transferStack.removeFirst()
+                                                    if (!transferSeen.add(node.id)) continue
+                                                    node.children.forEach { transferStack.add(it) }
+                                                    if (node.isFolder() || !(node.isOffline || node.isInOfflineFolder)) continue
+                                                    val destinationBytes = node.getOfflineFile(application, sharedScope.userId)
+                                                    if (destinationBytes != null && destinationBytes.exists()) continue
+                                                    val sourceRow = FileController.getFileById(currentDriveRealm, node.id)
+                                                    val sourceBytes = sourceRow
+                                                        ?.getOfflineFile(application, userDrive.userId)
+                                                        ?.takeIf { it.exists() }
+                                                    val sourceClaimed = sourceBytes == null || runCatching {
+                                                        val sourceUri = Uri.fromFile(sourceBytes).toString()
+                                                        UploadFile.hasPendingUpload(uri = sourceUri) ||
+                                                            UploadFile.hasRetainedUnsentUpload(uri = sourceUri)
+                                                    }.getOrDefault(true)
+                                                    val transferred = sourceBytes != null && !sourceClaimed &&
+                                                        destinationBytes != null && runCatching {
+                                                        destinationBytes.parentFile?.mkdirs()
+                                                        sourceBytes.copyTo(destinationBytes, overwrite = true)
+                                                        destinationBytes.exists() &&
+                                                            destinationBytes.length() == sourceBytes.length()
+                                                    }.getOrDefault(false)
+                                                    if (!transferred) {
+                                                        FileController.markFileAsOffline(
+                                                            customRealm = sharedRealm,
+                                                            fileId = node.id,
+                                                            isMarkedAsOffline = true,
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }.onFailure(Sentry::captureException)
+                                    }
                                     // COMMITTED VERIFICATION BEFORE SOURCE REMOVAL (issues:
                                     // round 17 #16, round 18 #10, round 19 #10): the root's
                                     // COMMITTED identity AND destination membership, plus the
@@ -765,6 +820,7 @@ class MainViewModel(
                                         // incomplete, erasing source metadata the reachable
                                         // destination never received).
                                         val reachable = mutableSetOf<Int>()
+                                        var ownedCopiesOk = true
                                         if (committedRoot != null) {
                                             val relationWalker = ArrayDeque<File>().apply { add(committedRoot) }
                                             val relationSeen = mutableSetOf<Int>()
@@ -772,12 +828,31 @@ class MainViewModel(
                                                 val node = relationWalker.removeFirst()
                                                 if (!relationSeen.add(node.id)) continue
                                                 reachable.add(node.id)
-                                                node.children.forEach { relationWalker.add(it) }
+                                                // AUTHORITATIVE EDGES (issue: round 22 #13): a
+                                                // children-list backlink whose row's own parentId
+                                                // does NOT name this container is not an
+                                                // authoritative relationship — the walk does not
+                                                // descend through it and the id stays unverifiable
+                                                // (the source metadata is retained below).
+                                                node.children.createSnapshot().forEach { child ->
+                                                    if (child.parentId == node.id) relationWalker.add(child)
+                                                }
+                                                // OWNED-COPY OUTCOMES (issue: round 22 #13): every
+                                                // flagged file row in the committed tree must hold
+                                                // its bytes at the destination-derived path OR carry
+                                                // the durable download intent — the destination must
+                                                // never appear offline with neither.
+                                                if (!node.isFolder() && (node.isOffline || node.isInOfflineFolder)) {
+                                                    val nodeBytes = node.getOfflineFile(application, sharedScope.userId)
+                                                    if (!(nodeBytes != null && nodeBytes.exists()) && !node.isMarkedAsOffline) {
+                                                        ownedCopiesOk = false
+                                                    }
+                                                }
                                             }
                                         }
                                         val requiredIds = graphIds - newParent.id
                                         val descendantsOk = requiredIds.all { it in reachable }
-                                        membershipOk && descendantsOk
+                                        membershipOk && descendantsOk && ownedCopiesOk
                                     }.getOrDefault(false)
                                 }
                             }
