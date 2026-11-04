@@ -886,7 +886,14 @@ class DownloadOfflineFileManager(
          * possibly-lagging accepted metadata, so the copy's readability coheres with its
          * own generation; the row's version and revision identity keep the record from
          * falsely proving currentness against metadata that has not accepted the new
-         * revision yet.
+         * revision yet. The proof records the ALREADY-VERIFIED immutable uploaded hash,
+         * never a fresh sample of the mutable original (issue: round 21 #13): an external
+         * editor holding write permission outside these Kotlin locks could write new bytes
+         * between the caller's verification and the write — a re-sampled hash would
+         * certify that edit as uploaded-clean content and advance the baseline over it.
+         * The original is revalidated against the SAME identity here; a later edit fails
+         * the write (the caller defers) and, should it land after even this check,
+         * mismatches the written proof and stays unuploaded/protected.
          */
         internal fun writeVerifiedRevisionProvenance(
             context: Context,
@@ -894,9 +901,11 @@ class DownloadOfflineFileManager(
             row: File,
             userDrive: UserDrive,
             verifiedLastModifiedAt: Long,
+            verifiedContentHash: String,
         ): Boolean {
             val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
             return runCatching {
+                if (UploadFile.sha256OrNull(target) != verifiedContentHash) return@runCatching false
                 val provenance = PublishedProvenance(
                     version = row.version?.number ?: 0,
                     lastModifiedAt = verifiedLastModifiedAt,
@@ -905,10 +914,9 @@ class DownloadOfflineFileManager(
                     userId = userDrive.userId,
                     driveId = userDrive.driveId,
                     fileId = row.id,
-                    contentHash = UploadFile.sha256OrNull(target),
+                    contentHash = verifiedContentHash,
                     absolutePath = target.absolutePath,
                 )
-                if (provenance.contentHash == null) return@runCatching false
                 recordFile.writeText(provenance.recordText(target))
                 readPublishedProvenance(context, target) != null
             }.getOrDefault(false)
@@ -1011,6 +1019,132 @@ class DownloadOfflineFileManager(
          */
         internal fun newStagedFile(context: Context, file: File): IOFile =
             IOFile(stagingDirectory(context), "${file.id}_${file.driveId}_${UUID.randomUUID()}.part")
+
+        private fun recoveryRecordFile(context: Context, recoveryFile: IOFile): IOFile =
+            IOFile(stagingDirectory(context), "${recoveryFile.name}.recovery")
+
+        /**
+         * DURABLE ROLLBACK ASSOCIATION (issues: round 21 #9, #10): every recovery backup is
+         * written together with a sidecar record naming its target, the retained OLD proof
+         * and the target's pre-publication mtime — an interrupted publication leaves a
+         * self-describing, resolvable recovery state after restart instead of an anonymous
+         * staged file whose restoration cannot know its target, proof or mtime.
+         */
+        private fun writeRecoveryRecord(
+            context: Context,
+            recoveryFile: IOFile,
+            target: IOFile,
+            oldRecordText: String?,
+            oldTargetMtimeMillis: Long,
+        ): Boolean = runCatching {
+            recoveryRecordFile(context, recoveryFile).writeText(
+                listOf(
+                    "1",
+                    target.absolutePath,
+                    recoveryFile.absolutePath,
+                    oldTargetMtimeMillis.toString(),
+                    oldRecordText ?: "",
+                ).joinToString("\n")
+            )
+            true
+        }.getOrDefault(false)
+
+        /**
+         * Reconciles interrupted publications left by crashes or failed restores (issue:
+         * round 21 #9/#10): for every durable recovery record —
+         *  - a backup whose target carries a readable, SELF-CERTIFYING proof is a completed
+         *    publication (or an already-restored target): the recovery state is disposed;
+         *  - otherwise the restore is (re-)attempted: bytes copied back and verified
+         *    against the backup's own content hash, the original mtime restored, the old
+         *    proof written back and read — only a VERIFIED restore disposes the recovery
+         *    state (the previous code deleted the only recovery copy even when restoration
+         *    failed, and a successful copyTo left the restored bytes at the wrong mtime,
+         *    inconsistent with their old proof and baseline);
+         *  - a failed or unresolvable recovery keeps BOTH the backup and its record for
+         *    the next pass.
+         * Returns true only when every record is resolved; callers treat a false as
+         * unresolved durable state to reconcile before further edit selection.
+         */
+        internal fun reconcileInterruptedRecoveries(context: Context): Boolean {
+            val records = runCatching {
+                stagingDirectory(context).listFiles { f -> f.name.endsWith(".recovery") }?.toList() ?: emptyList()
+            }.getOrDefault(emptyList())
+            var allResolved = true
+            for (recordFile in records) {
+                val parts = runCatching { recordFile.readText().split("\n", limit = 5) }.getOrNull()
+                val record = parts?.takeIf { it.size == 5 }
+                if (record == null) {
+                    // An unparseable record is never deleted: it may still guard a needed
+                    // backup, and dropping it could lose the only copy of a generation.
+                    allResolved = false
+                    continue
+                }
+                val (_, targetPath, recoveryPath, mtimeText, storedOldRecord) = record
+                val recoveryFile = IOFile(recoveryPath)
+                val target = IOFile(targetPath)
+                val oldRecordText = storedOldRecord.takeIf { it.isNotEmpty() }
+                if (!recoveryFile.exists()) {
+                    // The backup is gone: a completed publication (or completed restore)
+                    // leaves the target with its own readable proof; anything else is
+                    // unresolved durable state.
+                    if (readPublishedProvenance(context, target) == null) allResolved = false
+                    runCatching { recordFile.delete() }
+                    continue
+                }
+                val targetSelfCertifies =
+                    target.exists() && readPublishedProvenance(context, target)?.certifiesBytes(target) == true
+                if (targetSelfCertifies) {
+                    runCatching { recoveryFile.delete() }
+                    runCatching { recordFile.delete() }
+                    continue
+                }
+                val oldMtime = mtimeText.trim().toLongOrNull()
+                val restored = oldMtime != null && restoreRecoveryCopy(
+                    context = context,
+                    recoveryFile = recoveryFile,
+                    target = target,
+                    recordFile = recordFile,
+                    oldRecordText = oldRecordText,
+                    oldTargetMtimeMillis = oldMtime,
+                )
+                if (!restored) allResolved = false
+            }
+            return allResolved
+        }
+
+        /**
+         * RESTORES the retained old bytes with their retained proof and verifies the result
+         * before disposing the recovery state (issue: round 21 #9): copyTo does not restore
+         * the original mtime, an ignored restoration previously deleted the only recovery
+         * copy even when it had failed, and an unverified restore could leave partial bytes
+         * under the old proof. On any failure the recovery backup and its durable record
+         * are RETAINED for the reconciliation sweep; on success — bytes verified against
+         * the backup's own content hash, mtime restored, proof written back and read —
+         * they are disposed.
+         */
+        private fun restoreRecoveryCopy(
+            context: Context,
+            recoveryFile: IOFile,
+            target: IOFile,
+            recordFile: IOFile,
+            oldRecordText: String?,
+            oldTargetMtimeMillis: Long,
+        ): Boolean = runCatching {
+            recoveryFile.copyTo(target, overwrite = true)
+            val targetHash = UploadFile.sha256OrNull(target)
+            val backupHash = UploadFile.sha256OrNull(recoveryFile)
+            val restoredOk = target.exists() && target.length() == recoveryFile.length() &&
+                targetHash != null && targetHash == backupHash &&
+                target.setLastModified(oldTargetMtimeMillis)
+            if (!restoredOk) return@runCatching false
+            if (oldRecordText != null) {
+                provenanceFileFor(context, target).writeText(oldRecordText)
+                if (readPublishedProvenance(context, target) == null) return@runCatching false
+            }
+            runCatching { recoveryFile.delete() }
+            runCatching { recordFile.delete() }
+            true
+        }.getOrDefault(false)
 
         /**
          * Shared, coordinated publication of a staged file into its final offline location
@@ -1258,7 +1392,11 @@ class DownloadOfflineFileManager(
             // previously deleted the NEW bytes, leaving the destination EMPTY with the old
             // bytes gone. The old bytes are backed up in the app-owned staging directory
             // until the operation commits; every post-rename failure restores them with
-            // their retained proof.
+            // their retained proof. The backup carries a DURABLE sidecar record (issues:
+            // round 21 #9, #10) naming its target, the old proof and the target's
+            // pre-publication mtime, so an interrupted publication is resolvable after
+            // restart.
+            val oldTargetMtime = if (target.exists()) target.lastModified() else 0L
             val recoveryFile = if (target.exists()) newStagedFile(provenanceContext, file) else null
             // copyTo returns the DESTINATION file, not a success flag — the backup is
             // validated explicitly (complete bytes) after the copy (issue: round 21 #1).
@@ -1266,11 +1404,22 @@ class DownloadOfflineFileManager(
                 target.copyTo(recoveryFile, overwrite = true)
                 recoveryFile.exists() && recoveryFile.length() == target.length()
             }.getOrDefault(false)
-            if (!recoveryOk) {
+            // A backup without its durable association is never kept (issues: round 21
+            // #9, #10): an anonymous staged file cannot be reconciled after restart.
+            val recoveryRecorded = recoveryFile == null ||
+                writeRecoveryRecord(provenanceContext, recoveryFile, target, oldRecordText, oldTargetMtime)
+            if (!recoveryOk || !recoveryRecorded) {
                 runCatching { recoveryFile?.delete() }
+                recoveryFile?.let { runCatching { recoveryRecordFile(provenanceContext, it).delete() } }
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
             }
+            // Cancellation AFTER the backup I/O, BEFORE the first mutation (issue: round
+            // 21 #22): the backup copy can be long; a cancelled publication must not
+            // proceed from it to the proof invalidation and the rename. The exception
+            // propagates; the untouched target keeps its bytes and proof, and the sweep
+            // reconciles the (never-mutated) recovery state.
+            checkCancelled()
             // The OLD provenance is invalidated BEFORE the bytes are replaced (issue: round
             // 16 #12): a crash between the rename and the new sidecar write must never leave
             // the new bytes carrying the previous generation's provenance.
@@ -1281,20 +1430,27 @@ class DownloadOfflineFileManager(
                 // RESTORES the recoverable old bytes and their proof (issue: round 20 #10)
                 // instead of deleting the new bytes with the old ones already gone.
                 if (!movePublishedProvenance(provenanceContext, staged, target)) {
-                    if (recoveryFile != null) {
-                        runCatching { recoveryFile.copyTo(target, overwrite = true) }
-                        if (oldRecordText != null) {
-                            runCatching { provenanceFileFor(provenanceContext, target).writeText(oldRecordText) }
+                    val restored = recoveryFile != null && restoreRecoveryCopy(
+                        context = provenanceContext,
+                        recoveryFile = recoveryFile,
+                        target = target,
+                        recordFile = recoveryRecordFile(provenanceContext, recoveryFile),
+                        oldRecordText = oldRecordText,
+                        oldTargetMtimeMillis = oldTargetMtime,
+                    )
+                    if (!restored) {
+                        if (recoveryFile == null) {
+                            // Nothing recoverable existed before (fresh publication): fail closed.
+                            runCatching { target.delete() }
                         }
+                        // A FAILED restore RETAINS the recovery copy and its durable record
+                        // (issue: round 21 #9): the sweep reconciles them; deleting them
+                        // here could lose the only copy of the old generation.
                     }
-                    if (recoveryFile == null || !target.exists()) {
-                        // Nothing recoverable existed before (fresh publication): fail closed.
-                        runCatching { target.delete() }
-                    }
-                    runCatching { recoveryFile?.delete() }
                     return PublicationOutcome.FAILED
                 }
                 runCatching { recoveryFile?.delete() }
+                recoveryFile?.let { runCatching { recoveryRecordFile(provenanceContext, it).delete() } }
                 // Record the PUBLISHED bytes' clean baseline separately from the accepted
                 // server metadata (issue: round 15 #6): edit detection judges the copy
                 // against the baseline its bytes were actually written under until a
@@ -1475,7 +1631,10 @@ class DownloadOfflineFileManager(
                         val oldRecordText = if (oldRecordFile.exists()) runCatching { oldRecordFile.readText() }.getOrNull() else null
                         // RECOVERABLE OLD BYTES (issue: round 20 #10), as in the coordinated
                         // publication: the rename replaces the old bytes — a post-rename
-                        // proof-move failure restores them with their retained proof.
+                        // proof-move failure restores them with their retained proof. The
+                        // backup carries its DURABLE sidecar record (issues: round 21 #9,
+                        // #10).
+                        val oldTargetMtime = if (target.exists()) target.lastModified() else 0L
                         val recoveryFile = if (target.exists()) newStagedFile(context, file) else null
                         // copyTo returns the DESTINATION file, not a success flag — the
                         // backup is validated explicitly (complete bytes) after the copy
@@ -1484,15 +1643,26 @@ class DownloadOfflineFileManager(
                             target.copyTo(recoveryFile, overwrite = true)
                             recoveryFile.exists() && recoveryFile.length() == target.length()
                         }.getOrDefault(false)
-                        if (!recoveryOk) {
+                        // A backup without its durable association is never kept (issues:
+                        // round 21 #9, #10).
+                        val recoveryRecorded = recoveryFile == null ||
+                            writeRecoveryRecord(context, recoveryFile, target, oldRecordText, oldTargetMtime)
+                        if (!recoveryOk || !recoveryRecorded) {
                             runCatching { recoveryFile?.delete() }
+                            recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
                             runCatching { staged.delete() }
                             PublicationOutcome.FAILED
                         } else {
+                            // Cancellation AFTER the backup I/O, BEFORE the first mutation
+                            // (issue: round 21 #22): the backup copy can be long; a cancelled
+                            // publication must not proceed from it to the proof invalidation
+                            // and the rename.
+                            coroutineContext.ensureActive()
                             deletePublishedProvenance(context, target)
                             when {
                                 staged.renameTo(target) && movePublishedProvenance(context, staged, target) -> {
                                     runCatching { recoveryFile?.delete() }
+                                    recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
                                     PublicationOutcome.PUBLISHED
                                 }
                                 // A FAILED RENAME NEVER DELETES THE OLD TARGET (issue: round 19
@@ -1505,25 +1675,30 @@ class DownloadOfflineFileManager(
                                         runCatching { provenanceFileFor(context, target).writeText(oldRecordText) }
                                     }
                                     runCatching { recoveryFile?.delete() }
+                                    recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
                                     SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
                                     PublicationOutcome.FAILED
                                 }
                                 else -> {
                                     // The rename replaced the old bytes and the proof move
                                     // failed — RESTORE the recoverable old bytes and their
-                                    // proof (issue: round 20 #10); with nothing recoverable
-                                    // (fresh publication) fail closed.
-                                    if (recoveryFile != null) {
-                                        runCatching { recoveryFile.copyTo(target, overwrite = true) }
-                                        if (oldRecordText != null) {
-                                            runCatching { provenanceFileFor(context, target).writeText(oldRecordText) }
-                                        }
-                                    }
-                                    if (recoveryFile == null || !target.exists()) {
+                                    // proof (issue: round 20 #10), VERIFIED before the recovery
+                                    // state is disposed (issue: round 21 #9); with nothing
+                                    // recoverable (fresh publication) fail closed.
+                                    val restored = recoveryFile != null && restoreRecoveryCopy(
+                                        context = context,
+                                        recoveryFile = recoveryFile,
+                                        target = target,
+                                        recordFile = recoveryRecordFile(context, recoveryFile),
+                                        oldRecordText = oldRecordText,
+                                        oldTargetMtimeMillis = oldTargetMtime,
+                                    )
+                                    if (!restored && recoveryFile == null) {
                                         runCatching { target.delete() }
                                     }
-                                    runCatching { recoveryFile?.delete() }
-                                    SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                                    if (!restored) {
+                                        SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
+                                    }
                                     PublicationOutcome.FAILED
                                 }
                             }

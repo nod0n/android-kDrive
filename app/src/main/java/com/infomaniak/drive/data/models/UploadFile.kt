@@ -590,6 +590,12 @@ open class UploadFile(
                                 },
                                 userDrive = userDrive,
                                 verifiedLastModifiedAt = uploadedBaselineSeconds,
+                                // The ALREADY-VERIFIED immutable uploaded hash (issue: round
+                                // 21 #13): the writer records and revalidates against THIS
+                                // identity — never a fresh sample of the mutable original,
+                                // which an external editor can change between the caller's
+                                // verification and the proof write.
+                                verifiedContentHash = uploadedHash,
                             )
                         // DURABLE PROOF BEFORE CONCLUSION (issue: round 20 #13): a failed
                         // provenance write DEFERS — the baseline does not advance, the
