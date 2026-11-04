@@ -373,6 +373,11 @@ class DownloadOfflineFileManager(
                     PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
                         clearPendingMarker(file.id)
                     }
+                    PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                        // A newer generation owns the file's pending state and completion
+                        // (issue: round 8 #9): this transfer's skip must not clear its marker
+                        // out from under the newer transfer.
+                    }
                 }
                 ListenableWorker.Result.success()
             } else {
@@ -459,7 +464,7 @@ class DownloadOfflineFileManager(
 
         private const val STAGING_FOLDER = "offline_staging"
 
-        internal enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_INVALIDATED, FAILED }
+        internal enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_INVALIDATED, SKIPPED_SUPERSEDED, FAILED }
 
         /**
          * App-owned staging directory on the SAME volume as the offline storage (so publication
@@ -550,11 +555,20 @@ class DownloadOfflineFileManager(
             // Live intent: an inherited download requires a current pin or durable root
             // ancestry (a materialized inherited flag alone never authorizes retention); a
             // pin download accepts its own pending marker or explicit pin as the user's
-            // request.
+            // request. The same realm read also decides whether this transfer's captured
+            // revision has been superseded (issue: round 8 #9).
+            var supersededGeneration = false
             val intentOk = FileController.getRealmInstance(userDrive).use { realm ->
                 val live = FileController.getFileById(realm, file.id)
                 val pinned = live?.isOffline == true
                 val ancestryCovers = OfflineFolderController.isInsideActiveRoot(realm, file.id)
+                // Superseded-generation rejection (issue: round 8 #9): the transfer carries
+                // the revision it actually downloaded; a live row naming a NEWER revision
+                // means another generation already committed (or is committing) that content.
+                // Serializing individual writes does not order the generations: without this
+                // check a slower T1 transfer would replace a published T2 and then run T1's
+                // completion against T2's metadata and marker.
+                supersededGeneration = live != null && live.lastModifiedAt > file.lastModifiedAt
                 if (isInheritedDownload) {
                     pinned || ancestryCovers
                 } else {
@@ -565,6 +579,10 @@ class DownloadOfflineFileManager(
             if (!intentOk) {
                 runCatching { staged.delete() }
                 return PublicationOutcome.SKIPPED_INVALIDATED
+            }
+            if (supersededGeneration) {
+                runCatching { staged.delete() }
+                return PublicationOutcome.SKIPPED_SUPERSEDED
             }
 
             // The existing copy may have been edited, registered for upload, or re-owned by
