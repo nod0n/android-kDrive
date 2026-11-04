@@ -191,7 +191,11 @@ object SyncOfflineUtils {
                     .equalTo(File::isMarkedAsOffline.name, true)
                     .notEqualTo(File::type.name, File.Type.DIRECTORY.value)
                     .findAll()
-                    .map { realm.copyFromRealm(it, 0) }
+                    // DEPTH-ONE detachment (issue: round 20 #15): the currentness check
+                    // compares the row's embedded version — a depth-zero copy drops it and
+                    // makes an already-current marked row look unverified, re-driving work
+                    // forever.
+                    .map { realm.copyFromRealm(it, 1) }
             }
         }.onFailure { exception ->
             SentryLog.e("SyncOffline", "Failed to collect unverified pins for re-drive", exception)
@@ -203,11 +207,16 @@ object SyncOfflineUtils {
                     return@forEach
                 }
                 runCatching {
+                    // THE SAME CAPTURED-SCOPE KEEP PATH (issue: round 20 #15): the redrive
+                    // must never invoke the tag-wide cancellation or enter the explicit
+                    // shared chain — it re-establishes the account-scoped KEEP verification
+                    // work exactly like the direct scheduler.
                     Utils.downloadAsOfflineFileOperation(
                         context = context,
                         file = pinnedRow,
                         userDrive = userDrive,
                         isInheritedDownload = false,
+                        cancelPendingWork = false,
                     )
                 }.onFailure { exception ->
                     SentryLog.e("SyncOffline", "Failed to re-drive verification work for ${pinnedRow.id}", exception)

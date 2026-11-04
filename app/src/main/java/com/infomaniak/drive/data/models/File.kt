@@ -517,7 +517,11 @@ open class File(
 
     fun hasVisibilities(vararg types: VisibilityType) = getVisibilityType() in types
 
-    fun getWorkerTag() = "${id}_$driveId"
+    // ACCOUNT-SCOPED (issue: round 20 #15): the tag the enqueue and the explicit
+    // cancellation both use must not collide across accounts on a shared drive's same-id
+    // file — both sides run in the current account's session, so the current account's
+    // id scopes the tag identically for both.
+    fun getWorkerTag() = "${id}_${driveId}_${AccountUtils.currentUserId}"
 
     fun getMimeType(): String = name.guessMimeType()
 
