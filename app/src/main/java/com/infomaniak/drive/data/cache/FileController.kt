@@ -670,28 +670,35 @@ object FileController {
      * applied (the sync's rename/move actions): an identity difference at equal revisions is
      * the action's purpose there, not staleness.
      */
-    internal fun isSupersededGeneration(live: File, incoming: File): Boolean = when {
-        live.revisedAt > incoming.revisedAt -> true
-        live.revisedAt == 0L && incoming.revisedAt == 0L -> incoming.lastModifiedAt < live.lastModifiedAt
-        else -> false
+    internal fun isSupersededGeneration(live: File, incoming: File): Boolean {
+        // Authoritative version identifier where supplied (issue: round 12 #6): a strictly
+        // lower version number is an older content revision even when revisedAt seconds tie —
+        // two revisions sharing a nonzero timestamp interval are ordered by it.
+        val liveVersion = live.version?.number ?: 0
+        val incomingVersion = incoming.version?.number ?: 0
+        if (liveVersion > 0 && incomingVersion > 0 && liveVersion > incomingVersion) return true
+        return when {
+            live.revisedAt > incoming.revisedAt -> true
+            live.revisedAt == 0L && incoming.revisedAt == 0L -> incoming.lastModifiedAt < live.lastModifiedAt
+            else -> false
+        }
     }
 
     /**
      * Whether [incoming] metadata must be rejected by a REPLACEMENT boundary — a path whose
      * incoming row would overwrite the live one wholesale (listings, the download manager's
-     * refresh, graph imports). Adds the equal-revision identity rule to
-     * [isSupersededGeneration] (issue: round 11 #6): equal seconds are NOT the same revision —
-     * two revisions inside the same timestamp interval are only the same generation when the
-     * observed location identity (name, parent) and modification baseline match too. A delayed
-     * response of the OTHER revision must not roll the location or baseline back; such a
-     * response is deferred (refetched) rather than applied.
+     * refresh, graph imports). Beyond [isSupersededGeneration], the SERVER MUTATION timestamp
+     * ([File.updatedAt] — bumped by every rename/move/metadata change and copied monotonically
+     * onto the row) orders two observations of the same content revision (issue: round 12 #3):
+     * an observation from an OLDER server state is stale, while a response describing a LATER
+     * server mutation — a CURRENT rename at an unchanged content revision — is ACCEPTED. The
+     * previous equal-revision identity rejection refused exactly that response on every
+     * listing and refetch (refetching returns the same comparison), permanently rejecting
+     * legitimate renames and stranding already-moved bytes.
      */
     internal fun isStaleReplacement(live: File, incoming: File): Boolean = when {
         isSupersededGeneration(live, incoming) -> true
-        live.revisedAt == incoming.revisedAt && live.revisedAt != 0L ->
-            live.lastModifiedAt != incoming.lastModifiedAt ||
-                live.parentId != incoming.parentId ||
-                live.name != incoming.name
+        live.updatedAt > incoming.updatedAt -> true
         else -> false
     }
 
@@ -711,7 +718,9 @@ object FileController {
             newFile = newFile,
             oldFile = getFileById(realm, newFile.id),
             userDrive = userDrive,
-            acceptIf = { live -> !isStaleReplacement(live, newFile) },
+            // Must EXIST (issue: round 12 #2): a worker refresh without a live row has nothing
+            // to refresh — absence is rejection, not insertion.
+            acceptIf = { live -> live != null && !isStaleReplacement(live, newFile) },
         )
     }
 
@@ -722,13 +731,24 @@ object FileController {
      * stale ACTION is already prevented upstream by the activity-cursor ordering, so only a
      * strictly newer committed revision may reject it.
      */
-    fun updateExistingFileIfNotSuperseded(newFile: File, realm: Realm, userDrive: UserDrive): Boolean {
+    fun updateExistingFileIfNotSuperseded(
+        newFile: File,
+        realm: Realm,
+        userDrive: UserDrive,
+        requireActionAtOrAfter: Long = Long.MAX_VALUE,
+    ): Boolean {
         return insertOrUpdateFile(
             realm = realm,
             newFile = newFile,
             oldFile = getFileById(realm, newFile.id),
             userDrive = userDrive,
-            acceptIf = { live -> !isSupersededGeneration(live, newFile) },
+            // Must EXIST (issue: round 12 #2), generation-only, and the row's activity cursor
+            // must not already be PAST the action being applied (issue: round 12 #5) — a
+            // delayed action's commit must not overwrite a location a later action already
+            // committed, nor rewind anything.
+            acceptIf = { live ->
+                live != null && !isSupersededGeneration(live, newFile) && live.lastActionAt <= requireActionAtOrAfter
+            },
         )
     }
 
@@ -738,7 +758,7 @@ object FileController {
         oldFile: File? = null,
         userDrive: UserDrive,
         moreTransaction: (() -> Unit)? = null,
-        acceptIf: ((live: File) -> Boolean)? = null,
+        acceptIf: ((live: File?) -> Boolean)? = null,
     ): Boolean {
         // Identity/revision metadata writers share the publisher's per-file coordination
         // (issue: round 9 #7): without it, a writer could commit a newer identity or baseline
@@ -752,10 +772,13 @@ object FileController {
                 // Conditional acceptance INSIDE the committing transaction (issue: round 11 #5):
                 // the decision reads the transaction-fresh live row, so a response that was
                 // fresh when the caller fetched it is still revalidated against whatever
-                // committed during the coordination wait.
+                // committed during the coordination wait. The gate receives NULL for a
+                // row-absence so each caller distinguishes conditional UPSERT (absence
+                // inserts — single-file fetches after a cache miss) from conditional
+                // EXISTING-ROW UPDATE (must exist — worker refreshes) (issue: round 12 #2).
                 if (acceptIf != null) {
                     val live = getFileById(realm, newFile.id)
-                    if (live == null || !acceptIf(live)) return@executeTransaction
+                    if (!acceptIf(live)) return@executeTransaction
                 }
                 if (oldFile?.isUsable() == true) newFile.keepOldLocalFilesData(oldFile)
                 moreTransaction?.invoke()
@@ -971,7 +994,9 @@ object FileController {
                             preservedFile,
                             getFileProxyById(fileId, customRealm = realm),
                             userDrive,
-                            acceptIf = { live -> !isStaleReplacement(live, preservedFile) },
+                            // Must exist — the details refresh has nothing to refresh otherwise
+                            // (issue: round 12 #2).
+                            acceptIf = { live -> live != null && !isStaleReplacement(live, preservedFile) },
                         )
                     }
                 }
@@ -1456,7 +1481,8 @@ object FileController {
                 remoteFile,
                 localFile,
                 userDrive,
-                acceptIf = { live -> !isSupersededGeneration(live, remoteFile) },
+                // Must exist — this branch already resolved the live row (issue: round 12 #2).
+                acceptIf = { live -> live != null && !isSupersededGeneration(live, remoteFile) },
             )
         } else {
             // Coordinated commit boundary (issues: round 10 #3, round 11 #3/#7): the child-add
@@ -1498,16 +1524,24 @@ object FileController {
                 userDrive = userDrive,
             ).first()
             val localFile = getFileById(realm, preservedFile.id)
-            insertOrUpdateFile(
+            // Conditional UPSERT (issue: round 12 #2): absence INSERTS (playback and deep-link
+            // flows call this after a cache miss), while a stale response against an existing
+            // newer row is rejected.
+            val committed = insertOrUpdateFile(
                 realm,
                 preservedFile,
                 localFile,
                 userDrive,
-                acceptIf = { live -> !isStaleReplacement(live, preservedFile) },
+                acceptIf = { live -> live == null || !isStaleReplacement(live, preservedFile) },
             )
-
-            val driveId = userDrive.driveId
-            resolveAndLinkFileAncestorsChain(realm, preservedFile.parentId, preservedFile.id, driveId, userDrive, okHttpClient)
+            // Propagate rejection (issue: round 12 #2): a rejected response left the newer
+            // live row authoritative — continuing the ancestor linking would attach the LIVE
+            // row under the STALE response's parent, corrupting the graph with the loser's
+            // ancestry.
+            if (committed) {
+                val driveId = userDrive.driveId
+                resolveAndLinkFileAncestorsChain(realm, preservedFile.parentId, preservedFile.id, driveId, userDrive, okHttpClient)
+            }
         }
     }
 

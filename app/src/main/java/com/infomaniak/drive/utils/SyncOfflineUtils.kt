@@ -261,6 +261,16 @@ object SyncOfflineUtils {
         val remoteFile = fileAction.file
         val ioFileLastModified = ioFile.lastModified()
         var downloadOutcome = DownloadActionOutcome(handled = false)
+        // Fresh action-ordering check (issue: round 12 #5): supplying a cursor when issuing
+        // the request does not order its eventual commit against other writers, so the row's
+        // activity cursor must be validated against the action BEFORE any preservation or
+        // commit: a row already at or past this action has processed it (or a later one) —
+        // re-running a delayed duplicate/older action would overwrite a newer location.
+        val actionAt = fileAction.lastActionAt ?: 0
+        val liveRowForOrdering = FileController.getFileById(realm, localFile.id)
+        if (actionAt > 0 && liveRowForOrdering != null && liveRowForOrdering.lastActionAt >= actionAt) {
+            return true
+        }
         val handled = when {
             remoteFile == null -> {
                 SentryLog.e("SyncOffline", "Expect remote file instead of null file") { scope ->
@@ -271,7 +281,7 @@ object SyncOfflineUtils {
             ioFileLastModified > remoteFile.revisedAtInMillis ->
                 uploadFile(context, localFile, remoteFile, ioFile, userDrive, realm)
             ioFileLastModified < remoteFile.revisedAtInMillis -> {
-                downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm)
+                downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm, actionAt)
                 downloadOutcome.handled
             }
             fileAction.lastAction in renameActions -> synchronized(OfflineFileCoordination.rootIntentMonitor) {
@@ -305,10 +315,16 @@ object SyncOfflineUtils {
                 } else {
                     // Bytes are safely at (or durably registered for) the new location: commit
                     // the new identity so the row and the offline path agree. Conditional
-                    // (issue: round 11 #4): a newer generation committed in the acceptance
-                    // window wins; the action is consumed either way — its preservation is
-                    // done, and re-queueing a superseded rename would retry forever.
-                    FileController.updateExistingFileIfNotSuperseded(newFile = remoteFile, realm = realm, userDrive = userDrive)
+                    // (issues: round 11 #4, round 12 #5): a newer generation committed in the
+                    // acceptance window wins, and a row whose activity cursor moved past this
+                    // action rejects it — the action is consumed either way (its preservation
+                    // is done; re-queueing a superseded rename would retry forever).
+                    FileController.updateExistingFileIfNotSuperseded(
+                        newFile = remoteFile,
+                        realm = realm,
+                        userDrive = userDrive,
+                        requireActionAtOrAfter = actionAt,
+                    )
                     true
                 }
             }
@@ -333,7 +349,9 @@ object SyncOfflineUtils {
                 )
             }
             else -> FileController.updateFile(localFile.id, realm) { mutableFile ->
-                mutableFile.lastActionAt = fileAction.lastActionAt ?: 0
+                // No cursor rewind (issue: round 12 #5): a delayed action completing after a
+                // later one must never move the row's activity cursor backwards.
+                if (actionAt > mutableFile.lastActionAt) mutableFile.lastActionAt = actionAt
             }
         }
         return handled
@@ -437,7 +455,11 @@ object SyncOfflineUtils {
             if (remoteFile != null) {
                 remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
                 remoteFile.size = ioFile.length()
-                FileController.updateExistingFile(newFile = remoteFile, realm = realm, userDrive = userDrive)
+                // Conditional advance (issue: round 12 #4): the uploaded snapshot's baseline
+                // must not roll back a strictly newer generation committed meanwhile — the
+                // revision-dedup gate above keeps a rejected advance from re-registering the
+                // same snapshot, so no upload loop is possible.
+                FileController.updateExistingFileIfNotSuperseded(newFile = remoteFile, realm = realm, userDrive = userDrive)
             }
 
             context.syncImmediately(isAutomaticTrigger = false)
@@ -455,16 +477,20 @@ object SyncOfflineUtils {
         offlineFile: IOFile,
         userDrive: UserDrive,
         realm: Realm,
+        actionLastActionAt: Long = 0,
     ): DownloadActionOutcome {
         val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return DownloadActionOutcome(handled = false)
-        // Conditional acceptance BEFORE any preservation side effect (issues: round 11 #2/#4):
-        // a refresh superseded by an already-committed NEWER GENERATION must not move the
+        // Conditional acceptance BEFORE any preservation side effect (issues: round 11 #2/#4,
+        // round 12 #5): a refresh superseded by an already-committed NEWER GENERATION — or
+        // whose row's activity cursor already moved past this action — must not move the
         // bytes or relabel the live row; the newer generation's own flow owns this file's
         // identity, so the action is consumed with no side effect. Generation-only: an
         // identity difference at equal revisions is the change this action applies. The
         // authoritative revalidation still happens inside the committing transaction below.
         val liveRow = FileController.getFileById(realm, file.id)
-        if (liveRow != null && FileController.isSupersededGeneration(liveRow, remoteFile)) {
+        if (liveRow != null && (FileController.isSupersededGeneration(liveRow, remoteFile) ||
+                (actionLastActionAt > 0 && liveRow.lastActionAt >= actionLastActionAt))
+        ) {
             return DownloadActionOutcome(handled = true)
         }
         val pathChanged = offlineFile.path != remoteOfflineFile.path
@@ -512,10 +538,16 @@ object SyncOfflineUtils {
                 isStale = { live, incoming -> FileController.isSupersededGeneration(live, incoming) },
             ).first()
             if (commitFile !== remoteFile) return DownloadActionOutcome(handled = false)
-            // Conditional commit (issue: round 11 #4/#5): a newer generation committed in the
-            // acceptance window wins; the enqueued download revalidates everything itself, so
-            // the action is consumed either way.
-            FileController.updateExistingFileIfNotSuperseded(newFile = remoteFile, realm = realm, userDrive = userDrive)
+            // Conditional commit (issues: round 11 #4/#5, round 12 #5): a newer generation
+            // committed in the acceptance window wins, and a row whose cursor moved past this
+            // action rejects it; the enqueued download revalidates everything itself, so the
+            // action is consumed either way.
+            FileController.updateExistingFileIfNotSuperseded(
+                newFile = remoteFile,
+                realm = realm,
+                userDrive = userDrive,
+                requireActionAtOrAfter = actionLastActionAt,
+            )
             // Preserve the download origin: a refresh of a file covered by an offline folder is
             // an inherited download, so its completion can never manufacture an explicit pin
             // after an unmark (issue #1902). The enqueue's Operation is returned UNAWAITED

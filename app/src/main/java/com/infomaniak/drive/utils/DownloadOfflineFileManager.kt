@@ -605,6 +605,14 @@ class DownloadOfflineFileManager(
                         (live.revisedAt == 0L && live.lastModifiedAt > file.lastModifiedAt) ||
                         live.parentId != file.parentId ||
                         live.name != file.name ||
+                        // Accepted content-generation identity (issue: round 12 #6): the
+                        // committed metadata and this transfer must describe the SAME
+                        // revision — an equal-seconds newer revision (a different version
+                        // number or modification baseline) supersedes the staged bytes, so
+                        // completion can never run against newer metadata while installing
+                        // older bytes.
+                        (live.version?.number ?: 0) != (file.version?.number ?: 0) ||
+                        live.lastModifiedAt != file.lastModifiedAt ||
                         run {
                             val livePath = appContextForCheck?.let { ctx -> live.getOfflineFile(ctx, userDrive.userId)?.path }
                             livePath == null || livePath != target.path
