@@ -374,8 +374,17 @@ object FileController {
         recursive: Boolean = true,
         userDrive: UserDrive? = null,
         originFolderId: Int? = null,
+        originParentId: Int? = null,
     ) {
         val block: (Realm) -> Unit? = { realm ->
+            // REQUEST-TIME BOUNDARY ANCESTRY (issue: round 22 #10): the boundary's expected
+            // parent is captured at the TOP-LEVEL call — before any section and before the
+            // child recursion — and carried through the recursion. D moved or was restored
+            // after the removal was scheduled means the current location's content is not
+            // what this removal was authorized to delete, even though descendants still
+            // reach D's unchanged id.
+            val requestBoundaryParentId =
+                if (originFolderId == null) getFileById(realm, fileId)?.parentId else originParentId
             // Child recursion runs BEFORE this row's coordination (no nested lock
             // acquisition): each child re-runs the full protocol under its own section,
             // and the captured account flows through the recursion (issue: round 5 #6).
@@ -392,6 +401,7 @@ object FileController {
                             realm,
                             userDrive = userDrive,
                             originFolderId = originFolderId ?: fileId,
+                            originParentId = requestBoundaryParentId,
                         )
                     }
                 }
@@ -422,6 +432,17 @@ object FileController {
                         // its current copy and row are another location's content now.
                         // Fresh path ownership alone never establishes deletion authority.
                         if (originFolderId != null && !ancestryReachesBoundary(realm, file.parentId, originFolderId)) {
+                            return@withFileLock
+                        }
+                        // BOUNDARY ANCESTRY AUTHORITY (issue: round 22 #10): the boundary row
+                        // itself must still sit at its REQUEST-TIME parent — D moved (or was
+                        // restored elsewhere) after scheduling means these bytes belong to the
+                        // moved subtree, not to the requested deletion. This covers the
+                        // TOP-LEVEL boundary call (which has no originFolderId chain to reach)
+                        // and every descendant section alike, and runs BEFORE any preservation
+                        // or deletion effect — including the boundary's own row removal.
+                        val boundaryRow = if (originFolderId == null) file else getFileById(realm, originFolderId)
+                        if (requestBoundaryParentId != null && boundaryRow?.parentId != requestBoundaryParentId) {
                             return@withFileLock
                         }
                         val resolvedUserDrive = userDrive ?: UserDrive(driveId = file.driveId)
