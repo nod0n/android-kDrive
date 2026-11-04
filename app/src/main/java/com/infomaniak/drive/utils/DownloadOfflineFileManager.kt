@@ -784,6 +784,40 @@ class DownloadOfflineFileManager(
             return readPublishedProvenance(context, staged) != null
         }
 
+        /**
+         * Associates ALREADY-VERIFIED bytes (issue: round 19 #13) — the upload-completion
+         * reconciliation hash-proved them to BE the uploaded revision — with their own
+         * generation identity, written TOGETHER with the row's baseline advance. The
+         * record's modification baseline is the VERIFIED BYTE baseline, never the row's
+         * possibly-lagging accepted metadata, so the copy's readability coheres with its
+         * own generation; the row's version and revision identity keep the record from
+         * falsely proving currentness against metadata that has not accepted the new
+         * revision yet.
+         */
+        internal fun writeVerifiedRevisionProvenance(
+            context: Context,
+            target: IOFile,
+            row: File,
+            userDrive: UserDrive,
+            verifiedLastModifiedAt: Long,
+        ): Boolean {
+            val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
+            return runCatching {
+                val provenance = PublishedProvenance(
+                    version = row.version?.number ?: 0,
+                    lastModifiedAt = verifiedLastModifiedAt,
+                    revisedAt = row.revisedAt,
+                    updatedAt = row.updatedAt,
+                    userId = userDrive.userId,
+                    driveId = userDrive.driveId,
+                    fileId = row.id,
+                    absolutePath = target.absolutePath,
+                )
+                recordFile.writeText(provenance.recordText(target))
+                readPublishedProvenance(context, target) != null
+            }.getOrDefault(false)
+        }
+
         internal fun readPublishedProvenance(context: Context, publishedFile: IOFile): PublishedProvenance? = runCatching {
             val parts = provenanceFileFor(context, publishedFile).readText().trim().split("|")
             require(parts.size >= 8)

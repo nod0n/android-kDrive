@@ -34,6 +34,7 @@ import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.sync.UploadMigration
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.RealmModules
@@ -555,6 +556,27 @@ open class UploadFile(
                         if (actualHash != uploadedHash) return@withFileLock
                         val uploadedBaselineSeconds = record.fileModifiedAt.time / 1_000L
                         if (liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds) return@withFileLock
+                        // FULL PROVENANCE AND BASELINE ADVANCE TOGETHER (issue: round 19
+                        // #13): the hash proof above established these bytes as the uploaded
+                        // revision — the copy's provenance record is written from that
+                        // VERIFIED byte baseline in the same coordinated section as the
+                        // baseline advance. A baseline without its record left the copy's
+                        // readability story incoherent until a later redrive re-published
+                        // it; the row's lagging version/revision identity in the record
+                        // can never falsely prove currentness (the generation comparisons
+                        // reject it).
+                        val provenanceContext = Realm.getApplicationContext()
+                        if (provenanceContext != null) {
+                            runCatching {
+                                DownloadOfflineFileManager.writeVerifiedRevisionProvenance(
+                                    context = provenanceContext,
+                                    target = original,
+                                    row = liveRow,
+                                    userDrive = userDrive,
+                                    verifiedLastModifiedAt = uploadedBaselineSeconds,
+                                )
+                            }
+                        }
                         realm.executeTransaction { liveRow.publishedCleanBaseline = uploadedBaselineSeconds }
                     }
                 }

@@ -340,7 +340,22 @@ open class File(
      */
     fun storedOfflineCopyState(context: Context, offlineFile: IOFile, userDrive: UserDrive? = null): StoredOfflineCopyState {
         if (!(isOffline || isInOfflineFolder)) return StoredOfflineCopyState.ABSENT_OR_STALE
-        if (!(offlineFile.exists() && isIntactFile(offlineFile))) return StoredOfflineCopyState.ABSENT_OR_STALE
+        // PROTECTED EDITS ARE EXPLICIT (issue: round 19 #13): a copy backing a pending or
+        // retained-unsent upload is the usable local content of an unsent edit — explicitly
+        // readable without generation proof, never "absent" (which would route entry paths
+        // into replacement decisions the protection then has to veto).
+        val protectedCopyUri = Uri.fromFile(offlineFile).toString()
+        if (UploadFile.hasPendingUpload(uri = protectedCopyUri) ||
+            UploadFile.hasRetainedUnsentUpload(uri = protectedCopyUri)
+        ) {
+            return StoredOfflineCopyState.READABLE_UNVERIFIED
+        }
+        // READABILITY IS INDEPENDENT OF THE REMOTE SIZE (issue: round 19 #13): the previous
+        // gate compared the bytes against the row's CURRENT remote size — a complete
+        // retained copy of an older generation became "absent" the moment a
+        // differently-sized newer revision committed. Presence here is the copy's OWN:
+        // non-empty bytes for a non-empty row (an empty copy of an empty row is intact).
+        if (!offlineFile.exists() || (offlineFile.length() <= 0L && size > 0L)) return StoredOfflineCopyState.ABSENT_OR_STALE
         // OWN-GENERATION coherence (issue: round 18 #14): the copy's usability is judged
         // against the generation it was published under — never against current remote
         // metadata alone, which a backward-dated newer revision changes without the bytes
@@ -366,6 +381,9 @@ open class File(
         if (revisedAt > 0 && provenance.revisedAt != revisedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
         if (updatedAt > 0 && provenance.updatedAt != updatedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
         if (provenance.lastModifiedAt != lastModifiedAt) return StoredOfflineCopyState.READABLE_UNVERIFIED
+        // CURRENTNESS still requires the copy to be INTACT against the row's accepted size
+        // (issue: round 19 #13): readability never uses the remote size, the proof does.
+        if (!isIntactFile(offlineFile)) return StoredOfflineCopyState.READABLE_UNVERIFIED
         return StoredOfflineCopyState.PROVEN_CURRENT
     }
 
