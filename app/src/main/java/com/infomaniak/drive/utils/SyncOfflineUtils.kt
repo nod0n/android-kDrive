@@ -389,6 +389,19 @@ object SyncOfflineUtils {
             )
             return true
         }
+        if (file.isMarkedAsOffline && !remoteFile.isOfflineAndIntact(remoteOfflineFile)) {
+            // A pending marker alone does not prove that any worker owns the refresh (issue:
+            // round 7 #16): it can outlive failed or cancelled work, and reporting this action
+            // handled without durable work would advance the sync cursor past a missing or
+            // stale pin. Idempotently enqueue the scoped refresh — the download chain is
+            // serialized, so a worker that already owns the file simply completes first.
+            Utils.downloadAsOfflineFile(
+                context = context,
+                file = remoteFile,
+                userDrive = userDrive,
+                isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+            )
+        }
         // The local state already matches the remote revision, or a queued worker durably owns
         // the refresh: nothing left to do for this action (issue: round 6 #11).
         return true

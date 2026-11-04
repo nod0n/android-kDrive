@@ -111,10 +111,14 @@ object OfflineFolderUtils {
                     visitedFolderIds = visitedFolderIds,
                 )) {
                     FolderWalkOutcome.INCOMPLETE -> {
-                        // The folder's membership is unknown: stop here; the walk retries
-                        // later without having advanced lastSyncedAt.
+                        // The folder's membership is unknown: leave its coverage untouched,
+                        // keep the walk incomplete, but continue the other queued folders
+                        // (issue: round 7 #15) — one child's persistent listing failure must
+                        // not starve independent siblings. The loop top re-asserts the active
+                        // root before every folder, so a removed root still terminates the
+                        // walk immediately.
                         completed = false
-                        break@walk
+                        continue@walk
                     }
                     // Deferred moves keep their old metadata and durable membership; the
                     // collected files still count as safe walk progress (issue: round 6 #10).
