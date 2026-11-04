@@ -1420,6 +1420,14 @@ object FileController {
             .findAll()
     }
 
+    /**
+     * Commits a folder listing and returns the ids of the children whose row did NOT take the
+     * listing's identity at commit (issue: round 13 #8) — a DEFERRAL (the shared boundary kept
+     * the old row because the old copy's preservation is unfinished) or a REJECTION (the live
+     * row was strictly newer; the listing lost the race). Accepted ids are absent. The caller
+     * holds the listing context and separates the two via [isStaleReplacement] against the
+     * listed row.
+     */
     fun saveRemoteFiles(
         realm: Realm,
         localFolderProxy: File?,
@@ -1428,8 +1436,8 @@ object FileController {
         isFirstPage: Boolean,
         isCompleteFolder: Boolean,
         userDrive: UserDrive,
-    ) {
-        val remoteFiles = apiResponse.data ?: return
+    ): Set<Int> {
+        val remoteFiles = apiResponse.data ?: return emptySet()
 
         // Save remote folder if it doesn't exist locally
         var newLocalFolderProxy: File? = null
@@ -1474,6 +1482,16 @@ object FileController {
                 remoteFiles = remoteFiles,
                 userDrive = userDrive,
             )
+            // Explicit per-file outcomes (issue: round 13 #8), part 1 — the shared boundary:
+            // it maps the incoming list 1:1 and returns the OLD row in place of an entry it
+            // deferred (stale gate or unfinished preservation), the SAME reference otherwise,
+            // so reference identity detects every boundary substitution positionally.
+            val substitutedOrDroppedIds = mutableSetOf<Int>()
+            committableFiles.forEachIndexed { index, committable ->
+                if (index < remoteFiles.size && committable !== remoteFiles[index]) {
+                    substitutedOrDroppedIds.add(remoteFiles[index].id)
+                }
+            }
             realm.executeTransaction {
                 // Restore same children data
                 val acceptedChildren = keepSubFolderChildren(
@@ -1481,6 +1499,7 @@ object FileController {
                     localFolderProxy?.id ?: newLocalFolderProxy?.id,
                     localFolderProxy?.children,
                     committableFiles,
+                    substitutedOrDroppedIds,
                 )
                 // Save to realm
                 (localFolderProxy ?: newLocalFolderProxy)?.let { folderProxy ->
@@ -1497,6 +1516,7 @@ object FileController {
             }
         }
         }
+        return substitutedOrDroppedIds
     }
 
     /**
@@ -1506,13 +1526,15 @@ object FileController {
      * authoritative parent is still this container (issue: round 12 #12): a row that MOVED
      * away must not gain a second, wrong backlink, so the entry is dropped entirely and the
      * row's membership stays with the parent [File.parentId] names. The same parent
-     * consistency governs boundary-substituted managed rows reaching the else branch.
+     * consistency governs boundary-substituted managed rows reaching the else branch. Every
+     * substitution/drop is recorded in [substitutedOrDroppedIds] (issue: round 13 #8).
      */
     private fun keepSubFolderChildren(
         realm: Realm,
         containerId: Int?,
         localFolderChildren: List<File>?,
         remoteFolderChildren: List<File>,
+        substitutedOrDroppedIds: MutableSet<Int>,
     ): List<File> {
         val oldChildren = localFolderChildren?.associateBy { it.id }
         return remoteFolderChildren.mapNotNull { newFile ->
@@ -1520,8 +1542,13 @@ object FileController {
 
             val oldChild = oldChildren?.get(newFile.id) ?: getFileById(realm, newFile.id)
             if (oldChild != null && isStaleReplacement(oldChild, newFile)) {
+                // Explicit per-file outcomes (issue: round 13 #8), part 2 — the in-transaction
+                // restoration: a substituted or dropped entry did not take the listing's
+                // identity, whether the live row stays linked here or moved away.
+                substitutedOrDroppedIds.add(newFile.id)
                 oldChild.takeIf { it.parentId == containerId }
             } else if (newFile.isManaged && containerId != null && newFile.parentId != containerId) {
+                substitutedOrDroppedIds.add(newFile.id)
                 null
             } else {
                 oldChild?.let { oldFile ->

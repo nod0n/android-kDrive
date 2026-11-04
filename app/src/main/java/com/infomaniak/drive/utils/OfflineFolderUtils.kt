@@ -229,27 +229,6 @@ object OfflineFolderUtils {
         val last = lastResponse ?: return FolderWalkOutcome.INCOMPLETE
         val remoteIds = allPages.mapTo(mutableSetOf()) { it.id }
 
-        // Read-only MOVE-CANDIDATE detection (issue: round 12 #1): the previous preliminary
-        // pass RECONCILED moved copies here — outside any coordination and before the shared
-        // stale gate — so a delayed listing naming an obsolete location could snapshot a
-        // current edit under that identity and delete the original before the newer row
-        // rejected the listing. ALL preservation now runs inside saveRemoteFiles' coordinated
-        // validate–preserve–commit boundary; this pass only records which listed files changed
-        // location (directories excluded — not file content), to derive the walk's
-        // deferred-move outcome AFTER the commit from pure row reads.
-        data class MoveCandidate(val fileId: Int, val locationChanged: Boolean)
-        val moveCandidates = allPages.mapNotNull { remoteFile ->
-            val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@mapNotNull null
-            if (oldRow.isFolder()) return@mapNotNull null
-            val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() } ?: return@mapNotNull null
-            // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7),
-            // exactly like the per-file download manager: a remote path string can never equal
-            // the local offline directory path, so the previous comparison classified every
-            // unchanged file as a move and pushed clean copies through reconciliation.
-            val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
-            MoveCandidate(remoteFile.id, newOffline == null || newOffline.path != oldOffline.path)
-        }
-
         val completeResponse = CursorApiResponse<List<File>>(
             result = last.result,
             data = allPages,
@@ -259,7 +238,13 @@ object OfflineFolderUtils {
             hasMore = false,
         )
 
-        processPage(
+        // Explicit per-file outcomes (issue: round 13 #8): the commit itself reports which
+        // rows did NOT take the listing's identity — no post-commit inference from resolved
+        // paths, which could only see location changes and missed unchanged-path snapshot
+        // failures entirely. Accepted files are absent from the set; rejected and deferred
+        // files are both present and are separated below. Every sibling continues regardless:
+        // the outcomes are per-file, never an abort.
+        val substitutedOrDroppedIds = processPage(
             context = context,
             realm = realm,
             rootFolderId = rootFolderId,
@@ -279,24 +264,21 @@ object OfflineFolderUtils {
         // classify retained sources as confirmed deletions and clear their coverage.
         cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds)
 
-        // Deferred moves are the listed files whose location changed and whose row did NOT take
-        // the listing's identity at commit — the coordinated boundary deferred their
-        // preservation (or the listing was rejected as stale, which is not a deferral: a
-        // strictly newer row means the listing simply lost the race) (issue: round 12 #1).
-        val deferredMoveIds = moveCandidates.filter { candidate ->
-            if (!candidate.locationChanged) return@filter false
-            val row = FileController.getFileById(realm, candidate.fileId) ?: return@filter false
-            val listed = allPages.firstOrNull { it.id == candidate.fileId } ?: return@filter false
-            (row.parentId != listed.parentId || row.name != listed.name) &&
-                !FileController.isStaleReplacement(row, listed)
+        // A live row that is strictly NEWER than the listing is a race LOSS, not a deferral:
+        // the newer identity stands and the next listing refetches it. Only a row still
+        // matching the listing's generation is UNFINISHED reconciliation (issue: round 12 #1).
+        val deferredMoveIds = substitutedOrDroppedIds.filter { id ->
+            val row = FileController.getFileById(realm, id) ?: return@filter false
+            val listed = allPages.firstOrNull { it.id == id } ?: return@filter false
+            !FileController.isStaleReplacement(row, listed)
         }
 
         if (deferredMoveIds.isNotEmpty()) {
-            // The move reconciliation is incomplete: the affected files keep their old metadata
+            // The reconciliation is incomplete: the affected files keep their old metadata
             // and location this round, and the root stays incomplete for retry (issue: round
             // 5 #8/#9). The folder itself WAS fully listed — independent folders keep walking
             // so one occupied destination cannot starve the whole root (issue: round 6 #10).
-            SentryLog.i(TAG, "Deferred ${deferredMoveIds.size} move(s) whose old copies are not safely preserved yet")
+            SentryLog.i(TAG, "Deferred ${deferredMoveIds.size} file(s) whose old copies are not safely preserved yet")
             return FolderWalkOutcome.DEFERRED_MOVES
         }
 
@@ -305,7 +287,8 @@ object OfflineFolderUtils {
 
     /**
      * Commits the (already preservation-filtered) remote children of [folderId] into the local
-     * cache and materializes the folder coverage on them.
+     * cache and materializes the folder coverage on them. Returns [FileController.saveRemoteFiles]'s
+     * explicit per-file non-acceptance outcomes (issue: round 13 #8).
      */
     private fun processPage(
         context: Context,
@@ -318,11 +301,11 @@ object OfflineFolderUtils {
         fileIds: MutableList<Int>,
         folderQueue: ArrayDeque<Int>,
         visitedFolderIds: MutableSet<Int>,
-    ) {
-        val remoteFiles = apiResponse.data ?: return
+    ): Set<Int> {
+        val remoteFiles = apiResponse.data ?: return emptySet()
         val folderProxy = FileController.getFileById(realm, folderId)
 
-        FileController.saveRemoteFiles(
+        val substitutedOrDroppedIds = FileController.saveRemoteFiles(
             realm = realm,
             localFolderProxy = folderProxy,
             remoteFolder = folderProxy ?: File(id = folderId, driveId = userDrive.driveId, type = File.Type.DIRECTORY.value)
@@ -385,6 +368,7 @@ object OfflineFolderUtils {
                 }
             }
         }
+        return substitutedOrDroppedIds
     }
 
     /**
@@ -426,28 +410,30 @@ object OfflineFolderUtils {
 
     /**
      * Destructive-decision predicate for the absent-subtree traversal (issues: round 11
-     * #8/#10, round 12 #10), evaluated inside the committing transaction on the refreshed
-     * live row:
-     *  - the candidate's CURRENT ancestry must still reach the ORIGINAL absent boundary
-     *    [boundaryFolderId] through live parent links — a move of an INTERMEDIATE ancestor
-     *    between the boundary and the candidate keeps both the boundary's parent and the
-     *    candidate's immediate parent intact while disconnecting the subtree, so only the
-     *    live chain proves membership;
-     *  - an INDEPENDENT active root encountered along that chain owns the candidate's
-     *    coverage — this traversal must not clear beneath it;
-     *  - no root covering the candidate — its own record or its ancestry — changed intent
-     *    after [traversalStartedGeneration] (issue: round 12 #9): a newly created or revived
-     *    root stops the decision, while roots whose intent predates the traversal stay the
-     *    listing's maintenance responsibility.
+     * #8/#10, round 12 #10, round 13 #6), evaluated inside the committing transaction on the
+     * refreshed live row:
+     *  - the ORIGINAL boundary's listed-parent authority still holds — the boundary folder
+     *    must still hang from [boundaryListedParentId], the parent its listing spoke for;
+     *    F's own move beneath another subtree (or beneath a pre-existing root) invalidates
+     *    every remaining descendant, which the candidate-to-boundary chain alone cannot see;
+     *  - the candidate's CURRENT ancestry must reach the boundary through live parent links,
+     *    with an INDEPENDENT active root along the chain checked BEFORE the boundary is
+     *    treated as reached (that root's own walk owns the coverage);
+     *  - the boundary candidate ITSELF is handled explicitly — the chain walk starts at the
+     *    candidate's parent, so a self-started chain can never reach itself;
+     *  - no root covering the candidate changed intent after [traversalStartedGeneration]
+     *    (issue: round 12 #9).
      */
     private fun absentSubtreeClearable(
         boundaryFolderId: Int,
+        boundaryListedParentId: Int,
         traversalStartedGeneration: Long,
     ): (Realm, File) -> Boolean = { currentRealm, candidate ->
-        var reachesBoundary = false
+        val boundaryHolds = FileController.getFileById(currentRealm, boundaryFolderId)?.parentId == boundaryListedParentId
+        var reachesBoundary = candidate.id == boundaryFolderId
         var currentId: Int? = FileController.getFileById(currentRealm, candidate.id)?.parentId
         val visited = mutableSetOf(candidate.id)
-        while (currentId != null && visited.add(currentId)) {
+        while (!reachesBoundary && currentId != null && visited.add(currentId)) {
             if (currentId == boundaryFolderId) {
                 reachesBoundary = true
                 break
@@ -455,7 +441,7 @@ object OfflineFolderUtils {
             if (OfflineFolderController.hasActiveOfflineRoot(currentId, customRealm = currentRealm)) break
             currentId = FileController.getFileById(currentRealm, currentId)?.parentId
         }
-        reachesBoundary &&
+        boundaryHolds && reachesBoundary &&
             !OfflineFolderController.hasActiveRootCoveringSince(candidate.id, currentRealm, traversalStartedGeneration)
     }
 
@@ -545,9 +531,9 @@ object OfflineFolderUtils {
                 userDrive = userDrive,
                 result = result,
                 isFolder = true,
-                // The original absent-subtree boundary and the new-root check travel INSIDE
-                // the decision (issues: round 11 #8/#10).
-                isStillClearable = absentSubtreeClearable(rootFolderId, traversalStartedGeneration),
+                // The original absent-subtree boundary, its listed-parent authority and the
+                // new-root check travel INSIDE the decision (issues: round 11 #8/#10, 13 #6).
+                isStillClearable = absentSubtreeClearable(rootFolderId, listedParentId, traversalStartedGeneration),
             )
             // The subtree's original listing authority dies with the folder's rejection
             // (issue: round 10 #6): if the folder was not cleared because its live parent
@@ -577,7 +563,7 @@ object OfflineFolderUtils {
                             userDrive = userDrive,
                             result = result,
                             isFolder = false,
-                            isStillClearable = absentSubtreeClearable(rootFolderId, traversalStartedGeneration),
+                            isStillClearable = absentSubtreeClearable(rootFolderId, listedParentId, traversalStartedGeneration),
                         )
                     }
                 }

@@ -85,16 +85,22 @@ object OfflineFolderController {
             // (issue: round 10 #5) — one consistent intent → locks → transaction order.
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withFileLock(userDrive, folder.id) {
-                    val existingRoot = getOfflineRoot(folder.id, customRealm = realm)
-                    if (existingRoot != null && !existingRoot.isPendingRemoval) {
-                        false
-                    } else if (existingRoot != null) {
-                        // Re-marking a root whose deferred cleanup is still running revives it.
-                        realm.executeTransaction { if (existingRoot.isValid) existingRoot.isPendingRemoval = false }
-                        noteRootIntentChange(folder.id)
-                        updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
-                        true
-                    } else {
+                    // Refresh AFTER acquiring coordination (issue: round 13 #7): the Realm can
+                    // be opened before the monitor wait — a removal completing while this
+                    // re-mark queued must be visible, and the absence/active/pending decision
+                    // re-reads the record inside its own transaction, so the decision is
+                    // never made on stale state and the caller's re-mark cannot be silently
+                    // discarded by an "already active" answer derived from it.
+                    runCatching { realm.refresh() }
+                    var absent = false
+                    var pendingRevival = false
+                    realm.executeTransaction {
+                        val existingRoot = getOfflineRoot(folder.id, customRealm = realm)
+                        absent = existingRoot == null
+                        pendingRevival = existingRoot != null && existingRoot.isPendingRemoval
+                    }
+                    var stateChanged = false
+                    if (absent) {
                         realm.executeTransaction {
                             val root = OfflineRoot(
                                 folderId = folder.id,
@@ -106,12 +112,22 @@ object OfflineFolderController {
                             ).apply { initUid() }
                             it.copyToRealm(root)
                         }
-                        noteRootIntentChange(folder.id)
                         // Mark the root folder itself as covered and its walk as pending until the
                         // BulkDownloadWorker has walked it once.
                         updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
-                        true
+                        stateChanged = true
+                    } else if (pendingRevival) {
+                        // Re-marking a root whose deferred cleanup is still running revives it.
+                        val existingRoot = getOfflineRoot(folder.id, customRealm = realm)
+                        realm.executeTransaction { if (existingRoot != null && existingRoot.isValid) existingRoot.isPendingRemoval = false }
+                        updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
+                        stateChanged = true
                     }
+                    // The generation is recorded ONLY for a committed state change (issue:
+                    // round 13 #7): an "already active" answer must not masquerade as a
+                    // revival, and a false return here is now a reliable fresh answer.
+                    if (stateChanged) noteRootIntentChange(folder.id)
+                    stateChanged
                 }
             }
         }
