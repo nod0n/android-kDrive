@@ -148,7 +148,12 @@ class DownloadProgressViewModel : ViewModel() {
         // invalidated intent.
         downloadProgressLiveData.postValue(
             when (outcome) {
-                PublicationOutcome.SKIPPED_INVALIDATED, PublicationOutcome.FAILED, PublicationOutcome.SKIPPED_CONFLICT -> null
+                // An unresolved generation is never a completed download (issue: round 20
+                // #14): the bytes were published, but no generation proof exists — the
+                // dialog reports no 100 over them.
+                PublicationOutcome.SKIPPED_INVALIDATED, PublicationOutcome.FAILED,
+                PublicationOutcome.SKIPPED_CONFLICT, PublicationOutcome.PUBLISHED_UNRESOLVED,
+                -> null
                 PublicationOutcome.SKIPPED_SUPERSEDED -> {
                     // Supersession is completion only when the CURRENT row still owns the
                     // scoped destination AND that destination holds usable content (issue:

@@ -438,6 +438,10 @@ class DownloadOfflineFileManager(
                 // round 8 #9): this transfer's skip clears no marker and runs no completion.
                 CachePromotionOutcome.DEFERRED
             }
+            // UNRESOLVED generation (issue: round 20 #14): the bytes are published but the
+            // generation is unproven — the promotion is NOT fulfilled (the marker stays,
+            // the root's incompleteness is retained via the unresolved-outcome set).
+            PublicationOutcome.PUBLISHED_UNRESOLVED -> CachePromotionOutcome.DEFERRED
             PublicationOutcome.FAILED -> CachePromotionOutcome.FAILED
         }
     }
@@ -575,6 +579,11 @@ class DownloadOfflineFileManager(
                     // transfer actually published; skipped outcomes leave the existing content
                     // untouched (issue: round 4 #1).
                     PublicationOutcome.PUBLISHED -> onProgress(100, file.id)
+                    // UNRESOLVED generation (issue: round 20 #14): bytes are published but
+                    // the generation is unproven — NO 100, no completion; the transfer's
+                    // work is done (success) while lastTransferSuperseded (set membership)
+                    // retains the batch's and root's incompleteness.
+                    PublicationOutcome.PUBLISHED_UNRESOLVED -> Unit
                     PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
                         // Marker completion is conditional INSIDE the validating section
                         // (issue: round 17 #7); an invalidated old transfer clears nothing.
@@ -697,11 +706,29 @@ class DownloadOfflineFileManager(
 
         private const val STAGING_FOLDER = "offline_staging"
 
-        internal enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_CONFLICT, SKIPPED_INVALIDATED, SKIPPED_SUPERSEDED, FAILED }
+        internal enum class PublicationOutcome {
+            PUBLISHED,
+            SKIPPED_PROTECTED,
+            SKIPPED_CONFLICT,
+            SKIPPED_INVALIDATED,
+            SKIPPED_SUPERSEDED,
+            FAILED,
 
-        /** Outcomes that must retain Bulk/root incompleteness (issue: round 17 #7). */
+            /** Bytes published, generation UNRESOLVED (issue: round 20 #14): a both-unknown
+             * coarse-baseline tie cannot prove the published generation — never a
+             * completion, never a 100, never a marker clear, never a root completion.
+             * Typed so every public caller distinguishes it from PUBLISHED. */
+            PUBLISHED_UNRESOLVED,
+        }
+
+        /** Outcomes that must retain Bulk/root incompleteness (issues: round 17 #7, round 20 #14). */
         private val UNRESOLVED_PUBLICATION_OUTCOMES =
-            setOf(PublicationOutcome.SKIPPED_SUPERSEDED, PublicationOutcome.SKIPPED_CONFLICT, PublicationOutcome.SKIPPED_INVALIDATED)
+            setOf(
+                PublicationOutcome.SKIPPED_SUPERSEDED,
+                PublicationOutcome.SKIPPED_CONFLICT,
+                PublicationOutcome.SKIPPED_INVALIDATED,
+                PublicationOutcome.PUBLISHED_UNRESOLVED,
+            )
 
         /** Suffix of the old SIBLING sidecar experiment — never written or deleted again (round 17 #1). */
         private const val CACHE_PROVENANCE_SUFFIX = ".offlinegen"
@@ -1233,14 +1260,17 @@ class DownloadOfflineFileManager(
                     }
                 }
                 // Run the owner's completion while the per-file lock is still held
-                // (issue: round 5 #2) — but NOT for an UNRESOLVED generation (issue: round
-                // 19 #14): the coverage/flag writes, the downloaded notification, the media
-                // scan and the promotion-cache cleanup all assert a generation identity
-                // that neither side could prove. The bytes stay published (the record's
-                // version-0 identity keeps the copy non-current); a later pass with the
-                // authoritative identity completes the file, and no marker is cleared on
-                // this unresolved outcome.
-                if (!unresolvedGeneration) onPublishedLocked?.invoke()
+                // (issue: round 5 #2) — and for an UNRESOLVED generation (issues: round 19
+                // #14, round 20 #14) return the TYPED unresolved outcome instead of
+                // PUBLISHED: neither the completion callbacks (coverage/flag writes,
+                // downloaded notification, media scan, promotion-cache cleanup) nor any
+                // caller's success/100/marker-clear may fire over a generation neither
+                // side could prove. The bytes stay published (the record's version-0
+                // identity keeps the copy non-current); a later pass with the
+                // authoritative identity completes the file, and Bulk/root incompleteness
+                // is retained through the unresolved-outcome set.
+                if (unresolvedGeneration) return PublicationOutcome.PUBLISHED_UNRESOLVED
+                onPublishedLocked?.invoke()
                 return PublicationOutcome.PUBLISHED
             } else {
                 // A FAILED RENAME NEVER DELETES THE OLD TARGET (issue: round 19 #11): the
