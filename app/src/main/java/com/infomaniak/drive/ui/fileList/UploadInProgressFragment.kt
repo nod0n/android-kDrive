@@ -204,13 +204,18 @@ class UploadInProgressFragment : FileListFragment() {
         viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
             var needPopBackStack = false
             uploadFile?.let {
+                // Durable local stop FIRST, best-effort remote cancellation second (issue:
+                // round 10 #11): the removal publishes the exact-URI signal and soft-deletes
+                // the record transactionally, so a blocking or failing session request can
+                // never leave the record pending for the worker to start or finish.
+                UploadFile.deleteAll(listOf(it))
                 it.uploadToken?.let { token ->
                     // The session belongs to the displayed record's own drive (issue:
                     // round 6 #9): the current drive would cancel the wrong session when the
-                    // view shows shared-drive uploads.
-                    ApiRepository.cancelSession(it.driveId, token, it.okHttpClient)
+                    // view shows shared-drive uploads. A remote failure does not undo the
+                    // durable local stop.
+                    runCatching { ApiRepository.cancelSession(it.driveId, token, it.okHttpClient) }
                 }
-                UploadFile.deleteAll(listOf(it))
             }
             folderId?.let {
                 // The EXACT intended set is captured once, from fresh per-group queries that
@@ -230,8 +235,16 @@ class UploadInProgressFragment : FileListFragment() {
                             remoteFolder = recordFolder,
                         )
                     }
-                capturedRecords.forEach { record -> UploadFile.cancelSessionOf(record) }
+                // Transactionally stop the exact captured set FIRST — the removal publishes
+                // each record's exact-URI signal and soft-deletes it, so a worker can no
+                // longer start or finish any captured record while the remote cancellations
+                // below are still in flight (issue: round 10 #11).
                 UploadFile.deleteAll(capturedRecords)
+                // Best-effort remote session cancellation with the same captured records:
+                // a remote failure never undoes or prevents the durable local stop.
+                capturedRecords.forEach { record ->
+                    runCatching { UploadFile.cancelSessionOf(record) }
+                }
 
                 fileRecyclerView?.post { fileAdapter.setFiles(listOf()) }
 

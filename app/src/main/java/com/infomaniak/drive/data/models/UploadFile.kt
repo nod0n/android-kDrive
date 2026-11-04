@@ -27,9 +27,7 @@ import androidx.core.net.toFile
 import androidx.core.net.toUri
 import com.infomaniak.core.common.utils.SECONDS_IN_A_DAY
 import com.infomaniak.core.common.utils.format
-import com.infomaniak.core.network.models.exceptions.NetworkException
 import com.infomaniak.drive.data.api.ApiRepository
-import com.infomaniak.drive.data.api.UploadTask
 import com.infomaniak.drive.data.api.UploadTask.Companion.ConflictOption
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.sync.UploadMigration
@@ -69,15 +67,31 @@ import kotlin.coroutines.EmptyCoroutineContext
  */
 object UploadCancellationSignal {
     private val cancelledUris: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    private val activeJobs: java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job> =
+        java.util.concurrent.ConcurrentHashMap()
 
     fun cancel(uri: String) {
         cancelledUris.add(uri)
+        // IMMEDIATE executing-task cancellation (issue: round 10 #10): the polling watcher
+        // alone is bounded by its interval, and a blocking request could complete before it
+        // even starts observing — a registered executing job is cancelled directly.
+        activeJobs.remove(uri)?.cancel()
     }
 
     fun isCancelled(uri: String): Boolean = cancelledUris.contains(uri)
 
     fun clear(uri: String) {
         cancelledUris.remove(uri)
+        activeJobs.remove(uri)
+    }
+
+    fun registerJob(uri: String, job: kotlinx.coroutines.Job) {
+        activeJobs[uri] = job
+        if (cancelledUris.contains(uri)) cancel(uri)
+    }
+
+    fun unregisterJob(uri: String) {
+        activeJobs.remove(uri)
     }
 
     /** Thrown into the racing upload by [awaitCancellation]; NOT a coroutine cancellation. */
@@ -211,20 +225,25 @@ open class UploadFile(
 
     private fun deleteIfExistsInternal(keepFile: Boolean = false, realm: Realm) {
         val uploadFileProxy = uploadFileByUriQuery(realm, uri).findFirst() ?: return
-        // The record's removal publishes the exact-URI stop signal (issue: round 9 #9).
+        val capturedToken = uploadFileProxy.uploadToken
+        val capturedDriveId = uploadFileProxy.driveId
+        val capturedClient = uploadFileProxy.okHttpClient
+        // The record's removal publishes the exact-URI stop signal (issue: round 9 #9), and
+        // the DURABLE local stop commits BEFORE any network call (issue: round 10 #11): a
+        // remote-cancellation failure can no longer leave a pending record that uploads
+        // again after a process restart.
         UploadCancellationSignal.cancel(uri)
-        // Cancel session if exists
-        uploadFileProxy.uploadToken?.let { uploadToken ->
-            val response = ApiRepository.cancelSession(uploadFileProxy.driveId, uploadToken, okHttpClient)
-            if (response.error?.exception is NetworkException) throw UploadTask.NetworkException()
-        }
-        // Delete in realm. An UNSENT SYNC_OFFLINE record (validation failure, quota, cancel) is
-        // the durable owner of the only copy of an offline edit: it is always retained as a
-        // soft-deleted record, regardless of the caller's keepFile request (issue: round 5 #1).
         val unsentOfflineEdit = uploadFileProxy.isSyncOffline() && uploadFileProxy.uploadAt == null
         realm.executeTransaction {
             if (uploadFileProxy.isValid) {
                 if (keepFile || unsentOfflineEdit) uploadFileProxy.deletedAt = Date() else uploadFileProxy.deleteFromRealm()
+            }
+        }
+        // Best-effort remote cancellation with the CAPTURED session identity, AFTER the
+        // durable stop: the local cancellation stands regardless of the network outcome.
+        capturedToken?.let { token ->
+            runCatching {
+                ApiRepository.cancelSession(capturedDriveId, token, capturedClient)
             }
         }
     }

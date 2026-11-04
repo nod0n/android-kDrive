@@ -133,7 +133,23 @@ class UploadTask(
                         engine { preconfigured = uploadFile.okHttpClient }
                     }
                     when {
-                        uploadFile.fileSize == 0L -> uploadEmptyFile(uploadFile)
+                        uploadFile.fileSize == 0L -> {
+                            val emptyUploadResponse = uploadEmptyFile(uploadFile)
+                            if (!emptyUploadResponse.isSuccess()) {
+                                // Route the failure through the existing upload-error handling
+                                // (issue: round 10 #1): the previous code ignored the response
+                                // status, so a quota/authorization error reached
+                                // finishUpload — marking the record uploaded and DISPOSING its
+                                // sole retained zero-byte snapshot. Throwing here lands in
+                                // start()'s error catches, which retain an unsent offline
+                                // snapshot (deletedAt soft-delete, bytes kept) and never run
+                                // completion.
+                                throw emptyUploadResponse.error?.exception
+                                    ?: IllegalStateException(
+                                        "Empty upload failed: ${emptyUploadResponse.translatedError}"
+                                    )
+                            }
+                        }
                         uploadFile.fileSize <= MIN_FILE_SIZE_FOR_CHUNKING -> uploadDirectly(httpClient)
                         else -> uploadInChunks(httpClient)
                     }
@@ -471,11 +487,11 @@ class UploadTask(
         )
     }
 
-    private fun UploadFile.getValidChunks(): ValidChunks? {
+    private suspend fun UploadFile.getValidChunks(): ValidChunks? {
         return uploadToken?.let { ApiRepository.getValidChunks(uploadFile.driveId, it, okHttpClient).data }
     }
 
-    private fun UploadFile.prepareUploadSession(totalChunks: Int): String? {
+    private suspend fun UploadFile.prepareUploadSession(totalChunks: Int): String? {
         val sessionBody = UploadSession.StartSessionBody(
             conflict = uploadConflictOption(),
             createdAt = if (fileCreatedAt == null) null else fileCreatedAt!!.time / 1_000L,

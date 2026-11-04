@@ -220,36 +220,53 @@ object ApiRepository : ApiRepositoryCore() {
         return callApiWithCursor(url, GET, okHttpClient = okHttpClient)
     }
 
-    fun getValidChunks(driveId: Int, uploadToken: String, okHttpClient: OkHttpClient): ApiResponse<ValidChunks> {
+    /** Cancellable suspend HTTP, like the other session APIs (issue: round 10 #10). */
+    suspend fun getValidChunks(driveId: Int, uploadToken: String, okHttpClient: OkHttpClient): ApiResponse<ValidChunks> {
         val url = "${ApiRoutes.getSession(driveId, uploadToken)}?status[]=${ChunkStatus.OK}&with=chunks"
-        return callApi(url, GET, okHttpClient = okHttpClient)
+        return callApiSuspend(url, GET, okHttpClient = okHttpClient)
     }
 
-    fun startUploadSession(driveId: Int, body: StartSessionBody, okHttpClient: OkHttpClient): ApiResponse<StartUploadSession> {
-        return callApi(ApiRoutes.startUploadSession(driveId), POST, body, okHttpClient = okHttpClient)
+    /**
+     * Cancellable suspend HTTP (issue: round 10 #10): the blocking variant's `execute()` is
+     * uncancellable, so a stop signal could neither prevent session creation nor abort a
+     * running finalization; the suspend variant awaits the OkHttp [Call], whose cancellation
+     * reaches the underlying request.
+     */
+    suspend fun startUploadSession(
+        driveId: Int,
+        body: StartSessionBody,
+        okHttpClient: OkHttpClient,
+    ): ApiResponse<StartUploadSession> {
+        return callApiSuspend(ApiRoutes.startUploadSession(driveId), POST, body, okHttpClient = okHttpClient)
     }
 
-    fun finishSession(driveId: Int, uploadToken: String, okHttpClient: OkHttpClient): ApiResponse<UploadSession> {
-        return callApi(ApiRoutes.closeSession(driveId, uploadToken), POST, okHttpClient = okHttpClient)
+    suspend fun finishSession(driveId: Int, uploadToken: String, okHttpClient: OkHttpClient): ApiResponse<UploadSession> {
+        return callApiSuspend(ApiRoutes.closeSession(driveId, uploadToken), POST, okHttpClient = okHttpClient)
     }
 
     fun cancelSession(driveId: Int, uploadToken: String, okHttpClient: OkHttpClient): ApiResponse<Boolean> {
         return callApi(ApiRoutes.getSession(driveId, uploadToken), DELETE, okHttpClient = okHttpClient)
     }
 
+    /**
+     * The record's OWN captured client and conflict option (issue: round 10 #1): the empty
+     * upload previously used the active-account client and a hard-coded RENAME, and its
+     * response status was never checked — an API error reached completion and disposed the
+     * sole retained snapshot.
+     */
     suspend fun uploadEmptyFile(uploadFile: UploadFile) = with(uploadFile) {
         val uploadUrl = ApiRoutes.uploadFileDirectlyUrl(
             driveId = driveId,
             directoryId = remoteFolder,
             fileName = fileName,
             fileSize = 0L,
-            conflictOption = ConflictOption.RENAME,
+            conflictOption = uploadConflictOption(),
             directoryPath = remoteSubFolder,
             createdAt = uploadFile.fileCreatedAt,
             lastModifiedAt = Date(uploadFile.getLastModified()),
         )
 
-        ApiController.callApi<ApiResponse<File>>(uploadUrl, POST, okHttpClient = AuthHttpClientProvider.authOkHttpClient)
+        ApiController.callApi<ApiResponse<File>>(uploadUrl, POST, okHttpClient = okHttpClient)
     }
 
     fun createFolder(

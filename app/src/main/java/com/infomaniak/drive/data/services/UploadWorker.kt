@@ -78,6 +78,8 @@ import io.sentry.SentryLevel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -388,14 +390,33 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             uploadNotificationBuilder = uploadNotificationBuilder
         ).run {
             currentUploadTask = this
-            start().also { isUploaded ->
-                if (isUploaded) {
-                    // If the below is true, will be deleted after the user confirms pictures deletion.
-                    val toBeDeletedLater = UploadFile.getAppSyncSettings()?.deleteAfterSync == true && isSync()
-                    if (!toBeDeletedLater) deleteIfExists(keepFile = isSync())
-                }
+            // The executing transfer runs in a CHILD JOB registered under its exact uri
+            // (issue: round 10 #10): a published stop cancels it immediately — not only at
+            // the watcher's next poll — and the cancellable suspend HTTP calls abort the
+            // underlying requests. A genuine outer cancellation still propagates as one.
+            coroutineScope {
+                val uploadDeferred = async { start() }
+                UploadCancellationSignal.registerJob(uri, uploadDeferred)
+                try {
+                    val isUploaded = try {
+                        uploadDeferred.await()
+                    } catch (exception: CancellationException) {
+                        if (UploadCancellationSignal.isCancelled(uri)) {
+                            throw UploadCancellationSignal.UploadStoppedByUserException(uri)
+                        }
+                        throw exception
+                    }
+                    if (isUploaded) {
+                        // If the below is true, will be deleted after the user confirms pictures deletion.
+                        val toBeDeletedLater = UploadFile.getAppSyncSettings()?.deleteAfterSync == true && isSync()
+                        if (!toBeDeletedLater) deleteIfExists(keepFile = isSync())
+                    }
 
-                SentryLog.d(TAG, "startUploadFile> end upload file")
+                    SentryLog.d(TAG, "startUploadFile> end upload file")
+                    isUploaded
+                } finally {
+                    UploadCancellationSignal.unregisterJob(uri)
+                }
             }
         }
     }
