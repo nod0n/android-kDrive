@@ -114,20 +114,30 @@ class DownloadOfflineFileManager(
         // incomplete, the transfer aborts with the OLD metadata intact: nothing is stranded,
         // and the offline sync retries (issue: round 4 #9).
         val remoteFile = fetchRemoteFileDetails(context, file.id)
-        val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
-            OfflineFolderController.reconcileOwnedCopiesBeforeCommit(realm, listOf(remoteFile), userDrive).first()
-        }
-        if (commitFile !== remoteFile) {
-            SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
-            return ListenableWorker.Result.failure()
-        }
+        // ONE coordinated operation (issue: round 11 #2): the file's coordination lock spans
+        // the stale-response validation, the preservation side effects and the metadata
+        // commit, so no identity writer can interleave between them — a response rejected as
+        // stale leaves NO filesystem or upload-queue side effect, and an accepted one cannot
+        // be superseded between its validation and its commit. The per-file acquisitions
+        // inside the boundary and the commit reenter this lock.
+        val committed = OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
+            val commitFile = FileController.getRealmInstance(userDrive).use { realm ->
+                OfflineFolderController.reconcileOwnedCopiesBeforeCommit(realm, listOf(remoteFile), userDrive).first()
+            }
+            if (commitFile !== remoteFile) {
+                SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
+                return@withFileLock false
+            }
 
-        // Conditional replacement (issue: round 10 #4): a delayed response from an older
-        // fetch must not roll back a newer generation another worker already committed —
-        // otherwise this transfer's later publication compares against the rolled-back row,
-        // passes, and leaves bytes and metadata describing different revisions.
-        val committed = FileController.getRealmInstance(userDrive).use { realm ->
-            FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive)
+            // Conditional replacement (issue: round 10 #4): a delayed response from an older
+            // fetch must not roll back a newer generation another worker already committed —
+            // otherwise this transfer's later publication compares against the rolled-back row,
+            // passes, and leaves bytes and metadata describing different revisions. The
+            // acceptance decision reads the live row INSIDE the committing transaction
+            // (issue: round 11 #5).
+            FileController.getRealmInstance(userDrive).use { realm ->
+                FileController.updateExistingFileIfNotOlder(newFile = commitFile, realm = realm, userDrive = userDrive)
+            }
         }
         if (!committed) {
             SentryLog.i(TAG, "Deferring refresh of file ${file.id}: a newer generation was committed while the metadata response was in flight")

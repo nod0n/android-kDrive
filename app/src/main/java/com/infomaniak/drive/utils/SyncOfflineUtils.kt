@@ -275,12 +275,16 @@ object SyncOfflineUtils {
                 downloadOutcome.handled
             }
             fileAction.lastAction in renameActions -> {
-                // Shared move handling (issue: round 5 #4): a rename/move is reconciled through
-                // the same protection-aware routine as the folder walk, under the captured
-                // account, BEFORE any metadata or filesystem mutation. The previous direct
-                // renameTo could overwrite a protected destination and lose its sole edit, and
-                // it resolved the target with the active account.
-                if (ioFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
+                // Conditional acceptance BEFORE preservation side effects (issues: round 11
+                // #2/#4): an action superseded by an already-committed NEWER GENERATION of the
+                // file must not move the bytes to its obsolete target or relabel the live row;
+                // the newer generation's own flow owns this file's identity, so the action is
+                // consumed with no side effect. Generation-only: an identity difference at
+                // equal revisions is the change this action applies, not staleness.
+                val liveRow = FileController.getFileById(realm, localFile.id)
+                if (liveRow != null && FileController.isSupersededGeneration(liveRow, remoteFile)) {
+                    true
+                } else if (ioFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
                         context = context,
                         oldOfflineFile = ioFile,
                         oldIdentityName = localFile.name,
@@ -296,8 +300,11 @@ object SyncOfflineUtils {
                     false
                 } else {
                     // Bytes are safely at (or durably registered for) the new location: commit
-                    // the new identity so the row and the offline path agree.
-                    FileController.updateExistingFile(newFile = remoteFile, realm = realm, userDrive = userDrive)
+                    // the new identity so the row and the offline path agree. Conditional
+                    // (issue: round 11 #4): a newer generation committed in the acceptance
+                    // window wins; the action is consumed either way — its preservation is
+                    // done, and re-queueing a superseded rename would retry forever.
+                    FileController.updateExistingFileIfNotSuperseded(newFile = remoteFile, realm = realm, userDrive = userDrive)
                     true
                 }
             }
@@ -446,6 +453,16 @@ object SyncOfflineUtils {
         realm: Realm,
     ): DownloadActionOutcome {
         val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return DownloadActionOutcome(handled = false)
+        // Conditional acceptance BEFORE any preservation side effect (issues: round 11 #2/#4):
+        // a refresh superseded by an already-committed NEWER GENERATION must not move the
+        // bytes or relabel the live row; the newer generation's own flow owns this file's
+        // identity, so the action is consumed with no side effect. Generation-only: an
+        // identity difference at equal revisions is the change this action applies. The
+        // authoritative revalidation still happens inside the committing transaction below.
+        val liveRow = FileController.getFileById(realm, file.id)
+        if (liveRow != null && FileController.isSupersededGeneration(liveRow, remoteFile)) {
+            return DownloadActionOutcome(handled = true)
+        }
         val pathChanged = offlineFile.path != remoteOfflineFile.path
 
         if (pathChanged) {
@@ -486,9 +503,15 @@ object SyncOfflineUtils {
                 realm = realm,
                 remoteFiles = listOf(remoteFile),
                 userDrive = userDrive,
+                // Authoritative-change flow: the generation-only gate (issue: round 11 #4) —
+                // an identity difference at equal revisions is the move this action applies.
+                isStale = { live, incoming -> FileController.isSupersededGeneration(live, incoming) },
             ).first()
             if (commitFile !== remoteFile) return DownloadActionOutcome(handled = false)
-            FileController.updateExistingFile(newFile = remoteFile, realm = realm, userDrive = userDrive)
+            // Conditional commit (issue: round 11 #4/#5): a newer generation committed in the
+            // acceptance window wins; the enqueued download revalidates everything itself, so
+            // the action is consumed either way.
+            FileController.updateExistingFileIfNotSuperseded(newFile = remoteFile, realm = realm, userDrive = userDrive)
             // Preserve the download origin: a refresh of a file covered by an offline folder is
             // an inherited download, so its completion can never manufacture an explicit pin
             // after an unmark (issue #1902). The enqueue's Operation is returned UNAWAITED

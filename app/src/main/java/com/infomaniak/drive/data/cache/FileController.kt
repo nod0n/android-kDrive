@@ -579,10 +579,14 @@ object FileController {
         // Shared upsert boundary (issue: round 5 #5): an activity refresh can carry a
         // rename/move; the owned copy at the old location is preserved before the metadata
         // replacement, and a deferred reconciliation keeps the OLD row authoritative.
+        // Authoritative-change flow (the activity event IS the change): the generation-only
+        // gate — an identity difference at equal revisions is the rename being applied, and a
+        // superseded ACTION is already prevented upstream by the activity ordering.
         val preservedActionFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
             realm = realm,
             remoteFiles = listOf(actionFile),
             userDrive = userDrive,
+            isStale = { live, incoming -> FileController.isSupersededGeneration(live, incoming) },
         ).first()
         realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
             if (!realmFolder.children.contains(preservedActionFile)) {
@@ -631,21 +635,80 @@ object FileController {
     }
 
     /**
-     * Conditional metadata replacement (issue: round 10 #4): the incoming row commits only
-     * when the live row's SERVER generation is not newer than the incoming one — [File.revisedAt]
-     * is the server's revision sequence (every re-upload creates a new revision), unlike the
-     * file modification time, which a re-upload can legitimately move backwards. The check and
-     * the commit share the per-file coordination, so a delayed older response can no longer
-     * roll back a newer committed generation between the publication's supersession check and
-     * its rename. Returns false (nothing written) when the incoming row is stale.
+     * Whether [incoming] metadata describes a STRICTLY OLDER SERVER GENERATION than the live
+     * row and must be rejected by every conditional path (issues: round 10 #4, round 11 #4/#6).
+     *
+     * [File.revisedAt] is the server's revision sequence in SECONDS (every re-upload creates a
+     * new revision), unlike the modification time, which a re-upload can legitimately move
+     * backwards — a strictly older revisedAt is superseded, a strictly newer one is accepted
+     * even with a backward mtime. Legacy rows whose revisedAt was never populated fall back to
+     * the modification baseline, and a revision-less incoming row never replaces a row that
+     * holds a server revision.
+     *
+     * This generation-only rule governs flows where the incoming identity IS the change being
+     * applied (the sync's rename/move actions): an identity difference at equal revisions is
+     * the action's purpose there, not staleness.
+     */
+    internal fun isSupersededGeneration(live: File, incoming: File): Boolean = when {
+        live.revisedAt > incoming.revisedAt -> true
+        live.revisedAt == 0L && incoming.revisedAt == 0L -> incoming.lastModifiedAt < live.lastModifiedAt
+        else -> false
+    }
+
+    /**
+     * Whether [incoming] metadata must be rejected by a REPLACEMENT boundary — a path whose
+     * incoming row would overwrite the live one wholesale (listings, the download manager's
+     * refresh, graph imports). Adds the equal-revision identity rule to
+     * [isSupersededGeneration] (issue: round 11 #6): equal seconds are NOT the same revision —
+     * two revisions inside the same timestamp interval are only the same generation when the
+     * observed location identity (name, parent) and modification baseline match too. A delayed
+     * response of the OTHER revision must not roll the location or baseline back; such a
+     * response is deferred (refetched) rather than applied.
+     */
+    internal fun isStaleReplacement(live: File, incoming: File): Boolean = when {
+        isSupersededGeneration(live, incoming) -> true
+        live.revisedAt == incoming.revisedAt && live.revisedAt != 0L ->
+            live.lastModifiedAt != incoming.lastModifiedAt ||
+                live.parentId != incoming.parentId ||
+                live.name != incoming.name
+        else -> false
+    }
+
+    /**
+     * Conditional metadata replacement (issue: round 10 #4, refined round 11 #4/#5/#6): the
+     * incoming row commits only when it is not stale against the LIVE row read INSIDE the
+     * committing transaction — the caller's Realm view can lag a commit from another thread
+     * (lock wait, no-Looper realm), so the acceptance decision must not be made against a
+     * pre-transaction read. The check and the commit share the per-file coordination, so a
+     * delayed older response can no longer roll back a newer committed generation between the
+     * publication's supersession check and its rename. Returns false (nothing written) when
+     * the incoming row is stale or the row vanished.
      */
     fun updateExistingFileIfNotOlder(newFile: File, realm: Realm, userDrive: UserDrive): Boolean {
-        return OfflineFileCoordination.withFileLock(userDrive, newFile.id) {
-            val live = getFileById(realm, newFile.id) ?: return@withFileLock false
-            if (live.revisedAt > newFile.revisedAt) return@withFileLock false
-            insertOrUpdateFile(realm, newFile, live, userDrive)
-            true
-        }
+        return insertOrUpdateFile(
+            realm = realm,
+            newFile = newFile,
+            oldFile = getFileById(realm, newFile.id),
+            userDrive = userDrive,
+            acceptIf = { live -> !isStaleReplacement(live, newFile) },
+        )
+    }
+
+    /**
+     * Conditional metadata replacement for AUTHORITATIVE CHANGE flows (the offline sync's
+     * rename/move/download actions): the generation-only gate of [isSupersededGeneration] —
+     * the action's identity difference at equal revisions is the change being applied, and a
+     * stale ACTION is already prevented upstream by the activity-cursor ordering, so only a
+     * strictly newer committed revision may reject it.
+     */
+    fun updateExistingFileIfNotSuperseded(newFile: File, realm: Realm, userDrive: UserDrive): Boolean {
+        return insertOrUpdateFile(
+            realm = realm,
+            newFile = newFile,
+            oldFile = getFileById(realm, newFile.id),
+            userDrive = userDrive,
+            acceptIf = { live -> !isSupersededGeneration(live, newFile) },
+        )
     }
 
     private fun insertOrUpdateFile(
@@ -653,20 +716,32 @@ object FileController {
         newFile: File,
         oldFile: File? = null,
         userDrive: UserDrive,
-        moreTransaction: (() -> Unit)? = null
-    ) {
+        moreTransaction: (() -> Unit)? = null,
+        acceptIf: ((live: File) -> Boolean)? = null,
+    ): Boolean {
         // Identity/revision metadata writers share the publisher's per-file coordination
         // (issue: round 9 #7): without it, a writer could commit a newer identity or baseline
         // between the publisher's supersession check and its rename — the publisher's
         // check-and-rename is only a CAS if every identity/revision writer takes the same
         // lock. Reentrant locks reenter, so writers already holding the file's lock
         // (upload registration, move reconciliation) nest safely.
-        OfflineFileCoordination.withFileLock(userDrive, newFile.id) {
+        return OfflineFileCoordination.withFileLock(userDrive, newFile.id) {
+            var accepted = false
             realm.executeTransaction {
+                // Conditional acceptance INSIDE the committing transaction (issue: round 11 #5):
+                // the decision reads the transaction-fresh live row, so a response that was
+                // fresh when the caller fetched it is still revalidated against whatever
+                // committed during the coordination wait.
+                if (acceptIf != null) {
+                    val live = getFileById(realm, newFile.id)
+                    if (live == null || !acceptIf(live)) return@executeTransaction
+                }
                 if (oldFile?.isUsable() == true) newFile.keepOldLocalFilesData(oldFile)
                 moreTransaction?.invoke()
                 it.insertOrUpdate(newFile)
+                accepted = true
             }
+            accepted
         }
     }
 
@@ -739,21 +814,24 @@ object FileController {
         userDrive: UserDrive? = null
     ) {
         val block: (Realm) -> Unit = { currentRealm ->
-            // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6):
-            // Favorites/MyShares listings replace identities too.
-            val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                realm = currentRealm,
-                remoteFiles = files,
-                userDrive = userDrive ?: UserDrive(),
-            )
-            // Coordinated commit boundary BEFORE the transaction (issue: round 10 #3): the
-            // container folder and every committable child, ascending, share the publication
-            // lock set — a graph upsert cannot commit an identity/revision between the
-            // publisher's supersession check and its rename.
+            // Coordinated commit boundary BEFORE the boundary AND the transaction (issues:
+            // round 10 #3, round 11 #2): the container folder and every incoming child,
+            // ascending, share the publication lock set across the shared upsert boundary's
+            // validation/preservation AND the commit — one coordinated operation, so no
+            // identity writer can interleave between a file's freshness validation and its
+            // commit.
             OfflineFileCoordination.withLocksFor(
                 userDrive ?: UserDrive(),
-                listOf(folder.id) + committableFiles.map { it.id },
+                listOf(folder.id) + files.map { it.id },
             ) {
+                // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6):
+                // Favorites/MyShares listings replace identities too; a stale response is
+                // rejected here BEFORE any preservation side effect (issue: round 11 #4).
+                val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                    realm = currentRealm,
+                    remoteFiles = files,
+                    userDrive = userDrive ?: UserDrive(),
+                )
                 currentRealm.executeTransaction { realm ->
                     val newMySharesFolder = if (replaceOldData) {
                         realm.copyToRealmOrUpdate(folder)
@@ -850,7 +928,13 @@ object FileController {
                             remoteFiles = listOf(remoteFile),
                             userDrive = userDrive,
                         ).first()
-                        insertOrUpdateFile(realm, preservedFile, getFileProxyById(fileId, customRealm = realm), userDrive)
+                        insertOrUpdateFile(
+                            realm,
+                            preservedFile,
+                            getFileProxyById(fileId, customRealm = realm),
+                            userDrive,
+                            acceptIf = { live -> !isStaleReplacement(live, preservedFile) },
+                        )
                     }
                 }
                 remoteFile
@@ -993,33 +1077,40 @@ object FileController {
 
     fun storeFileActivities(fileActivities: ArrayList<FileActivity>, userDrive: UserDrive) {
         getRealmInstance(userDrive).use { realm ->
-            // Shared upsert boundary OUTSIDE the transaction (issue: round 7 #6): activity
-            // files are upserted recursively; an owned copy at a renamed/moved old location
-            // is preserved first, and a deferred activity keeps its OLD row. The request's
-            // captured scope flows through realm and preservation (issue: round 8 #4).
-            fileActivities.forEach { fileActivity ->
-                fileActivity.file?.let { file ->
-                    fileActivity.file = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                        realm = realm,
-                        remoteFiles = listOf(file),
-                        userDrive = userDrive,
-                    ).first()
-                }
-            }
-            // Coordinated commit boundary before the transaction (issue: round 10 #3): the
-            // activity rows cascade their embedded file rows, so every affected file id joins
-            // the lock set.
+            // Coordinated commit boundary BEFORE the boundary AND the transaction (issues:
+            // round 10 #3, round 11 #2): the activity rows cascade their embedded file rows,
+            // so every affected file id joins the lock set across the shared upsert
+            // boundary's validation/preservation AND the commit — one coordinated operation.
             val affectedFileIds = fileActivities.mapNotNull { fileActivity -> fileActivity.file?.id }
             OfflineFileCoordination.withLocksFor(userDrive, affectedFileIds) {
+                // Shared upsert boundary OUTSIDE the transaction (issue: round 7 #6): activity
+                // files are upserted recursively; an owned copy at a renamed/moved old location
+                // is preserved first, and a deferred activity keeps its OLD row. The request's
+                // captured scope flows through realm and preservation (issue: round 8 #4).
+                fileActivities.forEach { fileActivity ->
+                    fileActivity.file?.let { file ->
+                        fileActivity.file = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                            realm = realm,
+                            remoteFiles = listOf(file),
+                            userDrive = userDrive,
+                        ).first()
+                    }
+                }
                 realm.beginTransaction()
                 fileActivities.forEach { fileActivity ->
                     fileActivity.userId = fileActivity.user?.id
-                    fileActivity.file?.let { file ->
+                    val activityFile = fileActivity.file
+                    val liveFile = activityFile?.let { file ->
                         realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
-                    }?.let { localFile ->
-                        fileActivity.file?.keepOldLocalFilesData(localFile)
                     }
-                    realm.insertOrUpdate(fileActivity)
+                    // Conditional acceptance INSIDE the committing transaction (issue: round
+                    // 11 #5): a delayed activity carrying an older generation of a file whose
+                    // newer revision another writer already committed is skipped entirely —
+                    // inserting it would cascade the stale embedded row over the live one.
+                    if (activityFile == null || liveFile == null || !isStaleReplacement(liveFile, activityFile)) {
+                        liveFile?.let { file -> activityFile?.keepOldLocalFilesData(file) }
+                        realm.insertOrUpdate(fileActivity)
+                    }
                 }
                 realm.commitTransaction()
             }
@@ -1033,11 +1124,14 @@ object FileController {
         customRealm: Realm? = null,
     ) {
         val block: (Realm) -> Unit = { currentRealm ->
-            // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6). The
-            // request's captured scope flows through realm and preservation (issue: round 8 #4).
-            val committableMedia = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(currentRealm, mediaList, userDrive)
-            // Coordinated commit boundary before the transaction (issue: round 10 #3).
-            OfflineFileCoordination.withLocksFor(userDrive, listOf(Gallery.id) + committableMedia.map { media -> media.id }) {
+            // Coordinated commit boundary BEFORE the boundary AND the transaction (issues:
+            // round 10 #3, round 11 #2): the Gallery container and every incoming media row,
+            // ascending, share the lock set across the shared upsert boundary's
+            // validation/preservation AND the commit — one coordinated operation.
+            OfflineFileCoordination.withLocksFor(userDrive, listOf(Gallery.id) + mediaList.map { media -> media.id }) {
+                // Shared upsert boundary OUTSIDE the write transaction (issue: round 7 #6). The
+                // request's captured scope flows through realm and preservation (issue: round 8 #4).
+                val committableMedia = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(currentRealm, mediaList, userDrive)
                 currentRealm.executeTransaction { realm ->
                     val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
                         ?: realm.copyToRealm(Gallery.file)
@@ -1051,10 +1145,17 @@ object FileController {
 
     private fun RealmList<File>.addAll(realm: Realm, files: List<File>) {
         files.forEach { file ->
-            realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()?.also { managedFile ->
-                file.keepOldLocalFilesData(managedFile)
+            val managedFile = realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
+            // Conditional acceptance INSIDE the committing transaction (issue: round 11 #5):
+            // a response that was fresh when its listing landed is revalidated against the
+            // transaction-fresh row; a stale one does not relabel or roll it back — the live
+            // row stays linked in the container instead of the incoming entry.
+            if (managedFile != null && isStaleReplacement(managedFile, file)) {
+                add(managedFile)
+            } else {
+                managedFile?.also { file.keepOldLocalFilesData(it) }
+                add(file)
             }
-            add(file)
         }
     }
 
@@ -1139,17 +1240,6 @@ object FileController {
     ) {
         val remoteFiles = apiResponse.data ?: return
 
-        // Shared upsert boundary (issue: round 5 #5): owned copies at renamed/moved locations
-        // are preserved BEFORE any metadata replacement — ordinary listings included, not only
-        // the walk. Deferred files keep their OLD row in the commit list. This runs OUTSIDE the
-        // write transaction below: reconciliation coordinates per-file ownership and performs
-        // file I/O.
-        val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-            realm = realm,
-            remoteFiles = remoteFiles,
-            userDrive = userDrive,
-        )
-
         // Save remote folder if it doesn't exist locally
         var newLocalFolderProxy: File? = null
         if (localFolderProxy == null && remoteFolder != null) {
@@ -1163,22 +1253,35 @@ object FileController {
                 }
             }
         }
-        // Coordinated commit boundary before the transaction (issue: round 10 #3): the folder
-        // row (its properties and children list are identity-adjacent state) and every
-        // committable child, ascending.
+        // Coordinated commit boundary BEFORE the shared boundary AND the transaction (issues:
+        // round 10 #3, round 11 #2): the folder row (its properties and children list are
+        // identity-adjacent state) and every incoming child, ascending — one coordinated
+        // operation spans the shared boundary's validation/preservation and the commit, so no
+        // identity writer can interleave between a file's freshness validation and its commit.
         OfflineFileCoordination.withLocksFor(
             userDrive,
-            listOfNotNull(localFolderProxy?.id, remoteFolder?.id) + committableFiles.map { file -> file.id },
+            listOfNotNull(localFolderProxy?.id, remoteFolder?.id) + remoteFiles.map { file -> file.id },
         ) {
+            // Shared upsert boundary (issue: round 5 #5): owned copies at renamed/moved locations
+            // are preserved BEFORE any metadata replacement — ordinary listings included, not only
+            // the walk. Deferred files keep their OLD row in the commit list; a stale response is
+            // rejected before any preservation side effect (issue: round 11 #4). This runs OUTSIDE
+            // the write transaction below: reconciliation coordinates per-file ownership and
+            // performs file I/O.
+            val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                realm = realm,
+                remoteFiles = remoteFiles,
+                userDrive = userDrive,
+            )
             realm.executeTransaction {
                 // Restore same children data
-                keepSubFolderChildren(realm, localFolderProxy?.children, committableFiles)
+                val acceptedChildren = keepSubFolderChildren(realm, localFolderProxy?.children, committableFiles)
                 // Save to realm
                 (localFolderProxy ?: newLocalFolderProxy)?.let { folderProxy ->
                     // Remove old children
                     if (isFirstPage) folderProxy.children.clear()
                     // Add children
-                    folderProxy.children.addAll(committableFiles)
+                    folderProxy.children.addAll(acceptedChildren)
                     // Update folder properties
                     folderProxy.isComplete = isCompleteFolder
                     folderProxy.responseAt = apiResponse.responseAt
@@ -1189,18 +1292,34 @@ object FileController {
         }
     }
 
-    private fun keepSubFolderChildren(realm: Realm, localFolderChildren: List<File>?, remoteFolderChildren: List<File>) {
+    /**
+     * Applies the pre-commit child restoration INSIDE the listing transaction and returns the
+     * children to link: a child whose response is stale against the transaction-fresh live row
+     * (issue: round 11 #5) is substituted by that live row — the container keeps referencing
+     * the newer generation instead of the delayed response's, and the stale metadata never
+     * relabels it.
+     */
+    private fun keepSubFolderChildren(
+        realm: Realm,
+        localFolderChildren: List<File>?,
+        remoteFolderChildren: List<File>,
+    ): List<File> {
         val oldChildren = localFolderChildren?.associateBy { it.id }
-        remoteFolderChildren.forEach { newFile ->
+        return remoteFolderChildren.map { newFile ->
             newFile.sortedName = newFile.sortedName.lowercase().removeAccents()
 
             val oldChild = oldChildren?.get(newFile.id) ?: getFileById(realm, newFile.id)
-            oldChild?.let { oldFile ->
-                newFile.keepOldLocalFilesData(oldFile)
-            }
+            if (oldChild != null && isStaleReplacement(oldChild, newFile)) {
+                oldChild
+            } else {
+                oldChild?.let { oldFile ->
+                    newFile.keepOldLocalFilesData(oldFile)
+                }
 
-            // If the new file is an external import, start MQTT listening to receive its status updates.
-            if (newFile.isImporting()) MqttClientWrapper.start(newFile.externalImport?.id)
+                // If the new file is an external import, start MQTT listening to receive its status updates.
+                if (newFile.isImporting()) MqttClientWrapper.start(newFile.externalImport?.id)
+                newFile
+            }
         }
     }
 
@@ -1274,9 +1393,22 @@ object FileController {
     }
 
     private fun updateFileFromActivity(realm: Realm, remoteFile: File, folderId: Int, userDrive: UserDrive) {
-        getFileProxyById(remoteFile.id, customRealm = realm)?.let { localFile ->
-            insertOrUpdateFile(realm, remoteFile, localFile, userDrive)
-        } ?: also {
+        // Branch split on row EXISTENCE only (the conditional commit's result must not select
+        // the child-add path): a stale response keeps the live row and must not re-add it as a
+        // child of the container.
+        val localFile = getFileProxyById(remoteFile.id, customRealm = realm)
+        if (localFile != null) {
+            // Authoritative-change commit (activity event): generation-only gate (issue:
+            // round 11 #4) — an identity difference at equal revisions is the rename being
+            // applied, not a rollback.
+            insertOrUpdateFile(
+                realm,
+                remoteFile,
+                localFile,
+                userDrive,
+                acceptIf = { live -> !isSupersededGeneration(live, remoteFile) },
+            )
+        } else {
             // Coordinated commit boundary (issue: round 10 #3): the child-add is an identity
             // mutation of the new child and of the container's children list.
             OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId, remoteFile.id)) {
@@ -1313,7 +1445,13 @@ object FileController {
                 userDrive = userDrive,
             ).first()
             val localFile = getFileById(realm, preservedFile.id)
-            insertOrUpdateFile(realm, preservedFile, localFile, userDrive)
+            insertOrUpdateFile(
+                realm,
+                preservedFile,
+                localFile,
+                userDrive,
+                acceptIf = { live -> !isStaleReplacement(live, preservedFile) },
+            )
 
             val driveId = userDrive.driveId
             resolveAndLinkFileAncestorsChain(realm, preservedFile.parentId, preservedFile.id, driveId, userDrive, okHttpClient)
@@ -1385,7 +1523,12 @@ object FileController {
         isInOfflineFolder = oldFile.isInOfflineFolder
         responseAt = oldFile.responseAt
         if (path.isEmpty() && oldFile.path.isNotEmpty()) path = oldFile.path
-        if (oldFile.revisedAt > revisedAt) revisedAt = oldFile.revisedAt
+        // NO revisedAt transplant (issue: round 11 #4): the incoming row carries its own
+        // server revision; copying the live row's newer timestamp onto a stale incoming
+        // object would LABEL old content as the newer generation — the publication
+        // comparison and every later conditional acceptance would then treat that stale
+        // metadata as current. Stale responses are rejected by the acceptance gate before
+        // this point instead.
         if (oldFile.lastActionAt > lastActionAt) lastActionAt = oldFile.lastActionAt
         if (oldFile.updatedAt > updatedAt) updatedAt = oldFile.updatedAt
         versionCode = oldFile.versionCode

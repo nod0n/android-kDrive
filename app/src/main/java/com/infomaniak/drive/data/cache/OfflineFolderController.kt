@@ -558,12 +558,27 @@ object OfflineFolderController {
         realm: Realm,
         remoteFiles: List<File>,
         userDrive: UserDrive,
+        isStale: (live: File, incoming: File) -> Boolean = { live, incoming ->
+            FileController.isStaleReplacement(live, incoming)
+        },
     ): List<File> {
         val context = Realm.getApplicationContext() ?: return remoteFiles
         if (remoteFiles.isEmpty()) return remoteFiles
         return remoteFiles.map { remoteFile ->
             val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@map remoteFile
             if (oldRow.isFolder()) return@map remoteFile
+            // Stale-response gate BEFORE ANY preservation side effect (issue: round 11 #2/#4):
+            // when the live row already holds a newer server generation — or, for replacement
+            // boundaries, a different location identity at an equal revision — the incoming
+            // response describes a revision that no longer exists; reconciling its bytes would
+            // snapshot a current edit under the obsolete identity, delete the original, and
+            // then be rejected at the metadata commit, leaving the live row's bytes absent and
+            // an upload targeting the old location. The OLD row is returned in place: the
+            // caller commits (or defers to) the live state, and nothing on the filesystem or
+            // in the upload queue is touched. Authoritative-change callers (the offline sync's
+            // actions) pass the generation-only predicate — an identity difference at equal
+            // revisions is the change being applied there, not staleness.
+            if (isStale(oldRow, remoteFile)) return@map oldRow
             val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
                 ?: return@map remoteFile
             // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7).
