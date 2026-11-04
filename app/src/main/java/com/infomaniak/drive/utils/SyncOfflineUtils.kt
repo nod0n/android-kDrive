@@ -95,7 +95,12 @@ object SyncOfflineUtils {
                         context = context,
                         coroutineScope = this,
                         userDrive = userDrive,
-                        localFilesMap = it.associateBy { file -> file.id },
+                        // IMMUTABLE DETACHED observations (issue: round 15 #1): the map rows
+                        // are the request anchors — managed objects would be refreshed
+                        // together with the live rows inside the per-action coordination,
+                        // collapsing the historical state into the current one and defeating
+                        // the stale-action gate's tie resolution.
+                        localFilesMap = it.associateBy { file -> realm.copyFromRealm(file, 0) },
                         realm = realm,
                         pendingAdvances = pendingAdvances,
                     )
@@ -205,7 +210,6 @@ object SyncOfflineUtils {
                     context = context,
                     localFile = file,
                     remoteFile = null,
-                    ioFile = ioFile,
                     userDrive = userDrive,
                     realm = realm,
                 )
@@ -228,21 +232,50 @@ object SyncOfflineUtils {
 
         when (fileAction.lastAction) {
             FileActivityType.FILE_DELETE, FileActivityType.FILE_TRASH -> {
-                if (localFile.isOffline) {
-                    // Explicit pins keep the existing remote-wins behavior.
-                    ioFile.delete()
-                } else {
-                    // Inherited copies (issue #1902) go through the same preservation policy as
-                    // root removal: pending uploads and locally modified copies are protected
-                    // (snapshotted into the upload queue when needed) before bytes are dropped.
-                    OfflineFolderController.clearFileCoverage(
-                        context = context,
-                        realm = realm,
-                        file = localFile,
-                        userDrive = userDrive,
-                        result = OfflineFolderController.RemovalResult(),
-                        isFolder = false,
-                    )
+                // Deletion joins the per-action freshness protocol (issue: round 15 #3):
+                // intent monitor → file lock → fresh Realm BEFORE any byte or coverage side
+                // effect — an old trash response arriving after a restore, a move under
+                // another active root, or a redownload must not delete the current clean
+                // copy and coverage. When the action carries a file row, the complete
+                // action predicate gates it (the detached [localFile] is the request
+                // anchor); a legacy payload-less action applies the cursor bound alone, and
+                // ambiguous authority defers (nothing is cleared).
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withFileLock(userDrive, fileAction.fileId) {
+                        runCatching { realm.refresh() }
+                        val freshRow = FileController.getFileById(realm, fileAction.fileId)
+                            ?: return@withFileLock
+                        val actionAt = fileAction.lastActionAt
+                        val stale =
+                            (fileAction.file != null && FileController.isStaleForAuthoritativeAction(
+                                freshRow,
+                                fileAction.file,
+                                actionAt,
+                                observed = localFile,
+                            )) ||
+                                (actionAt != null && actionAt > 0 && freshRow.lastActionAt >= actionAt)
+                        if (stale) return@withFileLock
+                        val freshIoFile = freshRow.getOfflineFile(context, userDrive.userId)
+                        if (freshRow.isOffline) {
+                            // Explicit pins keep the existing remote-wins behavior.
+                            freshIoFile?.delete()
+                        } else {
+                            // Inherited copies (issue #1902) go through the same preservation
+                            // policy as root removal: pending uploads and locally modified
+                            // copies are protected (snapshotted into the upload queue when
+                            // needed) before bytes are dropped. The coverage clearing
+                            // reenters this section's monitor and lock.
+                            if (freshIoFile == null) return@withFileLock
+                            OfflineFolderController.clearFileCoverage(
+                                context = context,
+                                realm = realm,
+                                file = freshRow,
+                                userDrive = userDrive,
+                                result = OfflineFolderController.RemovalResult(),
+                                isFolder = false,
+                            )
+                        }
+                    }
                 }
             }
             else -> updateFile(context, ioFile, localFile, fileAction, userDrive, realm, pendingAdvances)
@@ -287,9 +320,9 @@ object SyncOfflineUtils {
                     val ioFileLastModified = ioFile.lastModified()
                     when {
                         ioFileLastModified > remoteFile.revisedAtInMillis ->
-                            uploadFile(context, localFile, remoteFile, ioFile, userDrive, realm, actionAt)
+                            uploadFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                         ioFileLastModified < remoteFile.revisedAtInMillis -> {
-                            downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm, actionAt)
+                            downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                             downloadOutcome.handled
                         }
                         fileAction.lastAction in renameActions -> {
@@ -301,15 +334,20 @@ object SyncOfflineUtils {
                             when {
                                 liveRow == null -> true
                                 FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionAt, observed = localFile) -> true
-                                ioFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
-                                    context = context,
-                                    oldOfflineFile = ioFile,
-                                    oldIdentityName = localFile.name,
-                                    oldIdentityParentId = localFile.parentId,
-                                    oldLastModifiedAt = localFile.lastModifiedAt,
-                                    newIdentity = remoteFile,
-                                    userDrive = userDrive,
-                                )
+                                // FRESH source (issue: round 15 #2): the bytes live at the
+                                // live row's current path — the pre-pass ioFile can be stale
+                                // or reused by another file.
+                                liveRow.getOfflineFile(context, userDrive.userId)?.let { freshSource ->
+                                    freshSource.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
+                                        context = context,
+                                        oldOfflineFile = freshSource,
+                                        oldIdentityName = localFile.name,
+                                        oldIdentityParentId = localFile.parentId,
+                                        oldLastModifiedAt = localFile.lastModifiedAt,
+                                        newIdentity = remoteFile,
+                                        userDrive = userDrive,
+                                    )
+                                } == true
                                 ->
                                     // Preservation incomplete (pending upload, snapshot
                                     // failed, protected destination): keep the old bytes and
@@ -381,21 +419,10 @@ object SyncOfflineUtils {
         context: Context,
         localFile: File,
         remoteFile: File?,
-        ioFile: IOFile,
         userDrive: UserDrive,
         realm: Realm,
         actionLastActionAt: Long? = null,
     ): Boolean {
-        val uri = Uri.fromFile(ioFile)
-        val fileModifiedAt = Date(ioFile.lastModified())
-
-        if (!UploadFile.canUpload(uri, fileModifiedAt)) {
-            // Not schedulable right now: the action stays pending for a later sync (issues:
-            // round 6 #11, round 7 #4). With per-revision snapshot registration this only
-            // trips for a legacy record still keyed by the original URI with the same
-            // modification date.
-            return false
-        }
         // Upload-source registration is a mutation owner of these bytes: it holds the shared
         // per-file coordination so a publication or cleanup cannot interleave (issue:
         // round 4 #4). The action predicate applies BEFORE the snapshot side effect (issue:
@@ -420,6 +447,27 @@ object SyncOfflineUtils {
                 FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionLastActionAt, observed = localFile)
             ) {
                 return true
+            }
+            // FRESH source resolution INSIDE coordination (issue: round 15 #2): the caller's
+            // ioFile was resolved from the pre-pass row and its timestamps captured before
+            // the lock — the live row may have moved meanwhile, and the old path can even be
+            // reused by another file, so registering bytes read there under this file's
+            // fresh identity would upload foreign content. Existence, size, modification
+            // date and the upload decision are re-read here, for the action and no-action
+            // branches alike.
+            val freshSource = liveRow.getOfflineFile(context, userDrive.userId)
+            if (freshSource == null || !freshSource.exists()) {
+                // Nothing owned at the current location: consume with no side effect.
+                return true
+            }
+            val uri = Uri.fromFile(freshSource)
+            val fileModifiedAt = Date(freshSource.lastModified())
+            if (!UploadFile.canUpload(uri, fileModifiedAt)) {
+                // Not schedulable right now: the action stays pending for a later sync
+                // (issues: round 6 #11, round 7 #4). With per-revision snapshot registration
+                // this only trips for a legacy record still keyed by the original URI with
+                // the same modification date.
+                return false
             }
             // Revision dedup under the file lock (issue: round 8 #7): the identity of a
             // registration is the captured owner + content revision + destination (name,
@@ -462,7 +510,7 @@ object SyncOfflineUtils {
             // content identity (fileName, folder, modification date).
             val snapshotUri = UploadFile.createDurableOfflineSnapshot(
                 context = context,
-                source = ioFile,
+                source = freshSource,
                 fileModifiedAt = fileModifiedAt,
                 fileId = localFile.id,
                 driveId = userDrive.driveId,
@@ -477,15 +525,15 @@ object SyncOfflineUtils {
                 // would recreate the old location remotely. The sweep path uses the FRESH
                 // row's identity (issue: round 14 #1), not the pre-pass map's snapshot.
                 fileName = remoteFile?.name ?: liveRow.name,
-                fileSize = ioFile.length(),
+                fileSize = freshSource.length(),
                 remoteFolder = remoteFile?.parentId ?: liveRow.parentId,
                 type = UploadFile.Type.SYNC_OFFLINE.name,
                 userId = userDrive.userId,
             ).store()
 
             if (remoteFile != null) {
-                remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
-                remoteFile.size = ioFile.length()
+                remoteFile.lastModifiedAt = freshSource.lastModified() / 1000
+                remoteFile.size = freshSource.length()
                 // Conditional advance (issues: round 12 #4, round 13 #3, round 14 #1): the
                 // uploaded snapshot's baseline must not roll back a strictly newer generation
                 // OR newer non-Sync metadata committed meanwhile; the action's nullable
@@ -518,12 +566,10 @@ object SyncOfflineUtils {
         context: Context,
         file: File,
         remoteFile: File,
-        offlineFile: IOFile,
         userDrive: UserDrive,
         realm: Realm,
         actionLastActionAt: Long?,
     ): DownloadActionOutcome {
-        val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return DownloadActionOutcome(handled = false)
         // Conditional acceptance BEFORE any preservation side effect (issues: round 11 #2/#4,
         // round 12 #5, round 13 #3/#10): a refresh superseded by an already-committed NEWER
         // GENERATION, by newer non-Sync metadata (updatedAt ordering), or whose row's
@@ -533,19 +579,31 @@ object SyncOfflineUtils {
         // so the action is consumed with no side effect. The authoritative revalidation
         // still happens inside the committing transaction below.
         val liveRow = FileController.getFileById(realm, file.id)
-        if (liveRow != null && FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionLastActionAt, observed = file)) {
+        if (liveRow == null) {
+            // The row is gone: nothing to refresh — consume.
             return DownloadActionOutcome(handled = true)
         }
-        val pathChanged = offlineFile.path != remoteOfflineFile.path
+        if (FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionLastActionAt, observed = file)) {
+            return DownloadActionOutcome(handled = true)
+        }
+        // FRESH row state and source path INSIDE the coordination (issue: round 15 #2): the
+        // caller's ioFile, marker and flags were resolved from the pre-pass row — the bytes
+        // live at the live row's current path and the marker/origin flags are the live
+        // row's, not the detached observation's.
+        val freshOffline = liveRow.getOfflineFile(context, userDrive.userId)
+            ?: return DownloadActionOutcome(handled = false)
+        val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId)
+            ?: return DownloadActionOutcome(handled = false)
+        val pathChanged = freshOffline.path != remoteOfflineFile.path
 
         if (pathChanged) {
             // A pending download marker leaves this refresh to the queued worker, which runs
             // its own protection checks: moving or deleting the bytes here would race it. The
             // action stays pending for a later sync (issue: round 6 #11).
-            if (file.isMarkedAsOffline) return DownloadActionOutcome(handled = false)
-            if (offlineFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
+            if (liveRow.isMarkedAsOffline) return DownloadActionOutcome(handled = false)
+            if (freshOffline.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
                     context = context,
-                    oldOfflineFile = offlineFile,
+                    oldOfflineFile = freshOffline,
                     oldIdentityName = file.name,
                     oldIdentityParentId = file.parentId,
                     oldLastModifiedAt = file.lastModifiedAt,
@@ -560,10 +618,10 @@ object SyncOfflineUtils {
             // The old location no longer holds this file's content (migrated, snapshotted
             // under the new identity, deleted as uploaded, or never existed): drop its stale
             // media index entry.
-            if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
+            if (liveRow.isMedia()) liveRow.deleteInMediaScan(context, userDrive)
         }
 
-        if (!file.isMarkedAsOffline && (!remoteFile.isOfflineAndIntact(remoteOfflineFile) || pathChanged)) {
+        if (!liveRow.isMarkedAsOffline && (!remoteFile.isOfflineAndIntact(remoteOfflineFile) || pathChanged)) {
             // Preservation against the OLD row baseline BEFORE the metadata replacement
             // (issue: round 8 #1): with baseline T1, an unregistered local edit T2 and a newer
             // remote revision T3 (T1 < T2 < T3), committing T3 metadata first would advance the
@@ -607,11 +665,11 @@ object SyncOfflineUtils {
                 context = context,
                 file = remoteFile,
                 userDrive = userDrive,
-                isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+                isInheritedDownload = liveRow.isInOfflineFolder && !liveRow.isOffline,
             )
             return DownloadActionOutcome(handled = true, pendingOperation = operation)
         }
-        if (file.isMarkedAsOffline && !remoteFile.isOfflineAndIntact(remoteOfflineFile)) {
+        if (liveRow.isMarkedAsOffline && !remoteFile.isOfflineAndIntact(remoteOfflineFile)) {
             // A pending marker alone does not prove that any worker owns the refresh (issue:
             // round 7 #16): it can outlive failed or cancelled work, and reporting this action
             // handled without durable work would advance the sync cursor past a missing or
@@ -623,7 +681,7 @@ object SyncOfflineUtils {
                 context = context,
                 file = remoteFile,
                 userDrive = userDrive,
-                isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
+                isInheritedDownload = liveRow.isInOfflineFolder && !liveRow.isOffline,
             )
             return DownloadActionOutcome(handled = true, pendingOperation = operation)
         }
