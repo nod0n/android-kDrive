@@ -259,83 +259,83 @@ object SyncOfflineUtils {
         pendingAdvances: MutableList<PendingCursorAdvance>,
     ): Boolean {
         val remoteFile = fileAction.file
-        val ioFileLastModified = ioFile.lastModified()
-        var downloadOutcome = DownloadActionOutcome(handled = false)
-        // Fresh action-ordering check (issue: round 12 #5): supplying a cursor when issuing
-        // the request does not order its eventual commit against other writers, so the row's
-        // activity cursor must be validated against the action BEFORE any preservation or
-        // commit: a row already at or past this action has processed it (or a later one) —
-        // re-running a delayed duplicate/older action would overwrite a newer location.
-        val actionAt = fileAction.lastActionAt ?: 0
-        val liveRowForOrdering = FileController.getFileById(realm, localFile.id)
-        if (actionAt > 0 && liveRowForOrdering != null && liveRowForOrdering.lastActionAt >= actionAt) {
-            return true
+        if (remoteFile == null) {
+            SentryLog.e("SyncOffline", "Expect remote file instead of null file") { scope ->
+                scope.setExtra("fileAction", "${fileAction.lastAction}")
+            }
+            return false
         }
-        val handled = when {
-            remoteFile == null -> {
-                SentryLog.e("SyncOffline", "Expect remote file instead of null file") { scope ->
-                    scope.setExtra("fileAction", "${fileAction.lastAction}")
-                }
-                false
-            }
-            ioFileLastModified > remoteFile.revisedAtInMillis ->
-                uploadFile(context, localFile, remoteFile, ioFile, userDrive, realm, fileAction.lastActionAt)
-            ioFileLastModified < remoteFile.revisedAtInMillis -> {
-                downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm, fileAction.lastActionAt)
-                downloadOutcome.handled
-            }
-            fileAction.lastAction in renameActions -> synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                // Ancestry-changing writers participate in the ROOT-INTENT protocol (issue:
-                // round 11 #7): the move's commit can re-parent a folder, changing the
-                // ancestry that coverage resolution walks — it serializes with root removal's
-                // coverage decisions, taken BEFORE the file locks below.
-                // Conditional acceptance BEFORE preservation side effects (issues: round 11
-                // #2/#4): an action superseded by an already-committed NEWER GENERATION of the
-                // file must not move the bytes to its obsolete target or relabel the live row;
-                // the newer generation's own flow owns this file's identity, so the action is
-                // consumed with no side effect. The gate accounts for newer metadata committed
-                // OUTSIDE Sync (issue: round 13 #3) — listings and details can move a file
-                // without advancing its activity cursor — via the updatedAt ordering, with
-                // the nullable action timestamp as the cursor bound (issue: round 13 #10).
+        var downloadOutcome = DownloadActionOutcome(handled = false)
+        // ONE coordinated operation per action (issue: round 14 #1): the ROOT-INTENT monitor
+        // precedes the file lock (the move branch re-parents), the Realm REFRESHES under
+        // them, and the CURRENT row, byte baseline and action ordering select the branch
+        // BEFORE any side effect. Every side effect and every commit re-applies the same
+        // action predicate against the fresh row; an action is consumed only when its
+        // rejection was side-effect-free. [localFile] is the request anchor (issue: round 14
+        // #2): the actions were requested FROM each row's cursor, so a live row still
+        // matching it resolves an otherwise ambiguous ordering tie.
+        val actionAt = fileAction.lastActionAt
+        val handled = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, localFile.id) {
+                runCatching { realm.refresh() }
                 val liveRow = FileController.getFileById(realm, localFile.id)
-                if (liveRow == null) {
-                    // The action's target row is gone (removed by another flow): the rename
-                    // has nothing to apply to — consume.
+                // Stale-action consumption BEFORE any side effect, on the fresh row (issue:
+                // round 12 #5 kept): a row already at or past this action has processed it.
+                if (actionAt != null && actionAt > 0 && liveRow != null && liveRow.lastActionAt >= actionAt) {
                     true
-                } else if (FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, fileAction.lastActionAt)) {
-                    true
-                } else if (ioFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
-                        context = context,
-                        oldOfflineFile = ioFile,
-                        oldIdentityName = localFile.name,
-                        oldIdentityParentId = localFile.parentId,
-                        oldLastModifiedAt = localFile.lastModifiedAt,
-                        newIdentity = remoteFile,
-                        userDrive = userDrive,
-                    )
-                ) {
-                    // Preservation incomplete (pending upload, snapshot failed, protected
-                    // destination): keep the old bytes and metadata, and do not consume the
-                    // action so a later sync retries it (issue: round 6 #11).
-                    false
                 } else {
-                    // Bytes are safely at (or durably registered for) the new location: commit
-                    // the new identity so the row and the offline path agree. Conditional
-                    // (issues: round 11 #4, round 12 #5, round 13 #3/#10): a newer generation,
-                    // newer non-Sync metadata, or a row whose cursor moved past this action
-                    // rejects it. A rejected commit is PROPAGATED (issue: round 13 #10) — the
-                    // action stays pending, and the retry's ordering gates consume it without
-                    // side effects, instead of reporting a rename whose bytes and metadata
-                    // disagree.
-                    FileController.updateExistingFileIfNotSuperseded(
-                        newFile = remoteFile,
-                        realm = realm,
-                        userDrive = userDrive,
-                        requireActionAtOrAfter = fileAction.lastActionAt,
-                    )
+                    val ioFileLastModified = ioFile.lastModified()
+                    when {
+                        ioFileLastModified > remoteFile.revisedAtInMillis ->
+                            uploadFile(context, localFile, remoteFile, ioFile, userDrive, realm, actionAt)
+                        ioFileLastModified < remoteFile.revisedAtInMillis -> {
+                            downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm, actionAt)
+                            downloadOutcome.handled
+                        }
+                        fileAction.lastAction in renameActions -> {
+                            // Conditional acceptance BEFORE preservation side effects (issues:
+                            // round 11 #2/#4, round 14 #1/#2): an action superseded by a newer
+                            // generation, newer non-Sync metadata, or an unresolved identity
+                            // tie must not move the bytes to its obsolete target; the anchor
+                            // resolves legitimate tied renames.
+                            when {
+                                liveRow == null -> true
+                                FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionAt, observed = localFile) -> true
+                                ioFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
+                                    context = context,
+                                    oldOfflineFile = ioFile,
+                                    oldIdentityName = localFile.name,
+                                    oldIdentityParentId = localFile.parentId,
+                                    oldLastModifiedAt = localFile.lastModifiedAt,
+                                    newIdentity = remoteFile,
+                                    userDrive = userDrive,
+                                )
+                                ->
+                                    // Preservation incomplete (pending upload, snapshot
+                                    // failed, protected destination): keep the old bytes and
+                                    // metadata, and do not consume the action so a later sync
+                                    // retries it (issue: round 6 #11).
+                                    false
+                                else ->
+                                    // Bytes are safely at (or durably registered for) the new
+                                    // location: commit the new identity so the row and the
+                                    // offline path agree. A rejected commit is PROPAGATED
+                                    // (issue: round 13 #10) — under this section's lock the
+                                    // gate and commit read the same row, so a false here
+                                    // means the row vanished mid-section; the action stays
+                                    // pending and the retry's ordering gates consume it.
+                                    FileController.updateExistingFileIfNotSuperseded(
+                                        newFile = remoteFile,
+                                        realm = realm,
+                                        userDrive = userDrive,
+                                        requireActionAtOrAfter = actionAt,
+                                    )
+                            }
+                        }
+                        else -> true
+                    }
                 }
             }
-            else -> true
         }
 
         when {
@@ -358,7 +358,7 @@ object SyncOfflineUtils {
             else -> FileController.updateFile(localFile.id, realm) { mutableFile ->
                 // No cursor rewind (issue: round 12 #5): a delayed action completing after a
                 // later one must never move the row's activity cursor backwards.
-                if (actionAt > mutableFile.lastActionAt) mutableFile.lastActionAt = actionAt
+                if ((actionAt ?: 0) > mutableFile.lastActionAt) mutableFile.lastActionAt = actionAt ?: 0
             }
         }
         return handled
@@ -397,8 +397,20 @@ object SyncOfflineUtils {
         }
         // Upload-source registration is a mutation owner of these bytes: it holds the shared
         // per-file coordination so a publication or cleanup cannot interleave (issue:
-        // round 4 #4).
+        // round 4 #4). The action predicate applies BEFORE the snapshot side effect (issue:
+        // round 14 #1): a stale action must not register available bytes under an obsolete
+        // identity — the anchor ([localFile], the state the action request was issued
+        // against) resolves ordering ties.
         OfflineFileCoordination.withFileLock(userDrive, localFile.id) {
+            runCatching { realm.refresh() }
+            val liveRow = FileController.getFileById(realm, localFile.id)
+            if (liveRow == null ||
+                FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionLastActionAt, observed = localFile)
+            ) {
+                // The action's target row is gone or the action is stale: consume with NO
+                // side effect — a later action or listing owns the identity.
+                return true
+            }
             // Revision dedup under the file lock (issue: round 8 #7): the identity of a
             // registration is the captured owner + content revision + destination (name,
             // folder, drive, user, modification date) — NOT the uri, since each registration
@@ -463,18 +475,23 @@ object SyncOfflineUtils {
             if (remoteFile != null) {
                 remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
                 remoteFile.size = ioFile.length()
-                // Conditional advance (issues: round 12 #4, round 13 #3): the uploaded
-                // snapshot's baseline must not roll back a strictly newer generation OR
-                // newer non-Sync metadata committed meanwhile; the action's nullable
-                // timestamp bounds the cursor the same way as the other action commits. The
-                // revision-dedup gate above keeps a rejected advance from re-registering the
-                // same snapshot, so no upload loop is possible.
-                FileController.updateExistingFileIfNotSuperseded(
+                // Conditional advance (issues: round 12 #4, round 13 #3, round 14 #1): the
+                // uploaded snapshot's baseline must not roll back a strictly newer generation
+                // OR newer non-Sync metadata committed meanwhile; the action's nullable
+                // timestamp bounds the cursor the same way as the other action commits. Under
+                // this section's lock the acceptance gate and this commit read the same row,
+                // so a rejection here means the row vanished mid-section: the snapshot's
+                // durable ownership exists, the action is consumed, and the rejection is
+                // logged rather than ignored.
+                val advanced = FileController.updateExistingFileIfNotSuperseded(
                     newFile = remoteFile,
                     realm = realm,
                     userDrive = userDrive,
                     requireActionAtOrAfter = actionLastActionAt,
                 )
+                if (!advanced) {
+                    SentryLog.i("SyncOffline", "Upload advance rejected for ${localFile.id}; snapshot ownership retained")
+                }
             }
 
             context.syncImmediately(isAutomaticTrigger = false)
@@ -504,7 +521,7 @@ object SyncOfflineUtils {
         // so the action is consumed with no side effect. The authoritative revalidation
         // still happens inside the committing transaction below.
         val liveRow = FileController.getFileById(realm, file.id)
-        if (liveRow != null && FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionLastActionAt)) {
+        if (liveRow != null && FileController.isStaleForAuthoritativeAction(liveRow, remoteFile, actionLastActionAt, observed = file)) {
             return DownloadActionOutcome(handled = true)
         }
         val pathChanged = offlineFile.path != remoteOfflineFile.path
@@ -547,24 +564,27 @@ object SyncOfflineUtils {
                 realm = realm,
                 remoteFiles = listOf(remoteFile),
                 userDrive = userDrive,
-                // Authoritative-change flow: the generation-only gate (issue: round 11 #4) —
-                // an identity difference at equal revisions is the move this action applies.
-                // The boundary's predicate is 3-arity (issue: round 13 #1); this flow has no
-                // request-observed basis and deliberately ignores any, hence the unused
-                // third parameter.
-                isStale = { live, incoming, _ -> FileController.isSupersededGeneration(live, incoming) },
+                // The COMPLETE action predicate (issue: round 14 #1/#2): generation, newer
+                // non-Sync metadata, the nullable cursor bound, and the request anchor
+                // ([file]) resolving ordering ties — the generation-only gate let ambiguous
+                // identities through to preservation.
+                isStale = { live, incoming, _ ->
+                    FileController.isStaleForAuthoritativeAction(live, incoming, actionLastActionAt, observed = file)
+                },
             ).first()
             if (commitFile !== remoteFile) return DownloadActionOutcome(handled = false)
-            // Conditional commit (issues: round 11 #4/#5, round 12 #5): a newer generation
-            // committed in the acceptance window wins, and a row whose cursor moved past this
-            // action rejects it; the enqueued download revalidates everything itself, so the
-            // action is consumed either way.
-            FileController.updateExistingFileIfNotSuperseded(
+            // Conditional commit (issues: round 11 #4/#5, round 12 #5, round 14 #1): a newer
+            // generation committed in the acceptance window wins, and a row whose cursor
+            // moved past this action rejects it. A REJECTED commit is PROPAGATED: the
+            // enqueue happens only for a committed identity — enqueueing work for obsolete
+            // metadata would download a superseded generation.
+            val committed = FileController.updateExistingFileIfNotSuperseded(
                 newFile = remoteFile,
                 realm = realm,
                 userDrive = userDrive,
                 requireActionAtOrAfter = actionLastActionAt,
             )
+            if (!committed) return DownloadActionOutcome(handled = false)
             // Preserve the download origin: a refresh of a file covered by an offline folder is
             // an inherited download, so its completion can never manufacture an explicit pin
             // after an unmark (issue #1902). The enqueue's Operation is returned UNAWAITED
