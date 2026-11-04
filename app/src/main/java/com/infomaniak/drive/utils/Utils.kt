@@ -330,8 +330,9 @@ object Utils {
         file: File,
         userDrive: UserDrive = UserDrive(),
         isInheritedDownload: Boolean = false,
+        cancelPendingWork: Boolean = true,
     ) {
-        enqueueOfflineDownload(context, file, userDrive, isInheritedDownload)
+        enqueueOfflineDownload(context, file, userDrive, isInheritedDownload, cancelPendingWork)
     }
 
     /**
@@ -347,17 +348,22 @@ object Utils {
         file: File,
         userDrive: UserDrive = UserDrive(),
         isInheritedDownload: Boolean = false,
-    ): Operation = enqueueOfflineDownload(context, file, userDrive, isInheritedDownload)
+        cancelPendingWork: Boolean = true,
+    ): Operation = enqueueOfflineDownload(context, file, userDrive, isInheritedDownload, cancelPendingWork)
 
     private fun enqueueOfflineDownload(
         context: Context,
         file: File,
         userDrive: UserDrive,
         isInheritedDownload: Boolean,
+        cancelPendingWork: Boolean,
     ): Operation {
         val workManager = WorkManager.getInstance(context)
 
-        if (file.isMarkedAsOffline) workManager.cancelAllWorkByTag(file.getWorkerTag())
+        // Cancellation belongs to EXPLICIT REPLACEMENT only (issue: round 19 #17): the
+        // verification path never cancels — repeated verification calls must not keep
+        // killing their own in-flight work for the file.
+        if (cancelPendingWork && file.isMarkedAsOffline) workManager.cancelAllWorkByTag(file.getWorkerTag())
         val inputData = workDataOf(
             BaseDownloadWorker.FILE_ID to file.id,
             DownloadWorker.FILE_NAME to file.name,
@@ -378,7 +384,21 @@ object Utils {
             .setExpeditedIfAvailable()
             .build()
 
-        return workManager.enqueueUniqueWork(DownloadWorker.TAG, ExistingWorkPolicy.APPEND_OR_REPLACE, downloadRequest)
+        return if (cancelPendingWork) {
+            // Explicit requests keep the shared draining chain (consecutive selections
+            // drain instead of being silently dropped).
+            workManager.enqueueUniqueWork(DownloadWorker.TAG, ExistingWorkPolicy.APPEND_OR_REPLACE, downloadRequest)
+        } else {
+            // VERIFICATION (issue: round 19 #17): ACCOUNT-SCOPED UNIQUE per-file work,
+            // KEEP-deduplicated — a pending verification for this account+file is kept;
+            // repeated scheduling neither cancels it nor piles duplicates. The request
+            // still carries the shared tags for the failure/redrive queries.
+            workManager.enqueueUniqueWork(
+                "${DownloadWorker.TAG}_${userDrive.userId}_${userDrive.driveId}_${file.id}",
+                ExistingWorkPolicy.KEEP,
+                downloadRequest,
+            )
+        }
     }
 
     fun enqueueBulkDownloadWorker(

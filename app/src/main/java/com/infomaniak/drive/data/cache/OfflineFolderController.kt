@@ -1356,6 +1356,10 @@ object OfflineFolderController {
                             // Follows the CURRENT authorization: a covered non-pinned row
                             // must never manufacture a pin through the verification work.
                             isInheritedDownload = !detachedRow.isOffline,
+                            // VERIFICATION NEVER CANCELS (issue: round 19 #17): repeated
+                            // scheduling keeps the existing account-scoped verification
+                            // work and never kills in-flight downloads for the file.
+                            cancelPendingWork = false,
                         )
                     }.onFailure { exception ->
                         SentryLog.e(
