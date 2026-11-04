@@ -267,18 +267,22 @@ class DownloadOfflineFileManager(
         // #20) — a pre-lock check can be stale by the time the marker is consumed, and a
         // stale observation falls through to the ordinary paths instead of reporting
         // success while consuming a newer request's re-mark.
-        if (consumeEarlySuccessIntent(file) {
-                UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())
+        if (consumeEarlySuccessIntent(context, file) { _, liveOffline ->
+                // THE ORIGINAL MUST EXIST (issue: round 22 #8): a pending record after the
+                // original disappeared is not usable content for this row.
+                liveOffline.exists() &&
+                    UploadFile.hasPendingUpload(uri = Uri.fromFile(liveOffline).toString())
             }
         ) {
             return ListenableWorker.Result.success()
         }
-        if (consumeEarlySuccessIntent(file) {
-                offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
-                    offlineFileLastModifiedMillis = offlineFile.lastModified(),
-                    // The PUBLISHED byte baseline, not accepted server metadata (issue:
-                    // round 15 #6) — retained old-clean bytes are not a local edit.
-                    remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
+        if (consumeEarlySuccessIntent(context, file) { live, liveOffline ->
+                liveOffline.exists() && OfflineFolderPolicy.isLocallyModified(
+                    offlineFileLastModifiedMillis = liveOffline.lastModified(),
+                    // The LIVE row's PUBLISHED byte baseline, not accepted server metadata
+                    // (issues: round 15 #6, round 22 #8) — re-derived from live state, and
+                    // retained old-clean bytes are not a local edit.
+                    remoteLastModifiedAtSeconds = live.effectivePublishedBaseline,
                 )
             }
         ) {
@@ -302,11 +306,11 @@ class DownloadOfflineFileManager(
             CachePromotionOutcome.FAILED -> Unit
         }
 
-        if (consumeEarlySuccessIntent(file) {
-                // The scoped current-copy proof (issue: round 21 #25) re-established INSIDE
-                // the consuming section (issue: round 21 #20), against the transfer's
-                // captured account.
-                file.isOfflineAndProvenCurrent(context, offlineFile, userDrive)
+        if (consumeEarlySuccessIntent(context, file) { live, liveOffline ->
+                // The scoped current-copy proof (issues: round 21 #25, round 22 #8)
+                // re-established INSIDE the consuming section, against the transfer's
+                // captured account and the LIVE row's own location.
+                live.isOfflineAndProvenCurrent(context, liveOffline, userDrive)
             }
         ) {
             // We can have this case for example when we try to put a lot of files at once in offline mode
@@ -681,15 +685,31 @@ class DownloadOfflineFileManager(
      * the caller (false), which falls through to the ordinary promotion/download paths
      * instead of reporting success while consuming a newer intent. Runs under the intent
      * monitor and the file lock.
+     *
+     * FRESH INPUTS, NEVER THE CAPTURED ROW/PATH (issue: round 22 #8): the condition
+     * receives the LIVE row and the offline path the LIVE row resolves to — a captured
+     * row/path pair validates a same-second moved or path-reused location while clearing
+     * the CURRENT row's marker. The live row must still hold the offline intent, and the
+     * consumed path's provenance must not be positively foreign (another identity's
+     * bytes are never this row's early success).
      */
-    private fun consumeEarlySuccessIntent(file: File, condition: () -> Boolean): Boolean =
+    private fun consumeEarlySuccessIntent(
+        context: Context,
+        file: File,
+        condition: (live: File, liveOffline: IOFile) -> Boolean,
+    ): Boolean =
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, file.id) {
                 FileController.getRealmInstance(userDrive).use { realm ->
                     runCatching { realm.refresh() }
                     val live = FileController.getFileById(realm, file.id) ?: return@use false
                     if (FileController.isSupersededGeneration(live, file) || live.updatedAt > file.updatedAt) return@use false
-                    if (!condition()) return@use false
+                    if (!live.isOffline && !live.isInOfflineFolder) return@use false
+                    val liveOffline = live.getOfflineFile(context, userDrive.userId) ?: return@use false
+                    if (readPublishedProvenance(context, liveOffline)?.positivelyForeignTo(live, userDrive) == true) {
+                        return@use false
+                    }
+                    if (!condition(live, liveOffline)) return@use false
                     if (live.isMarkedAsOffline) {
                         FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false, userDrive = userDrive)
                     }
