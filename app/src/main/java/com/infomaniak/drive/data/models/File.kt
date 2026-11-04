@@ -351,7 +351,10 @@ open class File(
         if (provenance == null) return StoredOfflineCopyState.READABLE_UNVERIFIED
         // OWNER identity (issue: round 18 #12): a record inherited across a path reuse by
         // another row (or, when the caller's account scope is known, published by another
-        // account on a shared drive) is not provenance for these bytes.
+        // account on a shared drive) is not provenance for these bytes. A record that
+        // POSITIVELY names a different owner is a CONFLICT (issue: round 19 #12) — never a
+        // readable copy of this row; only an unverifiable account scope stays readable.
+        if (provenance.positivelyForeignTo(this, userDrive)) return StoredOfflineCopyState.FOREIGN_CONFLICT
         if (!provenance.identifies(this, userDrive)) return StoredOfflineCopyState.READABLE_UNVERIFIED
         val rowVersion = version?.number ?: 0
         // UNKNOWN GENERATION IS NEVER PROOF (issue: round 18 #13).
@@ -383,8 +386,13 @@ open class File(
      * a complete retained copy unreadable. The copy's generation is unverified and
      * verification is scheduled separately.
      */
-    fun isOfflineAndReadable(context: Context, offlineFile: IOFile): Boolean =
-        storedOfflineCopyState(context, offlineFile) != StoredOfflineCopyState.ABSENT_OR_STALE
+    fun isOfflineAndReadable(context: Context, offlineFile: IOFile): Boolean {
+        val state = storedOfflineCopyState(context, offlineFile)
+        // EXPLICIT readable states (issue: round 19 #12): a positively foreign copy is a
+        // conflict — display and completion never serve another identity's bytes as this
+        // row's readable copy; the ownership decision precedes the presentation.
+        return state == StoredOfflineCopyState.PROVEN_CURRENT || state == StoredOfflineCopyState.READABLE_UNVERIFIED
+    }
 
     fun getConvertedPdfCache(context: Context, userDrive: UserDrive): IOFile {
         val folder = IOFile(context.cacheDir, "converted_pdf/${userDrive.userId}/${userDrive.driveId}")
@@ -647,6 +655,10 @@ open class File(
                         )
                         false
                     }
+                    // POSITIVELY FOREIGN provenance (issue: round 19 #12): a fresh download
+                    // is attempted; the coordinated publication reports the conflict — the
+                    // foreign bytes are never served nor overwritten in place.
+                    StoredOfflineCopyState.FOREIGN_CONFLICT -> true
                     StoredOfflineCopyState.ABSENT_OR_STALE -> true
                 }
                 else -> isObsoleteOrNotIntact(cacheFile)
@@ -838,4 +850,14 @@ open class File(
 }
 
 /** State of a row's retained offline copy — see [File.storedOfflineCopyState] (round 17 #13/#14/#15). */
-enum class StoredOfflineCopyState { PROVEN_CURRENT, READABLE_UNVERIFIED, ABSENT_OR_STALE }
+enum class StoredOfflineCopyState {
+    PROVEN_CURRENT,
+    READABLE_UNVERIFIED,
+
+    /** The provenance record POSITIVELY names a different owner at this location (issue:
+     * round 19 #12): the bytes are another identity's content — a conflict, never a
+     * readable copy of this row. Display and completion must not serve them; destructive
+     * operations preserve them until the conflict resolves. */
+    FOREIGN_CONFLICT,
+    ABSENT_OR_STALE,
+}

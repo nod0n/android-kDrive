@@ -739,6 +739,12 @@ class DownloadOfflineFileManager(
              * row matching on coarse metadata) is not provenance. */
             internal fun identifies(file: File, userDrive: UserDrive?): Boolean =
                 fileId == file.id && driveId == file.driveId && (userDrive == null || userId == userDrive.userId)
+
+            /** POSITIVELY foreign (issue: round 19 #12): the record names a DIFFERENT row,
+             * drive, or — when the caller's account scope is known — a different account. An
+             * unknown scope (userDrive == null) is unverifiable, not foreign. */
+            internal fun positivelyForeignTo(file: File, userDrive: UserDrive?): Boolean =
+                fileId != file.id || driveId != file.driveId || (userDrive != null && userId != userDrive.userId)
         }
 
         private fun PublishedProvenance.recordText(target: IOFile): String =

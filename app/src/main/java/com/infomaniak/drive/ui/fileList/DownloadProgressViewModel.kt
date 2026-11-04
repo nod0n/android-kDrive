@@ -76,6 +76,11 @@ class DownloadProgressViewModel : ViewModel() {
                     downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
                     return@launch
                 }
+                // POSITIVELY FOREIGN provenance (issue: round 19 #12): ownership precedes
+                // completion — the dialog never reports 100 over another identity's bytes.
+                // The download is attempted; the coordinated publication reports the
+                // conflict (null progress), preserving the foreign copy.
+                StoredOfflineCopyState.FOREIGN_CONFLICT -> Unit
                 StoredOfflineCopyState.ABSENT_OR_STALE -> Unit
             }
         } else if (!file.isObsoleteOrNotIntact(outputFile)) {

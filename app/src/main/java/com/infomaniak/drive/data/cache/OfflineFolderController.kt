@@ -1408,6 +1408,13 @@ object OfflineFolderController {
             // edit retaining the old mtime previously classified as NONE and destructive
             // operations destroyed it without a snapshot.
             file.storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.PROVEN_CURRENT -> CopyProtection.NONE
+            // POSITIVELY FOREIGN provenance (issue: round 19 #12): the record names another
+            // owner at this location — the bytes are another identity's content. Never
+            // classified as this row's edit, never snapshotted into this row's upload queue,
+            // never deleted: PRESERVED like unproven historical bytes until the conflict
+            // resolves (a fresh publication SKIPPED_CONFLICTs).
+            file.storedOfflineCopyState(context, offlineFile, userDrive) == StoredOfflineCopyState.FOREIGN_CONFLICT ->
+                CopyProtection.UNPROVEN_HISTORICAL
             OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
                 // The PUBLISHED byte baseline, not accepted server metadata (issue: round
