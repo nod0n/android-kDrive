@@ -1307,16 +1307,17 @@ class DownloadOfflineFileManager(
                     }
                 }
 
+                // REGISTRY OWNER CONFLICT (issue: round 20 #11): the destination's
+                // provenance record POSITIVELY names a different owner — the bytes
+                // are another identity's published content. Realm ownership and
+                // mtime alone never authorize overwriting them; the publication
+                // defers as a conflict until the registry conflict resolves.
+                val registryConflict = appContext != null &&
+                    readPublishedProvenance(appContext, target)
+                        ?.positivelyForeignTo(file, userDrive) == true
                 val targetProtected = UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
                         UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(target).toString()) ||
-                        // REGISTRY OWNER CONFLICT (issue: round 20 #11): the destination's
-                        // provenance record POSITIVELY names a different owner — the bytes
-                        // are another identity's published content. Realm ownership and
-                        // mtime alone never authorize overwriting them; the publication
-                        // defers as a conflict until the registry conflict resolves.
-                        (appContext != null &&
-                            readPublishedProvenance(appContext, target)
-                                ?.positivelyForeignTo(file, userDrive) == true) || when {
+                        registryConflict || when {
                     // Without an application context the ownership cannot be established: preserve.
                     appContext == null -> true
                     // Unknown ownership (no row claims the path — e.g. new-file/path-reuse
@@ -1334,11 +1335,26 @@ class DownloadOfflineFileManager(
                     else -> OfflineFolderPolicy.isLocallyModified(
                         offlineFileLastModifiedMillis = target.lastModified(),
                         remoteLastModifiedAtSeconds = liveOwner.effectivePublishedBaseline,
-                    )
+                    ) ||
+                        // SAME-MTIME CONTENT DRIFT IS PROTECTED (issue: round 21 #2): the
+                        // owner's own provenance record whose hash does NOT match the
+                        // current bytes is a proven same-mtime edit (or unknown content) —
+                        // the metadata-only mtime comparison alone previously let the
+                        // fresh publication overwrite it.
+                        (readPublishedProvenance(appContext, target)
+                            ?.takeIf { it.identifies(liveOwner, userDrive) }
+                            ?.let { it.contentHash != null && !it.certifiesBytes(target) } == true)
                 }
 
                 if (targetProtected) {
                     runCatching { staged.delete() }
+                    // A REGISTRY CONFLICT IS ALWAYS A CONFLICT (issue: round 21 #11): the
+                    // bytes at this path positively belong to another identity's published
+                    // generation — even when Realm's path attribution names THIS file (a
+                    // reused path), the protected content is NOT this file's own usable
+                    // content. It returns SKIPPED_CONFLICT, clears no marker, and never
+                    // reports a success over foreign bytes.
+                    if (registryConflict) return PublicationOutcome.SKIPPED_CONFLICT
                     // Usable protected content FOR THIS FILE vs a destination conflict
                     // (issue: round 14 #13): the protection proves F's own usable content
                     // only when the destination's owner row is F itself — its pending

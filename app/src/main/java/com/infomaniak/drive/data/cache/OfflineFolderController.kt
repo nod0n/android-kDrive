@@ -808,24 +808,61 @@ object OfflineFolderController {
                     // establish the cleanliness of bytes it did not write. Baseline T1, unsent
                     // edit T2, incoming T3 (T1 < T2 < T3): committing T3 first would classify the
                     // T2 edit as clean and let publication or root removal destroy it. A pending
-                    // or retained-unsent record already owns the copy; a dirty copy is snapshotted
-                    // against the OLD baseline first, and a failed registration defers the whole
-                    // commit so the edit is never replaced unowned. The PUBLISHED byte baseline
-                    // — not the (possibly replaced) server metadata — is the comparison basis
-                    // (issue: round 16 #2).
+                    // or retained-unsent record already owns the copy. The PUBLISHED byte
+                    // baseline — not the (possibly replaced) server metadata — is the
+                    // comparison basis (issue: round 16 #2).
                     val targetUri = Uri.fromFile(oldOffline).toString()
                     if (UploadFile.hasPendingUpload(uri = targetUri) ||
                         UploadFile.hasRetainedUnsentUpload(uri = targetUri)
                     ) {
                         return@withFileLock remoteFile
                     }
-                    if (OfflineFolderPolicy.isLocallyModified(
-                            offlineFileLastModifiedMillis = oldOffline.lastModified(),
-                            remoteLastModifiedAtSeconds = oldRow.effectivePublishedBaseline,
-                        )
+                    // ONE FRESH SCOPE+OWNERSHIP+CONTENT CLASSIFICATION decides the
+                    // unchanged-path boundary (issue: round 21 #2) — never the
+                    // metadata-only mtime comparison alone:
+                    //  - a copy the record CERTIFIES (immutable byte identity matches) is
+                    //    this row's published generation or a verified retained one:
+                    //    replaceable (a preserved future mtime does not make it an edit);
+                    //  - a KNOWN record whose hash MISMATCHES the bytes is a PROVEN
+                    //    same-mtime edit: snapshotted before the replacement (the
+                    //    seconds-resolution mtime comparison alone still matched);
+                    //  - a genuine edit against an ANCHORED (authoritative) baseline is
+                    //    snapshotted as before — the anchor came from content proof, so
+                    //    the mtime comparison is trustworthy;
+                    //  - everything else — unproven historical bytes whose UNSET baseline
+                    //    a backward-dated newer revision re-labels through the fallback,
+                    //    hashless legacy records that cannot certify content, unreadable
+                    //    bytes — is PRESERVED: never automatically uploaded, never
+                    //    overwritten; the whole commit defers side-effect-free and the
+                    //    verification path resolves the generation.
+                    if (oldRow.storedOfflineCopyState(context, oldOffline, userDrive) ==
+                        StoredOfflineCopyState.FOREIGN_CONFLICT
                     ) {
-                        val registered = registerDirtySnapshot(context, oldRow, oldOffline, userDrive)
-                        if (!registered) return@withFileLock oldRow
+                        return@withFileLock oldRow
+                    }
+                    val record = DownloadOfflineFileManager.readPublishedProvenance(context, oldOffline)
+                    val recordIdentifiesRow =
+                        record != null && record.identifies(oldRow, userDrive)
+                    val certified = recordIdentifiesRow && record.certifiesBytes(oldOffline)
+                    val provenSameMtimeEdit = recordIdentifiesRow && record.contentHash != null &&
+                        UploadFile.sha256OrNull(oldOffline) != record.contentHash
+                    when {
+                        certified -> Unit
+                        provenSameMtimeEdit -> {
+                            if (!registerDirtySnapshot(context, oldRow, oldOffline, userDrive)) {
+                                return@withFileLock oldRow
+                            }
+                        }
+                        (oldRow.publishedCleanBaseline ?: 0L) > 0L &&
+                            OfflineFolderPolicy.isLocallyModified(
+                                offlineFileLastModifiedMillis = oldOffline.lastModified(),
+                                remoteLastModifiedAtSeconds = oldRow.effectivePublishedBaseline,
+                            ) -> {
+                            if (!registerDirtySnapshot(context, oldRow, oldOffline, userDrive)) {
+                                return@withFileLock oldRow
+                            }
+                        }
+                        else -> return@withFileLock oldRow
                     }
                     return@withFileLock remoteFile
                 }
