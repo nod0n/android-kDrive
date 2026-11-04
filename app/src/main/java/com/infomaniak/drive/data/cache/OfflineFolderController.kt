@@ -714,6 +714,12 @@ object OfflineFolderController {
             // the owning root may have been re-enabled while this file waited for the lock, and
             // the once-per-folder abort check cannot protect the siblings queued behind it.
             if (isAborted()) return@synchronized
+            // Re-read the live pin state after the lock wait (issue: round 6 #6): the caller's
+            // row can be a stale detached snapshot, and pin writes serialize on this same lock.
+            if (FileController.getFileById(realm, file.id)?.isOffline == true) {
+                result.keptOfflineFilesCount++
+                return@synchronized
+            }
             when (protectionStateOf(file, offlineFile, userDrive)) {
                 CopyProtection.PENDING_UPLOAD -> result.keptOfflineFilesCount++
                 CopyProtection.UPLOADED -> {
@@ -726,6 +732,14 @@ object OfflineFolderController {
                     if (!uploadRegistered) {
                         // Keep the bytes and the flags rather than losing the edit; a later attempt
                         // (next sync) retries the snapshot.
+                        result.keptOfflineFilesCount++
+                        return@synchronized
+                    }
+                    // The snapshot copy can be lengthy: revalidate BOTH the root intent and the
+                    // live pin state AFTER preservation, before the destructive clear and delete
+                    // (issue: round 6 #6) — a root re-enabled, or the child newly pinned, while
+                    // its snapshot was being copied must keep the freshly requested offline copy.
+                    if (isAborted() || FileController.getFileById(realm, file.id)?.isOffline == true) {
                         result.keptOfflineFilesCount++
                         return@synchronized
                     }

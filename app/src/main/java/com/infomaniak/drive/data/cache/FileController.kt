@@ -488,19 +488,23 @@ object FileController {
     ) {
         val block: (Realm) -> Unit? = { currentRealm ->
             fileIds.forEach { fileId ->
-                currentRealm.executeTransaction {
-                    getFileById(currentRealm, fileId)?.let { file ->
-                        file.isOffline = isOffline
-                        if (!isOffline) {
-                            // Removing the explicit pin must materialize the current coverage
-                            // result (issue #1902): a file still covered by a root keeps its
-                            // inherited state (even when the pin was the only flag so far),
-                            // while an uncovered file loses any stale inherited flag.
-                            file.isInOfflineFolder = OfflineFolderController.isInsideActiveRoot(currentRealm, fileId)
-                            // The pending download marker is part of the removed intent
-                            // (issue: round 5 #15): a stale marker would otherwise resurrect
-                            // the pin through the sync's intent check after the next download.
-                            file.isMarkedAsOffline = false
+                // Per-file pin/unpin writes serialize with destructive cleanup on the same
+                // coordination lock, taken BEFORE the Realm write (issue: round 6 #6).
+                synchronized(OfflineFileCoordination.lockFor(userDrive ?: UserDrive(), fileId)) {
+                    currentRealm.executeTransaction {
+                        getFileById(currentRealm, fileId)?.let { file ->
+                            file.isOffline = isOffline
+                            if (!isOffline) {
+                                // Removing the explicit pin must materialize the current coverage
+                                // result (issue #1902): a file still covered by a root keeps its
+                                // inherited state (even when the pin was the only flag so far),
+                                // while an uncovered file loses any stale inherited flag.
+                                file.isInOfflineFolder = OfflineFolderController.isInsideActiveRoot(currentRealm, fileId)
+                                // The pending download marker is part of the removed intent
+                                // (issue: round 5 #15): a stale marker would otherwise resurrect
+                                // the pin through the sync's intent check after the next download.
+                                file.isMarkedAsOffline = false
+                            }
                         }
                     }
                 }
@@ -582,10 +586,13 @@ object FileController {
     }
 
     fun updateOfflineStatus(fileId: Int, isOffline: Boolean, userDrive: UserDrive? = null) {
-        // The pin write runs in the caller's captured account scope (issue: round 5 #13);
-        // without it the active account's Realm would be written.
-        updateFile(fileId, userDrive = userDrive) { file ->
-            file.isOffline = isOffline
+        // The pin write serializes on the same per-file coordination the destructive cleanup
+        // holds, taken BEFORE the Realm write, so a cleanup cannot delete a copy whose pin
+        // request is being written (issue: round 6 #6).
+        synchronized(OfflineFileCoordination.lockFor(userDrive ?: UserDrive(), fileId)) {
+            updateFile(fileId, userDrive = userDrive) { file ->
+                file.isOffline = isOffline
+            }
         }
     }
 
