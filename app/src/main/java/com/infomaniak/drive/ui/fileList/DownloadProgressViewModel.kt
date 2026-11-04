@@ -114,17 +114,24 @@ class DownloadProgressViewModel : ViewModel() {
             when (outcome) {
                 PublicationOutcome.SKIPPED_INVALIDATED, PublicationOutcome.FAILED -> null
                 PublicationOutcome.SKIPPED_SUPERSEDED -> {
-                    val liveOwnership = FileController.getRealmInstance(userDrive).use { realm ->
-                        FileController.getFileById(realm, file.id)?.let { live ->
-                            (live.isOffline || live.isInOfflineFolder) to
-                                live.getOfflineFile(context, userDrive.userId)?.path
-                        }
+                    // Supersession is completion only when the CURRENT row still owns the
+                    // scoped destination AND that destination holds usable content (issue:
+                    // round 12 #11): metadata ownership alone accepts an obsolete retained
+                    // copy. The destination must exist and either match the accepted CURRENT
+                    // content baseline or be an explicitly protected owned local edit;
+                    // anything else defers (null), like an invalidated intent.
+                    val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
+                        FileController.getFileById(realm, file.id)?.let { live -> realm.copyFromRealm(live, 0) }
                     }
-                    if (liveOwnership?.first == true && liveOwnership.second == outputFile.path && outputFile.exists()) {
-                        PROGRESS_COMPLETE
-                    } else {
-                        null
-                    }
+                    val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
+                    val usable = liveRow != null &&
+                        (liveRow.isOffline || liveRow.isInOfflineFolder) &&
+                        livePath == outputFile.path &&
+                        outputFile.exists() &&
+                        (!liveRow.isObsoleteOrNotIntact(outputFile) ||
+                            OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, outputFile, userDrive) ==
+                            OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL)
+                    if (usable) PROGRESS_COMPLETE else null
                 }
                 else -> PROGRESS_COMPLETE
             }

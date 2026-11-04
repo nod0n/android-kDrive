@@ -573,22 +573,28 @@ open class File(
             when (outcome) {
                 PublicationOutcome.PUBLISHED, PublicationOutcome.SKIPPED_PROTECTED -> Unit
                 PublicationOutcome.SKIPPED_SUPERSEDED -> {
-                    // Usable only when the CURRENT row still owns the named destination
-                    // (issue: round 11 #11): the offline path is parent+name derived, so
-                    // another file can occupy the obsolete location — existence alone would
-                    // return that file's bytes as this preview's source. The live row must
-                    // still hold the offline intent and resolve to the same scoped path.
-                    // Completion (100) is emitted only AFTER that validation — the transfer
-                    // layer no longer emits it for a superseded outcome — and a failure
-                    // defers the preview to a refetch.
+                    // Usable only when the CURRENT row still owns the named destination AND
+                    // that destination holds usable content (issue: round 12 #11): metadata
+                    // ownership alone reports completion over a missing or obsolete retained
+                    // copy — a newer generation can supersede an in-flight preview before any
+                    // usable bytes exist at the unchanged path. The destination must exist and
+                    // either match the accepted CURRENT content baseline or be an explicitly
+                    // protected owned local edit (a pending/unsent upload's copy); otherwise
+                    // the preview fails here — deferred to a refetch — and 100 is never
+                    // emitted.
                     if (destinationIsOwnedOfflineCopy) {
-                        val liveOwnership = FileController.getRealmInstance(userDrive).use { realm ->
-                            FileController.getFileById(realm, id)?.let { live ->
-                                (live.isOffline || live.isInOfflineFolder) to
-                                    live.getOfflineFile(context, userDrive.userId)?.path
-                            }
+                        val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
+                            FileController.getFileById(realm, id)?.let { live -> realm.copyFromRealm(live, 0) }
                         }
-                        if (liveOwnership?.first != true || liveOwnership.second != cacheFile.path) {
+                        val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
+                        val usable = liveRow != null &&
+                            (liveRow.isOffline || liveRow.isInOfflineFolder) &&
+                            livePath == cacheFile.path &&
+                            cacheFile.exists() &&
+                            (!liveRow.isObsoleteOrNotIntact(cacheFile) ||
+                                OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, cacheFile, userDrive) ==
+                                OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL)
+                        if (!usable) {
                             throw java.io.IOException("Superseded preview left no usable destination for $name")
                         }
                     } else if (!cacheFile.exists()) {
