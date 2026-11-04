@@ -674,18 +674,23 @@ object FolderFilesProvider {
     ): Boolean {
         // [FileAction] carries no timestamp: a payload-less destructive activity has NO
         // deletion authority of its own (issue: round 16 #15) — but the SERVER has.
+        // FRESH OBSERVATION IMMEDIATELY BEFORE THE PROBE (issue: round 19 #21): the
+        // caller's children-map observation can be stale — or ABSENT, in which case the
+        // previous null guard SKIPPED the freshness check entirely and the probe's
+        // absence could erase a row restored or moved since. The observation is the
+        // row's identity captured HERE, immediately before the probe, at FUNCTION scope
+        // so the coordinated section below compares against it.
+        val preProbeObservation = if (actionFile == null) {
+            FileController.getFileById(realm, fileId)?.let { realm.copyFromRealm(it, 1) }
+        } else {
+            null
+        }
         if (actionFile == null) {
             // RESOLVED ABSENCE IS CONSUMED (issue: round 18 #18): a later pass may already
             // have removed the row — the event has nothing left to delete and must not
             // block the folder cursor forever on an immutable event that will never grow
             // its missing payload.
             if (FileController.getFileById(realm, fileId) == null) return true
-            // FRESH OBSERVATION IMMEDIATELY BEFORE THE PROBE (issue: round 19 #21): the
-            // caller's children-map observation can be stale — or ABSENT, in which case
-            // the previous null guard SKIPPED the freshness check entirely and the
-            // probe's absence could erase a row restored or moved since. The observation
-            // is the row's identity captured HERE, immediately before the probe.
-            val preProbeObservation = FileController.getFileById(realm, fileId)?.let { realm.copyFromRealm(it, 1) }
             // NEW AUTHORITATIVE RESOLVING PATH (issue: round 18 #18): the resolving probe
             // answers CURRENT (a live remote row — the event is stale or misattributed),
             // VERIFIED MISSING (the explicit OBJECT_NOT_FOUND code — the same
