@@ -229,21 +229,26 @@ class DownloadOfflineFileManager(
         }
         // Protect offline edits (issue #1902): never replace the bytes backing a pending upload
         // or a locally newer copy; the sync layer uploads them and a later walk re-evaluates.
-        // Each early-success path consumes its OWN pending marker immediately and
-        // conditionally (issue: round 18 #20) — the marker belongs to the generation this
-        // transfer refreshed against, and a newer request's re-mark must survive.
-        if (UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())) {
-            clearPendingMarkerIfCurrent(file)
+        // Each early-success path consumes its OWN pending marker and validates the
+        // observation INSIDE the consuming coordination (issues: round 18 #20, round 21
+        // #20) — a pre-lock check can be stale by the time the marker is consumed, and a
+        // stale observation falls through to the ordinary paths instead of reporting
+        // success while consuming a newer request's re-mark.
+        if (consumeEarlySuccessIntent(file) {
+                UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())
+            }
+        ) {
             return ListenableWorker.Result.success()
         }
-        if (offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
-                offlineFileLastModifiedMillis = offlineFile.lastModified(),
-                // The PUBLISHED byte baseline, not accepted server metadata (issue: round
-                // 15 #6) — retained old-clean bytes are not a local edit.
-                remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
-            )
+        if (consumeEarlySuccessIntent(file) {
+                offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
+                    offlineFileLastModifiedMillis = offlineFile.lastModified(),
+                    // The PUBLISHED byte baseline, not accepted server metadata (issue:
+                    // round 15 #6) — retained old-clean bytes are not a local edit.
+                    remoteLastModifiedAtSeconds = file.effectivePublishedBaseline,
+                )
+            }
         ) {
-            clearPendingMarkerIfCurrent(file)
             return ListenableWorker.Result.success()
         }
 
@@ -264,11 +269,16 @@ class DownloadOfflineFileManager(
             CachePromotionOutcome.FAILED -> Unit
         }
 
-        if (file.isOfflineAndProvenCurrent(context, offlineFile, userDrive)) {
+        if (consumeEarlySuccessIntent(file) {
+                // The scoped current-copy proof (issue: round 21 #25) re-established INSIDE
+                // the consuming section (issue: round 21 #20), against the transfer's
+                // captured account.
+                file.isOfflineAndProvenCurrent(context, offlineFile, userDrive)
+            }
+        ) {
             // We can have this case for example when we try to put a lot of files at once in offline mode
             // and for some reason, the worker is cancelled after a long time, the worker is restarted
             filesDownloaded += 1
-            clearPendingMarkerIfCurrent(file)
             return ListenableWorker.Result.success()
         }
 
@@ -619,27 +629,33 @@ class DownloadOfflineFileManager(
     }
 
     /**
-     * Consumes THIS transfer's pending-download marker CONDITIONALLY (issue: round 18 #20):
-     * the marker is cleared only when the live row is still at the generation this transfer
-     * refreshed against — a newer request (a re-pin, or a newer server generation's pending
-     * state) has re-marked the row and owns the marker now. Runs under the intent monitor
-     * and the file lock. The batch-end unconditional clearing this replaces erased newer
-     * work's markers without any generation comparison.
+     * Consumes THIS transfer's pending-download marker CONDITIONALLY, validating the
+     * early-success observation INSIDE the same coordinated section (issues: round 18 #20,
+     * round 21 #20): the marker is cleared only when the live row is still at the
+     * generation this transfer refreshed against AND the transfer's early-success
+     * condition still holds after the locks. A pre-lock observation can be stale by the
+     * time the marker is consumed — upload completion followed by unpin/delete/re-pin
+     * establishes a newer marker for the same server metadata, which a metadata-only
+     * generation comparison cannot distinguish — so a stale observation is reported to
+     * the caller (false), which falls through to the ordinary promotion/download paths
+     * instead of reporting success while consuming a newer intent. Runs under the intent
+     * monitor and the file lock.
      */
-    private fun clearPendingMarkerIfCurrent(file: File) {
+    private fun consumeEarlySuccessIntent(file: File, condition: () -> Boolean): Boolean =
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, file.id) {
                 FileController.getRealmInstance(userDrive).use { realm ->
                     runCatching { realm.refresh() }
-                    val live = FileController.getFileById(realm, file.id) ?: return@withFileLock
-                    if (FileController.isSupersededGeneration(live, file) || live.updatedAt > file.updatedAt) return@withFileLock
+                    val live = FileController.getFileById(realm, file.id) ?: return@use false
+                    if (FileController.isSupersededGeneration(live, file) || live.updatedAt > file.updatedAt) return@use false
+                    if (!condition()) return@use false
                     if (live.isMarkedAsOffline) {
                         FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false, userDrive = userDrive)
                     }
+                    true
                 }
             }
         }
-    }
 
     private fun makeSureFileExists(offlineFile: java.io.File): Unit? {
         val parentExists = offlineFile.parentFile?.exists()
@@ -1289,6 +1305,15 @@ class DownloadOfflineFileManager(
                         FileController.getFileById(realm, file.id)?.publishedCleanBaseline = file.lastModifiedAt
                     }
                 }
+                // UNRESOLVED BEFORE ANY INTENT CONSUMPTION (issue: round 21 #14): the
+                // durable pending marker is the single-file work's retry intent — an
+                // unresolved generation must leave it in place for the durable re-drive.
+                // The previous order cleared the marker and then returned the unresolved
+                // outcome, so a single-file verification could terminate successfully
+                // without retained retry intent.
+                if (unresolvedGeneration) {
+                    return PublicationOutcome.PUBLISHED_UNRESOLVED
+                }
                 // EXACT FILE-INTENT CONSUMPTION (issue: round 20 #20): the fulfilled
                 // transfer's pending marker is consumed INSIDE the publication's
                 // coordinated commit — the CAS above validated this transfer's identity
@@ -1299,17 +1324,14 @@ class DownloadOfflineFileManager(
                 // for the same revision before the late call compared only server
                 // metadata — and erased the new intent.
                 FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false, userDrive = userDrive)
-                // Run the owner's completion while the per-file lock is still held
-                // (issue: round 5 #2) — and for an UNRESOLVED generation (issues: round 19
-                // #14, round 20 #14) return the TYPED unresolved outcome instead of
-                // PUBLISHED: neither the completion callbacks (coverage/flag writes,
-                // downloaded notification, media scan, promotion-cache cleanup) nor any
-                // caller's success/100/marker-clear may fire over a generation neither
-                // side could prove. The bytes stay published (the record's version-0
+                // Run the owner's completion while the per-file lock is still held (issue:
+                // round 5 #2): the unresolved arm above already returned, so completion
+                // fires only for a PROVEN generation — no completion callback (coverage/
+                // flag writes, downloaded notification, media scan, promotion-cache
+                // cleanup) may run over a generation neither side could prove. The bytes
+                // of an unresolved publication stay published (the record's version-0
                 // identity keeps the copy non-current); a later pass with the
-                // authoritative identity completes the file, and Bulk/root incompleteness
-                // is retained through the unresolved-outcome set.
-                if (unresolvedGeneration) return PublicationOutcome.PUBLISHED_UNRESOLVED
+                // authoritative identity completes the file.
                 onPublishedLocked?.invoke()
                 return PublicationOutcome.PUBLISHED
             } else {

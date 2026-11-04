@@ -82,6 +82,15 @@ class DownloadWorker(context: Context, workerParams: WorkerParameters) : BaseDow
                 )
             }
 
+            // UNRESOLVED generation (issue: round 21 #14): bytes may be published with an
+            // unproven generation — the single-file transfer is DEFERRED/RETRYABLE work,
+            // never a success. The durable pending marker stays intact (the manager no
+            // longer clears it on the unresolved return) and WorkManager re-drives the
+            // transfer with fresh state until the authoritative identity resolves it.
+            if (result == Result.success() && downloadOfflineFileManager.lastTransferSuperseded) {
+                result = Result.retry()
+            }
+
             if (result == Result.failure() && fileId > 0) notifyDownloadFinished()
             applicationContext.cancelNotification(fileId)
         }
