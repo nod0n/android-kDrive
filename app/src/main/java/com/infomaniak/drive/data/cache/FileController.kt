@@ -1101,6 +1101,61 @@ object FileController {
     }
 
     /**
+     * ABSENCE-AWARE payloadless upsert with AUTHORITATIVE MEMBERSHIP REPAIR (issue: round
+     * 21 #18): a resolving fetch's authoritative answer must make progress for an UNCACHED
+     * row too — the must-exist updater returned false forever and blocked the activity
+     * cursor on an authoritative details answer. Absent → INSERT (the fetched row IS the
+     * authoritative current state); present → the same conditional update as
+     * [updateExistingFileIfNotOlder]. The row's OWN parentId is the authoritative resulting
+     * location either way: the destination link and the obsolete old backlink are
+     * reconciled in the SAME coordinated operation (the previous update bypassed both for
+     * a moved row). A container that does not exist yet leaves the link to the ancestry
+     * resolvers (which own the chain) instead of blocking the cursor on it.
+     */
+    fun upsertFetchedFileIfNotOlder(
+        newFile: File,
+        realm: Realm,
+        userDrive: UserDrive,
+        observed: File? = null,
+    ): Boolean {
+        // Lock-set derivation only (a row's id/parent identity is stable); the membership
+        // repair itself re-reads the transaction-fresh rows.
+        val previousParentId = getFileById(realm, newFile.id)?.parentId?.takeIf { it != newFile.parentId }
+        return OfflineFileCoordination.withLocksFor(
+            userDrive,
+            buildList {
+                add(newFile.id)
+                if (newFile.parentId > 0) add(newFile.parentId)
+                previousParentId?.let(::add)
+            }.distinct(),
+        ) {
+            var accepted = false
+            realm.executeTransaction {
+                val live = getFileById(realm, newFile.id)
+                // ABSENCE-AWARE acceptance (issue: round 21 #18): absence INSERTS.
+                if (live != null && isStaleReplacement(live, newFile, observed)) return@executeTransaction
+                if (live?.isUsable() == true) newFile.keepOldLocalFilesData(live)
+                it.insertOrUpdate(newFile)
+                // AUTHORITATIVE MEMBERSHIP (issue: round 21 #18), same coordinated
+                // operation: link the committed row under the container its own parentId
+                // names, and drop the obsolete backlink from the previous one.
+                val committed = getFileById(realm, newFile.id)
+                if (committed != null && newFile.parentId > 0) {
+                    val container = getFileById(realm, newFile.parentId)
+                    if (container != null && container.children.none { it.id == newFile.id }) {
+                        container.children.add(committed)
+                    }
+                    previousParentId?.let { previous ->
+                        getFileById(realm, previous)?.children?.removeAll { it.id == newFile.id }
+                    }
+                }
+                accepted = true
+            }
+            accepted
+        }
+    }
+
+    /**
      * Conditional metadata replacement for AUTHORITATIVE CHANGE flows (the offline sync's
      * rename/move/download actions): the generation-only gate of [isSupersededGeneration] —
      * the action's identity difference at equal revisions is the change being applied, and a

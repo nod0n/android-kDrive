@@ -147,6 +147,7 @@ object FolderFilesProvider {
         rootFolder: File? = null,
         onRecursionStart: (() -> Unit)? = null,
         observedById: Map<Int, File> = emptyMap(),
+        accumulatedDeferredIds: Set<Int> = emptySet(),
         checkCancelled: () -> Unit = {},
     ) {
         val folderId = if (isRoot) SharedWithMe.id else folderFilesProviderArgs.folderId
@@ -162,14 +163,25 @@ object FolderFilesProvider {
         // exactly as before (the offline walk resolves such candidates with fresh
         // details requests instead, issue: round 18 #4).
         val sequenceObservations = if (cursor == null) {
-            // DURABLE PRE-HTTP MEMBERSHIP (issue: round 19 #25): the same basis as the
-            // walk's observations — the presentation children list is cleared and rebuilt
-            // by every first-page commit, so a retained pending candidate whose link a
-            // previous pass dropped lost its observation and its retry authority.
-            realm.where(File::class.java)
-                .equalTo(File::parentId.name, folderId)
-                .findAll()
-                .associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
+            if (isRoot) {
+                // PSEUDOCONTAINER MEMBERSHIP (issue: round 21 #17): the Shared ROOT is not a
+                // real parent — its members are the pseudocontainer's durable PRESENTATION
+                // children list, never a parentId == pseudocontainer-id query (shared rows'
+                // real parents are their actual shared folders, so the previous query
+                // observed nothing and every root candidate lost its retry authority).
+                FileController.getFileById(realm, folderId)?.children?.createSnapshot()
+                    ?.associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
+                    ?: emptyMap()
+            } else {
+                // DURABLE PRE-HTTP MEMBERSHIP (issue: round 19 #25): the same basis as the
+                // walk's observations — the presentation children list is cleared and rebuilt
+                // by every first-page commit, so a retained pending candidate whose link a
+                // previous pass dropped lost its observation and its retry authority.
+                realm.where(File::class.java)
+                    .equalTo(File::parentId.name, folderId)
+                    .findAll()
+                    .associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
+            }
         } else {
             observedById
         }
@@ -203,7 +215,10 @@ object FolderFilesProvider {
 
         when {
             apiResponse.hasMoreAndCursorExists -> {
-                saveFiles()
+                // WHOLE-PAGINATION OUTCOMES (issue: round 21 #17): every page's deferred
+                // ids accumulate into the sequence's single resolution pass — only the
+                // final page previously supplied candidates, discarding earlier pages'.
+                val pageOutcomes = saveFiles()
                 if (cursor == null) onRecursionStart?.invoke()
                 loadSharedWithMeFilesRec(
                     realm = realm,
@@ -212,22 +227,23 @@ object FolderFilesProvider {
                     folderFilesProviderArgs = folderFilesProviderArgs,
                     cursor = apiResponse.cursor,
                     observedById = sequenceObservations,
+                    accumulatedDeferredIds = accumulatedDeferredIds + pageOutcomes.deferredIds,
                     checkCancelled = checkCancelled,
                 )
             }
             apiResponse.isSuccess() -> {
                 val commitOutcomes = saveFiles()
-                // ONE budgeted resolution pass for this listing's deferred candidates
-                // (issue: round 19 #20) — ordinary and shared listings resolve their
-                // move-in candidates exactly like the offline walk: fresh pre-observed
-                // details requests, fair per-item outcomes. Unresolved candidates wait
-                // for the NEXT listing pass; this never converges in place.
+                // ONE budgeted resolution pass for the WHOLE SEQUENCE's deferred candidates
+                // (issues: round 19 #20, round 21 #17) — ordinary and shared listings
+                // resolve their move-in candidates exactly like the offline walk: fresh
+                // pre-observed details requests, fair per-item outcomes. Unresolved
+                // candidates wait for the NEXT listing pass; this never converges in place.
                 resolveDeferredCandidatesOnce(
                     realm = realm,
                     okHttpClient = okHttpClient,
                     folderId = folderId,
                     userDrive = folderFilesProviderArgs.userDrive,
-                    deferredIds = commitOutcomes.deferredIds,
+                    deferredIds = accumulatedDeferredIds + commitOutcomes.deferredIds,
                     checkCancelled = checkCancelled,
                 )
             }
@@ -262,9 +278,19 @@ object FolderFilesProvider {
         )) {
             val preObservation = FileController.getFileById(realm, deferredId)
                 ?.let { row -> realm.copyFromRealm(row, 1) } ?: continue
+            // THE CANDIDATE'S REAL DRIVE (issue: round 21 #17): a shared listing's
+            // container scope names the presentation drive — the candidate's ACTUAL drive
+            // (from its own row) scopes its details request and its byte locks; the
+            // container scope keeps scoping the container's lock.
+            val candidateDriveId = preObservation.driveId.takeIf { it > 0 } ?: userDrive.driveId
+            val candidateScope = UserDrive(
+                userId = userDrive.userId,
+                driveId = candidateDriveId,
+                sharedWithMe = userDrive.sharedWithMe,
+            )
             val details = runCatching {
                 ApiRepository.getFileDetails(
-                    file = File(id = deferredId, driveId = userDrive.driveId),
+                    file = File(id = deferredId, driveId = candidateDriveId),
                     okHttpClient = okHttpClient,
                 )
             }.getOrNull()?.data?.takeIf { it.id == deferredId } ?: continue
@@ -274,33 +300,41 @@ object FolderFilesProvider {
             // cancellation while blocked still allowed preservation and commits afterward.
             checkCancelled()
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                OfflineFileCoordination.withLocksFor(userDrive, listOf(deferredId, folderId).distinct()) {
-                    // POST-LOCK-WAIT check (issue: round 21 #22): the caller's executing
-                    // context rides the cancellation callback.
-                    checkCancelled()
-                    val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
-                        realm = realm,
-                        remoteFiles = listOf(details),
-                        userDrive = userDrive,
-                        observedById = mapOf(deferredId to preObservation),
-                    ).first()
-                    if (committable === details) {
-                        val committed = FileController.updateExistingFileIfNotOlder(
-                            newFile = committable,
+                OfflineFileCoordination.withLocksFor(candidateScope, listOf(deferredId)) {
+                    OfflineFileCoordination.withLocksFor(userDrive, listOf(folderId)) {
+                        // POST-LOCK-WAIT check (issue: round 21 #22): the caller's executing
+                        // context rides the cancellation callback.
+                        checkCancelled()
+                        val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                             realm = realm,
+                            remoteFiles = listOf(details),
                             userDrive = userDrive,
-                            observed = preObservation,
-                        )
-                        if (committed) {
-                            // MEMBERSHIP: link the accepted row under this container.
-                            realm.executeTransaction {
-                                val freshRow = FileController.getFileById(realm, deferredId)
-                                    ?: return@executeTransaction
-                                val container = FileController.getFileById(realm, folderId)
-                                if (container != null && freshRow.parentId == folderId &&
-                                    container.children.none { it.id == deferredId }
-                                ) {
-                                    container.children.add(freshRow)
+                            observedById = mapOf(deferredId to preObservation),
+                        ).first()
+                        if (committable === details) {
+                            val committed = FileController.updateExistingFileIfNotOlder(
+                                newFile = committable,
+                                realm = realm,
+                                userDrive = userDrive,
+                                observed = preObservation,
+                            )
+                            if (committed) {
+                                // MEMBERSHIP: real ancestry for a REAL container; PRESENTATION
+                                // membership for the Shared ROOT pseudocontainer (issue: round
+                                // 21 #17) — real-parent equality with the pseudocontainer id is
+                                // impossible for shared rows (their parents are their actual
+                                // shared folders), which previously rejected every root link.
+                                val pseudoContainerMembership = folderId == SharedWithMe.id
+                                realm.executeTransaction {
+                                    val freshRow = FileController.getFileById(realm, deferredId)
+                                        ?: return@executeTransaction
+                                    val container = FileController.getFileById(realm, folderId)
+                                    val membershipOk = pseudoContainerMembership || freshRow.parentId == folderId
+                                    if (container != null && membershipOk &&
+                                        container.children.none { it.id == deferredId }
+                                    ) {
+                                        container.children.add(freshRow)
+                                    }
                                 }
                             }
                         }
@@ -476,7 +510,7 @@ object FolderFilesProvider {
         return when {
             apiResponseData != null -> {
                 val isCompleteFolder = !apiResponse.hasMore || apiResponseData.count() < ApiRoutes.PER_PAGE
-                saveRemoteFiles(
+                val commitOutcomes = saveRemoteFiles(
                     realm = realm,
                     localFolderProxy = folderProxy,
                     remoteFolder = localFolder,
@@ -486,6 +520,20 @@ object FolderFilesProvider {
                     userDrive = userDrive,
                     observedById = observedById
                 )
+                // ORDINARY/SAF LISTING RESOLUTION (issue: round 21 #17): the shared route's
+                // budgeted resolver previously never ran for the ordinary and SAF paths —
+                // their move-in candidates deferred forever. ONE pass per listing, same
+                // protocol (fresh pre-observed details, fair per-item outcomes); unresolved
+                // candidates wait for the next listing pass.
+                if (commitOutcomes.deferredIds.isNotEmpty()) {
+                    resolveDeferredCandidatesOnce(
+                        realm = realm,
+                        okHttpClient = okHttpClient,
+                        folderId = folderFilesProviderArgs.folderId,
+                        userDrive = userDrive,
+                        deferredIds = commitOutcomes.deferredIds,
+                    )
+                }
                 val folderFiles = if (folderWithChildren) ArrayList(apiResponseData) else arrayListOf()
                 FolderFilesProviderResult(folder = localFolder, folderFiles = folderFiles, isComplete = isCompleteFolder)
             }
@@ -852,7 +900,13 @@ object FolderFilesProvider {
                         if (committable !== details) {
                             false
                         } else {
-                            FileController.updateExistingFileIfNotOlder(
+                            // ABSENCE-AWARE upsert (issue: round 21 #18): an authoritative
+                            // details answer for an UNCACHED row must make progress — the
+                            // must-exist updater returned false forever and blocked the
+                            // activity cursor; the upsert also reconciles the authoritative
+                            // membership (destination link + obsolete old backlink) in the
+                            // same coordinated operation.
+                            FileController.upsertFetchedFileIfNotOlder(
                                 newFile = committable,
                                 realm = realm,
                                 userDrive = userDrive,
