@@ -37,7 +37,6 @@ import com.infomaniak.drive.data.models.MqttAction
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.data.models.file.FileExternalImport
 import com.infomaniak.drive.data.models.file.FileExternalImport.FileExternalImportStatus
-import com.infomaniak.drive.data.models.file.FileVersion
 import com.infomaniak.drive.data.models.file.SpecialFolder.Favorites
 import com.infomaniak.drive.data.models.file.SpecialFolder.Gallery
 import com.infomaniak.drive.data.models.file.SpecialFolder.MyShares
@@ -2009,29 +2008,14 @@ object FileController {
         publishedCleanBaseline = oldFile.publishedCleanBaseline
         responseAt = oldFile.responseAt
         if (path.isEmpty() && oldFile.path.isNotEmpty()) path = oldFile.path
-        // Merge a version ONLY when the same content generation is PROVEN (issue: round 14
-        // #7): acceptance establishes "not rejected", not "same generation" — an inherited
-        // version N onto a newer generation would falsely prove equality with an in-flight
-        // transfer and let it publish beneath the newer metadata. Identity and BOTH server
-        // timestamps tying is the same-generation evidence; anything else retains UNKNOWN
-        // status. Omitted version data is UNKNOWN, not a generation difference (issue: round
-        // 13 #9) — a same-generation versionless listing keeps its populated version.
-        val inheritedVersion = oldFile.version
-        if ((version?.number ?: 0) == 0 && inheritedVersion != null && inheritedVersion.number > 0 &&
-            parentId == oldFile.parentId && name == oldFile.name &&
-            updatedAt == oldFile.updatedAt && revisedAt == oldFile.revisedAt
-        ) {
-            // UNMANAGED copy (issue: round 14 #3): the managed embedded object belongs to the
-            // caller's Realm — attaching it to a response object that escapes (folder loading
-            // returns the original response objects and closes its Realm; gallery/recent
-            // return the mutated lists) makes later reads or parcels touch a detached
-            // managed object outside its lifetime/thread.
-            version = FileVersion(
-                isMultiple = inheritedVersion.isMultiple,
-                number = inheritedVersion.number,
-                totalSize = inheritedVersion.totalSize,
-            )
-        }
+        // NO version transplant (issue: round 15 #8): metadata equality — identity, both
+        // server timestamps, even matching size and modification baseline — does not prove
+        // identical CONTENT, and an inherited version N would falsely prove equality with an
+        // in-flight transfer of the old generation. UNKNOWN version status is preserved: the
+        // publication's both-known comparison and its exactly-one-known ambiguity clause
+        // handle a null-version row safely (a version-bearing transfer against it DEFERS and
+        // the version-bearing details routes restore the identifier on the retry), so no
+        // timestamp equality ever manufactures a version identifier.
         // NO revisedAt transplant (issue: round 11 #4): the incoming row carries its own
         // server revision; copying the live row's newer timestamp onto a stale incoming
         // object would LABEL old content as the newer generation — the publication
