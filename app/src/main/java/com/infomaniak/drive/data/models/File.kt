@@ -591,6 +591,7 @@ open class File(
                                     FileController.getFileById(realm, id)?.let { live -> realm.copyFromRealm(live, 0) }
                                 }
                                 val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
+                                val targetUri = Uri.fromFile(cacheFile).toString()
                                 liveRow != null &&
                                     (liveRow.isOffline || liveRow.isInOfflineFolder) &&
                                     livePath == cacheFile.path &&
@@ -599,11 +600,17 @@ open class File(
                                     // "not older" accepts retained bytes whose timestamp is
                                     // NEWER than a backward-dated newer baseline (R1 at 100 vs
                                     // baseline 90) — only equality with the row's own
-                                    // modification time and size, or a positively established
-                                    // protected local edit, makes the retained bytes usable.
+                                    // modification time and size, or PRE-EXISTING durable
+                                    // upload ownership, makes the retained bytes usable.
+                                    // READ-ONLY ownership inspection (issue: round 14 #4): a
+                                    // comparison against the REPLACEMENT baseline would
+                                    // classify the old generation's clean bytes as an edit
+                                    // and the mutating decision would register an upload
+                                    // that can restore old content over the newer
+                                    // generation — no snapshot is manufactured here.
                                     (liveRow.isOfflineAndIntact(cacheFile) ||
-                                        OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, cacheFile, userDrive) ==
-                                        OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL)
+                                        UploadFile.hasPendingUpload(uri = targetUri) ||
+                                        UploadFile.hasRetainedUnsentUpload(uri = targetUri))
                             }
                         }
                         if (!usable) {

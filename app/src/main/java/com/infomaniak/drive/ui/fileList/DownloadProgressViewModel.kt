@@ -18,6 +18,7 @@
 package com.infomaniak.drive.ui.fileList
 
 import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -25,6 +26,7 @@ import com.infomaniak.core.common.cancellable
 import com.infomaniak.core.legacy.utils.SingleLiveEvent
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.data.api.ApiRoutes
+import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
@@ -131,13 +133,20 @@ class DownloadProgressViewModel : ViewModel() {
                                 FileController.getFileById(realm, file.id)?.let { live -> realm.copyFromRealm(live, 0) }
                             }
                             val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
+                            val targetUri = Uri.fromFile(outputFile).toString()
                             liveRow != null &&
                                 (liveRow.isOffline || liveRow.isInOfflineFolder) &&
                                 livePath == outputFile.path &&
                                 outputFile.exists() &&
+                                // Exact current clean baseline, or PRE-EXISTING durable
+                                // upload ownership. READ-ONLY inspection (issue: round 14
+                                // #4): the mutating replacement decision would classify the
+                                // old generation's clean bytes as an edit against the
+                                // replacement baseline and manufacture an upload that can
+                                // restore old content over the newer generation.
                                 (liveRow.isOfflineAndIntact(outputFile) ||
-                                    OfflineFolderController.decisionForReplacingOwnedCopy(liveRow, outputFile, userDrive) ==
-                                    OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL)
+                                    UploadFile.hasPendingUpload(uri = targetUri) ||
+                                    UploadFile.hasRetainedUnsentUpload(uri = targetUri))
                         }
                     }
                     if (usable) PROGRESS_COMPLETE else null
