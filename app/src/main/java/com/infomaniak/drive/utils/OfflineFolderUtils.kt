@@ -632,8 +632,18 @@ object OfflineFolderUtils {
         boundaryFolderId: Int,
         boundaryListedParentId: Int,
         traversalStartedGeneration: Long,
+        boundaryObservation: File?,
     ): (Realm, File) -> Boolean = { currentRealm, candidate ->
-        val boundaryHolds = FileController.getFileById(currentRealm, boundaryFolderId)?.parentId == boundaryListedParentId
+        val liveBoundary = FileController.getFileById(currentRealm, boundaryFolderId)
+        val boundaryHolds = liveBoundary != null &&
+            liveBoundary.parentId == boundaryListedParentId &&
+            // The boundary's PRE-REQUEST OBSERVATION is carried into every queued
+            // descendant's destructive predicate and compared INSIDE this committing
+            // transaction (issue: round 21 #21): a boundary restored or re-created since
+            // the request (same listed parent, newer identity) is a newer generation this
+            // response is not the authority for — the listed-parent check alone let its
+            // CURRENT descendants be cleared by the old traversal.
+            (boundaryObservation == null || FileController.isSameObservation(liveBoundary, boundaryObservation))
         var reachesBoundary = candidate.id == boundaryFolderId
         var currentId: Int? = FileController.getFileById(currentRealm, candidate.id)?.parentId
         val visited = mutableSetOf(candidate.id)
@@ -703,7 +713,20 @@ object OfflineFolderUtils {
                 ) {
                     return@forEach
                 }
-                clearConfirmedAbsentSubtree(context, realm, child.id, folderId, userDrive, result, traversalStartedGeneration)
+                // The boundary's PRE-REQUEST observation is the ORIGINAL destructive-
+                // authority token (issue: round 21 #21): it travels through every queued
+                // descendant and is compared inside each final destructive section — the
+                // outer pre-check above runs outside the clearing coordination.
+                clearConfirmedAbsentSubtree(
+                    context,
+                    realm,
+                    child.id,
+                    folderId,
+                    userDrive,
+                    result,
+                    traversalStartedGeneration,
+                    boundaryObservation = observedChild,
+                )
             } else if (OfflineFolderPolicy.shouldRemoveCoveredFileAbsentFromRemote(
                     isOffline = child.isOffline,
                     isInOfflineFolder = child.isInOfflineFolder,
@@ -750,6 +773,7 @@ object OfflineFolderUtils {
         userDrive: UserDrive,
         result: OfflineFolderController.RemovalResult,
         traversalStartedGeneration: Long,
+        boundaryObservation: File?,
     ) {
         val visited = mutableSetOf(rootFolderId)
         // folderId to the parent the traversal reached it from — the only parent relationship
@@ -776,9 +800,15 @@ object OfflineFolderUtils {
                 userDrive = userDrive,
                 result = result,
                 isFolder = true,
-                // The original absent-subtree boundary, its listed-parent authority and the
-                // new-root check travel INSIDE the decision (issues: round 11 #8/#10, 13 #6).
-                isStillClearable = absentSubtreeClearable(rootFolderId, listedParentId, traversalStartedGeneration),
+                // The original absent-subtree boundary, its listed-parent authority, its
+                // PRE-REQUEST observation token and the new-root check travel INSIDE the
+                // decision (issues: round 11 #8/#10, 13 #6, round 21 #21).
+                isStillClearable = absentSubtreeClearable(
+                    rootFolderId,
+                    listedParentId,
+                    traversalStartedGeneration,
+                    boundaryObservation,
+                ),
             )
             // The subtree's original listing authority dies with the folder's rejection
             // (issue: round 10 #6): if the folder was not cleared because its live parent
@@ -808,7 +838,12 @@ object OfflineFolderUtils {
                             userDrive = userDrive,
                             result = result,
                             isFolder = false,
-                            isStillClearable = absentSubtreeClearable(rootFolderId, listedParentId, traversalStartedGeneration),
+                            isStillClearable = absentSubtreeClearable(
+                                rootFolderId,
+                                listedParentId,
+                                traversalStartedGeneration,
+                                boundaryObservation,
+                            ),
                         )
                     }
                 }

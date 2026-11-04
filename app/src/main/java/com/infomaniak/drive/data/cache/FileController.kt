@@ -1026,7 +1026,17 @@ object FileController {
             a.updatedAt == b.updatedAt &&
             (a.version?.number ?: 0) == (b.version?.number ?: 0) &&
             a.parentId == b.parentId &&
-            a.name == b.name
+            a.name == b.name &&
+            // COMPLETE OBSERVATION IDENTITY (issue: round 21 #21): the accepted
+            // modification time, the accepted size and the row's MATERIALIZED published
+            // baseline are part of the observation a destructive decision is authorized
+            // against — a newer publication with an unknown version and tied timestamps
+            // (the baseline advanced under unchanged revisedAt/updatedAt/version), a
+            // same-second same-size edit, or a backward-dated metadata change previously
+            // passed an old absence probe.
+            a.lastModifiedAt == b.lastModifiedAt &&
+            a.size == b.size &&
+            (a.publishedCleanBaseline ?: 0L) == (b.publishedCleanBaseline ?: 0L)
 
     private fun isSameIdentity(live: File, incoming: File): Boolean =
         live.parentId == incoming.parentId && live.name == incoming.name
