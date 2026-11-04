@@ -278,6 +278,7 @@ object AccountUtils : CredentialManager(
             // public requests are refused, every queued security writer drains to completion,
             // and the settings reset, deletion and reconciliation happen inside the exclusion —
             // so no request can commit an enable between the reset and the deletion.
+            var cleanupComplete = false
             AppLockState.runWithWriterQuiesced {
                 val settingsReset = AppSettings.resetAppSettings()
                 if (!settingsReset) {
@@ -293,26 +294,44 @@ object AccountUtils : CredentialManager(
                     disableAutoSync()
                 }
 
-                val lockResetPersisted = AppLockState.resetToDisabledInternal()
-                if (!lockResetPersisted) {
-                    SentryLog.w("AccountUtils", "resetApp> app lock reset could not be persisted")
-                }
+                // Destructive security work starts here: any exceptional or cancelled exit
+                // retains an explicit unresolved-maintenance denial until a successful durable
+                // read and matching publication complete together (R5-3). Before this point the
+                // section remains cancellable without security consequence.
+                try {
+                    val lockResetPersisted = AppLockState.resetToDisabledInternal()
+                    if (!lockResetPersisted) {
+                        SentryLog.w("AccountUtils", "resetApp> app lock reset could not be persisted")
+                    }
 
-                val filesDeleted = with(context) { filesDir.deleteRecursively() }
-                val cacheDeleted = with(context) { cacheDir.deleteRecursively() }
-                if (!filesDeleted || !cacheDeleted) {
-                    SentryLog.w("AccountUtils", "resetApp> app data deletion incomplete")
-                }
+                    val filesDeleted = with(context) { filesDir.deleteRecursively() }
+                    val cacheDeleted = with(context) { cacheDir.deleteRecursively() }
+                    if (!filesDeleted || !cacheDeleted) {
+                        SentryLog.w("AccountUtils", "resetApp> app data deletion incomplete")
+                    }
 
-                // Reconcile cache and pending denial with the state future durable reads will
-                // actually present (an absent store reads as the default disabled value); an
-                // unreadable store keeps the fail-closed denial.
-                when (val durableEnabled = AppLockState.readDurableAppLockEnabled()) {
-                    null -> SentryLog.w("AccountUtils", "resetApp> settings store unreadable after deletion")
-                    else -> AppLockState.reconcileAfterMaintenance(durableEnabled = durableEnabled)
+                    // Reconcile cache and pending denial with the state future durable reads
+                    // will actually present (an absent store reads as the default disabled
+                    // value); an unreadable store retains the fail-closed denial.
+                    cleanupComplete = settingsReset && lockResetPersisted && filesDeleted && cacheDeleted
+                    when (val durableEnabled = AppLockState.readDurableAppLockEnabled()) {
+                        null -> {
+                            cleanupComplete = false
+                            AppLockState.markMaintenanceUnresolved()
+                            SentryLog.w("AccountUtils", "resetApp> settings store unreadable after deletion")
+                        }
+                        else -> AppLockState.reconcileAfterMaintenance(durableEnabled = durableEnabled)
+                    }
+                } catch (throwable: Throwable) {
+                    AppLockState.markMaintenanceUnresolved()
+                    throw throwable
                 }
             }
-            SentryLog.i("AccountUtils", "resetApp> all user data has been deleted")
+            if (cleanupComplete) {
+                SentryLog.i("AccountUtils", "resetApp> all user data has been deleted")
+            } else {
+                SentryLog.w("AccountUtils", "resetApp> logout cleanup incomplete")
+            }
         }
     }
 

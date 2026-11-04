@@ -18,6 +18,8 @@
 package com.infomaniak.drive.data.documentprovider
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.locks.ReentrantReadWriteLock
@@ -67,7 +69,8 @@ class AppLockTransitions(
     /** Guards [admittedWork]; acquired inside admission sections and by transitions. */
     private val workLock = Any()
 
-    /** Transition tasks enqueued but not yet fully completed; the writer drains them in order. */
+    /** Settings-store tasks enqueued but not fully completed: security transitions and
+     * registered ordinary writes alike; the writer drain waits for all of them (R5-2). */
     private var outstandingTasks = 0
 
     /** Completed whenever [outstandingTasks] returns to zero; replaced when it leaves zero. */
@@ -75,6 +78,12 @@ class AppLockTransitions(
 
     /** True while a maintenance section (e.g. logout settings deletion) excludes the writer. */
     private var maintenanceActive = false
+
+    /** Set when maintenance ended without a successful durable read plus matching publication. */
+    private var unresolvedMaintenanceDenial = false
+
+    /** Serializes complete maintenance operations: only the owner releases the exclusion (R5-1). */
+    private val maintenanceMutex = Mutex()
 
     /**
      * Registers work whose network issuance was admitted under the current policy. A later
@@ -98,8 +107,8 @@ class AppLockTransitions(
     /** Runs [block] atomically against transitions; the final authorization/issuance boundary. */
     fun <T> withAdmission(block: () -> T): T = admission.read { block() }
 
-    /** True while a requested transition has not durably completed. */
-    fun isPending(): Boolean = admission.read { pendingGeneration != null }
+    /** True while a requested transition has not durably completed, or maintenance is unresolved. */
+    fun isPending(): Boolean = admission.read { pendingGeneration != null || unresolvedMaintenanceDenial }
 
     /** Current policy generation; cursors and in-flight work tag themselves with it. */
     fun policyGeneration(): Long = admission.read { policyGeneration }
@@ -160,20 +169,46 @@ class AppLockTransitions(
     }
 
     /**
-     * Runs [block] after every queued transition task has fully completed (persist included),
-     * while new requests are refused for the duration. [block] suspends on the caller's
-     * coroutine — still inside the maintenance exclusion — so maintenance steps that are
-     * themselves suspending (repository clears, file deletion) remain ordered and excluded.
-     * Failure of the maintenance work itself is the caller's to handle before declaring its
-     * lifecycle step complete.
+     * Registers an out-of-band write to the settings store (the generic async updater) so the
+     * maintenance drain waits for it like a security transition (R5-2). Refused while
+     * maintenance is active: such a write is stale by definition and must be dropped, never
+     * committed across the destructive section.
+     */
+    fun registerSettingsWrite(): Boolean {
+        return admission.write {
+            if (maintenanceActive) {
+                false
+            } else {
+                outstandingTasks += 1
+                if (outstandingTasks == 1) quiescenceSignal = CompletableDeferred()
+                true
+            }
+        }
+    }
+
+    fun unregisterSettingsWrite() {
+        admission.write {
+            outstandingTasks -= 1
+            if (outstandingTasks == 0) quiescenceSignal.complete(Unit)
+        }
+    }
+
+    /**
+     * Serializes complete maintenance operations (R5-1): a second caller waits until the first
+     * has fully finished, so only the owning section ever clears [maintenanceActive]. The
+     * admission lock is never held across suspension — it guards only the brief flag flips;
+     * the drain wait happens outside it, and the coroutine [Mutex] is the sole lock held
+     * across the (suspending) maintenance work.
      */
     suspend fun <T> runWithWriterQuiesced(block: suspend () -> T): T {
-        admission.write { maintenanceActive = true }
-        try {
-            quiescenceSignal.await()
-            return block()
-        } finally {
-            admission.write { maintenanceActive = false }
+        return maintenanceMutex.withLock {
+            admission.write { maintenanceActive = true }
+            try {
+                quiescenceSignal.await()
+                block()
+            } finally {
+                admission.write { maintenanceActive = false }
+            }
         }
     }
 
@@ -181,13 +216,18 @@ class AppLockTransitions(
      * Maintenance-only security reset (Astra review R4-3): durably persists the disabled value
      * outside the public request path — public requests are refused under maintenance, so no
      * public write can interleave — publishing the matching cache on success and clearing the
-     * pending denial only on real success. Returns true only when the store write committed.
+     * pending denial only on real success. A failed persist retains an explicit
+     * unresolved-maintenance denial (R5-3). Returns true only when the store write committed.
      */
     fun resetToDisabledInternal(): Boolean {
         val persisted = persist(false)
         admission.write {
             policyGeneration += 1
-            if (persisted) pendingGeneration = null
+            if (persisted) {
+                pendingGeneration = null
+            } else {
+                unresolvedMaintenanceDenial = true
+            }
         }
         cancelAdmittedWork()
         onTransition()
@@ -195,16 +235,31 @@ class AppLockTransitions(
     }
 
     /**
-     * Maintenance-phase reconcile: clears any pending denial and publishes [durableEnabled] —
-     * the value future durable reads will actually present (an absent store reads as the
-     * default disabled value) — to in-memory readers, then notifies observers.
+     * Maintenance reconcile (R5-3): a successful durable read plus this matching publication
+     * complete together — clears the pending denial and the unresolved-maintenance state and
+     * publishes [durableEnabled], the value future durable reads will actually present (an
+     * absent store reads as the default disabled value).
      */
     fun reconcileAfterMaintenance(durableEnabled: Boolean) {
         admission.write {
             policyGeneration += 1
             pendingGeneration = null
+            unresolvedMaintenanceDenial = false
         }
         publish(durableEnabled)
+        onTransition()
+    }
+
+    /**
+     * Retains an explicit unresolved-maintenance denial (R5-3): used when maintenance exits
+     * exceptionally after destructive work, or when the post-deletion durable read fails, so
+     * the gate keeps denying until a later successful read and matching publication.
+     */
+    fun markMaintenanceUnresolved() {
+        admission.write {
+            policyGeneration += 1
+            unresolvedMaintenanceDenial = true
+        }
         onTransition()
     }
 

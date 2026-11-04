@@ -86,12 +86,33 @@ open class AppSettings(
             replay = 1,
         )
 
+        /**
+         * Hook wired by the ordered settings lifecycle (AppLockState): registers each ordinary
+         * writer with the maintenance drain and refuses writes dispatched while maintenance is
+         * active, so no stale write can commit across logout deletion (Astra review R5-2).
+         */
+        interface SettingsWriteGate {
+            fun register(): Boolean
+            fun unregister()
+        }
+
+        @Volatile
+        internal var settingsWriteGate: SettingsWriteGate? = null
+
         fun updateAppSettings(scope: CoroutineScope = Companion.scope, onUpdate: AppSettings.() -> Unit) {
+            // Register before dispatch so the maintenance drain covers this write even if its
+            // coroutine starts late; refusal means the write is stale and is dropped.
+            val gate = settingsWriteGate
+            if (gate?.register() == false) return
             scope.launch(Dispatchers.IO) {
-                getRealmInstance().use { realm ->
-                    realm.executeTransaction {
-                        onUpdate(getAppSettingsQuery(realm) ?: it.copyToRealm(AppSettings()))
+                try {
+                    getRealmInstance().use { realm ->
+                        realm.executeTransaction {
+                            onUpdate(getAppSettingsQuery(realm) ?: it.copyToRealm(AppSettings()))
+                        }
                     }
+                } finally {
+                    gate?.unregister()
                 }
             }
         }

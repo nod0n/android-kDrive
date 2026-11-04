@@ -43,6 +43,16 @@ object AppLockState {
         onTransition = { onTransition?.invoke() },
     )
 
+    init {
+        // All writers to AppSettings.realm join the ordered lifecycle: the maintenance drain
+        // waits for registered ordinary writes, and writes dispatched under maintenance are
+        // dropped as stale (Astra review R5-2).
+        AppSettings.settingsWriteGate = object : AppSettings.SettingsWriteGate {
+            override fun register(): Boolean = transitions.registerSettingsWrite()
+            override fun unregister() = transitions.unregisterSettingsWrite()
+        }
+    }
+
     /** Authoritative app-lock state for the provider gate. */
     fun isAppLockActive(): Boolean {
         if (transitions.isPending()) return true
