@@ -506,6 +506,12 @@ object OfflineFolderUtils {
                 isFolder = true,
                 isStillClearable = listingClearable(collectedParentId),
             )
+            // The subtree's original listing authority dies with the folder's rejection
+            // (issue: round 10 #6): if the folder was not cleared because its live parent
+            // moved — another subtree owns it now — descending would clear children whose
+            // only "authority" is an immediate-parent match against the moved row. The
+            // boundary is revalidated at EVERY level, not assumed from the top.
+            if (!listingClearable(collectedParentId)(realm, currentFolder)) continue
 
             realm.where(File::class.java)
                 .equalTo(File::parentId.name, currentId)

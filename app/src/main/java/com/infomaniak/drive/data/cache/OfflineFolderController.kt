@@ -56,33 +56,36 @@ object OfflineFolderController {
         customRealm: Realm? = null,
     ): Boolean {
         val block: (Realm) -> Boolean = { realm ->
-            // Root-intent writes serialize with destructive cleanup on the root folder's
-            // coordination lock, taken BEFORE the Realm write (issue: round 7 #9).
-            synchronized(OfflineFileCoordination.lockFor(userDrive, folder.id)) {
-                val existingRoot = getOfflineRoot(folder.id, customRealm = realm)
-                if (existingRoot != null && !existingRoot.isPendingRemoval) {
-                    false
-                } else if (existingRoot != null) {
-                    // Re-marking a root whose deferred cleanup is still running revives it.
-                    realm.executeTransaction { if (existingRoot.isValid) existingRoot.isPendingRemoval = false }
-                    updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
-                    true
-                } else {
-                    realm.executeTransaction {
-                        val root = OfflineRoot(
-                            folderId = folder.id,
-                            driveId = userDrive.driveId,
-                            userId = userDrive.userId,
-                            name = folder.name,
-                            path = folder.path,
-                            createdAt = Date(),
-                        ).apply { initUid() }
-                        it.copyToRealm(root)
+            // Root-intent writes serialize with destructive cleanup on the GLOBAL root-intent
+            // monitor FIRST, then the root folder's coordination lock, then the Realm write
+            // (issue: round 10 #5) — one consistent intent → locks → transaction order.
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                synchronized(OfflineFileCoordination.lockFor(userDrive, folder.id)) {
+                    val existingRoot = getOfflineRoot(folder.id, customRealm = realm)
+                    if (existingRoot != null && !existingRoot.isPendingRemoval) {
+                        false
+                    } else if (existingRoot != null) {
+                        // Re-marking a root whose deferred cleanup is still running revives it.
+                        realm.executeTransaction { if (existingRoot.isValid) existingRoot.isPendingRemoval = false }
+                        updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
+                        true
+                    } else {
+                        realm.executeTransaction {
+                            val root = OfflineRoot(
+                                folderId = folder.id,
+                                driveId = userDrive.driveId,
+                                userId = userDrive.userId,
+                                name = folder.name,
+                                path = folder.path,
+                                createdAt = Date(),
+                            ).apply { initUid() }
+                            it.copyToRealm(root)
+                        }
+                        // Mark the root folder itself as covered and its walk as pending until the
+                        // BulkDownloadWorker has walked it once.
+                        updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
+                        true
                     }
-                    // Mark the root folder itself as covered and its walk as pending until the
-                    // BulkDownloadWorker has walked it once.
-                    updateRootFolderFlags(folder.id, realm, isInOfflineFolder = true, isMarkedAsOffline = true)
-                    true
                 }
             }
         }
@@ -100,47 +103,49 @@ object OfflineFolderController {
             if (root == null) {
                 RemovalResult()
             } else {
-                // Root-intent writes serialize with revival on the root folder's coordination
-                // lock, taken BEFORE any Realm write below (issue: round 7 #9).
-                synchronized(OfflineFileCoordination.lockFor(userDrive, folderId)) {
-                    // If the folder is still covered by an ancestor root, everything below stays
-                    // covered: only the root record goes away.
-                    val isCoveredByAncestorRoot = isInsideActiveRoot(realm, folderId)
+                // Root-intent writes serialize with revival on the GLOBAL root-intent monitor
+                // first, then the root folder's coordination lock (issue: round 10 #5).
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    synchronized(OfflineFileCoordination.lockFor(userDrive, folderId)) {
+                        // If the folder is still covered by an ancestor root, everything below stays
+                        // covered: only the root record goes away.
+                        val isCoveredByAncestorRoot = isInsideActiveRoot(realm, folderId)
 
-                    if (isCoveredByAncestorRoot) {
-                        realm.executeTransaction { if (root.isValid) root.deleteFromRealm() }
-                        RemovalResult(rootExisted = true)
-                    } else {
-                        // Persist the deferred-cleanup intent BEFORE any cleanup runs: the record is
-                        // the durable owner and must exist while protected copies remain (issue:
-                        // round 3 #8).
-                        realm.executeTransaction { if (root.isValid) root.isPendingRemoval = true }
-
-                        val result = clearCoverageRecursively(context, realm, folderId, userDrive) {
-                            // Abort as soon as the record is gone (completed elsewhere) or revived.
-                            realm.where(OfflineRoot::class.java)
-                                .equalTo(OfflineRoot::folderId.name, folderId)
-                                .findFirst()
-                                ?.takeIf { it.isValid && it.isPendingRemoval } == null
-                        }
-                        result.rootExisted = true
-
-                        if (hasProtectedFilesRecursively(folderId, context, userDrive, realm)) {
-                            // Protected copies remain (pending uploads or unsynchronized edits): the
-                            // record stays as the durable owner until the offline sync finishes it.
-                            Unit
+                        if (isCoveredByAncestorRoot) {
+                            realm.executeTransaction { if (root.isValid) root.deleteFromRealm() }
+                            RemovalResult(rootExisted = true)
                         } else {
-                            // Nothing protected remains: delete the still-pending generation (a
-                            // concurrent re-mark revives the root and cancels this removal).
-                            realm.executeTransaction {
+                            // Persist the deferred-cleanup intent BEFORE any cleanup runs: the record is
+                            // the durable owner and must exist while protected copies remain (issue:
+                            // round 3 #8).
+                            realm.executeTransaction { if (root.isValid) root.isPendingRemoval = true }
+
+                            val result = clearCoverageRecursively(context, realm, folderId, userDrive) {
+                                // Abort as soon as the record is gone (completed elsewhere) or revived.
                                 realm.where(OfflineRoot::class.java)
                                     .equalTo(OfflineRoot::folderId.name, folderId)
                                     .findFirst()
-                                    ?.takeIf { it.isValid && it.isPendingRemoval }
-                                    ?.deleteFromRealm()
+                                    ?.takeIf { it.isValid && it.isPendingRemoval } == null
                             }
+                            result.rootExisted = true
+
+                            if (hasProtectedFilesRecursively(folderId, context, userDrive, realm)) {
+                                // Protected copies remain (pending uploads or unsynchronized edits): the
+                                // record stays as the durable owner until the offline sync finishes it.
+                                Unit
+                            } else {
+                                // Nothing protected remains: delete the still-pending generation (a
+                                // concurrent re-mark revives the root and cancels this removal).
+                                realm.executeTransaction {
+                                    realm.where(OfflineRoot::class.java)
+                                        .equalTo(OfflineRoot::folderId.name, folderId)
+                                        .findFirst()
+                                        ?.takeIf { it.isValid && it.isPendingRemoval }
+                                        ?.deleteFromRealm()
+                                }
+                            }
+                            result
                         }
-                        result
                     }
                 }
             }
@@ -356,12 +361,11 @@ object OfflineFolderController {
      */
     fun processPendingRemovalRoots(context: Context, userDrive: UserDrive, customRealm: Realm) {
         getOfflineRoots(customRealm = customRealm).filter { it.isPendingRemoval }.forEach { root ->
-            // The deferred cleanup serializes with revival/addition on the root folder's
-            // coordination lock — the SAME lock addOfflineRoot and removeOfflineRoot hold
-            // (issue: round 8 #8): without it, a revival racing the stillPending re-check
-            // could have its freshly requested coverage cleared and its copies deleted by
-            // this pass. Lock order stays root → descendants everywhere.
-            synchronized(OfflineFileCoordination.lockFor(userDrive, root.folderId)) {
+            // The deferred cleanup serializes with revival/addition on the GLOBAL root-intent
+            // monitor first, then the root folder's coordination lock (issue: round 10 #5) —
+            // a nested-root addition commits only outside this whole section.
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                synchronized(OfflineFileCoordination.lockFor(userDrive, root.folderId)) {
                 // Re-validate against the live record: the root may have been revived since
                 // the detached list was built (issue: round 4 #11).
                 val stillPending = customRealm.where(OfflineRoot::class.java)
@@ -389,6 +393,7 @@ object OfflineFolderController {
                         .findFirst()
                         ?.takeIf { it.isValid && it.isPendingRemoval }
                         ?.deleteFromRealm()
+                }
                 }
             }
         }
@@ -847,7 +852,13 @@ object OfflineFolderController {
             return
         }
 
-        synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
+        // GLOBAL root-intent monitor OUTSIDE the file lock (issue: round 10 #5): the intent
+        // decision, the coverage freshness decision and the byte deletion hold it
+        // continuously, so a nested-root addition — whose own lock no traversal holds —
+        // commits only before this whole section starts or after its byte deletion ends.
+        // Consistent order: intent monitor → file locks → Realm transaction.
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
             val needsSnapshot: Boolean
             when (protectionStateOf(file, offlineFile, userDrive)) {
                 CopyProtection.PENDING_UPLOAD -> {
@@ -886,11 +897,12 @@ object OfflineFolderController {
             }
             if (cleared) {
                 // Intent AND freshness re-check AFTER the commit, BEFORE the bytes go (issues:
-                // round 8 #8, round 9 #6): the flag commit and the byte deletion must share one
-                // intent protocol. A revival of the removed root, or a nested-root addition —
-                // a different lock, invisible to the abort predicate — between the committing
-                // transaction and the deletion keeps the bytes, so the newly established
-                // coverage finds its copy instead of losing it to the cleanup.
+                // round 8 #8, round 9 #6, round 10 #5): the flag commit and the byte deletion
+                // must share one intent protocol. The realm is refreshed first so commits from
+                // other threads are actually visible here, and the global intent monitor holds
+                // through this decision and the deletion — a nested-root addition cannot
+                // commit inside it.
+                runCatching { realm.refresh() }
                 val intentRevoked = isAborted() || (isStillClearable?.invoke(realm, file) == false)
                 if (!intentRevoked) {
                     deleteOfflineCopy(context, file, offlineFile, userDrive, result)
@@ -899,6 +911,7 @@ object OfflineFolderController {
                 }
             } else {
                 result.keptOfflineFilesCount++
+            }
             }
         }
     }

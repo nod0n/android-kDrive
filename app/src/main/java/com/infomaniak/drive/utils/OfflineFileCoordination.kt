@@ -34,6 +34,16 @@ object OfflineFileCoordination {
 
     private val locks = ConcurrentHashMap<String, Any>()
 
+    /**
+     * Process-wide ROOT-INTENT monitor (issue: round 10 #5): root writers (add, remove,
+     * deferred-removal processing) and destructive coverage cleanup hold it continuously
+     * through their freshness decisions and byte deletion, so a nested-root addition — whose
+     * own per-folder lock no cleanup traversal holds — cannot commit between a clearing
+     * transaction and the deletion of a newly covered copy. Lock order is ALWAYS this monitor
+     * first, then any per-file/per-root locks, then the Realm transaction.
+     */
+    val rootIntentMonitor: Any = Any()
+
     fun lockFor(userDrive: UserDrive, fileId: Int): Any =
         locks.getOrPut("${userDrive.userId}_${userDrive.driveId}_$fileId") { Any() }
 
