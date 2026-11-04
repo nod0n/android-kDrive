@@ -603,6 +603,13 @@ class CloudStorageProvider : DocumentsProvider() {
             val fileId = getFileIdFromDocumentId(sourceDocumentId)
             val file = FileController.getFileProxyById(fileId, customRealm = realm) ?: throw fileNotFoundException
 
+            // IMMUTABLE pre-HTTP request observation (issue: round 16 #7): detached identity
+            // values captured before the request — the proxy would be live-refreshed together
+            // with the row inside the coordination below, collapsing the request's basis into
+            // the current state.
+            val observedName = file.name
+            val observedParentId = file.parentId
+
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
             val targetParentFile =
                 FileController.getFileProxyById(targetParentFileId, customRealm = realm) ?: throw fileNotFoundException
@@ -631,7 +638,16 @@ class CloudStorageProvider : DocumentsProvider() {
                             runCatching { realm.refresh() }
                             val freshFile = FileController.getFileProxyById(fileId, customRealm = realm)
                             val freshTargetParent = FileController.getFileProxyById(targetParentFileId, customRealm = realm)
+                            // Delayed-success validation (issue: round 16 #7): a newer move or
+                            // rename that committed locally while this response was in flight
+                            // owns the row's identity now — preserving toward the obsolete
+                            // destination and deleting the row would discard the newer
+                            // operation's committed state. The stale operation defers; the
+                            // destination listing recreates the authoritative identity.
+                            val requestIsCurrent = freshFile == null ||
+                                (freshFile.name == observedName && freshFile.parentId == observedParentId)
                             when {
+                                !requestIsCurrent -> false
                                 freshFile == null -> false
                                 freshFile.isFolder() -> {
                                     // Required ancestry (issues: round 5 #10, round 7 #7)

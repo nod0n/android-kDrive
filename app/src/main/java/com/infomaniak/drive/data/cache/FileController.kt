@@ -439,6 +439,11 @@ object FileController {
         realm: Realm? = null,
         userDrive: UserDrive? = null,
     ): ApiResponse<CancellableAction> {
+        // IMMUTABLE pre-HTTP request observation (issue: round 16 #7): the identity the rename
+        // was issued against, captured before the request — a delayed successful response must
+        // not apply an old requested name over a newer committed identity.
+        val observedName = file.name
+        val observedParentId = file.parentId
         val apiResponse = ApiRepository.renameFile(file, newName)
         if (apiResponse.isSuccess()) {
             // Preservation BEFORE the identity replacement (issue: round 6 #4): the owned copy
@@ -448,16 +453,48 @@ object FileController {
             // precedes the file lock, and both the preservation and the name write hold them.
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), file.id) {
-                    val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm)
-                    if (preserved) {
-                        updateFile(file.id, realm, userDrive = userDrive) { localFile ->
-                            localFile.name = newName
+                    // Delayed-success validation (issue: round 16 #7): another rename/move that
+                    // committed while this response was in flight owns the row's identity now —
+                    // preserving toward the obsolete target and writing the old requested name
+                    // would roll the row back. The stale operation defers; the authoritative
+                    // current identity stays and a later listing/details pass reconciles.
+                    if (renameRequestStillCurrent(file.id, observedName, observedParentId, userDrive, realm)) {
+                        val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm)
+                        if (preserved) {
+                            updateFile(file.id, realm, userDrive = userDrive) { localFile ->
+                                localFile.name = newName
+                            }
                         }
+                    } else {
+                        SentryLog.i(
+                            "FileController",
+                            "Deferring rename of ${file.id}: a newer identity committed while the rename response was in flight",
+                        )
                     }
                 }
             }
         }
         return apiResponse
+    }
+
+    /**
+     * Whether the live row still carries the identity a rename/move request was issued
+     * against (issue: round 16 #7): a missing row defers to the caller's own missing-row
+     * handling, and a row whose name or parent changed since the request belongs to a newer
+     * committed operation.
+     */
+    private fun renameRequestStillCurrent(
+        fileId: Int,
+        observedName: String,
+        observedParentId: Int,
+        userDrive: UserDrive?,
+        customRealm: Realm?,
+    ): Boolean {
+        val block: (Realm) -> Boolean = { realmInstance ->
+            val liveRow = getFileProxyById(fileId, customRealm = realmInstance)
+            liveRow == null || (liveRow.name == observedName && liveRow.parentId == observedParentId)
+        }
+        return customRealm?.let(block) ?: getRealmInstance(userDrive ?: UserDrive()).use(block)
     }
 
     /**
