@@ -60,6 +60,7 @@ import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.NotificationUtils.buildGeneralNotification
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.NotificationUtils.cancelNotification
 import com.infomaniak.drive.utils.SyncUtils.syncImmediately
 import com.infomaniak.drive.utils.Utils
@@ -647,7 +648,11 @@ class CloudStorageProvider : DocumentsProvider() {
                 }
 
                 if (preserved) {
-                    realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                    // The row deletion REMOVES ancestry (issue: round 13 #5): the intent
+                    // monitor serializes it with cleanup's coverage decisions.
+                    synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                        realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                    }
                 } else {
                     // Preservation deferred (or ancestry still required): the OLD row and its
                     // ancestry stay so the original path stays discoverable; the destination

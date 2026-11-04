@@ -90,8 +90,14 @@ object FileController {
 
     fun getParentFileProxy(fileId: Int, userDrive: UserDrive? = null, realm: Realm? = null): File? {
         val block: (Realm) -> File? = { currentRealm ->
-            getFileById(currentRealm, fileId)?.localParent?.let { parents ->
-                parents.firstOrNull { it.id > 0 }
+            getFileById(currentRealm, fileId)?.let { file ->
+                // The AUTHORITATIVE parent relationship resolves the proxy (issue: round 13
+                // #12): the backlink matching parentId wins, a missing backlink is resolved
+                // BY ID from the known parent, and the first-positive backlink is only the
+                // legacy fallback for rows without a real parent id.
+                file.localParent?.firstOrNull { it.id == file.parentId && it.id > 0 }
+                    ?: file.parentId.takeIf { it > ROOT_ID }?.let { getFileById(currentRealm, it) }
+                    ?: file.localParent?.firstOrNull { it.id > 0 }
             }
         }
 
@@ -166,7 +172,11 @@ object FileController {
         // first positive-id backlink is only the legacy fallback.
         val parents = file.localParent?.createSnapshot()
         val folder = parents?.firstOrNull { it.id == file.parentId && it.id > 0 }
-            ?: parents?.firstOrNull { it.id > 0 }
+            // A known authoritative parent with NO matching backlink DEFERS the derivation
+            // (issue: round 13 #12): falling back to an inconsistent real-folder backlink
+            // would derive the abandoned location's path. Rows without a real parent id
+            // (virtual containers) keep the legacy first-positive fallback.
+            ?: parents?.firstOrNull { it.id > 0 }?.takeIf { file.parentId <= ROOT_ID }
         return when {
             folder == null -> ""
             folder.id == ROOT_ID -> recPath.insert(0, "/${file.name}").toString()
@@ -422,11 +432,17 @@ object FileController {
         if (apiResponse.isSuccess()) {
             // Preservation BEFORE the identity replacement (issue: round 6 #4): the owned copy
             // at the old name's path is reconciled to the new name first, and an incomplete
-            // reconciliation keeps the OLD name until a later pass retries.
-            val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm)
-            if (preserved) {
-                updateFile(file.id, realm, userDrive = userDrive) { localFile ->
-                    localFile.name = newName
+            // reconciliation keeps the OLD name until a later pass retries. The rename is an
+            // ancestry-changing identity commit (issue: round 13 #5): the intent monitor
+            // precedes the file lock, and both the preservation and the name write hold them.
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), file.id) {
+                    val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm)
+                    if (preserved) {
+                        updateFile(file.id, realm, userDrive = userDrive) { localFile ->
+                            localFile.name = newName
+                        }
+                    }
                 }
             }
         }
@@ -1419,7 +1435,11 @@ object FileController {
         var newLocalFolderProxy: File? = null
         if (localFolderProxy == null && remoteFolder != null) {
             runCatching {
-                realm.executeTransaction { newLocalFolderProxy = it.copyToRealm(remoteFolder) }
+                // Initial folder insertion establishes ancestry (issue: round 13 #5): the
+                // intent monitor precedes it.
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    realm.executeTransaction { newLocalFolderProxy = it.copyToRealm(remoteFolder) }
+                }
             }.onFailure { exception ->
                 if (exception is RealmPrimaryKeyConstraintException) {
                     SentryLog.i("FileController", "Exception while adding a folder to Realm", exception)
@@ -1704,7 +1724,21 @@ object FileController {
         okHttpClient: OkHttpClient,
     ): File? {
         val remoteParent = getRemoteFile(fileId = parentId, driveId = driveId, okHttpClient = okHttpClient) ?: return null
-        insertOrUpdateFile(realm, remoteParent, userDrive = userDrive)
+        // Conditional ancestor upsert (issue: round 13 #4): the HTTP fetch precedes it, the
+        // transaction-fresh live row gates acceptance (a newer committed ancestor wins),
+        // absence inserts (the chain is being built), and the live row's local fields are
+        // preserved. The insert establishes ancestry — the intent monitor precedes the file
+        // lock (issue: round 13 #5).
+        val parentOldRow = getFileById(realm, remoteParent.id)
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            insertOrUpdateFile(
+                realm,
+                remoteParent,
+                parentOldRow,
+                userDrive = userDrive,
+                acceptIf = { live -> live == null || !isStaleReplacement(live, remoteParent) },
+            )
+        }
         linkChildToParent(realm, parentId = parentId, childId = childId)
         return remoteParent
     }
