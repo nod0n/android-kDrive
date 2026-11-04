@@ -327,6 +327,7 @@ object OfflineFolderUtils {
             apiResponse = apiResponse,
             isFirstPage = true,
             isCompleteFolder = isCompleteFolder,
+            userDrive = userDrive,
         )
 
         val subFolderIds = mutableListOf<Int>()

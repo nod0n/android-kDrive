@@ -160,7 +160,8 @@ object FolderFilesProvider {
             remoteFolder = if (folderFilesProviderArgs.folderId == ROOT_ID) rootFolder else folderProxy,
             apiResponse = apiResponse,
             isFirstPage = cursor == null,
-            isCompleteFolder = !apiResponse.hasMore
+            isCompleteFolder = !apiResponse.hasMore,
+            userDrive = folderFilesProviderArgs.userDrive
         )
 
         when {
@@ -338,7 +339,8 @@ object FolderFilesProvider {
                     remoteFolder = localFolder,
                     apiResponse = apiResponse,
                     isFirstPage = folderFilesProviderArgs.isFirstPage,
-                    isCompleteFolder = isCompleteFolder
+                    isCompleteFolder = isCompleteFolder,
+                    userDrive = userDrive
                 )
                 val folderFiles = if (folderWithChildren) ArrayList(apiResponseData) else arrayListOf()
                 FolderFilesProviderResult(folder = localFolder, folderFiles = folderFiles, isComplete = isCompleteFolder)
@@ -485,7 +487,7 @@ object FolderFilesProvider {
             FileController.removeFile(fileId, customRealm = realm, recursive = false, userDrive = userDrive)
         } else {
             if (actionFile.isImporting()) MqttClientWrapper.start(actionFile.externalImport?.id)
-            FileController.upsertActionFile(realm, currentFolder.id, actionFile)
+            FileController.upsertActionFile(realm, currentFolder.id, actionFile, userDrive)
         }
     }
 

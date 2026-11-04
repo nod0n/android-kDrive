@@ -293,7 +293,13 @@ object FileController {
             getFileById(realm, fileId)?.let { file ->
                 if (recursive) {
                     file.children.createSnapshot().forEach {
-                        if (!keepFiles.contains(it.id)) removeFile(it.id, keepFileCaches, keepFiles, realm)
+                        // The captured account flows through the recursion (issue: round 5 #6):
+                        // a descendant resolving UserDrive from the active account would
+                        // inspect, snapshot or delete another account's bytes while removing
+                        // this account's metadata.
+                        if (!keepFiles.contains(it.id)) {
+                            removeFile(it.id, keepFileCaches, keepFiles, realm, userDrive = userDrive)
+                        }
                     }
                 }
                 runCatching {
@@ -425,12 +431,20 @@ object FileController {
         }
     }
 
-    fun upsertActionFile(realm: Realm, folderId: Int, actionFile: File) {
+    fun upsertActionFile(realm: Realm, folderId: Int, actionFile: File, userDrive: UserDrive) {
+        // Shared upsert boundary (issue: round 5 #5): an activity refresh can carry a
+        // rename/move; the owned copy at the old location is preserved before the metadata
+        // replacement, and a deferred reconciliation keeps the OLD row authoritative.
+        val preservedActionFile = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+            realm = realm,
+            remoteFiles = listOf(actionFile),
+            userDrive = userDrive,
+        ).first()
         realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
-            if (!realmFolder.children.contains(actionFile)) {
-                realm.executeTransaction { realmFolder.children.add(actionFile) }
+            if (!realmFolder.children.contains(preservedActionFile)) {
+                realm.executeTransaction { realmFolder.children.add(preservedActionFile) }
             } else {
-                updateFileFromActivity(realm, actionFile, realmFolder.id)
+                updateFileFromActivity(realm, preservedActionFile, realmFolder.id)
             }
         }
     }
@@ -517,7 +531,7 @@ object FileController {
                 } else offlineFile?.delete()
             }
 
-            if (replaceOldData) removeFile(MyShares.id, keepCaches, keepFiles, realm)
+            if (replaceOldData) removeFile(MyShares.id, keepCaches, keepFiles, realm, userDrive = userDrive)
             saveFiles(MyShares.file, files, replaceOldData, realm)
         }
     }
@@ -855,8 +869,20 @@ object FileController {
         apiResponse: CursorApiResponse<List<File>>,
         isFirstPage: Boolean,
         isCompleteFolder: Boolean,
+        userDrive: UserDrive,
     ) {
         val remoteFiles = apiResponse.data ?: return
+
+        // Shared upsert boundary (issue: round 5 #5): owned copies at renamed/moved locations
+        // are preserved BEFORE any metadata replacement — ordinary listings included, not only
+        // the walk. Deferred files keep their OLD row in the commit list. This runs OUTSIDE the
+        // write transaction below: reconciliation coordinates per-file ownership and performs
+        // file I/O.
+        val committableFiles = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+            realm = realm,
+            remoteFiles = remoteFiles,
+            userDrive = userDrive,
+        )
 
         // Save remote folder if it doesn't exist locally
         var newLocalFolderProxy: File? = null
@@ -873,13 +899,13 @@ object FileController {
         }
         realm.executeTransaction {
             // Restore same children data
-            keepSubFolderChildren(realm, localFolderProxy?.children, remoteFiles)
+            keepSubFolderChildren(realm, localFolderProxy?.children, committableFiles)
             // Save to realm
             (localFolderProxy ?: newLocalFolderProxy)?.let { folderProxy ->
                 // Remove old children
                 if (isFirstPage) folderProxy.children.clear()
                 // Add children
-                folderProxy.children.addAll(remoteFiles)
+                folderProxy.children.addAll(committableFiles)
                 // Update folder properties
                 folderProxy.isComplete = isCompleteFolder
                 folderProxy.responseAt = apiResponse.responseAt

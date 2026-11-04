@@ -221,7 +221,29 @@ object SyncOfflineUtils {
                 downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm)
             }
             fileAction.lastAction in renameActions -> {
-                remoteFile.getOfflineFile(context)?.let { ioFile.renameTo(it) }
+                // Shared move handling (issue: round 5 #4): a rename/move is reconciled through
+                // the same protection-aware routine as the folder walk, under the captured
+                // account, BEFORE any metadata or filesystem mutation. The previous direct
+                // renameTo could overwrite a protected destination and lose its sole edit, and
+                // it resolved the target with the active account.
+                if (ioFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
+                        context = context,
+                        oldOfflineFile = ioFile,
+                        oldIdentityName = localFile.name,
+                        oldIdentityParentId = localFile.parentId,
+                        oldLastModifiedAt = localFile.lastModifiedAt,
+                        newIdentity = remoteFile,
+                        userDrive = userDrive,
+                    )
+                ) {
+                    // Preservation incomplete (pending upload, snapshot failed, protected
+                    // destination): keep the old bytes and metadata, and do not consume the
+                    // action so a later sync retries it.
+                    return
+                }
+                // Bytes are safely at (or durably registered for) the new location: commit the
+                // new identity so the row and the offline path agree.
+                FileController.updateExistingFile(newFile = remoteFile, realm = realm)
             }
         }
 
@@ -293,15 +315,28 @@ object SyncOfflineUtils {
         val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return
         val pathChanged = offlineFile.path != remoteOfflineFile.path
 
-        if (pathChanged && UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())) {
-            // The old copy backs a pending upload: keep its bytes in place and retry this
-            // refresh after the upload completed (issue #1902).
-            return
-        }
-
         if (pathChanged) {
+            // A pending download marker leaves this refresh to the queued worker, which runs
+            // its own protection checks: moving or deleting the bytes here would race it.
+            if (file.isMarkedAsOffline) return
+            if (offlineFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
+                    context = context,
+                    oldOfflineFile = offlineFile,
+                    oldIdentityName = file.name,
+                    oldIdentityParentId = file.parentId,
+                    oldLastModifiedAt = file.lastModifiedAt,
+                    newIdentity = remoteFile,
+                    userDrive = userDrive,
+                )
+            ) {
+                // Preservation incomplete: keep the old bytes and metadata; a later sync
+                // retries the refresh (issue: round 5 #4).
+                return
+            }
+            // The old location no longer holds this file's content (migrated, snapshotted
+            // under the new identity, deleted as uploaded, or never existed): drop its stale
+            // media index entry.
             if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
-            offlineFile.delete()
         }
 
         if (!file.isMarkedAsOffline && (!remoteFile.isOfflineAndIntact(remoteOfflineFile) || pathChanged)) {

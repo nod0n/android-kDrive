@@ -435,6 +435,52 @@ object OfflineFolderController {
         }
     }
 
+    /**
+     * Shared upsert boundary (issue: round 5 #5): preserves owned copies at their OLD location
+     * before ANY metadata replacement — ordinary listings and activity refreshes included, not
+     * only the folder walk. A file whose reconciliation is incomplete keeps its OLD metadata:
+     * the OLD row is returned in its place so the caller commits a coherent state, and no
+     * edited bytes are stranded at an untracked path.
+     *
+     * MUST run OUTSIDE a Realm write transaction: reconciliation takes the shared per-file
+     * coordination and performs file I/O. Without an application context the input is returned
+     * unchanged (no preservation possible — same as the pre-feature behavior).
+     */
+    fun reconcileOwnedCopiesBeforeCommit(
+        realm: Realm,
+        remoteFiles: List<File>,
+        userDrive: UserDrive,
+    ): List<File> {
+        val context = Realm.getApplicationContext() ?: return remoteFiles
+        if (remoteFiles.isEmpty()) return remoteFiles
+        return remoteFiles.map { remoteFile ->
+            val oldRow = FileController.getFileById(realm, remoteFile.id) ?: return@map remoteFile
+            if (oldRow.isFolder()) return@map remoteFile
+            val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
+                ?: return@map remoteFile
+            // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7).
+            val newOffline = remoteFile.getOfflineFile(context, userDrive.userId)
+            val locationChanged = newOffline == null || newOffline.path != oldOffline.path
+            if (!locationChanged) return@map remoteFile
+            if (reconcileMovedInheritedCopy(
+                    context = context,
+                    oldOfflineFile = oldOffline,
+                    oldIdentityName = oldRow.name,
+                    oldIdentityParentId = oldRow.parentId,
+                    oldLastModifiedAt = oldRow.lastModifiedAt,
+                    newIdentity = remoteFile,
+                    userDrive = userDrive,
+                )
+            ) {
+                remoteFile
+            } else {
+                // Preservation incomplete (pending upload, snapshot failed, protected
+                // destination): keep the OLD row authoritative for this commit.
+                oldRow
+            }
+        }
+    }
+
     /** Outcome of the removal preservation hook (issue: round 4 #6). */
     enum class PreservationOutcome {
         /** Content is durably safe (uploaded, snapshotted, or nothing to preserve): bytes and row can go. */

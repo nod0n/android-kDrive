@@ -332,7 +332,13 @@ class MainViewModel(
                 if (isSharedWithMe) {
                     // If the selected folder is a shared folder, it is removed from the user's realm table (userId_driveId)
                     // and added to the share realm (userId_share)
-                    FileController.removeFile(fileId = file.id, customRealm = currentDriveRealm)
+                    // Explicit captured scope (issue: round 5 #6): preservation and cache
+                    // deletion must not re-derive the account from the active one.
+                    FileController.removeFile(
+                        fileId = file.id,
+                        customRealm = currentDriveRealm,
+                        userDrive = UserDrive(driveId = file.driveId),
+                    )
                     FileController.getRealmInstance(UserDrive(sharedWithMe = true)).use { sharedRealm ->
                         FileController.updateFile(newParent.id, sharedRealm) { localFolder ->
                             runCatching { localFolder.children.add(file) }.onFailure(Sentry::captureException)
