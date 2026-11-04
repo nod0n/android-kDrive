@@ -1050,7 +1050,7 @@ class MainViewModel(
             name = file.name
         }
         // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
-        OfflineFolderController.anchorHistoricalBaseline(realm, file, ioFile)
+        OfflineFolderController.anchorHistoricalBaseline(application, realm, file, ioFile, userDrive)
         return OfflineFolderController.reconcileMovedInheritedCopy(
             context = application,
             oldOfflineFile = ioFile,

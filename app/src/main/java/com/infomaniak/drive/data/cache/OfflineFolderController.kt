@@ -1427,6 +1427,11 @@ object OfflineFolderController {
      */
     internal fun anchorHistoricalBaseline(context: Context, realm: Realm, row: File, bytes: IOFile, userDrive: UserDrive) {
         if ((row.publishedCleanBaseline ?: 0L) > 0L) return
+        // EXCLUSIVE CURRENT-PATH OWNERSHIP before the anchor (issue: round 19 #7): the
+        // historical baseline relabels [bytes] as this row's published generation — on a
+        // contested or foreign path those bytes may be another identity's copy, and
+        // anchoring them would launder foreign content into this row's provenance.
+        if (exclusivePathOwner(realm, context, userDrive, bytes.path) != row.id) return
         if (row.storedOfflineCopyState(context, bytes, userDrive) == StoredOfflineCopyState.PROVEN_CURRENT) {
             runCatching { realm.executeTransaction { row.publishedCleanBaseline = row.lastModifiedAt } }
         }

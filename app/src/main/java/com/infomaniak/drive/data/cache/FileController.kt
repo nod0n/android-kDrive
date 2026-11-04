@@ -372,23 +372,35 @@ object FileController {
         userDrive: UserDrive? = null,
     ) {
         val block: (Realm) -> Unit? = { realm ->
-            getFileById(realm, fileId)?.let { file ->
-                if (recursive) {
-                    file.children.createSnapshot().forEach {
-                        // The captured account flows through the recursion (issue: round 5 #6):
-                        // a descendant resolving UserDrive from the active account would
-                        // inspect, snapshot or delete another account's bytes while removing
-                        // this account's metadata.
-                        if (!keepFiles.contains(it.id)) {
-                            removeFile(it.id, keepFileCaches, keepFiles, realm, userDrive = userDrive)
-                        }
+            // Child recursion runs BEFORE this row's coordination (no nested lock
+            // acquisition): each child re-runs the full protocol under its own section,
+            // and the captured account flows through the recursion (issue: round 5 #6).
+            if (recursive) {
+                getFileById(realm, fileId)?.children?.createSnapshot()?.forEach {
+                    if (!keepFiles.contains(it.id)) {
+                        removeFile(it.id, keepFileCaches, keepFiles, realm, userDrive = userDrive)
                     }
                 }
-                runCatching {
-                    val resolvedUserDrive = userDrive ?: UserDrive(driveId = file.driveId)
-                    // Row removal is a mutation owner of the offline copy: preservation, cache
-                    // deletion and row deletion are one coordinated section (issue: round 4 #4).
-                    OfflineFileCoordination.withFileLock(resolvedUserDrive, fileId) {
+            }
+            runCatching {
+                // Lock-scope derivation from a read-only pre-read (a row's id/driveId
+                // identity is stable); every DECISION below re-reads the row inside the
+                // section. No row and no scope: nothing to remove.
+                val lockScope = userDrive ?: getFileById(realm, fileId)?.driveId?.let { UserDrive(driveId = it) }
+                    ?: return@runCatching
+                // Removal is a destructive effect (issue: round 19 #7): the whole decision
+                // section runs under the intent monitor → file lock → refresh → CURRENT row,
+                // then byte effects only on confirmed current-path ownership. The previous
+                // order read the row and its descendants BEFORE the lock and preserved or
+                // deleted from that stale view.
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withFileLock(lockScope, fileId) {
+                        // A refresh failure STOPS the removal (issue: round 17 #9 doctrine):
+                        // preservation and deletion must never run on a stale Realm; the row
+                        // stays and a later pass retries.
+                        runCatching { realm.refresh() }.onFailure { return@withFileLock }
+                        val file = getFileById(realm, fileId) ?: return@withFileLock
+                        val resolvedUserDrive = userDrive ?: UserDrive(driveId = file.driveId)
                         // Required ancestry (issue: round 5 #10): a folder row whose descendants
                         // remain locally owned must survive — deleting it strands the preserved
                         // copies' metadata and breaks every parentId traversal (deferred
@@ -405,11 +417,30 @@ object FileController {
                             when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(file, resolvedUserDrive, realm)) {
                                 // Content safe (or nothing to preserve): bytes and row can go.
                                 OfflineFolderController.PreservationOutcome.CONTENT_SAFE -> {
-                                    if (!keepFileCaches.contains(fileId)) {
-                                        file.deleteCaches(Realm.getApplicationContext()!!, resolvedUserDrive.userId)
+                                    val context = Realm.getApplicationContext()
+                                    // CURRENT-PATH byte ownership (issue: round 19 #7): an
+                                    // offline-scoped file row's bytes go only when the row still
+                                    // EXCLUSIVELY owns its resolved path — a rename, move or
+                                    // duplicate that committed while this removal waited leaves
+                                    // the bytes to another identity's claim, and the byte
+                                    // effects defer instead of deleting another row's copy.
+                                    val offlinePath = context?.let {
+                                        file.getOfflineFile(it, resolvedUserDrive.userId)?.path
                                     }
-                                    if (!keepFiles.contains(fileId) && !folderStillNeeded) {
-                                        realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                                    val pathOwned = context == null || file.isFolder() ||
+                                        !(file.isOffline || file.isInOfflineFolder) ||
+                                        offlinePath == null ||
+                                        OfflineFolderController.exclusivePathOwner(
+                                            realm,
+                                            context,
+                                            resolvedUserDrive,
+                                            offlinePath,
+                                        ) == file.id
+                                    if (pathOwned) {
+                                        file.deleteCaches(context!!, resolvedUserDrive.userId)
+                                        if (!keepFiles.contains(fileId) && !folderStillNeeded) {
+                                            realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                                        }
                                     }
                                 }
                                 // Preservation pending: retain bytes AND the row (with its durable
@@ -421,14 +452,14 @@ object FileController {
                             realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                         }
                     }
-                }.onFailure { exception ->
-                    Sentry.captureException(exception) { scope ->
-                        scope.setExtra("with custom realm", "${customRealm != null}")
-                        scope.setExtra("recursive", "$recursive")
-                    }
                 }
-                Unit
+            }.onFailure { exception ->
+                Sentry.captureException(exception) { scope ->
+                    scope.setExtra("with custom realm", "${customRealm != null}")
+                    scope.setExtra("recursive", "$recursive")
+                }
             }
+            Unit
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
@@ -543,7 +574,7 @@ object FileController {
                 name = newName
             }
             // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
-            OfflineFolderController.anchorHistoricalBaseline(realm, liveRow, oldOffline)
+            OfflineFolderController.anchorHistoricalBaseline(context, realm, liveRow, oldOffline, scope)
             OfflineFolderController.reconcileMovedInheritedCopy(
                 context = context,
                 oldOfflineFile = oldOffline,

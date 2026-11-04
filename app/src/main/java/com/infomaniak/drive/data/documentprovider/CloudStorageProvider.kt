@@ -676,7 +676,7 @@ class CloudStorageProvider : DocumentsProvider() {
                                                 .getOfflineFile(appContext, userDrive.userId)
                                                 ?.let { parentDir -> IOFile(parentDir, freshFile.name) }
                                             // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
-                                            OfflineFolderController.anchorHistoricalBaseline(realm, freshFile, oldOffline)
+                                            OfflineFolderController.anchorHistoricalBaseline(appContext, realm, freshFile, oldOffline, userDrive)
                                             destinationFile != null && OfflineFolderController.reconcileMovedInheritedCopy(
                                                 context = appContext,
                                                 oldOfflineFile = oldOffline,
