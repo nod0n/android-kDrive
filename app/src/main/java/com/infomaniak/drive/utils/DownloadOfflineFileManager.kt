@@ -106,6 +106,15 @@ class DownloadOfflineFileManager(
 
     private var lastUpdateProgressMillis = System.currentTimeMillis()
 
+    /**
+     * Whether this transfer's metadata commit was DEFERRED to the verification outcome
+     * (issue: round 23 #7): a boundary-substituted transfer fetches comparison bytes with
+     * the row uncommitted; a converged publication (the staged copy published) then
+     * advances the historical row through the conditional acceptance, so the published
+     * record identifies the row on the next pass.
+     */
+    private var verificationMetadataDeferred = false
+
     suspend fun execute(
         context: Context,
         file: File,
@@ -117,6 +126,7 @@ class DownloadOfflineFileManager(
         currentFile = file
         lastDownloadedFile = null
         lastTransferSuperseded = false
+        verificationMetadataDeferred = false
 
         // CAPTURED CACHE PUBLICATION TOKEN (issue: round 22 #21): the pre-download cache
         // cleanup validates the cache's CURRENT self-certification, but a later writer can
@@ -187,30 +197,26 @@ class DownloadOfflineFileManager(
                     if (boundaryResult === remoteFile) remoteFile else realm.copyFromRealm(boundaryResult, 1)
                 }
                 if (commitFile !== remoteFile) {
-                    // NON-DESTRUCTIVE VERIFICATION DOWNLOAD (issue: round 22 #6): a
-                    // boundary substitution for an UNCHANGED identity is the
-                    // unproven-historical preservation defer — the verification may still
-                    // fetch a SEPARATE staged copy and compare it against the retained
-                    // bytes at the (non-destructive) publication: equal bytes certify the
-                    // retained generation, different bytes are retained. The historical
-                    // row and bytes are never replaced first, and the metadata commit is
-                    // skipped (the row stays as-is). Any OTHER substitution still defers.
-                    // Compared on the SERVER-OBSERVED fields only: publishedCleanBaseline
-                    // is a local materialized field the API payload never carries — its
-                    // presence must not block the non-destructive verification, whose
-                    // authority is the byte comparison at the publication.
-                    val unchangedIdentity = commitFile.revisedAt == remoteFile.revisedAt &&
-                        commitFile.updatedAt == remoteFile.updatedAt &&
-                        (commitFile.version?.number ?: 0) == (remoteFile.version?.number ?: 0) &&
-                        commitFile.parentId == remoteFile.parentId &&
-                        commitFile.name == remoteFile.name &&
-                        commitFile.lastModifiedAt == remoteFile.lastModifiedAt &&
-                        commitFile.size == remoteFile.size
-                    if (!unchangedIdentity) {
+                    // NON-DESTRUCTIVE VERIFICATION DOWNLOAD (issues: round 22 #6, round 23
+                    // #7): a boundary substitution defers the METADATA, not the
+                    // verification — a separate staged copy is fetched and compared against
+                    // the retained bytes at the (non-destructive) publication: equal bytes
+                    // certify the retained generation, different bytes are retained. The
+                    // historical row and bytes are never replaced first, and the metadata
+                    // commit is skipped (the row stays as-is; a converged publication is
+                    // committed by the NEXT pass, whose boundary sees the certified copy
+                    // as replaceable). METADATA EQUALITY IS NO LONGER A PREREQUISITE:
+                    // a legacy row with an unknown version against details with a known
+                    // one — or an older row followed by a newer remote revision — now
+                    // obtains comparison bytes. Only a genuinely STALE payload (the live
+                    // row is NEWER than the fetch — a newer generation already owns the
+                    // file) still defers outright.
+                    if (FileController.isSupersededGeneration(commitFile, remoteFile)) {
                         SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its old offline copy is not safely preserved yet")
                         return@withFileLock false
                     }
                     skipMetadataCommit = true
+                    verificationMetadataDeferred = true
                 }
                 // The SAME complete-chain validation holds THROUGH the commit (issue: round
                 // 17 #8): a chain broken during preservation defers without the metadata
@@ -712,6 +718,27 @@ class DownloadOfflineFileManager(
                 // Public superseded/conflict status for the bulk caller (issues: round 9 #8,
                 // round 14 #13).
                 lastTransferSuperseded = outcome in UNRESOLVED_PUBLICATION_OUTCOMES
+                // CONDITIONAL METADATA ADVANCE (issue: round 23 #7): a verification whose
+                // bytes CONVERGED published the staged copy under the fetched generation —
+                // the historical row is advanced through the same conditional acceptance
+                // under the coordination, so the published record identifies the row on
+                // the next pass (the comparison was resolved BEFORE the metadata moved).
+                if (verificationMetadataDeferred &&
+                    (outcome == PublicationOutcome.PUBLISHED || outcome == PublicationOutcome.PUBLISHED_UNRESOLVED)
+                ) {
+                    synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                        OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                            FileController.getRealmInstance(userDrive).use { realm ->
+                                FileController.updateExistingFileIfNotOlder(
+                                    newFile = file,
+                                    realm = realm,
+                                    userDrive = userDrive,
+                                    observed = file,
+                                )
+                            }
+                        }
+                    }
+                }
                 when (outcome) {
                     PublicationOutcome.FAILED -> return@withContext ListenableWorker.Result.failure()
                     // Completion (flag writes, timestamp, media scan) only runs for bytes this

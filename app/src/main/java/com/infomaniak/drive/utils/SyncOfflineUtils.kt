@@ -872,6 +872,18 @@ object SyncOfflineUtils {
                     provenHashDrift
                 )
             if (!uploadStillNeeded) return true
+            // COMPLETE DESTINATION ANCESTRY BEFORE REGISTRATION (issue: round 23 #10):
+            // the upload registers under the POST-COMMIT destination
+            // (remoteFile.parentId/name) — an accepted move action into an uncached
+            // ancestry previously registered the upload and advanced metadata/cursor
+            // while the resulting local identity had no usable path. The complete fresh
+            // chain is validated BEFORE the snapshot; the action defers WITHOUT
+            // registration while ancestry is unresolved (bounded fair ancestor
+            // resolution grows it outside coordination).
+            val registrationFolder = remoteFile?.parentId ?: liveRow.parentId
+            if (registrationFolder > 0 && !FileController.destinationChainExists(realm, registrationFolder)) {
+                return false
+            }
             val uri = Uri.fromFile(freshSource)
             val fileModifiedAt = Date(freshSource.lastModified())
             if (!UploadFile.canUpload(uri, fileModifiedAt)) {
@@ -1029,7 +1041,13 @@ object SyncOfflineUtils {
                 // so a rejection here means the row vanished mid-section: the snapshot's
                 // durable ownership exists, the action is consumed, and the rejection is
                 // logged rather than ignored.
-                val advanced = FileController.updateExistingFileIfNotSuperseded(
+                // THE ANCESTRY AUTHORITY HOLDS THROUGH ACCEPTANCE (issue: round 23 #10):
+                // a chain broken during the registration I/O defers the metadata commit —
+                // the durable snapshot registration exists, the action is consumed, and
+                // the acceptance retries on a later pass with the resolved ancestry.
+                if (registrationFolder > 0 && !FileController.destinationChainExists(realm, registrationFolder)) {
+                    SentryLog.i("SyncOffline", "Upload advance deferred for ${localFile.id}: its destination ancestry broke during registration")
+                } else FileController.updateExistingFileIfNotSuperseded(
                     newFile = remoteFile,
                     realm = realm,
                     userDrive = userDrive,
