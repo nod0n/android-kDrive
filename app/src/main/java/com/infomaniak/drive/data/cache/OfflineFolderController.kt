@@ -380,6 +380,10 @@ object OfflineFolderController {
         synchronized(OfflineFileCoordination.lockFor(userDrive, newIdentity.id)) {
             val fileModifiedAt = Date(oldOfflineFile.lastModified())
             return when {
+                // A pending upload owns the bytes at the old path until it completes (issue:
+                // round 5 #9): committing the new metadata now would leave the upload reading a
+                // location the walk no longer tracks. Deferring keeps the old row and location
+                // authoritative; the caller retries reconciliation after the upload finished.
                 UploadFile.hasPendingUpload(uri = Uri.fromFile(oldOfflineFile).toString()) ||
                     UploadFile.hasUploadRecordFor(
                         fileName = oldIdentityName,
@@ -388,7 +392,7 @@ object OfflineFolderController {
                         userId = userDrive.userId,
                         fileModifiedAt = fileModifiedAt,
                         pendingOnly = true,
-                    ) -> true
+                    ) -> false
                 UploadFile.hasUploadRecordFor(
                     fileName = oldIdentityName,
                     remoteFolder = oldIdentityParentId,
@@ -513,7 +517,15 @@ object OfflineFolderController {
                 continue
             }
 
-            clearFileCoverage(context, realm, file = folder, userDrive = userDrive, result = result, isFolder = true)
+            clearFileCoverage(
+                context = context,
+                realm = realm,
+                file = folder,
+                userDrive = userDrive,
+                result = result,
+                isFolder = true,
+                isAborted = isAborted,
+            )
 
             realm.where(File::class.java)
                 .equalTo(File::parentId.name, folderId)
@@ -523,7 +535,15 @@ object OfflineFolderController {
                     if (child.isFolder()) {
                         if (visited.add(child.id)) queue.add(child.id)
                     } else {
-                        clearFileCoverage(context, realm, file = child, userDrive = userDrive, result = result, isFolder = false)
+                        clearFileCoverage(
+                            context = context,
+                            realm = realm,
+                            file = child,
+                            userDrive = userDrive,
+                            result = result,
+                            isFolder = false,
+                            isAborted = isAborted,
+                        )
                     }
                 }
         }
@@ -552,11 +572,12 @@ object OfflineFolderController {
         userDrive: UserDrive,
         result: RemovalResult,
         isFolder: Boolean,
+        isAborted: () -> Boolean = { false },
     ) {
         if (file.isOffline) return
 
         if (isFolder) {
-            clearInheritedFlags(realm, file)
+            if (!isAborted()) clearInheritedFlags(realm, file)
             return
         }
 
@@ -569,6 +590,10 @@ object OfflineFolderController {
         // Copy ownership and mutation coordination (issue: round 4 #4): the protection check and
         // the flag/byte writes are one coordinated section.
         synchronized(OfflineFileCoordination.lockFor(userDrive, file.id)) {
+            // Re-validate the removal intent INSIDE the coordinated section (issue: round 5 #12):
+            // the owning root may have been re-enabled while this file waited for the lock, and
+            // the once-per-folder abort check cannot protect the siblings queued behind it.
+            if (isAborted()) return@synchronized
             when (protectionStateOf(file, offlineFile, userDrive)) {
                 CopyProtection.PENDING_UPLOAD -> result.keptOfflineFilesCount++
                 CopyProtection.UPLOADED -> {

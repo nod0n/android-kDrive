@@ -224,8 +224,12 @@ object OfflineFolderUtils {
         val unresolvedMoveIds = mutableSetOf<Int>()
         oldOwnedCopies.forEach { old ->
             val newIdentity = allPages.firstOrNull { it.id == old.fileId } ?: return@forEach
-            val locationChanged = newIdentity.path != old.oldOffline.parentFile?.path ||
-                    newIdentity.name != old.oldOffline.name
+            // Location changes are detected on the RESOLVED offline paths (issue: round 5 #7),
+            // exactly like the per-file download manager: a remote path string can never equal
+            // the local offline directory path, so the previous comparison classified every
+            // unchanged file as a move and pushed clean copies through reconciliation.
+            val newOffline = newIdentity.getOfflineFile(context, userDrive.userId)
+            val locationChanged = newOffline == null || newOffline.path != old.oldOffline.path
             if (locationChanged && !OfflineFolderController.reconcileMovedInheritedCopy(
                     context = context,
                     oldOfflineFile = old.oldOffline,
@@ -245,9 +249,20 @@ object OfflineFolderUtils {
 
         val committableFiles = allPages.filterNot { it.id in unresolvedMoveIds }
 
+        // Deferred moves keep their presentation membership (issue: round 5 #8): the retained
+        // OLD row joins the commit list so the folder listing does not lose the file while its
+        // reconciliation is deferred. Managed rows are merged with themselves by
+        // saveRemoteFiles and re-flagged at their old location, which never schedules a
+        // re-download: deferred copies are dirty or upload-protected by definition.
+        val presentationFiles = if (unresolvedMoveIds.isEmpty()) {
+            committableFiles
+        } else {
+            committableFiles + unresolvedMoveIds.mapNotNull { FileController.getFileById(realm, it) }
+        }
+
         val completeResponse = CursorApiResponse<List<File>>(
             result = last.result,
-            data = committableFiles,
+            data = presentationFiles,
             error = last.error,
             responseAt = last.responseAt,
             cursor = last.cursor,
@@ -269,9 +284,18 @@ object OfflineFolderUtils {
 
         // Fully listed: children confirmed absent from this authoritative listing are reconciled
         // from durable coverage membership, not from the replaceable presentation child list
-        // (issue #1902). Unresolved moves keep their old metadata and are absent from the fresh
-        // listing comparison, so they are never treated as stale here.
-        cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds - unresolvedMoveIds)
+        // (issue #1902). The FULL membership set is passed (issue: round 5 #8): deferred moves
+        // are remotely PRESENT files whose reconciliation is unfinished — subtracting them would
+        // classify retained sources as confirmed deletions and clear their coverage.
+        cleanupConfirmedAbsentChildren(context, realm, folderId, userDrive, remoteIds)
+
+        if (unresolvedMoveIds.isNotEmpty()) {
+            // The move reconciliation is incomplete: the affected files keep their old metadata
+            // and location this round. Reporting the folder incomplete keeps the whole walk
+            // scheduled for retry, so reconciliation runs again once the blocking condition
+            // (pending upload, protected destination) clears (issue: round 5 #8/#9).
+            return false
+        }
 
         return true
     }
