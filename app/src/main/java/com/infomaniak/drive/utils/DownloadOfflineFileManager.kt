@@ -68,6 +68,15 @@ import okhttp3.Request
 import okhttp3.Response
 import java.util.UUID
 
+/**
+ * TYPED outcome of a cache promotion for its caller (issue: round 19 #24): the previous
+ * Boolean collapsed "this transfer's intent token was fulfilled" into the same `true` as
+ * the conflicts and supersessions, whose pending markers the caller then erased. Only
+ * [FULFILLED] authorizes the marker consumption; [DEFERRED] retains the marker and the
+ * root's incompleteness; [FAILED] falls through to the fresh download branch.
+ */
+enum class CachePromotionOutcome { FULFILLED, DEFERRED, FAILED }
+
 class DownloadOfflineFileManager(
     private val userDrive: UserDrive,
     private val filesCount: Int,
@@ -238,9 +247,20 @@ class DownloadOfflineFileManager(
             return ListenableWorker.Result.success()
         }
 
-        if (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) {
-            clearPendingMarkerIfCurrent(file)
-            return ListenableWorker.Result.success()
+        when (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) {
+            // The EXACT fulfilled file-intent token (issue: round 19 #24): this transfer's
+            // generation was published — the marker is consumed conditionally on the row
+            // still being at the generation the transfer refreshed against.
+            CachePromotionOutcome.FULFILLED -> {
+                clearPendingMarkerIfCurrent(file)
+                return ListenableWorker.Result.success()
+            }
+            // Deferred outcomes (conflict, superseded, protected/invalidated) retain the
+            // pending marker and the root's incompleteness; the batch's work is done for
+            // this file either way.
+            CachePromotionOutcome.DEFERRED -> return ListenableWorker.Result.success()
+            // A failed promotion falls through to the fresh download branch.
+            CachePromotionOutcome.FAILED -> Unit
         }
 
         if (file.isOfflineAndProvenCurrent(context, offlineFile)) {
@@ -334,7 +354,7 @@ class DownloadOfflineFileManager(
         file: File,
         cacheFile: IOFile,
         offlineFile: IOFile,
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): CachePromotionOutcome = withContext(Dispatchers.IO) {
         // ASYNC-PREPARATION / HELD-PUBLICATION split (round-16 compile correction): Kotlin
         // forbids a suspension point inside a critical section, so the SHARED provenance
         // validation THROUGH STAGING (issues: round 16 #11/#12) runs as ONE SYNCHRONOUS
@@ -371,7 +391,7 @@ class DownloadOfflineFileManager(
                     }
                 }
             }
-        } ?: return@withContext false
+        } ?: return@withContext CachePromotionOutcome.FAILED
 
         val published = runCatching {
             publishStagedOfflineFile(context, file, offlineFile, staged)
@@ -386,10 +406,17 @@ class DownloadOfflineFileManager(
         lastTransferSuperseded = published in UNRESOLVED_PUBLICATION_OUTCOMES
 
         runCatching { if (staged.exists()) staged.delete() }
+        // TYPED promotion outcomes for the CALLER (issue: round 19 #24): the previous
+        // Boolean collapsed PUBLISHED (this transfer's intent token WAS fulfilled — the
+        // marker may clear) into the same `true` as the conflicts and supersessions
+        // (whose pending marker the caller then ERASED, contradicting their own
+        // retain-the-marker contract).
         when (published) {
             // Completion (flag write, media scan, invalidation) already ran inside the per-file
-            // lock via onPublishedLocked (issue: round 5 #2).
-            PublicationOutcome.PUBLISHED -> true
+            // lock via onPublishedLocked (issue: round 5 #2). The caller may consume the
+            // marker: clearPendingMarkerIfCurrent re-validates the EXACT fulfilled intent
+            // token (the row is still at the generation this transfer refreshed against).
+            PublicationOutcome.PUBLISHED -> CachePromotionOutcome.FULFILLED
             // Skipped outcomes leave the existing bytes and timestamps untouched (issue:
             // round 4 #1). Marker completion is NOT unconditional here (issue: round 17 #7):
             // SKIPPED_PROTECTED-for-this-file cleared its marker INSIDE the validating
@@ -398,20 +425,20 @@ class DownloadOfflineFileManager(
             // established pending work after the skip decision owns its marker.
             PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
                 filesDownloaded += 1
-                true
+                CachePromotionOutcome.DEFERRED
             }
             PublicationOutcome.SKIPPED_CONFLICT -> {
                 // The destination holds protected content owned by another row (issue: round
-                // 14 #13): deferred — the pending marker stays so the work and the root's
+                // 14 #13): deferred — the pending marker STAYS so the work and the root's
                 // incompleteness are retained until the conflict resolves.
-                true
+                CachePromotionOutcome.DEFERRED
             }
             PublicationOutcome.SKIPPED_SUPERSEDED -> {
                 // A newer generation owns the file's pending state and completion (issue:
                 // round 8 #9): this transfer's skip clears no marker and runs no completion.
-                true
+                CachePromotionOutcome.DEFERRED
             }
-            PublicationOutcome.FAILED -> false
+            PublicationOutcome.FAILED -> CachePromotionOutcome.FAILED
         }
     }
 

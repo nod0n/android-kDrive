@@ -31,7 +31,9 @@ import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.NotificationUtils.BULK_DOWNLOAD_ID
 import com.infomaniak.drive.utils.NotificationUtils.cancelNotification
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.OfflineFolderUtils
+import java.util.Date
 
 class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : BaseDownloadWorker(context, workerParams) {
 
@@ -143,22 +145,34 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
             // for a successful synchronization so unfinished work keeps its pending state
             // (issue #1902). An explicit removal clears it through the pending-removal path.
             // ROOT COMPLETION MATCHES THE PROCESSED INTENT GENERATION (issue: round 18
-            // #20): the walk captured the root's generation BEFORE its first request — a
-            // root removed and revived (or a newer walk started) while this batch ran is
-            // never completed by it: the marker stays pending and lastSyncedAt does not
-            // advance.
-            if (synchronizationSucceeded &&
-                !OfflineFolderController.rootIntentChangedSince(folderId, walkResult?.intentGeneration ?: 0L)
-            ) {
-                FileController.markFilesAsOffline(
-                    customRealm = null,
-                    filesId = listOf(folderId),
-                    isMarkedAsOffline = false,
-                    userDrive = userDrive,
-                )
-                if (walkCompleted) OfflineFolderController.updateLastSyncedAt(folderId, userDrive)
-            } else if (synchronizationSucceeded) {
-                SentryLog.i(TAG, "Root $folderId intent changed during the walk; completion deferred to the newer walk")
+            // #20), and the GENERATION CHECK + COMPLETION RUN IN ONE MONITORED FRESH
+            // TRANSACTION (issue: round 19 #24): the previous check ran OUTSIDE any
+            // coordination and the marker clear and the lastSyncedAt write ran as
+            // SEPARATE operations — a root removal or revival could interleave between
+            // the check and the effects, unmarking (or advancing) a root whose intent
+            // this walk no longer matches. The check and BOTH effects now run under the
+            // intent monitor and the root's file lock, on a refreshed Realm, in ONE
+            // transaction; a concurrent intent writer cannot interleave.
+            val intentGeneration = walkResult?.intentGeneration ?: 0L
+            if (synchronizationSucceeded) {
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withFileLock(userDrive, folderId) {
+                        FileController.getRealmInstance(userDrive).use { realm ->
+                            runCatching { realm.refresh() }
+                            if (!OfflineFolderController.rootIntentChangedSince(folderId, intentGeneration)) {
+                                realm.executeTransaction {
+                                    val root = FileController.getFileById(realm, folderId)
+                                    if (root != null && root.isValid) {
+                                        if (root.isMarkedAsOffline) root.isMarkedAsOffline = false
+                                        if (walkCompleted) root.lastSyncedAt = Date()
+                                    }
+                                }
+                            } else {
+                                SentryLog.i(TAG, "Root $folderId intent changed during the walk; completion deferred to the newer walk")
+                            }
+                        }
+                    }
+                }
             }
         }
         clearLastDownloadedFile()
