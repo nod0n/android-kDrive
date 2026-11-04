@@ -326,58 +326,96 @@ class MainViewModel(
             // unsent edits — at the old, untracked path. The row realm stays the session's
             // current-drive Realm (shared-with-me rows live here, as upstream); the captured
             // scopes key the offline-path/preservation APIs and the shares realm.
-            var preserved = true
             FileController.getRealmInstance(presentationScope).use { currentDriveRealm ->
-                file.getStoredFile(getContext(), userDrive)?.let { ioFile ->
-                    // Destination resolution in its CORRECT captured realm (issue: round 8 #5):
-                    // a shared destination's row lives in the shares realm, not the
-                    // current-drive realm — missing it there skipped the destination
-                    // reconciliation entirely, and the source bytes were then removed under
-                    // their OLD identity.
-                    val folderProxy = FileController.getFileById(currentDriveRealm, newParent.id)
-                        ?: if (isSharedWithMe) FileController.getRealmInstance(
-                            UserDrive(userId = presentationScope.userId, sharedWithMe = true)
-                        ).use { sharesRealm ->
-                            // DETACHED copy (issue: round 9 #3): the shares Realm closes here,
-                            // and preservation reads the destination's identity afterward —
-                            // a managed row would escape its closed Realm and fail the
-                            // reconciliation. The captured account scope stays explicit.
-                            FileController.getFileById(sharesRealm, newParent.id)?.let { sharesRealm.copyFromRealm(it, 0) }
-                        } else null
-                    if (file.isFolder()) {
-                        // Directory storage never goes through the single-file helper (issue:
-                        // round 8 #6): a directory timestamp cannot establish that descendants
-                        // are clean, and physically moving the whole subtree first would leave
-                        // descendant rows pointing at paths that no longer hold their bytes —
-                        // breaking per-child reconciliation. The old directory location and
-                        // ownership metadata are retained until the offline walk reconciles
-                        // each descendant individually.
-                        preserved = true
-                    } else if (ioFile.exists() && folderProxy != null) {
-                        preserved = moveIfOfflineFileOrDelete(file, ioFile, folderProxy, userDrive, currentDriveRealm)
-                    }
-                }
-
-                // Ancestry-changing writers participate in the ROOT-INTENT protocol (issue:
-                // round 11 #7): a move — a folder move above all — changes the ancestry that
-                // coverage resolution walks, so its commits serialize with root removal's
-                // coverage decisions on the global monitor, taken BEFORE the file locks.
+                // ONE intent → ordered-locks → Realm operation (issues: round 15 #14, round
+                // 11 #7): fresh acceptance, source/destination resolution, preservation and
+                // the conditional identity replacement hold ONE section — the previous
+                // shape preserved under a released lock and then committed the captured UI
+                // object unconditionally, so an intervening committed identity (a newer
+                // refresh that published or received an edit elsewhere) could be
+                // overwritten with the older one, leaving its bytes undiscoverable. The
+                // pre-HTTP [file] object is the immutable request observation.
                 synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                    FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
-                        // Ignore expired transactions when it's suspended
-                        // In case the phone is slow or in standby, the transaction can create an IllegalStateException
-                        // because realm will not be available anymore, the transaction is resumed afterwards
-                        // so we ignore the cases where it fails.
-                        runCatching { localFolder.children.remove(file) }
-                    }
+                    val lockIds = listOf(file.id, file.parentId, newParent.id).filter { it > 0 }.distinct().sorted()
+                    OfflineFileCoordination.withLocksFor(userDrive, lockIds) {
+                        runCatching { currentDriveRealm.refresh() }
+                        val freshRow = FileController.getFileById(currentDriveRealm, file.id)
+                        // Fresh acceptance against the immutable observation: an intervening
+                        // committed identity (a newer move or metadata) defers the local
+                        // commit — the row's newer state and its bytes stay authoritative
+                        // and the next listing reconciles.
+                        val movedIdentity = File(id = file.id, driveId = file.driveId).apply {
+                            parentId = newParent.id
+                            name = file.name
+                            updatedAt = file.updatedAt
+                            revisedAt = file.revisedAt
+                        }
+                        val accepted = freshRow == null ||
+                            !FileController.isStaleForAuthoritativeAction(freshRow, movedIdentity, null, observed = file)
+                        var preserved = accepted
+                        if (accepted) {
+                            // Destination resolution in its CORRECT captured realm (issue: round 8 #5):
+                            // a shared destination's row lives in the shares realm, not the
+                            // current-drive realm — missing it there skipped the destination
+                            // reconciliation entirely, and the source bytes were then removed under
+                            // their OLD identity.
+                            val folderProxy = FileController.getFileById(currentDriveRealm, newParent.id)
+                                ?: if (isSharedWithMe) FileController.getRealmInstance(
+                                    UserDrive(userId = presentationScope.userId, sharedWithMe = true)
+                                ).use { sharesRealm ->
+                                    // DETACHED copy (issue: round 9 #3): the shares Realm closes here,
+                                    // and preservation reads the destination's identity afterward —
+                                    // a managed row would escape its closed Realm and fail the
+                                    // reconciliation. The captured account scope stays explicit.
+                                    FileController.getFileById(sharesRealm, newParent.id)?.let { sharesRealm.copyFromRealm(it, 0) }
+                                } else null
+                            val freshSource = freshRow?.getStoredFile(getContext(), userDrive)
+                            if (freshRow == null || freshRow.isFolder()) {
+                                // Directory storage never goes through the single-file helper (issue:
+                                // round 8 #6): a directory timestamp cannot establish that descendants
+                                // are clean, and physically moving the whole subtree first would leave
+                                // descendant rows pointing at paths that no longer hold their bytes —
+                                // breaking per-child reconciliation. The old directory location and
+                                // ownership metadata are retained until the offline walk reconciles
+                                // each descendant individually.
+                                preserved = true
+                            } else if (freshSource != null && freshSource.exists() && folderProxy != null) {
+                                preserved = moveIfOfflineFileOrDelete(freshRow, freshSource, folderProxy, userDrive, currentDriveRealm)
+                            }
+                            // No stored file at the old location (or destination unresolvable with
+                            // nothing owned): nothing to preserve — the identity commit proceeds.
+                        }
 
-                    if (isSharedWithMe) {
+                        if (accepted && preserved) {
+                            FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
+                                // Ignore expired transactions when it's suspended
+                                // In case the phone is slow or in standby, the transaction can create an IllegalStateException
+                                // because realm will not be available anymore, the transaction is resumed afterwards
+                                // so we ignore the cases where it fails.
+                                runCatching { localFolder.children.remove(file) }
+                            }
+                        }
+
+                        if (isSharedWithMe) {
                         // If the selected folder is a shared folder, it is removed from the user's realm table (userId_driveId)
                         // and added to the share realm (userId_share)
                         // Explicit captured scope (issue: round 5 #6): preservation and cache
                         // deletion must not re-derive the account from the active one. The shares
                         // realm is keyed by the CAPTURED user (issue: round 7 #8).
-                        if (preserved) {
+                        if (accepted && preserved) {
+                            // The committed identity carries the FRESH row's current local
+                            // fields (issue: round 15 #14) — the captured UI object could be
+                            // stale in fields the ordering gate cannot see (an unmark since
+                            // capture) — with the complete post-move identity applied: the
+                            // stale source parent/path must not survive, or uploads keep
+                            // targeting the old location (issue: round 8 #5).
+                            val movedChild = freshRow?.let { currentDriveRealm.copyFromRealm(it, 0) }?.apply {
+                                parentId = newParent.id
+                                path = ""
+                            } ?: file.apply {
+                                parentId = newParent.id
+                                path = ""
+                            }
                             FileController.removeFile(
                                 fileId = file.id,
                                 customRealm = currentDriveRealm,
@@ -393,37 +431,36 @@ class MainViewModel(
                                 OfflineFileCoordination.withLocksFor(sharedScope, listOf(newParent.id, file.id)) {
                                     FileController.updateFile(newParent.id, sharedRealm, userDrive = sharedScope) { localFolder ->
                                         runCatching {
-                                            // The complete post-move identity crosses realms, and the
-                                            // transfer happens only after preservation succeeded
-                                            // (issue: round 8 #5): the stale source parent/path must
-                                            // not survive, or uploads keep targeting the old location.
-                                            localFolder.children.add(file.apply {
-                                                parentId = newParent.id
-                                                path = ""
-                                            })
+                                            localFolder.children.add(movedChild)
                                         }.onFailure(Sentry::captureException)
                                     }
                                 }
                             }
                         } else {
-                            // Preservation incomplete (pending upload, protected destination): the
+                            // Preservation incomplete or a newer committed identity won
+                            // (pending upload, protected destination, intervening commit): the
                             // row keeps its OLD identity and location in this realm; the offline
-                            // sync re-processes the move until preservation succeeds (issue:
-                            // round 8 #5).
+                            // sync re-processes the move until preservation succeeds (issues:
+                            // round 8 #5, round 15 #14).
                             SentryLog.i("MainViewModel", "Deferred shared move of ${file.id}: its offline copy is not safely preserved yet")
                         }
-                    } else if (preserved) {
+                    } else if (accepted && preserved) {
                         // The committed identity is the complete post-move one (issue: round 7 #5):
                         // the stale source path must not survive the parent change, or derived
-                        // offline paths keep pointing at the location the bytes left.
-                        // addChild coordinates both affected identities (issue: round 11 #3);
-                        // the captured request scope keys its locks.
+                        // offline paths keep pointing at the location the bytes left. The add
+                        // commits the FRESH row's current local fields with the moved identity
+                        // applied (issue: round 15 #14); the acceptance gate already rejected
+                        // intervening identity changes under this section's locks.
+                        val movedChild = freshRow?.let { currentDriveRealm.copyFromRealm(it, 0) }?.apply {
+                            parentId = newParent.id
+                            path = ""
+                        } ?: file.apply {
+                            parentId = newParent.id
+                            path = ""
+                        }
                         FileController.addChild(
                             newParent.id,
-                            file.apply {
-                                parentId = newParent.id
-                                path = ""
-                            },
+                            movedChild,
                             currentDriveRealm,
                             userDrive,
                             // This add also COMMITS the post-move identity (issue: round 14
@@ -432,11 +469,13 @@ class MainViewModel(
                             revalidateExistingRow = false,
                         )
                     } else {
-                        // Preservation incomplete (pending upload, protected destination): the row
-                        // keeps its OLD identity and location; the offline sync and the shared
-                        // upsert boundary re-process the move until preservation succeeds
-                        // (issue: round 6 #2).
+                        // Preservation incomplete or a newer committed identity won (pending
+                        // upload, protected destination, intervening commit): the row keeps its
+                        // OLD identity and location; the offline sync and the shared upsert
+                        // boundary re-process the move until preservation succeeds (issues:
+                        // round 6 #2, round 15 #14).
                         SentryLog.i("MainViewModel", "Deferred local move of ${file.id}: its offline copy is not safely preserved yet")
+                    }
                     }
                 }
             }

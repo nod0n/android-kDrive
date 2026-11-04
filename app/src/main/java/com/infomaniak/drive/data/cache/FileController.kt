@@ -1176,24 +1176,34 @@ object FileController {
                             val liveChild = getFileById(realm, preservedFile.id)
                             val index = parentResponse.children.indexOfFirst { child -> child.id == preservedFile.id }
                             when {
+                                // The boundary returned a live row that lives elsewhere — its
+                                // replacement was rejected or deferred, so no link in this
+                                // cascade: the row's membership stays with the parent its
+                                // authoritative parentId names.
+                                preservedFile.parentId != parentResponse.id ->
+                                    parentResponse.children.removeAll { it.id == preservedFile.id }
                                 // The child row does not exist yet: add the accepted cascade
                                 // child back when its authoritative parent is this container.
                                 liveChild == null ->
-                                    if (preservedFile.parentId == parentResponse.id && index < 0) {
+                                    if (index < 0) {
                                         parentResponse.children.add(preservedFile)
                                     }
-                                // Membership re-derived from the LIVE row: a row that moved
-                                // away carries no link in this cascade at all.
-                                liveChild.parentId != parentResponse.id ->
-                                    parentResponse.children.removeAll { it.id == preservedFile.id }
-                                // Existing member: substitute the live row when the cascade's
-                                // identity is stale against it.
-                                index >= 0 ->
-                                    if (isStaleReplacement(liveChild, preservedFile)) {
-                                        parentResponse.children[index] = liveChild
+                                // The ACCEPTED child commits explicitly with its current
+                                // local fields preserved (issue: round 15 #5), then links
+                                // under its RESULTING parent — an accepted move whose live
+                                // row still names the old parent is committed and kept, not
+                                // dropped, so metadata never points at the emptied old
+                                // location. The old child is substituted only when its
+                                // replacement was actually rejected or deferred (the branch
+                                // above).
+                                else -> {
+                                    preservedFile.keepOldLocalFilesData(liveChild)
+                                    if (index >= 0) {
+                                        parentResponse.children[index] = preservedFile
+                                    } else {
+                                        parentResponse.children.add(preservedFile)
                                     }
-                                // Present row, absent from the (replaced) list: link it.
-                                else -> parentResponse.children.add(liveChild)
+                                }
                             }
                         },
                     )
