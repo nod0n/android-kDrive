@@ -100,7 +100,9 @@ object SyncOfflineUtils {
                         // together with the live rows inside the per-action coordination,
                         // collapsing the historical state into the current one and defeating
                         // the stale-action gate's tie resolution.
-                        localFilesMap = it.associateBy { file -> realm.copyFromRealm(file, 0) },
+                        localFilesMap = it.associateBy({ file -> file.id }) { file ->
+                            realm.copyFromRealm(file, 0)
+                        },
                         realm = realm,
                         pendingAdvances = pendingAdvances,
                     )

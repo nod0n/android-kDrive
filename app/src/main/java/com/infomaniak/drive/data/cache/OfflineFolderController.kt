@@ -479,7 +479,14 @@ object OfflineFolderController {
      * collection membership but not the objects — escapes a closed Realm as a detached
      * failure waiting to happen.
      */
-    internal class DestinationOwner(val id: Int, val lastModifiedAt: Long)
+    internal class DestinationOwner(
+        val id: Int,
+        val lastModifiedAt: Long,
+        // The owning row's PUBLISHED byte baseline travels with the DTO (issue: round 15
+        // #6): edit detection against the owned bytes judges this, not accepted server
+        // metadata — the DTO must not lose the field the row carries.
+        val publishedCleanBaseline: Long? = null,
+    )
 
     /**
      * Resolves the row that owns the existing bytes at [target], by derived offline path, among
@@ -503,7 +510,11 @@ object OfflineFolderController {
         for (candidate in candidates) {
             val candidatePath = candidate.getOfflineFile(context, userDrive.userId)?.path ?: continue
             if (candidatePath == target.path) {
-                return DestinationOwner(id = candidate.id, lastModifiedAt = candidate.lastModifiedAt)
+                return DestinationOwner(
+                    id = candidate.id,
+                    lastModifiedAt = candidate.lastModifiedAt,
+                    publishedCleanBaseline = candidate.publishedCleanBaseline,
+                )
             }
         }
         return null
