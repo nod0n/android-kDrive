@@ -462,6 +462,38 @@ open class UploadFile(
         }
 
         /**
+         * READ-ONLY ownership check for the ORIGINAL revision at a destination (issue: round
+         * 15 #7): durable offline revisions are registered under unique SNAPSHOT uris, so the
+         * destination-uri queries cannot see their ownership of the original revision.
+         * Matches the destination identity, modification date and RECORDED size, covering
+         * pending AND retained-unsent records, and creates no snapshot — a record for this
+         * exact revision means the destination bytes are durably owned local content.
+         */
+        fun hasDurableOriginalRevisionOwnership(
+            fileName: String,
+            remoteFolder: Int,
+            driveId: Int,
+            userId: Int,
+            fileModifiedAt: Date,
+            fileSize: Long,
+            customRealm: Realm? = null,
+        ): Boolean {
+            val block: (Realm) -> Boolean = { realm ->
+                realm.uploadTable
+                    .equalTo(UploadFile::fileName.name, fileName)
+                    .equalTo(UploadFile::remoteFolder.name, remoteFolder)
+                    .equalTo(UploadFile::driveId.name, driveId)
+                    .equalTo(UploadFile::userId.name, userId)
+                    .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
+                    .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
+                    .equalTo(UploadFile::fileSize.name, fileSize)
+                    .isNull(UploadFile::uploadAt.name)
+                    .count() > 0
+            }
+            return customRealm?.let(block) ?: getRealmInstance().use(block)
+        }
+
+        /**
          * Whether an upload record already exists for this exact content revision (identified by
          * file name, target folder, drive, user and modification date). Distinct from
          * [hasPendingUpload]: the uri of an offline folder snapshot changes per revision, so the

@@ -19,6 +19,7 @@ package com.infomaniak.drive.ui.fileList
 
 import android.content.Context
 import android.net.Uri
+import java.util.Date
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -146,7 +147,18 @@ class DownloadProgressViewModel : ViewModel() {
                                 // restore old content over the newer generation.
                                 (liveRow.isOfflineAndIntact(outputFile) ||
                                     UploadFile.hasPendingUpload(uri = targetUri) ||
-                                    UploadFile.hasRetainedUnsentUpload(uri = targetUri))
+                                    UploadFile.hasRetainedUnsentUpload(uri = targetUri) ||
+                                    // Durable SNAPSHOT registrations own the original
+                                    // revision under unique uris the uri queries cannot
+                                    // see (issue: round 15 #7).
+                                    UploadFile.hasDurableOriginalRevisionOwnership(
+                                        fileName = liveRow.name,
+                                        remoteFolder = liveRow.parentId,
+                                        driveId = userDrive.driveId,
+                                        userId = userDrive.userId,
+                                        fileModifiedAt = Date(outputFile.lastModified()),
+                                        fileSize = outputFile.length(),
+                                    ))
                         }
                     }
                     if (usable) PROGRESS_COMPLETE else null

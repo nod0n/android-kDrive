@@ -161,6 +161,18 @@ class DownloadOfflineFileManager(
             return ListenableWorker.Result.failure()
         }
 
+        // POSITIVE destination ownership for the early-success paths (issue: round 15 #11):
+        // pending/dirty fast paths return success without otherwise proving who owns the
+        // destination — foreign or unknown ownership defers like a conflict, so the bulk
+        // retains the root's incompleteness instead of completing F over another row's
+        // protected bytes.
+        val destinationOwner = FileController.getRealmInstance(userDrive).use { realm ->
+            OfflineFolderController.destinationOwnerRow(realm, context, userDrive, file, offlineFile)
+        }
+        if (destinationOwner == null || destinationOwner.id != file.id) {
+            lastTransferSuperseded = true
+            return ListenableWorker.Result.success()
+        }
         // Protect offline edits (issue #1902): never replace the bytes backing a pending upload
         // or a locally newer copy; the sync layer uploads them and a later walk re-evaluates.
         if (UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())) {
@@ -774,7 +786,11 @@ class DownloadOfflineFileManager(
                     // baseline. Unknown ownership and a CHANGED owner are preservation
                     // reasons for OTHER content, not proof that F has usable local content:
                     // they defer as a conflict, with pending and root work retained.
-                    val ownedByThisFile = liveOwner != null && liveOwner.id == lockedOwnerId
+                    // POSITIVE ownership (issue: round 15 #11): the protected content must
+                    // belong to the INCOMING file — [lockedOwnerId] is the previously
+                    // discovered destination owner and can equally be another row's, which
+                    // would report foreign bytes as F's usable content.
+                    val ownedByThisFile = liveOwner != null && liveOwner.id == file.id && liveOwner.id == lockedOwnerId
                     return if (ownedByThisFile) {
                         PublicationOutcome.SKIPPED_PROTECTED
                     } else {

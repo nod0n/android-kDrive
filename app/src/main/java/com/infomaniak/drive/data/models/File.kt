@@ -620,7 +620,21 @@ open class File(
                                     // generation — no snapshot is manufactured here.
                                     (liveRow.isOfflineAndIntact(cacheFile) ||
                                         UploadFile.hasPendingUpload(uri = targetUri) ||
-                                        UploadFile.hasRetainedUnsentUpload(uri = targetUri))
+                                        UploadFile.hasRetainedUnsentUpload(uri = targetUri) ||
+                                        // Durable SNAPSHOT registrations own the original
+                                        // revision under unique uris the uri queries cannot
+                                        // see (issue: round 15 #7): a read-only identity,
+                                        // modification-date and recorded-size match on the
+                                        // scoped original revision establishes the same
+                                        // ownership without creating any snapshot.
+                                        UploadFile.hasDurableOriginalRevisionOwnership(
+                                            fileName = liveRow.name,
+                                            remoteFolder = liveRow.parentId,
+                                            driveId = userDrive.driveId,
+                                            userId = userDrive.userId,
+                                            fileModifiedAt = Date(cacheFile.lastModified()),
+                                            fileSize = cacheFile.length(),
+                                        ))
                             }
                         }
                         if (!usable) {
