@@ -743,6 +743,7 @@ open class File(
                                             fileModifiedAt = Date(cacheFile.lastModified()),
                                             fileSize = cacheFile.length(),
                                             contentHash = UploadFile.sha256OrNull(cacheFile),
+                                            originalFileId = liveRow.id,
                                         ))
                             }
                         }

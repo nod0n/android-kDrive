@@ -643,6 +643,7 @@ object OfflineFolderController {
                             fileModifiedAt = fileModifiedAt,
                             pendingOnly = true,
                             contentHash = hash,
+                            originalFileId = newIdentity.id,
                         )
                     } == true -> false
                 contentHashOf(oldOfflineFile)?.let { hash ->
@@ -654,6 +655,7 @@ object OfflineFolderController {
                         fileModifiedAt = fileModifiedAt,
                         pendingOnly = false,
                         contentHash = hash,
+                        originalFileId = newIdentity.id,
                     )
                 } == true -> {
                     // Every byte deletion clears matching provenance (issue: round 18 #12).
@@ -1377,6 +1379,7 @@ object OfflineFolderController {
                 fileModifiedAt = fileModifiedAt,
                 pendingOnly = true,
                 contentHash = contentHash,
+                originalFileId = file.id,
             ) -> CopyProtection.PENDING_UPLOAD
             contentHash != null && UploadFile.hasUploadRecordFor(
                 fileName = file.name,
@@ -1386,6 +1389,7 @@ object OfflineFolderController {
                 fileModifiedAt = fileModifiedAt,
                 pendingOnly = false,
                 contentHash = contentHash,
+                originalFileId = file.id,
             ) -> CopyProtection.UPLOADED
             // AUTHORITATIVE content proof decides cleanliness (issue: round 19 #2): bytes
             // are the published generation only when the provenance record names THIS row's
@@ -1479,6 +1483,7 @@ object OfflineFolderController {
                         fileModifiedAt = fileModifiedAt,
                         pendingOnly = false,
                         contentHash = contentHash,
+                        originalFileId = file.id,
                     ) || UploadFile.hasCancelledUploadRecordFor(
                         fileName = file.name,
                         remoteFolder = file.parentId,
@@ -1486,6 +1491,7 @@ object OfflineFolderController {
                         userId = userDrive.userId,
                         fileModifiedAt = fileModifiedAt,
                         contentHash = contentHash,
+                        originalFileId = file.id,
                     )
                 ) {
                     // A duplicate registration adds nothing; the fresh snapshot copy is

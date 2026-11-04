@@ -189,6 +189,7 @@ class DownloadProgressViewModel : ViewModel() {
                                         fileModifiedAt = Date(outputFile.lastModified()),
                                         fileSize = outputFile.length(),
                                         contentHash = UploadFile.sha256OrNull(outputFile),
+                                        originalFileId = liveRow.id,
                                     ))
                         }
                     }

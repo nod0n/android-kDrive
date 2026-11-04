@@ -660,15 +660,20 @@ open class UploadFile(
         }
 
         /**
-         * Whether a candidate record provably holds [contentHash]'s bytes (issue: round 18 #7):
-         * the record's stored identity when present, else its RETAINED SNAPSHOT bytes' hash
-         * (legacy records registered before the field existed — their snapshot is the only
-         * content proof they carry). A record whose content cannot be proven is never treated
-         * as ownership of [contentHash]'s revision.
+         * Whether a candidate record provably holds [contentHash]'s bytes (issues: round 18
+         * #7, round 19 #5): the record's stored identity when present, else its RETAINED
+         * SNAPSHOT bytes' hash read through the CANONICAL owned-snapshot decoder (a stored
+         * `file:///…` uri string is not a filesystem path — hashing `IOFile(uriString)`
+         * silently misses the file and a retained cancelled legacy snapshot then failed
+         * dedup, re-registering and re-uploading the cancelled revision). A record whose
+         * content cannot be proven is never treated as ownership of [contentHash]'s
+         * revision.
          */
         private fun recordProvesContent(record: UploadFile, contentHash: String): Boolean {
             val recorded = record.contentHash
-                ?: record.uri.takeIf { it.isNotEmpty() }?.let { snapshotUri -> sha256OrNull(IOFile(snapshotUri)) }
+                ?: record.uri.takeIf { it.isNotEmpty() }?.let { snapshotUri ->
+                    durableSnapshotFile(snapshotUri)?.let { snapshotFile -> sha256OrNull(snapshotFile) }
+                }
             return recorded == contentHash
         }
 
@@ -690,6 +695,7 @@ open class UploadFile(
             fileModifiedAt: Date,
             fileSize: Long,
             contentHash: String? = null,
+            originalFileId: Int? = null,
             customRealm: Realm? = null,
         ): Boolean {
             val block: (Realm) -> Boolean = { realm ->
@@ -702,6 +708,7 @@ open class UploadFile(
                     .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
                     .equalTo(UploadFile::fileSize.name, fileSize)
                     .isNull(UploadFile::uploadAt.name)
+                    .apply { if (originalFileId != null && originalFileId > 0) equalTo(UploadFile::originalFileId.name, originalFileId) }
                     .findAll()
                 if (candidates.isEmpty()) {
                     false
@@ -729,6 +736,7 @@ open class UploadFile(
             fileModifiedAt: Date,
             pendingOnly: Boolean,
             contentHash: String? = null,
+            originalFileId: Int? = null,
             customRealm: Realm? = null,
         ): Boolean {
             val block: (Realm) -> Boolean = { realm ->
@@ -738,8 +746,17 @@ open class UploadFile(
                     .equalTo(UploadFile::driveId.name, driveId)
                     .equalTo(UploadFile::userId.name, userId)
                     .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
+                    // OFFLINE revisions only (issue: round 19 #5): the general query
+                    // previously accepted any upload type occupying the same identity.
+                    .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
                     .isNull(UploadFile::deletedAt.name)
                     .apply { if (pendingOnly) isNull(UploadFile::uploadAt.name) }
+                    // STABLE ORIGINAL identity (issue: round 19 #5): a record for an EARLIER
+                    // file occupying the same name/parent must never certify a replacement
+                    // file's bytes. When the caller knows the row id, an ID-LESS legacy
+                    // record (originalFileId == 0) is excluded too — it carries no
+                    // trustworthy ownership and never grants another file its authority.
+                    .apply { if (originalFileId != null && originalFileId > 0) equalTo(UploadFile::originalFileId.name, originalFileId) }
                     .findAll()
                 if (candidates.isEmpty()) {
                     false
@@ -769,6 +786,7 @@ open class UploadFile(
             userId: Int,
             fileModifiedAt: Date,
             contentHash: String? = null,
+            originalFileId: Int? = null,
             customRealm: Realm? = null,
         ): Boolean {
             val block: (Realm) -> Boolean = { realm ->
@@ -780,6 +798,9 @@ open class UploadFile(
                     .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
                     .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
                     .isNotNull(UploadFile::deletedAt.name)
+                    // STABLE ORIGINAL identity (issue: round 19 #5): an ID-less legacy
+                    // record never certifies another file's revision as cancelled.
+                    .apply { if (originalFileId != null && originalFileId > 0) equalTo(UploadFile::originalFileId.name, originalFileId) }
                     .findAll()
                 if (candidates.isEmpty()) {
                     false

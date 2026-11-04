@@ -688,6 +688,7 @@ object SyncOfflineUtils {
                     fileModifiedAt = fileModifiedAt,
                     pendingOnly = false,
                     contentHash = registrationHash,
+                    originalFileId = liveRow.id,
                 ) || UploadFile.hasCancelledUploadRecordFor(
                     fileName = registrationName,
                     remoteFolder = registrationFolder,
@@ -695,6 +696,7 @@ object SyncOfflineUtils {
                     userId = userDrive.userId,
                     fileModifiedAt = fileModifiedAt,
                     contentHash = registrationHash,
+                    originalFileId = liveRow.id,
                 )
             ) {
                 // The revision is already registered — live (pending or sent) or retained
