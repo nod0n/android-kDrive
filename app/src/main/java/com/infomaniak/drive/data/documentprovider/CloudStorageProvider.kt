@@ -671,6 +671,7 @@ class CloudStorageProvider : DocumentsProvider() {
                                                 },
                                                 userDrive = userDrive,
                                                 newOfflineTarget = destinationFile,
+                                                realm = realm,
                                             )
                                         }
                                     }

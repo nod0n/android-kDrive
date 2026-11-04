@@ -355,6 +355,7 @@ object SyncOfflineUtils {
                                         oldLastModifiedAt = liveRow.publishedCleanBaseline ?: liveRow.lastModifiedAt,
                                         newIdentity = remoteFile,
                                         userDrive = userDrive,
+                                        realm = realm,
                                     )
                                 } == true
                                 ->
@@ -620,6 +621,7 @@ object SyncOfflineUtils {
                     oldLastModifiedAt = liveRow.publishedCleanBaseline ?: liveRow.lastModifiedAt,
                     newIdentity = remoteFile,
                     userDrive = userDrive,
+                    realm = realm,
                 )
             ) {
                 // Preservation incomplete: keep the old bytes and metadata; a later sync

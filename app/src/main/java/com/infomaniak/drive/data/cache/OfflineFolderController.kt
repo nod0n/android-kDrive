@@ -489,11 +489,48 @@ object OfflineFolderController {
     )
 
     /**
+     * The id of the row that EXCLUSIVELY claims [claimedPath] as its derived offline path, or
+     * null when no row claims it or — decisively — when SEVERAL rows claim it (issue: round 16
+     * #3): a first-match among multiple claimants is not proof of byte ownership. Callers must
+     * defer ambiguous paths (no preservation, snapshot or deletion against those bytes) until a
+     * later pass resolves the duplicate; a single claimant is the proven byte owner.
+     *
+     * Candidates are every non-directory row whose name matches the path's file component —
+     * both derived-path claimants and rows still carrying a stale stored path that resolves
+     * here.
+     */
+    internal fun exclusivePathOwner(
+        realm: Realm,
+        context: Context,
+        userDrive: UserDrive,
+        claimedPath: String,
+    ): Int? {
+        val nameComponent = claimedPath.substringAfterLast('/')
+        val candidates = realm.where(File::class.java)
+            .equalTo(File::name.name, nameComponent)
+            .notEqualTo(File::type.name, File.Type.DIRECTORY.value)
+            .findAll()
+            .createSnapshot()
+        var claimantId: Int? = null
+        for (candidate in candidates) {
+            val candidatePath = candidate.getOfflineFile(context, userDrive.userId)?.path ?: continue
+            if (candidatePath == claimedPath) {
+                if (claimantId != null && claimantId != candidate.id) return null
+                claimantId = candidate.id
+            }
+        }
+        return claimantId
+    }
+
+    /**
      * Resolves the row that owns the existing bytes at [target], by derived offline path, among
      * candidates sharing the incoming file's parent and name (the incoming file's own row
      * included). Returns null when no row claims that path: the bytes' ownership is unknown and
-     * must be preserved, not replaced (issue: round 6 #3). The returned owner is a plain DTO,
-     * safe to read after the Realm session closes (issue: round 7 #1).
+     * must be preserved, not replaced (issue: round 6 #3) — and null TOO when multiple rows
+     * claim the path (issue: round 16 #3): a first match is not proof of ownership, and an
+     * ambiguous path defers instead of publishing over whichever bytes happen to sit there.
+     * The returned owner is a plain DTO, safe to read after the Realm session closes (issue:
+     * round 7 #1).
      */
     internal fun destinationOwnerRow(
         realm: Realm,
@@ -502,6 +539,7 @@ object OfflineFolderController {
         incoming: File,
         target: IOFile,
     ): DestinationOwner? {
+        val claimantId = exclusivePathOwner(realm, context, userDrive, target.path) ?: return null
         val candidates = realm.where(File::class.java)
             .equalTo(File::parentId.name, incoming.parentId)
             .equalTo(File::name.name, incoming.name)
@@ -509,7 +547,7 @@ object OfflineFolderController {
             .createSnapshot()
         for (candidate in candidates) {
             val candidatePath = candidate.getOfflineFile(context, userDrive.userId)?.path ?: continue
-            if (candidatePath == target.path) {
+            if (candidatePath == target.path && candidate.id == claimantId) {
                 return DestinationOwner(
                     id = candidate.id,
                     lastModifiedAt = candidate.lastModifiedAt,
@@ -551,7 +589,19 @@ object OfflineFolderController {
         newIdentity: File,
         userDrive: UserDrive,
         newOfflineTarget: IOFile? = null,
+        realm: Realm? = null,
     ): Boolean {
+        // SOURCE-OWNERSHIP GATE before any snapshot or deletion (issue: round 16 #3): when the
+        // caller supplies its Realm, the old path must be EXCLUSIVELY claimed by this file's
+        // row (the post-move identity keeps the row's id, so [newIdentity.id] is the expected
+        // owner). An ambiguous or foreign path defers the whole reconciliation — the bytes
+        // there may be another file's edit, and the caller keeps the old metadata for a later
+        // retry. Callers that run inside the shared boundary already ran the same gate; the
+        // check is re-applied here so every direct caller (sync actions, UI moves, SAF moves,
+        // renames) is covered too.
+        if (realm != null && exclusivePathOwner(realm, context, userDrive, oldOfflineFile.path) != newIdentity.id) {
+            return false
+        }
         // Copy ownership and mutation coordination (issue: round 4 #4): move reconciliation
         // competes with publication, cleanup and upload registration for the same bytes.
         OfflineFileCoordination.withFileLock(userDrive, newIdentity.id) {
@@ -672,6 +722,15 @@ object OfflineFolderController {
                 if (isStale(oldRow, remoteFile, observedById[remoteFile.id])) return@withFileLock oldRow
                 val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
                     ?: return@withFileLock remoteFile
+                // SOURCE-OWNERSHIP GATE, before ANY preservation side effect (issue: round 16
+                // #3): the bytes at the old row's path must be EXCLUSIVELY claimed by this
+                // file's row. A path reused by another row (a stale duplicate claiming the
+                // same derived path) makes the owner ambiguous — snapshotting or deleting
+                // there would capture or destroy another file's edit; the whole replacement
+                // defers (the OLD row is returned, nothing on disk or in the upload queue is
+                // touched) and a later pass retries once the duplicate resolves.
+                val pathOwnerId = exclusivePathOwner(realm, context, userDrive, oldOffline.path)
+                if (pathOwnerId != oldRow.id) return@withFileLock oldRow
                 // Historical baseline ANCHOR (issue: round 16 #2): a row whose bytes were
                 // published before the baseline field existed carries null. While those bytes
                 // still verify against the row's CURRENT metadata (the metadata they were

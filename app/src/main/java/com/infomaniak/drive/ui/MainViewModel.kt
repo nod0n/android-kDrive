@@ -912,6 +912,7 @@ class MainViewModel(
             newIdentity = postMoveIdentity,
             userDrive = userDrive,
             newOfflineTarget = destinationFile,
+            realm = realm,
         )
     }
 

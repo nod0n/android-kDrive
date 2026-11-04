@@ -504,6 +504,7 @@ object FileController {
                 newIdentity = snapshotIdentity,
                 userDrive = scope,
                 newOfflineTarget = newOffline,
+                realm = realm,
             )
         }
         return customRealm?.let(block) ?: getRealmInstance(scope).use(block)
