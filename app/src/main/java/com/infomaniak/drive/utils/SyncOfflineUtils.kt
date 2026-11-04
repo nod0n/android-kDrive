@@ -204,22 +204,20 @@ object SyncOfflineUtils {
         fileAction: LastFileAction,
         userDrive: UserDrive,
         realm: Realm,
-    ) {
+    ): Boolean {
         val remoteFile = fileAction.file
         val ioFileLastModified = ioFile.lastModified()
-        when {
+        val handled = when {
             remoteFile == null -> {
                 SentryLog.e("SyncOffline", "Expect remote file instead of null file") { scope ->
                     scope.setExtra("fileAction", "${fileAction.lastAction}")
                 }
-                return
+                false
             }
-            ioFileLastModified > remoteFile.revisedAtInMillis -> {
+            ioFileLastModified > remoteFile.revisedAtInMillis ->
                 uploadFile(context, localFile, remoteFile, ioFile, userDrive, realm)
-            }
-            ioFileLastModified < remoteFile.revisedAtInMillis -> {
+            ioFileLastModified < remoteFile.revisedAtInMillis ->
                 downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm)
-            }
             fileAction.lastAction in renameActions -> {
                 // Shared move handling (issue: round 5 #4): a rename/move is reconciled through
                 // the same protection-aware routine as the folder walk, under the captured
@@ -238,18 +236,29 @@ object SyncOfflineUtils {
                 ) {
                     // Preservation incomplete (pending upload, snapshot failed, protected
                     // destination): keep the old bytes and metadata, and do not consume the
-                    // action so a later sync retries it.
-                    return
+                    // action so a later sync retries it (issue: round 6 #11).
+                    false
+                } else {
+                    // Bytes are safely at (or durably registered for) the new location: commit
+                    // the new identity so the row and the offline path agree.
+                    FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+                    true
                 }
-                // Bytes are safely at (or durably registered for) the new location: commit the
-                // new identity so the row and the offline path agree.
-                FileController.updateExistingFile(newFile = remoteFile, realm = realm)
             }
+            else -> true
         }
 
-        FileController.updateFile(localFile.id, realm) { mutableFile ->
-            mutableFile.lastActionAt = fileAction.lastActionAt ?: 0
+        if (handled) {
+            FileController.updateFile(localFile.id, realm) { mutableFile ->
+                mutableFile.lastActionAt = fileAction.lastActionAt ?: 0
+            }
+        } else {
+            // The activity cursor is NOT advanced for deferred operations (issue: round 6 #11):
+            // the action stays pending, so a later sync re-processes it instead of the retry
+            // depending on another mechanism.
+            SentryLog.i("SyncOffline", "Deferring file action ${fileAction.lastAction} for ${localFile.id}")
         }
+        return handled
     }
 
     /**
@@ -271,40 +280,44 @@ object SyncOfflineUtils {
         ioFile: IOFile,
         userDrive: UserDrive,
         realm: Realm,
-    ) {
+    ): Boolean {
         val uri = Uri.fromFile(ioFile)
         val fileModifiedAt = Date(ioFile.lastModified())
 
-        if (UploadFile.canUpload(uri, fileModifiedAt)) {
-            // Upload-source registration is a mutation owner of these bytes: it holds the shared
-            // per-file coordination so a publication or cleanup cannot interleave (issue:
-            // round 4 #4).
-            synchronized(OfflineFileCoordination.lockFor(userDrive, localFile.id)) {
-                // Registration FIRST (issue: round 6 #4): if the upload record cannot be created,
-                // the replacement metadata must not be committed — a committed clean baseline
-                // without a durable owner would leave the copy reading as clean and unprotected.
-                // If the metadata write fails after a successful registration, the record still
-                // owns the source and the next sync retries.
-                UploadFile(
-                    uri = uri.toString(),
-                    driveId = userDrive.driveId,
-                    fileModifiedAt = fileModifiedAt,
-                    fileName = localFile.name,
-                    fileSize = ioFile.length(),
-                    remoteFolder = localFile.parentId,
-                    type = UploadFile.Type.SYNC_OFFLINE.name,
-                    userId = userDrive.userId,
-                ).store()
-
-                if (remoteFile != null) {
-                    remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
-                    remoteFile.size = ioFile.length()
-                    FileController.updateExistingFile(newFile = remoteFile, realm = realm)
-                }
-
-                context.syncImmediately(isAutomaticTrigger = false)
-            }
+        if (!UploadFile.canUpload(uri, fileModifiedAt)) {
+            // Not schedulable right now: the action stays pending for a later sync
+            // (issue: round 6 #11).
+            return false
         }
+        // Upload-source registration is a mutation owner of these bytes: it holds the shared
+        // per-file coordination so a publication or cleanup cannot interleave (issue:
+        // round 4 #4).
+        synchronized(OfflineFileCoordination.lockFor(userDrive, localFile.id)) {
+            // Registration FIRST (issue: round 6 #4): if the upload record cannot be created,
+            // the replacement metadata must not be committed — a committed clean baseline
+            // without a durable owner would leave the copy reading as clean and unprotected.
+            // If the metadata write fails after a successful registration, the record still
+            // owns the source and the next sync retries.
+            UploadFile(
+                uri = uri.toString(),
+                driveId = userDrive.driveId,
+                fileModifiedAt = fileModifiedAt,
+                fileName = localFile.name,
+                fileSize = ioFile.length(),
+                remoteFolder = localFile.parentId,
+                type = UploadFile.Type.SYNC_OFFLINE.name,
+                userId = userDrive.userId,
+            ).store()
+
+            if (remoteFile != null) {
+                remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
+                remoteFile.size = ioFile.length()
+                FileController.updateExistingFile(newFile = remoteFile, realm = realm)
+            }
+
+            context.syncImmediately(isAutomaticTrigger = false)
+        }
+        return true
     }
 
     /**
@@ -317,14 +330,15 @@ object SyncOfflineUtils {
         offlineFile: IOFile,
         userDrive: UserDrive,
         realm: Realm,
-    ) {
-        val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return
+    ): Boolean {
+        val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return false
         val pathChanged = offlineFile.path != remoteOfflineFile.path
 
         if (pathChanged) {
             // A pending download marker leaves this refresh to the queued worker, which runs
-            // its own protection checks: moving or deleting the bytes here would race it.
-            if (file.isMarkedAsOffline) return
+            // its own protection checks: moving or deleting the bytes here would race it. The
+            // action stays pending for a later sync (issue: round 6 #11).
+            if (file.isMarkedAsOffline) return false
             if (offlineFile.exists() && !OfflineFolderController.reconcileMovedInheritedCopy(
                     context = context,
                     oldOfflineFile = offlineFile,
@@ -336,8 +350,8 @@ object SyncOfflineUtils {
                 )
             ) {
                 // Preservation incomplete: keep the old bytes and metadata; a later sync
-                // retries the refresh (issue: round 5 #4).
-                return
+                // retries the refresh (issues: round 5 #4, round 6 #11).
+                return false
             }
             // The old location no longer holds this file's content (migrated, snapshotted
             // under the new identity, deleted as uploaded, or never existed): drop its stale
@@ -356,6 +370,10 @@ object SyncOfflineUtils {
                 userDrive = userDrive,
                 isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
             )
+            return true
         }
+        // The local state already matches the remote revision, or a queued worker durably owns
+        // the refresh: nothing left to do for this action (issue: round 6 #11).
+        return true
     }
 }

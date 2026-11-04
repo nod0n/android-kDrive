@@ -96,7 +96,8 @@ object OfflineFolderUtils {
                 }
 
                 val isRootFolder = folderId == rootFolderId
-                val folderWasListed = walkSingleFolder(
+
+                when (walkSingleFolder(
                     context = context,
                     realm = realm,
                     okHttpClient = okHttpClient,
@@ -108,11 +109,17 @@ object OfflineFolderUtils {
                     fileIds = fileIds,
                     folderQueue = folderQueue,
                     visitedFolderIds = visitedFolderIds,
-                )
-
-                if (!folderWasListed) {
-                    completed = false
-                    break@walk
+                )) {
+                    FolderWalkOutcome.INCOMPLETE -> {
+                        // The folder's membership is unknown: stop here; the walk retries
+                        // later without having advanced lastSyncedAt.
+                        completed = false
+                        break@walk
+                    }
+                    // Deferred moves keep their old metadata and durable membership; the
+                    // collected files still count as safe walk progress (issue: round 6 #10).
+                    FolderWalkOutcome.DEFERRED_MOVES -> completed = false
+                    FolderWalkOutcome.COMPLETED -> Unit
                 }
             }
 
@@ -126,13 +133,24 @@ object OfflineFolderUtils {
         }
     }
 
+    /** Outcome of one folder's walk pass (issue: round 6 #10). */
+    private enum class FolderWalkOutcome {
+        /** Fully listed and reconciled. */
+        COMPLETED,
+        /** Fully listed; only the move reconciliation is deferred. Independent folders continue. */
+        DEFERRED_MOVES,
+        /** The listing itself is incomplete: the folder's membership is unknown. */
+        INCOMPLETE,
+    }
+
     /**
      * Aggregates all pages of one remote folder, then upserts and marks its children. The cache
      * membership is only replaced, and the stale reconciliation only runs, once the folder has
      * been fully listed with valid pages and a terminating response: an incomplete pagination
      * (missing data, `hasMore` without cursor, non-advancing cursor) mutates nothing and reports
-     * an incomplete outcome so the walk is retried (issue #1902). Returns false when the folder
-     * could not be completely listed.
+     * [FolderWalkOutcome.INCOMPLETE] so the walk is retried (issue #1902). A fully listed folder
+     * whose move reconciliation deferred reports [FolderWalkOutcome.DEFERRED_MOVES] — its
+     * membership is coherent and independent folders keep walking (issue: round 6 #10).
      */
     private suspend fun walkSingleFolder(
         context: Context,
@@ -146,7 +164,7 @@ object OfflineFolderUtils {
         fileIds: MutableList<Int>,
         folderQueue: ArrayDeque<Int>,
         visitedFolderIds: MutableSet<Int>,
-    ): Boolean {
+    ): FolderWalkOutcome {
         val allPages = mutableListOf<File>()
         var lastResponse: CursorApiResponse<List<File>>? = null
         var cursor: String? = null
@@ -168,10 +186,10 @@ object OfflineFolderUtils {
                 // or indeterminate failures preserve it for a retry.
                 if (isRootFolder && cursor == null && isRootGone(apiResponse)) {
                     removeRootCoverage(context, realm, folderId, userDrive)
-                    return false
+                    return FolderWalkOutcome.INCOMPLETE
                 }
                 SentryLog.i(TAG, "Failed to list folder $folderId (cursor: ${cursor != null})")
-                return false
+                return FolderWalkOutcome.INCOMPLETE
             }
 
             val pageData = apiResponse.data
@@ -179,7 +197,7 @@ object OfflineFolderUtils {
                 // A successful response without data is not an empty page: treat it as
                 // incomplete rather than reconciling against nothing.
                 SentryLog.i(TAG, "Incomplete listing for folder $folderId (null page data)")
-                return false
+                return FolderWalkOutcome.INCOMPLETE
             }
             allPages.addAll(pageData)
 
@@ -188,14 +206,14 @@ object OfflineFolderUtils {
                     val nextCursor = apiResponse.cursor
                     if (nextCursor == cursor) {
                         SentryLog.i(TAG, "Incomplete listing for folder $folderId (cursor not advancing)")
-                        return false
+                        return FolderWalkOutcome.INCOMPLETE
                     }
                     cursor = nextCursor
                 }
                 apiResponse.hasMore -> {
                     // hasMore without a cursor cannot be continued: incomplete.
                     SentryLog.i(TAG, "Incomplete listing for folder $folderId (hasMore without cursor)")
-                    return false
+                    return FolderWalkOutcome.INCOMPLETE
                 }
                 else -> {
                     lastResponse = apiResponse
@@ -204,7 +222,7 @@ object OfflineFolderUtils {
             }
         }
 
-        val last = lastResponse ?: return false
+        val last = lastResponse ?: return FolderWalkOutcome.INCOMPLETE
         val remoteIds = allPages.mapTo(mutableSetOf()) { it.id }
 
         // Capture every locally owned copy (explicit pins included — the walk would otherwise
@@ -291,13 +309,13 @@ object OfflineFolderUtils {
 
         if (unresolvedMoveIds.isNotEmpty()) {
             // The move reconciliation is incomplete: the affected files keep their old metadata
-            // and location this round. Reporting the folder incomplete keeps the whole walk
-            // scheduled for retry, so reconciliation runs again once the blocking condition
-            // (pending upload, protected destination) clears (issue: round 5 #8/#9).
-            return false
+            // and location this round, and the root stays incomplete for retry (issue: round
+            // 5 #8/#9). The folder itself WAS fully listed — independent folders keep walking
+            // so one occupied destination cannot starve the whole root (issue: round 6 #10).
+            return FolderWalkOutcome.DEFERRED_MOVES
         }
 
-        return true
+        return FolderWalkOutcome.COMPLETED
     }
 
     /**

@@ -89,12 +89,12 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                 synchronizationSucceeded = true // the root was removed: nothing left to synchronize
                 return Result.success()
             }
-            if (!walkResult.completed) {
-                // Listing failed: the root intent stays durable and the offline sync retries the
-                // walk; reporting success here would advance the completion marker wrongly.
-                return Result.retry()
-            }
 
+            // Safe partial progress (issue: round 6 #10): the files already collected by the
+            // completed part of the walk are downloaded even when the overall walk is
+            // incomplete (a failed folder listing or deferred moves); the root outcome stays
+            // incomplete below, so the remaining folders and moves are retried without
+            // advancing lastSyncedAt.
             files = walkResult.fileIds.mapNotNull { FileController.getFileByUidOrId(it, userDrive) }
         } else {
             files = FileController.getFolderOfflineFilesId(
@@ -115,7 +115,11 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
             return Result.failure(getNotEnoughSpaceOutputData())
         }
 
-        return downloadFiles().also { synchronizationSucceeded = it == Result.success() }
+        val downloadResult = downloadFiles()
+        // An incomplete walk never reports success: the root's walk-in-progress marker stays
+        // and lastSyncedAt does not advance (issue: round 6 #10).
+        synchronizationSucceeded = downloadResult == Result.success() && walkCompleted
+        return if (walkCompleted) downloadResult else Result.retry()
     }
 
     override fun onFinish() {
