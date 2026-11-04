@@ -279,7 +279,17 @@ object SyncOfflineUtils {
 
             migrateOfflineIfNeeded(context, file, ioFile, userDrive)
 
-            if (ioFile.lastModified() > file.revisedAtInMillis) {
+            // PUBLISHED-BASELINE + PROTECTION CANDIDATE FILTER (issue: round 19 #23): the
+            // previous bare remote-revisedAt comparison uploaded retained clean bytes
+            // whose mtime sat above a BACKWARD-DATED newer revision, and swept bytes
+            // already owned by a pending upload into a second upload. The candidate
+            // filter is the same provenance decision the action paths use (round 17 #3):
+            // bytes are an edit only when they are NEWER THAN THEIR OWN PUBLISHED
+            // BASELINE, and never while a pending or retained-unsent record owns them.
+            if (UploadFile.hasPendingUpload(uri = Uri.fromFile(ioFile).toString()) ||
+                UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(ioFile).toString())
+            ) continue
+            if (ioFile.lastModified() / 1_000L > file.effectivePublishedBaseline) {
                 uploadFile(
                     context = context,
                     localFile = file,
