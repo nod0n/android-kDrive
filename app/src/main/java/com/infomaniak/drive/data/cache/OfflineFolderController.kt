@@ -356,33 +356,40 @@ object OfflineFolderController {
      */
     fun processPendingRemovalRoots(context: Context, userDrive: UserDrive, customRealm: Realm) {
         getOfflineRoots(customRealm = customRealm).filter { it.isPendingRemoval }.forEach { root ->
-            // Re-validate against the live record: the root may have been revived since the
-            // detached list was built (issue: round 4 #11).
-            val stillPending = customRealm.where(OfflineRoot::class.java)
-                .equalTo(OfflineRoot::folderId.name, root.folderId)
-                .findFirst()
-                ?.takeIf { it.isValid && it.isPendingRemoval } != null
-            if (!stillPending) return@forEach
-
-            clearCoverageRecursively(context, customRealm, root.folderId, userDrive) {
-                customRealm.where(OfflineRoot::class.java)
+            // The deferred cleanup serializes with revival/addition on the root folder's
+            // coordination lock — the SAME lock addOfflineRoot and removeOfflineRoot hold
+            // (issue: round 8 #8): without it, a revival racing the stillPending re-check
+            // could have its freshly requested coverage cleared and its copies deleted by
+            // this pass. Lock order stays root → descendants everywhere.
+            synchronized(OfflineFileCoordination.lockFor(userDrive, root.folderId)) {
+                // Re-validate against the live record: the root may have been revived since
+                // the detached list was built (issue: round 4 #11).
+                val stillPending = customRealm.where(OfflineRoot::class.java)
                     .equalTo(OfflineRoot::folderId.name, root.folderId)
                     .findFirst()
-                    ?.takeIf { it.isValid && it.isPendingRemoval } == null
-            }
+                    ?.takeIf { it.isValid && it.isPendingRemoval } != null
+                if (!stillPending) return@synchronized
 
-            // Delete only the still-pending generation, and only once nothing protected remains
-            // (issue: round 5 #11): pending uploads or snapshot failures retain bytes and flags,
-            // and the pending record is the durable owner that schedules their eventual cleanup.
-            // A revived root keeps its record through the same live re-check.
-            if (hasProtectedFilesRecursively(root.folderId, context, userDrive, customRealm)) return@forEach
+                clearCoverageRecursively(context, customRealm, root.folderId, userDrive) {
+                    customRealm.where(OfflineRoot::class.java)
+                        .equalTo(OfflineRoot::folderId.name, root.folderId)
+                        .findFirst()
+                        ?.takeIf { it.isValid && it.isPendingRemoval } == null
+                }
 
-            customRealm.executeTransaction {
-                customRealm.where(OfflineRoot::class.java)
-                    .equalTo(OfflineRoot::folderId.name, root.folderId)
-                    .findFirst()
-                    ?.takeIf { it.isValid && it.isPendingRemoval }
-                    ?.deleteFromRealm()
+                // Delete only the still-pending generation, and only once nothing protected remains
+                // (issue: round 5 #11): pending uploads or snapshot failures retain bytes and flags,
+                // and the pending record is the durable owner that schedules their eventual cleanup.
+                // A revived root keeps its record through the same live re-check.
+                if (hasProtectedFilesRecursively(root.folderId, context, userDrive, customRealm)) return@synchronized
+
+                customRealm.executeTransaction {
+                    customRealm.where(OfflineRoot::class.java)
+                        .equalTo(OfflineRoot::folderId.name, root.folderId)
+                        .findFirst()
+                        ?.takeIf { it.isValid && it.isPendingRemoval }
+                        ?.deleteFromRealm()
+                }
             }
         }
     }
@@ -706,6 +713,14 @@ object OfflineFolderController {
             // A missing folder row no longer drops the whole subtree (issue: round 5 #10): the
             // children are enumerated through the durable parentId relationships below, so their
             // coverage cleanup and preserved-copy handling still run.
+            // Fresh coverage predicate (issue: round 8 #8): a nested root added after this
+            // traversal's own subtree check stops the clearing inside the committing
+            // transaction — the traversal-time skip at the top of the loop cannot see it.
+            val removalClearable: (Realm, File) -> Boolean = { currentRealm, candidate ->
+                getOfflineRoot(candidate.id, customRealm = currentRealm)
+                    ?.takeIf { it.isValid && !it.isPendingRemoval } == null &&
+                    !isInsideActiveRoot(currentRealm, candidate.id)
+            }
             if (folder != null && folder.isUsable()) {
                 clearFileCoverage(
                     context = context,
@@ -715,6 +730,7 @@ object OfflineFolderController {
                     result = result,
                     isFolder = true,
                     isAborted = isAborted,
+                    isStillClearable = removalClearable,
                 )
             }
 
@@ -734,6 +750,7 @@ object OfflineFolderController {
                             result = result,
                             isFolder = false,
                             isAborted = isAborted,
+                            isStillClearable = removalClearable,
                         )
                     }
                 }
@@ -755,6 +772,13 @@ object OfflineFolderController {
      *  - a revision that was already uploaded is content-safe: the stale local duplicate is
      *    cleared;
      *  - plain covered copies are cleared and deleted (offline cache only).
+     *
+     * [isStillClearable] is the context's fresh coverage predicate, re-evaluated INSIDE each
+     * committing transaction (issue: round 8 #8): the root-removal cleanup rejects rows a
+     * newly added nested root now covers, and the orphan sweep rejects rows a root added in
+     * the meantime covers. Callers whose authority is the remote listing itself (the walk's
+     * stale cleanup, the per-file sync deletion) pass nil and keep the pre-existing
+     * semantics.
      */
     fun clearFileCoverage(
         context: Context,
@@ -764,6 +788,7 @@ object OfflineFolderController {
         result: RemovalResult,
         isFolder: Boolean,
         isAborted: () -> Boolean = { false },
+        isStillClearable: ((Realm, File) -> Boolean)? = null,
     ) {
         if (file.isOffline) return
 
@@ -781,6 +806,13 @@ object OfflineFolderController {
                     if (isAborted()) return@executeTransaction
                     val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
                     if (liveRow.isOffline) return@executeTransaction
+                    // Caller-supplied freshness predicate, evaluated INSIDE the committing
+                    // transaction (issue: round 8 #8): each clearing context revalidates the
+                    // ancestry that authorizes IT — the root-removal cleanup rejects rows a
+                    // newly added nested root now covers, the orphan sweep rejects rows a
+                    // root newly covers. A nil predicate keeps the pre-existing semantics:
+                    // the walk's and the sync's remote-listing truth needs no ancestry gate.
+                    isStillClearable?.let { clearable -> if (!clearable(realm, file)) return@executeTransaction }
                     liveRow.isInOfflineFolder = false
                     liveRow.isMarkedAsOffline = false
                     cleared = true
@@ -799,6 +831,13 @@ object OfflineFolderController {
                     if (isAborted()) return@executeTransaction
                     val liveRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
                     if (liveRow.isOffline) return@executeTransaction
+                    // Caller-supplied freshness predicate, evaluated INSIDE the committing
+                    // transaction (issue: round 8 #8): each clearing context revalidates the
+                    // ancestry that authorizes IT — the root-removal cleanup rejects rows a
+                    // newly added nested root now covers, the orphan sweep rejects rows a
+                    // root newly covers. A nil predicate keeps the pre-existing semantics:
+                    // the walk's and the sync's remote-listing truth needs no ancestry gate.
+                    isStillClearable?.let { clearable -> if (!clearable(realm, file)) return@executeTransaction }
                     liveRow.isInOfflineFolder = false
                     liveRow.isMarkedAsOffline = false
                     cleared = true
@@ -843,7 +882,16 @@ object OfflineFolderController {
                 cleared = true
             }
             if (cleared) {
-                deleteOfflineCopy(context, file, offlineFile, userDrive, result)
+                // Intent re-check AFTER the commit, BEFORE the bytes go (issue: round 8 #8):
+                // the flag commit and the byte deletion must share one intent protocol — a
+                // revival between the committing transaction and the deletion keeps the
+                // bytes, so the revived root's walk finds the copy it just re-requested
+                // instead of deleting it.
+                if (!isAborted()) {
+                    deleteOfflineCopy(context, file, offlineFile, userDrive, result)
+                } else {
+                    result.keptOfflineFilesCount++
+                }
             } else {
                 result.keptOfflineFilesCount++
             }

@@ -540,6 +540,12 @@ object OfflineFolderUtils {
                 userDrive = userDrive,
                 result = result,
                 isFolder = orphan.isFolder(),
+                // Fresh coverage predicate INSIDE the clearing transaction (issue: round 8
+                // #8): a root covering this row after the snapshot filter ran stops the
+                // clearing — the filter alone saw only the traversal-time state.
+                isStillClearable = { currentRealm, candidate ->
+                    !OfflineFolderController.isCoveredByRootIncludingSelf(candidate.id, customRealm = currentRealm)
+                },
             )
         }
 
