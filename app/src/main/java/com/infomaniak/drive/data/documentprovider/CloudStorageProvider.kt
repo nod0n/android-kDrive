@@ -624,48 +624,63 @@ class CloudStorageProvider : DocumentsProvider() {
                 val preserved: Boolean = when {
                     appContext == null -> false
                     else -> synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                        runCatching { realm.refresh() }
-                        val freshFile = FileController.getFileProxyById(fileId, customRealm = realm)
-                        val freshTargetParent = FileController.getFileProxyById(targetParentFileId, customRealm = realm)
-                        when {
-                            freshFile == null -> false
-                            freshFile.isFolder() ->
-                                // Required ancestry (issues: round 5 #10, round 7 #7): a
-                                // folder row whose descendants remain locally owned survives
-                                // the SAF move.
-                                !OfflineFolderController.hasLocallyOwnedDescendant(freshFile.id, realm)
-                            else -> {
-                                val oldOffline =
-                                    freshFile.getOfflineFile(appContext, userDrive.userId)?.takeIf { it.exists() }
-                                if (oldOffline == null) {
-                                    true // nothing owned at the old location
-                                } else if (freshTargetParent == null) {
-                                    false
-                                } else {
-                                    val destinationFile = freshTargetParent
-                                        .getOfflineFile(appContext, userDrive.userId)
-                                        ?.let { parentDir -> IOFile(parentDir, freshFile.name) }
-                                    destinationFile != null && OfflineFolderController.reconcileMovedInheritedCopy(
-                                        context = appContext,
-                                        oldOfflineFile = oldOffline,
-                                        oldIdentityName = freshFile.name,
-                                        oldIdentityParentId = freshFile.parentId,
-                                        oldLastModifiedAt = freshFile.lastModifiedAt,
-                                        newIdentity = File(id = freshFile.id, driveId = userDrive.driveId).apply {
-                                            parentId = freshTargetParent.id
-                                            name = freshFile.name
-                                        },
-                                        userDrive = userDrive,
-                                        newOfflineTarget = destinationFile,
-                                    )
+                        // The FILE coordination spans preservation AND deletion (issue:
+                        // round 15 #13): the preservation helper's internal lock previously
+                        // ended before the row deletion.
+                        OfflineFileCoordination.withFileLock(userDrive, fileId) {
+                            runCatching { realm.refresh() }
+                            val freshFile = FileController.getFileProxyById(fileId, customRealm = realm)
+                            val freshTargetParent = FileController.getFileProxyById(targetParentFileId, customRealm = realm)
+                            when {
+                                freshFile == null -> false
+                                freshFile.isFolder() -> {
+                                    // Required ancestry (issues: round 5 #10, round 7 #7)
+                                    // REVALIDATED INSIDE the deleting transaction (issue:
+                                    // round 15 #13): coverage materialization and pin writes
+                                    // that do not all hold this monitor can commit between a
+                                    // check outside and the deletion, stranding ancestry a
+                                    // newly committed offline intent requires.
+                                    var deletable = false
+                                    realm.executeTransaction {
+                                        deletable = !OfflineFolderController.hasLocallyOwnedDescendant(freshFile.id, realm)
+                                        if (deletable) freshFile.deleteFromRealm()
+                                    }
+                                    deletable
                                 }
-                            }
-                        }.also { preservedNow ->
-                            if (preservedNow) {
-                                // The row deletion REMOVES ancestry (issues: round 13 #5,
-                                // round 14 #10): conditional and inside the SAME section.
-                                realm.executeTransaction {
-                                    if (freshFile != null && freshFile.isValid) freshFile.deleteFromRealm()
+                                else -> {
+                                    val oldOffline =
+                                        freshFile.getOfflineFile(appContext, userDrive.userId)?.takeIf { it.exists() }
+                                    val preservedNow = when {
+                                        oldOffline == null -> true // nothing owned at the old location
+                                        freshTargetParent == null -> false
+                                        else -> {
+                                            val destinationFile = freshTargetParent
+                                                .getOfflineFile(appContext, userDrive.userId)
+                                                ?.let { parentDir -> IOFile(parentDir, freshFile.name) }
+                                            destinationFile != null && OfflineFolderController.reconcileMovedInheritedCopy(
+                                                context = appContext,
+                                                oldOfflineFile = oldOffline,
+                                                oldIdentityName = freshFile.name,
+                                                oldIdentityParentId = freshFile.parentId,
+                                                oldLastModifiedAt = freshFile.lastModifiedAt,
+                                                newIdentity = File(id = freshFile.id, driveId = userDrive.driveId).apply {
+                                                    parentId = freshTargetParent.id
+                                                    name = freshFile.name
+                                                },
+                                                userDrive = userDrive,
+                                                newOfflineTarget = destinationFile,
+                                            )
+                                        }
+                                    }
+                                    if (preservedNow) {
+                                        // The row deletion REMOVES ancestry (issues: round
+                                        // 13 #5, round 14 #10): conditional and inside the
+                                        // SAME file lock.
+                                        realm.executeTransaction {
+                                            if (freshFile.isValid) freshFile.deleteFromRealm()
+                                        }
+                                    }
+                                    preservedNow
                                 }
                             }
                         }

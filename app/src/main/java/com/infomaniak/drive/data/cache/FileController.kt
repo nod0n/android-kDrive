@@ -321,13 +321,16 @@ object FileController {
         setExplicitPin: Boolean = false,
     ) {
         if (setExplicitPin) {
-            // Explicit-pin writes serialize with destructive cleanup on each file's
-            // coordination lock, taken BEFORE the Realm write (issue: round 7 #9).
+            // Explicit-pin writes join the ROOT-INTENT protocol (issue: round 15 #13) and
+            // serialize with destructive cleanup on each file's coordination lock, taken
+            // BEFORE the Realm write (issue: round 7 #9).
             val lockedBlock: (Realm) -> Unit? = { realm ->
-                filesId.forEach { fileId ->
-                    OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), fileId) {
-                        realm.executeTransaction {
-                            markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin)
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    filesId.forEach { fileId ->
+                        OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), fileId) {
+                            realm.executeTransaction {
+                                markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin)
+                            }
                         }
                     }
                 }
@@ -335,10 +338,14 @@ object FileController {
             customRealm?.let(lockedBlock) ?: getRealmInstance(userDrive).use(lockedBlock)
             return
         }
+        // Marker writes authorize publication and completion: they take the intent monitor
+        // too (issue: round 15 #13).
         val block: (Realm) -> Unit? = { realm ->
-            realm.executeTransaction {
-                filesId.forEach { fileId ->
-                    markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin)
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                realm.executeTransaction {
+                    filesId.forEach { fileId ->
+                        markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin)
+                    }
                 }
             }
         }
@@ -704,12 +711,18 @@ object FileController {
     }
 
     fun updateOfflineStatus(fileId: Int, isOffline: Boolean, userDrive: UserDrive? = null) {
-        // The pin write serializes on the same per-file coordination the destructive cleanup
-        // holds, taken BEFORE the Realm write, so a cleanup cannot delete a copy whose pin
-        // request is being written (issue: round 6 #6).
-        OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), fileId) {
-            updateFile(fileId, userDrive = userDrive) { file ->
-                file.isOffline = isOffline
+        // The pin write joins the ROOT-INTENT protocol (issue: round 15 #13) and serializes
+        // on the same per-file coordination the destructive cleanup holds, taken BEFORE the
+        // Realm write, so a cleanup cannot delete a copy whose pin request is being written
+        // (issue: round 6 #6).
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive ?: UserDrive(), fileId) {
+                updateFile(fileId, userDrive = userDrive) { file ->
+                    file.isOffline = isOffline
+                    // A removed intent cannot be reauthorized by its stale pending marker
+                    // (issue: round 15 #12): unpinning clears both.
+                    if (!isOffline) file.isMarkedAsOffline = false
+                }
             }
         }
     }

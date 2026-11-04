@@ -346,6 +346,10 @@ object OfflineFolderUtils {
             )
         }
 
+        // Coverage materialization is an OWNERSHIP write: it joins the ROOT-INTENT protocol
+        // (issue: round 15 #13) so a concurrent SAF deletion that requires D's ancestry
+        // cannot interleave between its descendant check and its delete.
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
         realm.executeTransaction {
             // Re-check inside the transaction: the root may have been unmarked while this folder
             // was being listed, and the coverage flags must not be (re)introduced by a stale walk.
@@ -367,6 +371,7 @@ object OfflineFolderUtils {
                     fileIds.add(localFile.id)
                 }
             }
+        }
         }
         return commitOutcomes
     }

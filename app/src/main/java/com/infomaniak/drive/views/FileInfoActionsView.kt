@@ -447,25 +447,33 @@ class FileInfoActionsView @JvmOverloads constructor(
                                 // old unconditional rollback must not erase a newer pin
                                 // request — the fresh intent alone decides the pin's fate.
                                 CoroutineScope(Dispatchers.IO).launch {
+                                    // ONE coordinated transaction performs the live intent
+                                    // check and the conditional marker write (issue: round
+                                    // 15 #12): reading under coordination and writing after
+                                    // release let an unpin that clears both pin and marker
+                                    // be restored by the stale marker write. The enqueue
+                                    // happens only for the intent this transaction
+                                    // retained; a removed intent cannot be reauthorized by
+                                    // its marker.
                                     val intentStands =
                                         synchronized(OfflineFileCoordination.rootIntentMonitor) {
                                             OfflineFileCoordination.withFileLock(capturedUserDrive, fileId) {
                                                 FileController.getRealmInstance(capturedUserDrive).use { realm ->
                                                     runCatching { realm.refresh() }
-                                                    FileController.getFileById(realm, fileId)?.isOffline == true
+                                                    var stands = false
+                                                    realm.executeTransaction {
+                                                        val live = FileController.getFileById(realm, fileId)
+                                                        stands = live?.isOffline == true
+                                                        if (stands) live?.isMarkedAsOffline = true
+                                                    }
+                                                    stands
                                                 }
                                             }
                                         }
                                     if (intentStands) {
-                                        // The intent stands (ours or a newer request): retain
-                                        // it, persist the pending-download marker WITHOUT
-                                        // recreating an explicit request, and enqueue the
+                                        // The intent stands (ours or a newer request): the
+                                        // marker is already persisted atomically — enqueue the
                                         // refresh with this request's own (explicit) origin.
-                                        FileController.markFilesAsOffline(
-                                            filesId = listOf(fileId),
-                                            isMarkedAsOffline = true,
-                                            userDrive = capturedUserDrive,
-                                        )
                                         Utils.downloadAsOfflineFile(context, file = file, userDrive = capturedUserDrive)
                                     }
                                     // else: the intent is gone (a newer unpin) — do nothing.
