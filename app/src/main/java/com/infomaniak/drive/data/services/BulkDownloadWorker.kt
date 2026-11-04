@@ -116,10 +116,15 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
         }
 
         val downloadResult = downloadFiles()
+        // Traversal completeness is a RECURSIVE-mode property (issue: round 7 #10): explicit-pin
+        // batches have no walk, and gating them on walkCompleted returned retry for successful
+        // batches — their APPEND_OR_REPLACE chains never completed normally and successors
+        // stayed blocked behind retries.
+        val traversalSucceeded = !recursive || walkCompleted
         // An incomplete walk never reports success: the root's walk-in-progress marker stays
         // and lastSyncedAt does not advance (issue: round 6 #10).
-        synchronizationSucceeded = downloadResult == Result.success() && walkCompleted
-        return if (walkCompleted) downloadResult else Result.retry()
+        synchronizationSucceeded = downloadResult == Result.success() && traversalSucceeded
+        return if (traversalSucceeded) downloadResult else Result.retry()
     }
 
     override fun onFinish() {

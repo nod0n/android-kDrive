@@ -284,6 +284,21 @@ object FileController {
         userDrive: UserDrive? = null,
         setExplicitPin: Boolean = false,
     ) {
+        if (setExplicitPin) {
+            // Explicit-pin writes serialize with destructive cleanup on each file's
+            // coordination lock, taken BEFORE the Realm write (issue: round 7 #9).
+            val lockedBlock: (Realm) -> Unit? = { realm ->
+                filesId.forEach { fileId ->
+                    synchronized(OfflineFileCoordination.lockFor(userDrive ?: UserDrive(), fileId)) {
+                        realm.executeTransaction {
+                            markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin)
+                        }
+                    }
+                }
+            }
+            customRealm?.let(lockedBlock) ?: getRealmInstance(userDrive).use(lockedBlock)
+            return
+        }
         val block: (Realm) -> Unit? = { realm ->
             realm.executeTransaction {
                 filesId.forEach { fileId ->
