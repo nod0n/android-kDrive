@@ -262,6 +262,12 @@ object FolderFilesProvider {
      * converges in place (no loop-until-done), and the listing's own commit outcome is
      * unaffected.
      */
+    /**
+     * ONE budgeted resolution pass over [deferredIds]; returns the number of candidates that
+     * remain UNRESOLVED (budget-skipped, failed fetches, rejected or uncommitted resolutions)
+     * — the caller durably marks the folder's reconciliation incomplete from it (issue: round
+     * 22 #17).
+     */
     private fun resolveDeferredCandidatesOnce(
         realm: Realm,
         okHttpClient: OkHttpClient,
@@ -269,8 +275,9 @@ object FolderFilesProvider {
         userDrive: UserDrive,
         deferredIds: Set<Int>,
         checkCancelled: () -> Unit = {},
-    ) {
-        if (deferredIds.isEmpty()) return
+    ): Int {
+        if (deferredIds.isEmpty()) return 0
+        val resolvedIds = mutableSetOf<Int>()
         for (deferredId in OfflineFolderUtils.fairDeferredSelection(
             deferredIds,
             folderId,
@@ -324,7 +331,13 @@ object FolderFilesProvider {
                                 // 21 #17) — real-parent equality with the pseudocontainer id is
                                 // impossible for shared rows (their parents are their actual
                                 // shared folders), which previously rejected every root link.
-                                val pseudoContainerMembership = folderId == SharedWithMe.id
+                                // SAF SHARED ROOT PRESENTATION (issue: round 22 #17): the SAF
+                                // shared root's container id is ROOT_ID (with the sharedWithMe
+                                // scope), not SharedWithMe.id — the presentation-membership
+                                // recognition previously matched only the latter, so a resolved
+                                // shared-root candidate never linked.
+                                val pseudoContainerMembership = folderId == SharedWithMe.id ||
+                                    (folderId == ROOT_ID && userDrive.sharedWithMe)
                                 realm.executeTransaction {
                                     val freshRow = FileController.getFileById(realm, deferredId)
                                         ?: return@executeTransaction
@@ -342,6 +355,7 @@ object FolderFilesProvider {
                 }
             }
         }
+        return deferredIds.size - resolvedIds.size
     }
 
     fun getCloudStorageFiles(
@@ -526,13 +540,29 @@ object FolderFilesProvider {
                 // protocol (fresh pre-observed details, fair per-item outcomes); unresolved
                 // candidates wait for the next listing pass.
                 if (commitOutcomes.deferredIds.isNotEmpty()) {
-                    resolveDeferredCandidatesOnce(
+                    val unresolvedCount = resolveDeferredCandidatesOnce(
                         realm = realm,
                         okHttpClient = okHttpClient,
                         folderId = folderFilesProviderArgs.folderId,
                         userDrive = userDrive,
                         deferredIds = commitOutcomes.deferredIds,
                     )
+                    if (unresolvedCount > 0) {
+                        // INCOMPLETE RECONCILIATION OUTLIVES PAGINATION (issue: round 22 #17):
+                        // the folder's persisted completeness previously came from pagination
+                        // alone — a fully listed folder with unresolved deferred candidates
+                        // looked complete, a nonempty cached folder then bypassed remote
+                        // loading (needToLoadFromRemote), and candidates beyond the budget
+                        // never received another resolution pass. The folder row is durably
+                        // marked INCOMPLETE whenever unresolved candidates remain; the next
+                        // visit re-drives the remote load and the budgeted resolver (fair
+                        // redrive), independent of pagination completion. A later fully
+                        // resolving pass re-persists the pagination completeness through
+                        // saveRemoteFiles.
+                        FileController.updateFile(folderFilesProviderArgs.folderId, realm) { folderRow ->
+                            folderRow.isComplete = false
+                        }
+                    }
                 }
                 val folderFiles = if (folderWithChildren) ArrayList(apiResponseData) else arrayListOf()
                 FolderFilesProviderResult(folder = localFolder, folderFiles = folderFiles, isComplete = isCompleteFolder)
