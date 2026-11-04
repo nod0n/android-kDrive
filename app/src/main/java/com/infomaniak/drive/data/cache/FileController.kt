@@ -1632,6 +1632,12 @@ object FileController {
     /**
      * Commits a folder listing and returns the [ListingCommitOutcomes] of the children whose
      * row did NOT take the listing's identity at commit (issues: round 13 #8, round 14 #8).
+     *
+     * [observedById] carries the COMPLETE PRE-REQUEST observations (issue: round 16 #16): the
+     * container's children as they stood before the listing HTTP request, detached. They anchor
+     * tied identity changes through the shared boundary AND the in-transaction restoration —
+     * without them a legitimate same-second directory rename was rejected on every pass, and
+     * the offline sync (which excludes directories) provided no recovery route.
      */
     fun saveRemoteFiles(
         realm: Realm,
@@ -1641,6 +1647,7 @@ object FileController {
         isFirstPage: Boolean,
         isCompleteFolder: Boolean,
         userDrive: UserDrive,
+        observedById: Map<Int, File> = emptyMap(),
     ): ListingCommitOutcomes {
         val remoteFiles = apiResponse.data ?: return ListingCommitOutcomes(emptySet(), emptySet())
 
@@ -1689,6 +1696,7 @@ object FileController {
                 realm = realm,
                 remoteFiles = remoteFiles,
                 userDrive = userDrive,
+                observedById = observedById,
             )
             // Explicit per-file outcomes (issue: round 13 #8), part 1 — the shared boundary:
             // it maps the incoming list 1:1 and returns the OLD row in place of an entry it
@@ -1707,6 +1715,7 @@ object FileController {
                     localFolderProxy?.children,
                     committableFiles,
                     substitutedOrDroppedIds,
+                    observedById,
                 )
                 // Save to realm
                 (localFolderProxy ?: newLocalFolderProxy)?.let { folderProxy ->
@@ -1761,13 +1770,17 @@ object FileController {
         localFolderChildren: List<File>?,
         remoteFolderChildren: List<File>,
         substitutedOrDroppedIds: MutableSet<Int>,
+        observedById: Map<Int, File> = emptyMap(),
     ): List<File> {
         val oldChildren = localFolderChildren?.associateBy { it.id }
         return remoteFolderChildren.mapNotNull { newFile ->
             newFile.sortedName = newFile.sortedName.lowercase().removeAccents()
 
             val oldChild = oldChildren?.get(newFile.id) ?: getFileById(realm, newFile.id)
-            if (oldChild != null && isStaleReplacement(oldChild, newFile)) {
+            // The pre-request observation resolves tied identity changes (issue: round 16 #16):
+            // a legitimate same-second rename against an unchanged observation is the server's
+            // current truth, not an ambiguous tie to defer forever.
+            if (oldChild != null && isStaleReplacement(oldChild, newFile, observedById[newFile.id])) {
                 // Explicit per-file outcomes (issue: round 13 #8), part 2 — the in-transaction
                 // restoration: a substituted or dropped entry did not take the listing's
                 // identity, whether the live row stays linked here or moved away.

@@ -244,6 +244,15 @@ object FolderFilesProvider {
         val userDrive = folderFilesProviderArgs.userDrive
         val (okHttpClient, driveId) = runBlocking { AccountUtils.getHttpClient(userDrive.userId) } to userDrive.driveId
 
+        // COMPLETE PRE-REQUEST OBSERVATIONS (issue: round 16 #16): the container's children as
+        // they stood before the listing HTTP request, detached at depth one (embedded version
+        // included, issue: round 16 #9). They anchor tied identity changes through the shared
+        // boundary and the committing transaction, so ordinary listings converge on
+        // same-second renames instead of deferring them on every pass.
+        val observedById = folderProxy?.children
+            ?.associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
+            ?: emptyMap()
+
         val apiResponse = when {
             folderFilesProviderArgs.folderId == ROOT_ID -> {
                 ApiRepository.getFolderFiles(
@@ -277,7 +286,7 @@ object FolderFilesProvider {
 
         ensureActive()
 
-        handleRemoteFiles(realm, apiResponse, folderFilesProviderArgs, folderProxy, okHttpClient)
+        handleRemoteFiles(realm, apiResponse, folderFilesProviderArgs, folderProxy, okHttpClient, observedById)
     }
 
     private fun loadCloudStorageFromRemote(
@@ -287,6 +296,11 @@ object FolderFilesProvider {
         okHttpClient: OkHttpClient,
     ): FolderFilesProviderResult? = with(Dispatchers.IO) {
         val userDrive = folderFilesProviderArgs.userDrive
+
+        // COMPLETE PRE-REQUEST OBSERVATIONS (issue: round 16 #16), as in [loadFromRemote].
+        val observedById = folderProxy?.children
+            ?.associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
+            ?: emptyMap()
 
         val apiResponse = when {
             folderFilesProviderArgs.folderId == ROOT_ID && userDrive.sharedWithMe -> {
@@ -309,7 +323,7 @@ object FolderFilesProvider {
 
         ensureActive()
 
-        handleRemoteFiles(realm, apiResponse, folderFilesProviderArgs, folderProxy)
+        handleRemoteFiles(realm, apiResponse, folderFilesProviderArgs, folderProxy, observedById = observedById)
     }
 
     private fun handleRemoteFiles(
@@ -318,6 +332,7 @@ object FolderFilesProvider {
         folderFilesProviderArgs: FolderFilesProviderArgs,
         folderProxy: File?,
         okHttpClient: OkHttpClient = DefaultHttpClientProvider.okHttpClient,
+        observedById: Map<Int, File> = emptyMap(),
     ): FolderFilesProviderResult? {
         val userDrive = folderFilesProviderArgs.userDrive
         val apiResponseData = apiResponse.data
@@ -340,7 +355,8 @@ object FolderFilesProvider {
                     apiResponse = apiResponse,
                     isFirstPage = folderFilesProviderArgs.isFirstPage,
                     isCompleteFolder = isCompleteFolder,
-                    userDrive = userDrive
+                    userDrive = userDrive,
+                    observedById = observedById
                 )
                 val folderFiles = if (folderWithChildren) ArrayList(apiResponseData) else arrayListOf()
                 FolderFilesProviderResult(folder = localFolder, folderFiles = folderFiles, isComplete = isCompleteFolder)
@@ -379,6 +395,15 @@ object FolderFilesProvider {
                 || minDateToIgnoreCache >= folderProxy.responseAt
     }
 
+    /**
+     * Pagination-pass state (issue: round 16 #17): a deferral on ANY page retains the folder
+     * cursor for the WHOLE pass — a later fully-handled page must never persist a cursor
+     * beyond an earlier unresolved action.
+     */
+    private class FolderActivitiesPassState {
+        var anyPageDeferred = false
+    }
+
     private tailrec fun loadActivitiesFromFolderRec(
         activitiesJob: Job,
         folderProxy: File,
@@ -386,6 +411,7 @@ object FolderFilesProvider {
         okHttpClient: OkHttpClient,
         cursor: String? = folderProxy.cursor,
         returnResponse: ArrayMap<Int, FileAction> = arrayMapOf(),
+        passState: FolderActivitiesPassState = FolderActivitiesPassState(),
     ): Map<out Int, FileAction> {
         SentryLog.i(TAG, "loadActivitiesFromFolderRec with folderId ${folderProxy.id} cursor: ${cursor != null}")
         val realm = folderProxy.realm
@@ -430,24 +456,24 @@ object FolderFilesProvider {
             }
         }
 
-        // The folder cursor advances ONLY when every activity was applied (issue: round 15
-        // #10): a deferred tied change retains unresolved work — the next activities fetch
-        // re-runs from the retained cursor and the periodic folder walk is the resolving
-        // refresh. Consuming the cursor over a deferral would advance it past unfinished
-        // work permanently.
+        // Cross-page deferral memory (issue: round 16 #17): a deferral on THIS page marks the
+        // whole pagination pass unresolved, so a later fully-handled page cannot persist a
+        // cursor beyond the earlier action.
+        if (!allActivitiesHandled) passState.anyPageDeferred = true
+
+        // The folder cursor advances ONLY when every activity of the WHOLE pagination pass
+        // was applied (issues: round 15 #10, round 16 #17): a deferred tied change retains
+        // unresolved work — the next activities fetch re-runs from the retained cursor and
+        // the periodic folder walk is the resolving refresh. The write happens ONCE at the
+        // pass's final page: per-page persistence previously let a fully-handled later page
+        // advance the cursor past an earlier deferred page's action, permanently skipping
+        // the unresolved work (whose duplicate suppression inside the pass cannot hide it).
         if (allActivitiesHandled) {
-            if (apiResponse.responseAt > 0L) {
-                FileController.updateFile(folderProxy.id, realm) { file ->
-                    file.responseAt = apiResponse.responseAt
-                    apiResponse.cursor?.let { file.cursor = it }
-                }
-            } else {
-                Sentry.captureMessage("response at is null") { scope -> scope.setExtra("data", apiResponse.toString()) }
-            }
+            SentryLog.d(TAG, "loadActivitiesFromFolderRec: page fully handled for folder ${folderProxy.id}")
         } else {
             SentryLog.i(
                 TAG,
-                "loadActivitiesFromFolderRec: deferred folder ${folderProxy.id} activities; cursor retained for fair retry"
+                "loadActivitiesFromFolderRec: deferred folder ${folderProxy.id} activities on this page; pass cursor retained for fair retry"
             )
         }
 
@@ -460,10 +486,26 @@ object FolderFilesProvider {
                 cursor = apiResponse.cursor,
                 userDrive = userDrive,
                 okHttpClient = okHttpClient,
-                returnResponse = returnResponse
+                returnResponse = returnResponse,
+                passState = passState,
             )
         } else {
             SentryLog.i(TAG, "loadActivitiesFromFolderRec: no more pages")
+            if (!passState.anyPageDeferred) {
+                if (apiResponse.responseAt > 0L) {
+                    FileController.updateFile(folderProxy.id, realm) { file ->
+                        file.responseAt = apiResponse.responseAt
+                        apiResponse.cursor?.let { file.cursor = it }
+                    }
+                } else {
+                    Sentry.captureMessage("response at is null") { scope -> scope.setExtra("data", apiResponse.toString()) }
+                }
+            } else {
+                SentryLog.i(
+                    TAG,
+                    "loadActivitiesFromFolderRec: folder ${folderProxy.id} pass deferred on an earlier page; cursor retained for fair retry"
+                )
+            }
             returnResponse
         }
     }

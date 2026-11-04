@@ -173,6 +173,16 @@ object OfflineFolderUtils {
         var lastResponse: CursorApiResponse<List<File>>? = null
         var cursor: String? = null
 
+        // COMPLETE PRE-REQUEST OBSERVATIONS (issue: round 16 #16): the folder's children as
+        // they stood before the FIRST listing request — detached at depth one, so the
+        // embedded version survives (issue: round 16 #9). They anchor tied identity changes
+        // through the shared boundary and the committing transaction: without them a
+        // legitimate same-second directory rename was rejected on every pass, and the
+        // offline sync (which excludes directories) provided no recovery route.
+        val observedById = FileController.getFileById(realm, folderId)?.children
+            ?.associateBy({ child -> child.id }) { child -> realm.copyFromRealm(child, 1) }
+            ?: emptyMap()
+
         while (true) {
             coroutineContext.ensureActive()
 
@@ -254,6 +264,7 @@ object OfflineFolderUtils {
             fileIds = fileIds,
             folderQueue = folderQueue,
             visitedFolderIds = visitedFolderIds,
+            observedById = observedById,
         )
 
         // Fully listed: children confirmed absent from this authoritative listing are reconciled
@@ -298,6 +309,7 @@ object OfflineFolderUtils {
         fileIds: MutableList<Int>,
         folderQueue: ArrayDeque<Int>,
         visitedFolderIds: MutableSet<Int>,
+        observedById: Map<Int, File>,
     ): FileController.ListingCommitOutcomes {
         val remoteFiles = apiResponse.data ?: return FileController.ListingCommitOutcomes(emptySet(), emptySet())
         val folderProxy = FileController.getFileById(realm, folderId)
@@ -311,6 +323,7 @@ object OfflineFolderUtils {
             isFirstPage = true,
             isCompleteFolder = isCompleteFolder,
             userDrive = userDrive,
+            observedById = observedById,
         )
 
         val subFolderIds = mutableListOf<Int>()
