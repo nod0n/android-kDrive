@@ -39,6 +39,7 @@ import com.infomaniak.drive.data.services.MqttClientWrapper
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.FileId
 import com.infomaniak.drive.utils.OfflineFileCoordination
+import com.infomaniak.drive.utils.OfflineFolderUtils
 import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
 import io.realm.RealmQuery
@@ -200,7 +201,86 @@ object FolderFilesProvider {
                 )
             }
             apiResponse.isSuccess() -> {
-                saveFiles()
+                val commitOutcomes = saveFiles()
+                // ONE budgeted resolution pass for this listing's deferred candidates
+                // (issue: round 19 #20) — ordinary and shared listings resolve their
+                // move-in candidates exactly like the offline walk: fresh pre-observed
+                // details requests, fair per-item outcomes. Unresolved candidates wait
+                // for the NEXT listing pass; this never converges in place.
+                resolveDeferredCandidatesOnce(
+                    realm = realm,
+                    okHttpClient = okHttpClient,
+                    folderId = folderId,
+                    userDrive = folderFilesProviderArgs.userDrive,
+                    deferredIds = commitOutcomes.deferredIds,
+                )
+            }
+        }
+    }
+
+    /**
+     * ONE budgeted resolution pass for a listing's deferred candidates (issue: round 19
+     * #20): each selected id gets a NEW details request issued after its detached
+     * pre-request observation is captured, and THAT response is committed against THAT
+     * observation through the shared preservation boundary — the same protocol as the
+     * offline walk's resolution (round 18 #4), with FAIR per-item outcomes (a rotating
+     * selection, one outcome per candidate). The accepted resolution is linked under this
+     * container — a single-file commit bypasses the listing's child linking. ONE pass per
+     * listing: unresolved candidates wait for the NEXT listing pass — this loop never
+     * converges in place (no loop-until-done), and the listing's own commit outcome is
+     * unaffected.
+     */
+    private fun resolveDeferredCandidatesOnce(
+        realm: Realm,
+        okHttpClient: OkHttpClient,
+        folderId: Int,
+        userDrive: UserDrive,
+        deferredIds: Set<Int>,
+    ) {
+        if (deferredIds.isEmpty()) return
+        for (deferredId in OfflineFolderUtils.fairDeferredSelection(
+            deferredIds,
+            folderId,
+            OfflineFolderUtils.DEFERRED_RESOLUTION_BUDGET,
+        )) {
+            val preObservation = FileController.getFileById(realm, deferredId)
+                ?.let { row -> realm.copyFromRealm(row, 1) } ?: continue
+            val details = runCatching {
+                ApiRepository.getFileDetails(
+                    file = File(id = deferredId, driveId = userDrive.driveId),
+                    okHttpClient = okHttpClient,
+                )
+            }.getOrNull()?.data?.takeIf { it.id == deferredId } ?: continue
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withLocksFor(userDrive, listOf(deferredId, folderId).distinct()) {
+                    val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
+                        realm = realm,
+                        remoteFiles = listOf(details),
+                        userDrive = userDrive,
+                        observedById = mapOf(deferredId to preObservation),
+                    ).first()
+                    if (committable === details) {
+                        val committed = FileController.updateExistingFileIfNotOlder(
+                            newFile = committable,
+                            realm = realm,
+                            userDrive = userDrive,
+                            observed = preObservation,
+                        )
+                        if (committed) {
+                            // MEMBERSHIP: link the accepted row under this container.
+                            realm.executeTransaction {
+                                val freshRow = FileController.getFileById(realm, deferredId)
+                                    ?: return@executeTransaction
+                                val container = FileController.getFileById(realm, folderId)
+                                if (container != null && freshRow.parentId == folderId &&
+                                    container.children.none { it.id == deferredId }
+                                ) {
+                                    container.children.add(freshRow)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

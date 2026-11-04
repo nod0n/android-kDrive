@@ -870,7 +870,7 @@ object OfflineFolderUtils {
      * 17 #17): one pathological folder cannot spin the walk into an unbounded request loop;
      * the remainder stays deferred for the next listing.
      */
-    private const val DEFERRED_RESOLUTION_BUDGET = 4
+    internal const val DEFERRED_RESOLUTION_BUDGET = 4
 
     /**
      * Rotating resolution cursor per folder (issue: round 18 #21): a FAIR slice of the
@@ -882,7 +882,7 @@ object OfflineFolderUtils {
      */
     private val deferredResolutionCursors = java.util.concurrent.ConcurrentHashMap<Int, Int>()
 
-    private fun fairDeferredSelection(deferredIds: Set<Int>, folderId: Int, budget: Int): List<Int> {
+    internal fun fairDeferredSelection(deferredIds: Set<Int>, folderId: Int, budget: Int): List<Int> {
         val ordered = deferredIds.sorted()
         if (ordered.size <= budget) return ordered
         // merge returns the NEW cursor value (old + budget; absent counts as 0).
