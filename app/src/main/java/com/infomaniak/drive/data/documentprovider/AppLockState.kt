@@ -47,7 +47,7 @@ object AppLockState {
         // All writers to AppSettings.realm join the ordered lifecycle: the maintenance drain
         // waits for registered ordinary writes, and writes dispatched under maintenance are
         // dropped as stale (Astra review R5-2).
-        AppSettings.settingsWriteGate = object : AppSettings.SettingsWriteGate {
+        AppSettings.settingsWriteGate = object : AppSettings.Companion.SettingsWriteGate {
             override fun register(): Boolean = transitions.registerSettingsWrite()
             override fun unregister() = transitions.unregisterSettingsWrite()
         }
@@ -82,6 +82,9 @@ object AppLockState {
 
     /** Maintenance reconcile; see [AppLockTransitions.reconcileAfterMaintenance]. */
     fun reconcileAfterMaintenance(durableEnabled: Boolean) = transitions.reconcileAfterMaintenance(durableEnabled)
+
+    /** Retains the unresolved-maintenance denial; see [AppLockTransitions.markMaintenanceUnresolved]. */
+    fun markMaintenanceUnresolved() = transitions.markMaintenanceUnresolved()
 
     /** Durable store value; null when the store cannot be read (maintenance reconciliation). */
     fun readDurableAppLockEnabled(): Boolean? =
