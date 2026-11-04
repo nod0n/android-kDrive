@@ -913,7 +913,7 @@ object FileController {
     }
 
     /** Whether two rows describe the same identity/generation observation of one file. */
-    private fun isSameObservation(a: File, b: File): Boolean =
+    internal fun isSameObservation(a: File, b: File): Boolean =
         a.revisedAt == b.revisedAt &&
             a.updatedAt == b.updatedAt &&
             (a.version?.number ?: 0) == (b.version?.number ?: 0) &&

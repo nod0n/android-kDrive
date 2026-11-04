@@ -24,6 +24,7 @@ import androidx.work.Operation
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.R
 import com.infomaniak.drive.data.api.ApiRepository
+import com.infomaniak.drive.data.api.ErrorCode
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.OfflineFolderController
@@ -45,6 +46,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runBlocking
 import java.util.Date
 
 object SyncOfflineUtils {
@@ -306,18 +308,42 @@ object SyncOfflineUtils {
                 if (fileAction.file == null) {
                     val actionAt0 = fileAction.lastActionAt
                     if (actionAt0 == null || actionAt0 <= 0) return
+                    // EXPLICIT three-valued authority with the CAPTURED scope's client
+                    // (issues: round 17 #10, round 18 #18): the previous probe returned on
+                    // EVERY unsuccessful response — including the explicit OBJECT_NOT_FOUND
+                    // error that is the missing-object authority everywhere else — so a
+                    // verified-absent object deferred forever; and a SUCCESS without data
+                    // fell through to the deletion as though absence were verified. The
+                    // probe answers CURRENT (a live remote row: the trash is stale —
+                    // consume and advance the cursor, delete nothing), VERIFIED MISSING
+                    // (the explicit OBJECT_NOT_FOUND code), or INDETERMINATE (transport and
+                    // other errors, and a success without data — which is NOT verified
+                    // absence). Only verified missing grants deletion authority. The
+                    // detached PRE-PROBE observation of the local row travels into the
+                    // coordinated decision below.
+                    val preProbeObservation = localFile
+                    val okHttpClient = runCatching {
+                        runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+                    }.getOrNull() ?: return
                     val probe = runCatching {
-                        ApiRepository.getFileDetails(File(id = fileAction.fileId, driveId = userDrive.driveId))
+                        ApiRepository.getFileDetails(
+                            file = File(id = fileAction.fileId, driveId = userDrive.driveId),
+                            okHttpClient = okHttpClient,
+                        )
                     }.getOrNull()
                     when {
-                        probe == null || !probe.isSuccess() -> return
+                        probe == null -> return
                         probe.data != null -> {
                             FileController.updateFile(fileAction.fileId, realm, userDrive = userDrive) { mutableFile ->
                                 if (actionAt0 > mutableFile.lastActionAt) mutableFile.lastActionAt = actionAt0
                             }
                             return
                         }
-                        // verified object_not_found: fall through to the coordinated deletion
+                        // VERIFIED MISSING: the explicit code is the authority — fall
+                        // through to the coordinated deletion.
+                        probe.error?.code == ErrorCode.OBJECT_NOT_FOUND -> Unit
+                        // INDETERMINATE: defer with copy and cursor retained.
+                        else -> return
                     }
                 }
                 // Deletion joins the per-action freshness protocol (issue: round 15 #3):

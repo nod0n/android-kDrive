@@ -25,6 +25,7 @@ import com.infomaniak.core.network.networking.DefaultHttpClientProvider
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.ApiRoutes
+import com.infomaniak.drive.data.api.ErrorCode
 import com.infomaniak.drive.data.api.CursorApiResponse
 import com.infomaniak.drive.data.cache.FileController.saveRemoteFiles
 import com.infomaniak.drive.data.cache.FolderFilesProvider.SourceRestrictionType.ONLY_FROM_REMOTE
@@ -592,8 +593,37 @@ object FolderFilesProvider {
         observed: File?,
     ): Boolean {
         // [FileAction] carries no timestamp: a payload-less destructive activity has NO
-        // deletion authority (issue: round 16 #15).
-        if (actionFile == null) return false
+        // deletion authority of its own (issue: round 16 #15) — but the SERVER has.
+        if (actionFile == null) {
+            // RESOLVED ABSENCE IS CONSUMED (issue: round 18 #18): a later pass may already
+            // have removed the row — the event has nothing left to delete and must not
+            // block the folder cursor forever on an immutable event that will never grow
+            // its missing payload.
+            if (FileController.getFileById(realm, fileId) == null) return true
+            // NEW AUTHORITATIVE RESOLVING PATH (issue: round 18 #18): the resolving probe
+            // answers CURRENT (a live remote row — the event is stale or misattributed:
+            // defer, copy and cursor retained), VERIFIED MISSING (the explicit
+            // OBJECT_NOT_FOUND code — the same missing-object authority every other route
+            // uses: deletion authority is ESTABLISHED and the coordinated section runs), or
+            // INDETERMINATE (transport and other errors — defer). The previous behavior
+            // rejected every payload-less destructive activity unconditionally, so a
+            // verified-absent object deferred forever.
+            val okHttpClient = runCatching {
+                runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+            }.getOrNull() ?: return false
+            val probe = runCatching {
+                ApiRepository.getFileDetails(
+                    file = File(id = fileId, driveId = userDrive.driveId),
+                    okHttpClient = okHttpClient,
+                )
+            }.getOrNull()
+            when {
+                probe == null -> return false
+                probe.data != null -> return false
+                probe.error?.code == ErrorCode.OBJECT_NOT_FOUND -> Unit
+                else -> return false
+            }
+        }
         // ONE coordinated operation (issue: round 17 #12): intent monitor → ordered locks
         // (container + file) → fresh Realm; the COMPLETE action predicate re-applies against
         // the FRESH row INSIDE the section (a restore or newer generation committed since the
@@ -607,7 +637,16 @@ object FolderFilesProvider {
             OfflineFileCoordination.withLocksFor(userDrive, listOf(currentFolder.id, fileId)) {
                 runCatching { realm.refresh() }
                 val liveRow = FileController.getFileById(realm, fileId) ?: return@withLocksFor true
-                if (FileController.isStaleForAuthoritativeAction(liveRow, actionFile, null, observed)) {
+                if (actionFile == null) {
+                    // VERIFIED-MISSING authority, freshness still required (issue: round 18
+                    // #18): the fresh row must still match the detached PRE-PROBE
+                    // observation — a restore or move committed since the probe defers; the
+                    // probe's server absence applies only to the row the probe was issued
+                    // against.
+                    if (observed != null && !FileController.isSameObservation(liveRow, observed)) {
+                        return@withLocksFor false
+                    }
+                } else if (FileController.isStaleForAuthoritativeAction(liveRow, actionFile, null, observed)) {
                     return@withLocksFor false
                 }
                 val parentRow = FileController.getFileById(realm, currentFolder.id)
