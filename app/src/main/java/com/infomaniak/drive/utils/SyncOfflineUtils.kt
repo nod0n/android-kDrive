@@ -86,9 +86,15 @@ object SyncOfflineUtils {
         // provenance reconciliation did not conclude keep their snapshot owned; each pass
         // re-runs the reconciliation and disposes only concluded snapshots.
         UploadFile.retryUnreconciledOriginals()
-        DriveInfosController.getDrives(AccountUtils.currentUserId).forEach { drive ->
+        // THE ACCOUNT IS CAPTURED ONCE BEFORE ENUMERATING DRIVES (issue: round 19 #18):
+        // both loops previously re-derived AccountUtils.currentUserId per drive — an
+        // account switch mid-enumeration ran the redrive and the sync of the REMAINING
+        // drives against ANOTHER account's realm with THIS drive list's ids (mixed
+        // scope): inspecting, enqueueing and advancing another account's rows.
+        val syncUserId = AccountUtils.currentUserId
+        DriveInfosController.getDrives(syncUserId).forEach { drive ->
             ensureActive()
-            val userDrive = UserDrive(driveId = drive.id)
+            val userDrive = UserDrive(userId = syncUserId, driveId = drive.id)
             // Durable verification re-drive (issue: round 18 #17): an explicit pin outside
             // any walked root whose verification enqueue failed keeps its pending marker as
             // retry evidence — each pass re-enqueues the scoped verification work for
@@ -97,9 +103,9 @@ object SyncOfflineUtils {
             // re-drive is bounded. Scoped per drive — never the re-derived active account.
             redriveUnverifiedPins(context, userDrive)
         }
-        DriveInfosController.getDrives(AccountUtils.currentUserId).forEach { drive ->
+        DriveInfosController.getDrives(syncUserId).forEach { drive ->
             ensureActive()
-            val userDrive = UserDrive(driveId = drive.id)
+            val userDrive = UserDrive(userId = syncUserId, driveId = drive.id)
             val pendingAdvances = mutableListOf<PendingCursorAdvance>()
 
             FileController.getRealmInstance(userDrive).use { realm ->

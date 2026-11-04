@@ -876,6 +876,13 @@ open class FileListFragment : MultiSelectFragment(
 
             val sourceRestrictionType = if (ignoreCache) ONLY_FROM_REMOTE else UNRESTRICTED
 
+            // IMMUTABLE REQUEST SCOPE (issue: round 19 #18): the listing's UserDrive is
+            // captured ONCE at request time and carried through EVERY check in the result
+            // callback — the fragment's mutable `userDrive` re-read at callback time let
+            // an account/drive switch between the request and the result route the
+            // crash-recovery (and every other check) into another realm's scope.
+            val requestUserDrive = userDrive
+
             getFolderFiles(sourceRestrictionType, isNewSort, onFinish = {
                 it?.let { result ->
 
@@ -899,7 +906,9 @@ open class FileListFragment : MultiSelectFragment(
                     fileAdapter.isComplete = result.isComplete
                     fileAdapter.hideLoading()
                     refreshActivities()
-                    result.parentFolder?.let { folder -> fileListViewModel.updateOfflineFilesIfNeeded(folder, result.files, userDrive) }
+                    result.parentFolder?.let { folder ->
+                        fileListViewModel.updateOfflineFilesIfNeeded(folder, result.files, requestUserDrive)
+                    }
 
                 } ?: run {
                     changeNoFilesLayoutVisibility(
