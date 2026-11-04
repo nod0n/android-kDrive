@@ -2253,6 +2253,11 @@ class DownloadOfflineFileManager(
             // coordinated core; missing or mismatched provenance fails and the caller
             // enqueues a fresh download.
             val staged = newStagedFile(context, authoritativeFile)
+            // THE CAPTURED PROMOTION TOKEN (issue: round 23 #20): captured ATOMICALLY WITH
+            // STAGING — inside the same monitor+lock section that copies the cache — so a
+            // writer that replaces the cache after the section (certifying different bytes
+            // under the same captured row metadata) can no longer satisfy the cleanup.
+            var capturedPromotionToken: CachePublicationToken? = null
             val stagedOk = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withFileLock(userDrive, file.id) {
                     // EXPLICIT Boolean success AFTER the actual copy (round-16 compile fix
@@ -2260,6 +2265,7 @@ class DownloadOfflineFileManager(
                     // merge with the failure default into a non-Boolean condition.
                     cacheBytesProvenCurrent(context, cacheFile, authoritativeFile, userDrive) && runCatching {
                         cacheFile.copyTo(staged, overwrite = true)
+                        capturedPromotionToken = capturedCachePublicationToken(context, cacheFile)
                         true
                     }.getOrDefault(false)
                 }
@@ -2286,13 +2292,13 @@ class DownloadOfflineFileManager(
                         if (cacheFile.exists() &&
                             (cacheFile.lastModified() / 1_000L) == authoritativeFile.lastModifiedAt &&
                             authoritativeFile.isIntactFile(cacheFile) &&
-                            // EXACT CAPTURED PUBLICATION IDENTITY (issue: round 21 #24):
-                            // the promotion's cleanup runs under the publication's locks —
-                            // a concurrent writer can have published a DIFFERENT generation
-                            // with the same size/mtime over the cache source; only the
-                            // cache's own provenance record certifying THESE bytes for THIS
-                            // exact generation authorizes the deletion.
-                            cacheBytesProvenCurrent(context, cacheFile, authoritativeFile, userDrive)
+                            // EXACT CAPTURED PUBLICATION IDENTITY (issues: round 21 #24,
+                            // round 23 #20): the promotion's cleanup runs under the
+                            // publication's locks and requires the token captured ATOMICALLY
+                            // WITH STAGING — a concurrent writer's new self-certifying record
+                            // (same captured row metadata, different bytes) does not match.
+                            cacheBytesProvenCurrent(context, cacheFile, authoritativeFile, userDrive) &&
+                            capturedCacheTokenStillMatches(context, cacheFile, capturedPromotionToken)
                         ) {
                             deletePublishedProvenance(context, cacheFile)
                             runCatching { cacheFile.delete() }

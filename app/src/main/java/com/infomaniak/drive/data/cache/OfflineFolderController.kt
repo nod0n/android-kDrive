@@ -1398,7 +1398,19 @@ object OfflineFolderController {
      * unverified indefinitely while the dialog reported completion. A failed enqueue keeps
      * the marker as its durable retry evidence (the sync's re-drive re-enqueues from it).
      */
-    fun scheduleOfflineVerification(fileId: Int, userDrive: UserDrive, observedGeneration: Long? = null) {
+    fun scheduleOfflineVerification(
+        fileId: Int,
+        userDrive: UserDrive,
+        observedGeneration: Long? = null,
+        /**
+         * The pending request's ORIGIN (issue: round 23 #21): when supplied, it overrides
+         * the `!isOffline` derivation — a marker-only EXPLICIT download must use the
+         * marker-authorized explicit path (inherited work requires a pin or root coverage
+         * to publish, which the marker-only recovery state can never satisfy), while
+         * inherited verification stays dependent on active-root coverage.
+         */
+        forceExplicitDownload: Boolean? = null,
+    ) {
         val appContext = Realm.getApplicationContext()
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, fileId) {
@@ -1440,7 +1452,7 @@ object OfflineFolderController {
                             userDrive = userDrive,
                             // Follows the CURRENT authorization: a covered non-pinned row
                             // must never manufacture a pin through the verification work.
-                            isInheritedDownload = !detachedRow.isOffline,
+                            isInheritedDownload = forceExplicitDownload ?: !detachedRow.isOffline,
                             // VERIFICATION NEVER CANCELS (issue: round 19 #17): repeated
                             // scheduling keeps the existing account-scoped verification
                             // work and never kills in-flight downloads for the file.

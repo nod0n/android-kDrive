@@ -344,6 +344,12 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                                     OfflineFolderController.scheduleOfflineVerification(
                                         fileId = file.id,
                                         userDrive = effectiveUserDrive,
+                                        // THE MARKER-AUTHORIZED EXPLICIT PATH (issue: round
+                                        // 23 #21): the selected row is exactly a marker-only
+                                        // explicit download (neither offline flag nor
+                                        // active-root coverage) — inherited work could never
+                                        // publish it; the marker's own origin is explicit.
+                                        forceExplicitDownload = false,
                                     )
                                 }
                             }
