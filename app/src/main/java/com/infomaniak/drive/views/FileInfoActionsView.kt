@@ -70,6 +70,7 @@ import com.infomaniak.drive.ui.fileList.SelectFolderActivityArgs
 import com.infomaniak.drive.ui.fileList.ShareLinkViewModel
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
 import com.infomaniak.drive.utils.DrivePermissions
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.SingleOperation
@@ -426,13 +427,13 @@ class FileInfoActionsView @JvmOverloads constructor(
                             // under-lock validation that the destination holds protected
                             // owned content that wins over the promoted bytes (issue: round
                             // 13 #13).
-                            DownloadOfflineFileManager.PublicationOutcome.PUBLISHED,
-                            DownloadOfflineFileManager.PublicationOutcome.SKIPPED_PROTECTED,
+                            PublicationOutcome.PUBLISHED,
+                            PublicationOutcome.SKIPPED_PROTECTED,
                             -> {
                                 file.isOffline = true
                                 onItemClickListener.onCacheAddedToOffline()
                             }
-                            DownloadOfflineFileManager.PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                            PublicationOutcome.SKIPPED_SUPERSEDED -> {
                                 // The cached copy's generation was superseded before
                                 // publication: announcing success would leave the pin over a
                                 // destination that may hold no usable bytes for the current
@@ -455,8 +456,8 @@ class FileInfoActionsView @JvmOverloads constructor(
                             // Invalidation (the intent disappeared mid-transfer) and failure
                             // are never successes (issue: round 13 #13): the pin is rolled
                             // back like the pre-existing failure path.
-                            DownloadOfflineFileManager.PublicationOutcome.SKIPPED_INVALIDATED,
-                            DownloadOfflineFileManager.PublicationOutcome.FAILED,
+                            PublicationOutcome.SKIPPED_INVALIDATED,
+                            PublicationOutcome.FAILED,
                             -> {
                                 CoroutineScope(Dispatchers.IO).launch {
                                     FileController.updateOfflineStatus(fileId, isOffline = false, userDrive = capturedUserDrive)

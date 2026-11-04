@@ -1488,6 +1488,9 @@ object FileController {
         // ancestry that coverage resolution walks — the same intent protocol as cleanup, so
         // an ancestor move cannot commit between a coverage decision and a deletion. Order:
         // intent monitor → ascending file locks → transaction.
+        // The outcome set outlives the coordination section: it is declared in the function
+        // scope, filled inside the section and returned after it (issue: round 13 #8).
+        val substitutedOrDroppedIds = mutableSetOf<Int>()
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withLocksFor(
                 userDrive,
@@ -1508,7 +1511,6 @@ object FileController {
             // it maps the incoming list 1:1 and returns the OLD row in place of an entry it
             // deferred (stale gate or unfinished preservation), the SAME reference otherwise,
             // so reference identity detects every boundary substitution positionally.
-            val substitutedOrDroppedIds = mutableSetOf<Int>()
             committableFiles.forEachIndexed { index, committable ->
                 if (index < remoteFiles.size && committable !== remoteFiles[index]) {
                     substitutedOrDroppedIds.add(remoteFiles[index].id)

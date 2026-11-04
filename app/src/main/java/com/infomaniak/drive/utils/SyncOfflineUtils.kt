@@ -549,7 +549,10 @@ object SyncOfflineUtils {
                 userDrive = userDrive,
                 // Authoritative-change flow: the generation-only gate (issue: round 11 #4) —
                 // an identity difference at equal revisions is the move this action applies.
-                isStale = { live, incoming -> FileController.isSupersededGeneration(live, incoming) },
+                // The boundary's predicate is 3-arity (issue: round 13 #1); this flow has no
+                // request-observed basis and deliberately ignores any, hence the unused
+                // third parameter.
+                isStale = { live, incoming, _ -> FileController.isSupersededGeneration(live, incoming) },
             ).first()
             if (commitFile !== remoteFile) return DownloadActionOutcome(handled = false)
             // Conditional commit (issues: round 11 #4/#5, round 12 #5): a newer generation
