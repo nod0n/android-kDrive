@@ -26,6 +26,7 @@ import com.infomaniak.core.legacy.utils.SingleLiveEvent
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.data.api.ApiRoutes
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
@@ -51,6 +52,15 @@ class DownloadProgressViewModel : ViewModel() {
         }
 
         if (file.isObsoleteOrNotIntact(outputFile)) {
+            if ((file.isOffline || file.isInOfflineFolder) &&
+                OfflineFolderController.decisionForReplacingOwnedCopy(file, outputFile, userDrive) ==
+                OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL
+            ) {
+                // The offline-owned copy backs an unsent upload (or its snapshot failed): it is
+                // the usable local content and must not be bare-deleted (issue: round 7 #3).
+                downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
+                return@launch
+            }
             runCatching {
                 val apiResponse = DownloadOfflineFileManager.downloadFileResponse(
                     fileUrl = ApiRoutes.downloadFile(file),

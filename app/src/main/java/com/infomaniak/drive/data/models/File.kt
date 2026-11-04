@@ -30,6 +30,7 @@ import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.R
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.documentprovider.CloudStorageProvider
 import com.infomaniak.drive.data.models.drive.Category
 import com.infomaniak.drive.data.models.file.FileConversion
@@ -536,6 +537,17 @@ open class File(
         }
 
         if (fileNeedDownload) {
+            if (isOffline || isInOfflineFolder) {
+                // An offline-owned path is replaced only through the shared preservation policy
+                // (issue: round 7 #3): size mismatch alone never deletes an inherited edit. A
+                // copy backing an upload (or whose snapshot failed) stays the preview source; a
+                // dirty edit is snapshotted before the replacement.
+                if (OfflineFolderController.decisionForReplacingOwnedCopy(this, cacheFile, userDrive) ==
+                    OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL
+                ) {
+                    return cacheFile
+                }
+            }
             navigateToDownloadDialog?.invoke()
             downloadFile(cacheFile, file = this, shouldBePdf, onProgress, isPublicShared)
             Dispatchers.IO { cacheFile.setLastModified(getLastModifiedInMilliSecond()) }

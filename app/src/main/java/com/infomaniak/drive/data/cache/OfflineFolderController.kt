@@ -585,6 +585,35 @@ object OfflineFolderController {
         }
     }
 
+    /** Outcome of the shared pre-replacement check for an offline-owned copy (issue: round 7 #3). */
+    enum class OwnedCopyReplacementDecision {
+        /** The copy backs an unsent upload (or its snapshot failed): it IS the usable local content. */
+        KEEP_LOCAL,
+        /** Nothing owned is lost by replacing the bytes (snapshot succeeded or content-safe). */
+        REPLACEABLE,
+    }
+
+    /**
+     * Decision for replacing an offline-owned copy's bytes locally (preview re-downloads and
+     * download-dialog writes, issue: round 7 #3): a size mismatch alone never authorizes
+     * deleting an inherited edit. A copy backing a pending or retained-unsent upload is the
+     * usable local content; a dirty copy is snapshotted into the durable upload queue first —
+     * a failed registration keeps the local copy; content-safe copies are replaceable.
+     */
+    fun decisionForReplacingOwnedCopy(file: File, offlineFile: IOFile, userDrive: UserDrive): OwnedCopyReplacementDecision {
+        val context = Realm.getApplicationContext() ?: return OwnedCopyReplacementDecision.KEEP_LOCAL
+        return when (protectionStateOf(file, offlineFile, userDrive)) {
+            CopyProtection.PENDING_UPLOAD -> OwnedCopyReplacementDecision.KEEP_LOCAL
+            CopyProtection.DIRTY ->
+                if (registerDirtySnapshot(context, file, offlineFile, userDrive)) {
+                    OwnedCopyReplacementDecision.REPLACEABLE
+                } else {
+                    OwnedCopyReplacementDecision.KEEP_LOCAL
+                }
+            CopyProtection.UPLOADED, CopyProtection.NONE -> OwnedCopyReplacementDecision.REPLACEABLE
+        }
+    }
+
     /** Outcome of the removal preservation hook (issue: round 4 #6). */
     enum class PreservationOutcome {
         /** Content is durably safe (uploaded, snapshotted, or nothing to preserve): bytes and row can go. */
