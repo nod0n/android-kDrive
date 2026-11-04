@@ -244,9 +244,9 @@ class GalleryFragment : MultiSelectFragment(
 
         // While the gallery list is empty the RecyclerView is hidden, so its scroll listener
         // cannot drive pagination. A scan that is not complete still holds a resumable cursor:
-        // offer an explicit continuation from the empty state instead of relying on scrolling
-        // (or on restarting the pagination).
-        val canResumeFromCursor = isGalleryEmpty && !galleryAdapter.isComplete && mainViewModel.hasNetwork
+        // offer an explicit continuation from the empty state — including while offline, where
+        // the retry handler is a deliberate no-op that preserves the cursor until reconnection.
+        val canResumeFromCursor = isGalleryEmpty && !galleryAdapter.isComplete && galleryViewModel.hasResumableCursor
         when {
             isError && !canResumeFromCursor -> binding.noGalleryLayout.toggleVisibility(
                 noNetwork = !mainViewModel.hasNetwork,
@@ -254,6 +254,7 @@ class GalleryFragment : MultiSelectFragment(
                 showRefreshButton = true,
             )
             canResumeFromCursor -> binding.noGalleryLayout.toggleVisibility(
+                noNetwork = !mainViewModel.hasNetwork,
                 isVisible = true,
                 refreshAction = { retryGalleryOrRefresh() },
             )
