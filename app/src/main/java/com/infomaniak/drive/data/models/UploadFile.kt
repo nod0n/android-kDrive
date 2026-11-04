@@ -30,9 +30,11 @@ import com.infomaniak.core.common.utils.format
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.UploadTask.Companion.ConflictOption
 import com.infomaniak.drive.data.cache.DriveInfosController
+import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.sync.UploadMigration
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IOFile
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.RealmModules
 import io.realm.Realm
 import java.util.UUID
@@ -398,6 +400,56 @@ open class UploadFile(
                         // The snapshot was the only copy of this revision: its upload completed,
                         // so the owned file can go (issue #1902).
                         runCatching { IOFile(uri.path ?: "").takeIf { it.exists() }?.delete() }
+                    }
+                    if (uploadFile.type == Type.SYNC_OFFLINE.name) {
+                        // The completed snapshot owns its ORIGINAL revision's provenance
+                        // (issue: round 16 #14): a successfully uploaded exact snapshot must
+                        // advance the original copy's clean baseline, or later walks keep
+                        // classifying the uploaded bytes as an unsent edit and suppress
+                        // downloading newer remote content.
+                        reconcileOriginalCopyCleanBaseline(uploadFile)
+                    }
+                }
+            }
+        }
+
+        /**
+         * Advances the ORIGINAL copy's clean provenance to the revision its completed upload
+         * carried (issue: round 16 #14), under the intent/file coordination. The advance
+         * happens ONLY when the live row still holds the snapshot's identity AND the bytes at
+         * its current path still ARE the uploaded revision (same modification date) — a newer
+         * intervening edit is never relabeled as clean, and a renamed/moved row keeps its own
+         * provenance story.
+         */
+        private fun reconcileOriginalCopyCleanBaseline(record: UploadFile) {
+            val context = Realm.getApplicationContext() ?: return
+            val userDrive = UserDrive(userId = record.userId, driveId = record.driveId)
+            // The lock key is derived from an uncoordinated identity lookup; the DECISION is
+            // made on the fresh row re-read inside the coordination.
+            val candidateId = FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(File::class.java)
+                    .equalTo(File::name.name, record.fileName)
+                    .equalTo(File::parentId.name, record.remoteFolder)
+                    .findFirst()?.id
+            } ?: return
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                OfflineFileCoordination.withFileLock(userDrive, candidateId) {
+                    FileController.getRealmInstance(userDrive).use { realm ->
+                        runCatching { realm.refresh() }
+                        val liveRow = realm.where(File::class.java)
+                            .equalTo(File::id.name, candidateId)
+                            .findFirst() ?: return@withFileLock
+                        // Identity must still match the completed snapshot.
+                        if (liveRow.name != record.fileName || liveRow.parentId != record.remoteFolder) return@withFileLock
+                        val original = liveRow.getOfflineFile(context, userDrive.userId) ?: return@withFileLock
+                        // Only the EXACT uploaded revision is advanced: the bytes must still be
+                        // the ones the snapshot was created from — never a newer edit.
+                        if (!original.exists() || original.lastModified() != record.fileModifiedAt.time) {
+                            return@withFileLock
+                        }
+                        val uploadedBaselineSeconds = record.fileModifiedAt.time / 1_000L
+                        if ((liveRow.publishedCleanBaseline ?: 0L) >= uploadedBaselineSeconds) return@withFileLock
+                        realm.executeTransaction { liveRow.publishedCleanBaseline = uploadedBaselineSeconds }
                     }
                 }
             }
