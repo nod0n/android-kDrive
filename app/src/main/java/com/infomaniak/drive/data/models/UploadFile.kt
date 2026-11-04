@@ -31,6 +31,7 @@ import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.UploadTask.Companion.ConflictOption
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.sync.UploadMigration
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IOFile
@@ -131,6 +132,15 @@ open class UploadFile(
     var uploadAt: Date? = null,
     var uploadHost: String? = null,
     var userId: Int = -1,
+    // Stable identity of the ORIGINAL file row this snapshot was created from (issue: round
+    // 17 #4): reconciliation must not depend on a name+parent first-match, which a
+    // concurrent rename/move or a same-name sibling resolves to the wrong row. 0 = legacy
+    // record registered before this field existed (the historical lookup is its fallback).
+    var originalFileId: Int = 0,
+    // Durable completion marker for the provenance reconciliation (issue: round 17 #4): the
+    // snapshot is disposed only AFTER this is recorded, so a crash between the upload
+    // completion and the baseline advance leaves the snapshot owned and retryable.
+    var reconciliationDone: Boolean = false,
 ) : RealmObject() {
 
     @delegate:Ignore
@@ -391,23 +401,29 @@ open class UploadFile(
                     // completion; it stays the retained owner of its unsent snapshot bytes.
                     if (uploadFile.deletedAt != null) return@let
                     val isOwnedSnapshot = isDurableOfflineSnapshot(uploadFile.uri)
+                    val isSyncOffline = uploadFile.type == Type.SYNC_OFFLINE.name
                     realm.executeTransaction {
                         uploadFile.uploadToken = null
                         uploadFile.uploadHost = null
                         uploadFile.uploadAt = Date()
                     }
-                    if (isOwnedSnapshot) {
+                    if (isSyncOffline) {
+                        // Durable retryable reconciliation BEFORE disposal (issue: round 17
+                        // #4): the snapshot is the last owner of the uploaded revision until
+                        // the baseline advance is durably concluded. A deferred verdict
+                        // (transient ownership ambiguity) keeps record + snapshot intact for
+                        // [retryUnreconciledOriginals]; a concluded one is recorded in its
+                        // own transaction, and only then is the snapshot disposed.
+                        if (reconcileOriginalCopyCleanBaseline(uploadFile)) {
+                            realm.executeTransaction { uploadFile.reconciliationDone = true }
+                            if (isOwnedSnapshot) {
+                                runCatching { IOFile(uri.path ?: "").takeIf { it.exists() }?.delete() }
+                            }
+                        }
+                    } else if (isOwnedSnapshot) {
                         // The snapshot was the only copy of this revision: its upload completed,
                         // so the owned file can go (issue #1902).
                         runCatching { IOFile(uri.path ?: "").takeIf { it.exists() }?.delete() }
-                    }
-                    if (uploadFile.type == Type.SYNC_OFFLINE.name) {
-                        // The completed snapshot owns its ORIGINAL revision's provenance
-                        // (issue: round 16 #14): a successfully uploaded exact snapshot must
-                        // advance the original copy's clean baseline, or later walks keep
-                        // classifying the uploaded bytes as an unsent edit and suppress
-                        // downloading newer remote content.
-                        reconcileOriginalCopyCleanBaseline(uploadFile)
                     }
                 }
             }
@@ -417,39 +433,103 @@ open class UploadFile(
          * Advances the ORIGINAL copy's clean provenance to the revision its completed upload
          * carried (issue: round 16 #14), under the intent/file coordination. The advance
          * happens ONLY when the live row still holds the snapshot's identity AND the bytes at
-         * its current path still ARE the uploaded revision (same modification date) — a newer
-         * intervening edit is never relabeled as clean, and a renamed/moved row keeps its own
-         * provenance story.
+         * its current path still ARE the uploaded revision (same modification date AND
+         * recorded size) — a newer intervening edit is never relabeled as clean, and a
+         * renamed/moved row keeps its own provenance story.
+         *
+         * Returns TRUE when reconciliation CONCLUDED durably (baseline advanced, already
+         * current, or a terminal no-advance such as a vanished row or a superseded revision):
+         * the caller may record completion and dispose the snapshot. Returns FALSE only when
+         * the verdict is DEFERRED — a transiently ambiguous or foreign source ownership, which
+         * a later move reconciliation may still resolve: record and snapshot stay intact for
+         * [retryUnreconciledOriginals] (issue: round 17 #4).
          */
-        private fun reconcileOriginalCopyCleanBaseline(record: UploadFile) {
-            val context = Realm.getApplicationContext() ?: return
+        private fun reconcileOriginalCopyCleanBaseline(record: UploadFile): Boolean {
+            val context = Realm.getApplicationContext() ?: return false
             val userDrive = UserDrive(userId = record.userId, driveId = record.driveId)
-            // The lock key is derived from an uncoordinated identity lookup; the DECISION is
-            // made on the fresh row re-read inside the coordination.
-            val candidateId = FileController.getRealmInstance(userDrive).use { realm ->
-                realm.where(File::class.java)
-                    .equalTo(File::name.name, record.fileName)
-                    .equalTo(File::parentId.name, record.remoteFolder)
-                    .findFirst()?.id
-            } ?: return
+            // Stable ORIGINAL id (issue: round 17 #4): reconciliation is keyed by the row id
+            // captured at registration, never by a name+parent first-match — a concurrent
+            // rename/move or same-name sibling would anchor the wrong row. Legacy records
+            // (originalFileId == 0) keep the historical lookup as their fallback.
+            val candidateId = if (record.originalFileId > 0) {
+                record.originalFileId
+            } else {
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    realm.where(File::class.java)
+                        .equalTo(File::name.name, record.fileName)
+                        .equalTo(File::parentId.name, record.remoteFolder)
+                        .findFirst()?.id
+                } ?: return true // row gone: nothing to advance — a durable terminal conclusion
+            }
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                var deferred = false
                 OfflineFileCoordination.withFileLock(userDrive, candidateId) {
                     FileController.getRealmInstance(userDrive).use { realm ->
                         runCatching { realm.refresh() }
                         val liveRow = realm.where(File::class.java)
                             .equalTo(File::id.name, candidateId)
                             .findFirst() ?: return@withFileLock
-                        // Identity must still match the completed snapshot.
-                        if (liveRow.name != record.fileName || liveRow.parentId != record.remoteFolder) return@withFileLock
-                        val original = liveRow.getOfflineFile(context, userDrive.userId) ?: return@withFileLock
-                        // Only the EXACT uploaded revision is advanced: the bytes must still be
-                        // the ones the snapshot was created from — never a newer edit.
-                        if (!original.exists() || original.lastModified() != record.fileModifiedAt.time) {
+                        // Identity must still match the completed snapshot (legacy fallback
+                        // rows only: stable-id records tolerate renames/moves by design).
+                        if (record.originalFileId == 0 &&
+                            (liveRow.name != record.fileName || liveRow.parentId != record.remoteFolder)
+                        ) return@withFileLock
+                        val original = liveRow.getOfflineFile(context, userDrive.userId)
+                            ?: return@withFileLock
+                        if (!original.exists()) return@withFileLock
+                        // EXCLUSIVE source ownership before any provenance effect (issues:
+                        // round 17 #2/#4): an ambiguous or foreign path may be another file's
+                        // copy at a transiently contested location — defer, never advance.
+                        if (OfflineFolderController.exclusivePathOwner(realm, context, userDrive, original.path)
+                            != liveRow.id
+                        ) {
+                            deferred = true
+                            return@withFileLock
+                        }
+                        // Only the EXACT uploaded revision is advanced: same modification date
+                        // AND recorded size (issue: round 17 #4) — never a newer or edited
+                        // revision relabeled as clean.
+                        if (original.lastModified() != record.fileModifiedAt.time ||
+                            (record.fileSize > 0L && original.length() != record.fileSize)
+                        ) {
                             return@withFileLock
                         }
                         val uploadedBaselineSeconds = record.fileModifiedAt.time / 1_000L
                         if (liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds) return@withFileLock
                         realm.executeTransaction { liveRow.publishedCleanBaseline = uploadedBaselineSeconds }
+                    }
+                }
+                return !deferred
+            }
+        }
+
+        /**
+         * Durable retry pass (issue: round 17 #4): records whose upload completed but whose
+         * provenance reconciliation did NOT conclude — a crash between the completion write
+         * and the baseline advance, or a transiently contested source path — keep their
+         * snapshot and stay `reconciliationDone == false`. Each sync pass re-runs the
+         * reconciliation for them; a concluded verdict records the completion state and only
+         * then disposes the snapshot.
+         */
+        fun retryUnreconciledOriginals() {
+            val deferredRecords = getRealmInstance().use { realm ->
+                realm.where(UploadFile::class.java)
+                    .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
+                    .isNotNull(UploadFile::uploadAt.name)
+                    .isNull(UploadFile::deletedAt.name)
+                    .equalTo(UploadFile::reconciliationDone.name, false)
+                    .findAll()?.map { realm.copyFromRealm(it, 0) }
+            } ?: return
+            deferredRecords.forEach { record ->
+                if (reconcileOriginalCopyCleanBaseline(record)) {
+                    getRealmInstance().use { realm ->
+                        val managed = uploadFileByUriQuery(realm, record.uri).findFirst() ?: return@use
+                        if (managed.reconciliationDone) return@use
+                        realm.executeTransaction { managed.reconciliationDone = true }
+                    }
+                    if (isDurableOfflineSnapshot(record.uri)) {
+                        val path = Uri.parse(record.uri).path ?: return@forEach
+                        runCatching { IOFile(path).takeIf { it.exists() }?.delete() }
                     }
                 }
             }

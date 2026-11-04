@@ -116,9 +116,18 @@ class UploadMigration : RealmMigration {
                 ?.addField("onlyWifiSyncMedia", Boolean::class.java, FieldAttribute.REQUIRED)
         }
 
+        // Migrate to version 9: stable snapshot→original identity and a durable
+        // reconciliation marker (issue: round 17 #4)
+        if (oldVersionTemp < 9L) {
+            schema[UploadFile::class.java.simpleName]?.apply {
+                addField(UploadFile::originalFileId.name, Int::class.java, FieldAttribute.REQUIRED)
+                addField(UploadFile::reconciliationDone.name, Boolean::class.java, FieldAttribute.REQUIRED)
+            }
+        }
+
     }
 
     companion object {
-        const val DB_VERSION = 8L // Must be bumped when the schema changes
+        const val DB_VERSION = 9L // Must be bumped when the schema changes
     }
 }

@@ -78,6 +78,10 @@ object SyncOfflineUtils {
     suspend fun startSyncOffline(context: Context) = coroutineScope {
         // Delete all offline storage files prior to APIv3. For more info, see deleteLegacyOfflineFolder kDoc
         deleteLegacyOfflineFolder(context)
+        // Durable reconciliation retry (issue: round 17 #4): completed uploads whose
+        // provenance reconciliation did not conclude keep their snapshot owned; each pass
+        // re-runs the reconciliation and disposes only concluded snapshots.
+        UploadFile.retryUnreconciledOriginals()
         DriveInfosController.getDrives(AccountUtils.currentUserId).forEach { drive ->
             ensureActive()
             val userDrive = UserDrive(driveId = drive.id)
@@ -617,6 +621,8 @@ object SyncOfflineUtils {
                 fileName = remoteFile?.name ?: liveRow.name,
                 fileSize = freshSource.length(),
                 remoteFolder = remoteFile?.parentId ?: liveRow.parentId,
+                // Stable ORIGINAL identity for completion reconciliation (issue: round 17 #4).
+                originalFileId = liveRow.id,
                 type = UploadFile.Type.SYNC_OFFLINE.name,
                 userId = userDrive.userId,
             ).store()

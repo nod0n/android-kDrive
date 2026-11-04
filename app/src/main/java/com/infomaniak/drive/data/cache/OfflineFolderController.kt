@@ -1280,6 +1280,9 @@ object OfflineFolderController {
                     fileName = file.name,
                     fileSize = offlineFile.length(),
                     remoteFolder = file.parentId,
+                    // Stable ORIGINAL identity for completion reconciliation (issue: round
+                    // 17 #4).
+                    originalFileId = file.id,
                     type = UploadFile.Type.SYNC_OFFLINE.name,
                     userId = userDrive.userId,
                 ).store()
