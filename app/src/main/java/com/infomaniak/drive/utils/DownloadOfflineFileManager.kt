@@ -979,6 +979,7 @@ class DownloadOfflineFileManager(
             // identity/revision has been superseded (issues: round 8 #9, round 9 #7).
             val appContextForCheck = Realm.getApplicationContext()
             var supersededGeneration = false
+            var unresolvedGeneration = false
             val intentOk = FileController.getRealmInstance(userDrive).use { realm ->
                 val live = FileController.getFileById(realm, file.id)
                 val pinned = live?.isOffline == true
@@ -1031,6 +1032,15 @@ class DownloadOfflineFileManager(
                 } else {
                     pinned || live?.isMarkedAsOffline == true || ancestryCovers
                 }
+                // UNRESOLVED GENERATION (issue: round 19 #14): when NEITHER side carries a
+                // version, the coarse baseline tie is the only generation evidence — the
+                // publication may still proceed (the bytes were fetched fresh from the
+                // server's current revision, and the record's version-0 identity keeps the
+                // copy non-current), but it is UNRESOLVED, NOT current: the file/root
+                // completion callbacks assert a generation identity both-unknown cannot
+                // prove, so they are skipped and a later details-resolved pass completes.
+                unresolvedGeneration = live != null &&
+                    (live.version?.number ?: 0) <= 0 && (file.version?.number ?: 0) <= 0
             }
 
             if (!intentOk) {
@@ -1149,8 +1159,14 @@ class DownloadOfflineFileManager(
                     }
                 }
                 // Run the owner's completion while the per-file lock is still held
-                // (issue: round 5 #2).
-                onPublishedLocked?.invoke()
+                // (issue: round 5 #2) — but NOT for an UNRESOLVED generation (issue: round
+                // 19 #14): the coverage/flag writes, the downloaded notification, the media
+                // scan and the promotion-cache cleanup all assert a generation identity
+                // that neither side could prove. The bytes stay published (the record's
+                // version-0 identity keeps the copy non-current); a later pass with the
+                // authoritative identity completes the file, and no marker is cleared on
+                // this unresolved outcome.
+                if (!unresolvedGeneration) onPublishedLocked?.invoke()
                 return PublicationOutcome.PUBLISHED
             } else {
                 // A FAILED RENAME NEVER DELETES THE OLD TARGET (issue: round 19 #11): the
