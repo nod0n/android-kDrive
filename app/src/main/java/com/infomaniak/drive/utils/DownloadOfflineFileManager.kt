@@ -245,8 +245,13 @@ class DownloadOfflineFileManager(
         // The previous published copy is never deleted upfront: the fresh download is staged in
         // an app-owned directory and published by an atomic rename, so a failed transfer never
         // destroys it (issue: round 3 #2/#4).
-        if (cacheFile.exists()) cacheFile.delete()
-        deletePublishedProvenance(context, cacheFile)
+        // CONDITIONAL cache cleanup (issue: round 17 #6): only a cache still representing
+        // THIS transfer's source revision goes — a later publication's bytes are never
+        // removed by this older transfer, and the provenance record dies with its bytes.
+        if (cacheFile.exists() && (cacheFile.lastModified() / 1_000L) == file.lastModifiedAt && file.isIntactFile(cacheFile)) {
+            cacheFile.delete()
+            deletePublishedProvenance(context, cacheFile)
+        }
 
         return if (currentFile?.rights?.canRead == false) {
             ListenableWorker.Result.failure()
@@ -356,20 +361,23 @@ class DownloadOfflineFileManager(
         // Cache promotion is a transfer path too: its superseded/conflict outcomes must reach
         // the bulk caller like the network branch's (issues: round 10 #7, round 14 #13), or
         // the batch clears pending work and reports the root synchronized.
-        lastTransferSuperseded =
-            published == PublicationOutcome.SKIPPED_SUPERSEDED || published == PublicationOutcome.SKIPPED_CONFLICT
+        // Unresolved outcomes propagate to Bulk completion (issue: round 17 #7): an
+        // invalidated transfer's root incompleteness is retained like a conflict.
+        lastTransferSuperseded = published in UNRESOLVED_PUBLICATION_OUTCOMES
 
         runCatching { if (staged.exists()) staged.delete() }
         when (published) {
             // Completion (flag write, media scan, invalidation) already ran inside the per-file
             // lock via onPublishedLocked (issue: round 5 #2).
             PublicationOutcome.PUBLISHED -> true
-            // Skipped outcomes leave the existing bytes and timestamps untouched (issue: round
-            // 4 #1): only the pending marker is cleared, since there is nothing valid left to
-            // download for this transfer.
+            // Skipped outcomes leave the existing bytes and timestamps untouched (issue:
+            // round 4 #1). Marker completion is NOT unconditional here (issue: round 17 #7):
+            // SKIPPED_PROTECTED-for-this-file cleared its marker INSIDE the validating
+            // section (publishLockedCore, under the locks, generation+intent validated);
+            // SKIPPED_INVALIDATED never clears — a revived root or newer request that
+            // established pending work after the skip decision owns its marker.
             PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
                 filesDownloaded += 1
-                clearPendingMarker(file.id)
                 true
             }
             PublicationOutcome.SKIPPED_CONFLICT -> {
@@ -513,8 +521,7 @@ class DownloadOfflineFileManager(
                 val outcome = publishStagedOfflineFile(context, file, offlineFile, staged)
                 // Public superseded/conflict status for the bulk caller (issues: round 9 #8,
                 // round 14 #13).
-                lastTransferSuperseded =
-                    outcome == PublicationOutcome.SKIPPED_SUPERSEDED || outcome == PublicationOutcome.SKIPPED_CONFLICT
+                lastTransferSuperseded = outcome in UNRESOLVED_PUBLICATION_OUTCOMES
                 when (outcome) {
                     PublicationOutcome.FAILED -> return@withContext ListenableWorker.Result.failure()
                     // Completion (flag writes, timestamp, media scan) only runs for bytes this
@@ -522,7 +529,8 @@ class DownloadOfflineFileManager(
                     // untouched (issue: round 4 #1).
                     PublicationOutcome.PUBLISHED -> onProgress(100, file.id)
                     PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
-                        clearPendingMarker(file.id)
+                        // Marker completion is conditional INSIDE the validating section
+                        // (issue: round 17 #7); an invalidated old transfer clears nothing.
                     }
                     PublicationOutcome.SKIPPED_CONFLICT -> {
                         // A protected destination owned by another row defers (issue: round
@@ -620,6 +628,10 @@ class DownloadOfflineFileManager(
         private const val STAGING_FOLDER = "offline_staging"
 
         internal enum class PublicationOutcome { PUBLISHED, SKIPPED_PROTECTED, SKIPPED_CONFLICT, SKIPPED_INVALIDATED, SKIPPED_SUPERSEDED, FAILED }
+
+        /** Outcomes that must retain Bulk/root incompleteness (issue: round 17 #7). */
+        private val UNRESOLVED_PUBLICATION_OUTCOMES =
+            setOf(PublicationOutcome.SKIPPED_SUPERSEDED, PublicationOutcome.SKIPPED_CONFLICT, PublicationOutcome.SKIPPED_INVALIDATED)
 
         /** Suffix of the old SIBLING sidecar experiment — never written or deleted again (round 17 #1). */
         private const val CACHE_PROVENANCE_SUFFIX = ".offlinegen"
@@ -921,6 +933,11 @@ class DownloadOfflineFileManager(
                     // would report foreign bytes as F's usable content.
                     val ownedByThisFile = liveOwner != null && liveOwner.id == file.id && liveOwner.id == lockedOwnerId
                     return if (ownedByThisFile) {
+                        // The transfer's own generation and intent were validated INSIDE this
+                        // section (superseded/intent checks above) — clearing THIS transfer's
+                        // pending marker here cannot erase a newer request's marker (issue:
+                        // round 17 #7).
+                        FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false, userDrive = userDrive)
                         PublicationOutcome.SKIPPED_PROTECTED
                     } else {
                         PublicationOutcome.SKIPPED_CONFLICT
@@ -1032,8 +1049,14 @@ class DownloadOfflineFileManager(
 
             runCatching { if (staged.exists()) staged.delete() }
             if (outcome == PublicationOutcome.PUBLISHED) {
-                runCatching { if (cacheFile.exists()) cacheFile.delete() }
-                deletePublishedProvenance(context, cacheFile)
+                // CONDITIONAL cache cleanup (issue: round 17 #6): the promoted cache goes
+                // only when it still IS the staged source revision.
+                if (cacheFile.exists() && (cacheFile.lastModified() / 1_000L) == authoritativeFile.lastModifiedAt &&
+                    authoritativeFile.isIntactFile(cacheFile)
+                ) {
+                    runCatching { cacheFile.delete() }
+                    deletePublishedProvenance(context, cacheFile)
+                }
             }
             return outcome
         }
