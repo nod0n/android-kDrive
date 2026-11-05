@@ -2428,9 +2428,11 @@ class DownloadOfflineFileManager(
                         proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
                         observationText = observationField?.takeIf { it.isNotEmpty() && it != "A" },
                         observationFieldDamaged = false,
-                        // THREE lines = the pre-observation writer's documented absence;
-                        // a FOUR-line record with an empty field is ambiguous (review-34 #8).
-                        observationAmbiguous = parts.size == 4 && observationField?.isEmpty() == true,
+                        // THE WRITER-CONTRACT EVIDENCE (review-36 #10): an empty field in a
+                        // structurally complete legacy record is the writer's Absent — the
+                        // writers fail Invalid captures, so a required-and-lost observation
+                        // never persisted (truncation destroys lines and is undecodable).
+                        observationAmbiguous = false,
                         recordedSourcePath = null,
                         // LEGACY RECORDS CARRY NEITHER NEW AUTHORITY (review-34 #3/#4): a
                         // v1 record has no source-bound proof and no recorded preexisting
@@ -3264,19 +3266,6 @@ class DownloadOfflineFileManager(
             return text.removePrefix(PROVENANCE_FRAME).split("|").getOrNull(8)?.trim()?.toLongOrNull()
         }
 
-        /** THE EXPECTED RECORD'S GENERATION RESOLUTION (review-35 #13): the VERSION field of
-         * the operation's expected/target proof is independent durable evidence of whether
-         * the attempt's observation was REQUIRED — version 0 (or unparseable) is the
-         * unresolved marker whose observation evidence matters; a positive version marks a
-         * RESOLVED generation whose observation was legitimately optional. Legacy emptiness
-         * alone never authorizes anything: the version authority, read from the durable
-         * record, does. */
-        private fun recordTextIndicatesUnresolvedGeneration(recordText: String?): Boolean {
-            if (recordText == null) return true
-            val version = recordText.removePrefix(PROVENANCE_FRAME).split("|").getOrNull(0)?.trim()?.toIntOrNull()
-            return version == null || version == 0
-        }
-
         private fun writeRecoveryRecord(
             context: Context,
             recoveryFile: IOFile,
@@ -3455,10 +3444,14 @@ class DownloadOfflineFileManager(
                     // carried text (its own "1|" frame is validated at use — malformed
                     // contents retain the operation, never read as absence).
                     attemptedObservationText = v4[11].takeIf { it.isNotEmpty() && it != "A" },
-                    // AMBIGUOUS LEGACY EMPTY (review-34 #8): an empty v4 field is the
-                    // round-31 writer's absent OR a lost/truncated required observation —
-                    // the ambiguity rides the record.
-                    attemptedObservationAmbiguous = v4[11].isEmpty(),
+                    // THE WRITER-CONTRACT EVIDENCE (review-36 #10): the record writers FAIL the
+                    // whole write when a REQUIRED observation cannot be presented — so an
+                    // EMPTY field in a structurally complete v4 record proves the capture was
+                    // Absent at write time (the version-0 verified-uploaded proofs and the
+                    // historical relocation writer's empty-for-absent are legitimate). A lost
+                    // or truncated observation destroys LINES, making the record undecodable
+                    // and retained. Legacy emptiness therefore resolves as explicit absence.
+                    attemptedObservationAmbiguous = false,
                     legacy = false,
                 )
             }
@@ -4039,8 +4032,7 @@ class DownloadOfflineFileManager(
                                                         context,
                                                         target,
                                                         parsed.observationText,
-                                                        parsed.observationAmbiguous &&
-                                                            recordTextIndicatesUnresolvedGeneration(parsed.proofText),
+                                                        parsed.observationAmbiguous,
                                                         retainedPublicationId,
                                                     )
                                                 }.getOrDefault(false)
@@ -4147,8 +4139,7 @@ class DownloadOfflineFileManager(
                                                                 context,
                                                                 sourceFile,
                                                                 parsed.observationText,
-                                                                parsed.observationAmbiguous &&
-                                                                    recordTextIndicatesUnresolvedGeneration(parsed.proofText),
+                                                                parsed.observationAmbiguous,
                                                                 publicationIdOfRecordText(sourceProofText),
                                                             )
                                                         ) {
@@ -4300,13 +4291,20 @@ class DownloadOfflineFileManager(
                         operationScope,
                     ) && when {
                         expectedPublicationId == null -> false
-                        // THE VERSION AUTHORITY (review-35 #13): a RESOLVED generation
-                        // (positive version in the expected record) had a legitimately
-                        // optional observation — the ambiguous legacy emptiness converges;
-                        // an UNRESOLVED marker requires the validated target evidence.
-                        !recordTextIndicatesUnresolvedGeneration(record.expectedPublicationRecordText) -> true
+                        // THE JOURNAL'S ACTUAL OBSERVATION CONTRACT (review-36 #9): the SAME
+                        // explicit absent/carried/ambiguous resolver as the self-certifying
+                        // arm — the carried observation RE-ESTABLISHES at the target before
+                        // disposal, an explicit absence succeeds, and an ambiguous legacy
+                        // case requires the validated target evidence. No version test
+                        // substitutes for the operation's persisted contract.
                         missingBackupProof.publicationId != expectedPublicationId -> true
-                        else -> targetObservationEvidenceComplete(context, target, expectedPublicationId)
+                        else -> observationEvidenceComplete(
+                            context,
+                            target,
+                            record.attemptedObservationText,
+                            record.attemptedObservationAmbiguous,
+                            expectedPublicationId,
+                        )
                     }
                 if (!missingBackupComplete) return false
                 runCatching { recoveryFile.delete() }
@@ -4356,16 +4354,14 @@ class DownloadOfflineFileManager(
                             // deliberately not rewritten.
                         }
                     }
-                    // AMBIGUOUS LEGACY EMPTY (review-34 #8, converged review-35 #13):
-                    // emptiness alone is never authority — but a RESOLVED generation
-                    // (positive version in the expected record) had a legitimately optional
-                    // observation and converges; an UNRESOLVED marker requires the
-                    // validated target evidence; a SUPERSEDED target spends the evidence
-                    // either way.
+                    // AMBIGUOUS LEGACY EVIDENCE (review-34 #8, resolved review-36 #10): the
+                    // writers fail Invalid captures, so structurally complete records never
+                    // carry a lost required observation — an ambiguous flag here protects
+                    // only genuinely unknown legacy evidence, which requires the validated
+                    // target evidence; a SUPERSEDED target spends the evidence either way.
                     record.attemptedObservationAmbiguous -> {
                         when {
                             expectedPublicationId == null -> return false
-                            !recordTextIndicatesUnresolvedGeneration(record.expectedPublicationRecordText) -> Unit
                             targetProof.publicationId != expectedPublicationId -> Unit
                             else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId)) {
                                 return false
@@ -4417,18 +4413,16 @@ class DownloadOfflineFileManager(
                     // publication id, parsed from its persisted expected proof) BEFORE the
                     // recovery state is disposed; a failed observation write retains the
                     // whole operation state, never half of it.
-                    // THE AMBIGUITY-AWARE RESOLUTION (review-34 #8, converged review-35 #13),
+                    // THE AMBIGUITY-AWARE RESOLUTION (review-34 #8, resolved review-36 #10),
                     // as in every recovery disposal: a carried text establishes; an ambiguous
-                    // legacy absence requires the evidence at the target ONLY for an
-                    // UNRESOLVED generation (version-0 expected proof) — a resolved
-                    // generation's observation was legitimately optional; an explicit
-                    // absence succeeds.
+                    // legacy absence requires the evidence at the target; an explicit absence
+                    // succeeds. The writers' fail-closed contract already resolves legacy
+                    // emptiness — no version test participates.
                     if (!observationEvidenceComplete(
                             context,
                             target,
                             record.attemptedObservationText,
-                            record.attemptedObservationAmbiguous &&
-                                recordTextIndicatesUnresolvedGeneration(record.expectedPublicationRecordText),
+                            record.attemptedObservationAmbiguous,
                             publicationIdOfRecordText(record.expectedPublicationRecordText),
                         )
                     ) {
