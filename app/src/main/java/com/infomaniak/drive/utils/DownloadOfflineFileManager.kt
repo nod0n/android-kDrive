@@ -2290,8 +2290,9 @@ class DownloadOfflineFileManager(
             return null
         }
 
-        /** THE PARSED PROOFMOVE RECORD — the ONE validated decoder's output (review-33 #9):
-         * replay, exclusion and enumeration share this single structural parse. */
+        /** THE PARSED PROOFMOVE RECORD — the ONE validated decoder's output (review-33 #9,
+         * extended review-34 #9/#10): replay, exclusion and enumeration share this single
+         * structural parse, INCLUDING the retained proof's full-grammar validation. */
         private class ParsedProofMoveRecord(
             val version: Int,
             val targetPath: String,
@@ -2305,8 +2306,19 @@ class DownloadOfflineFileManager(
             /** DAMAGED CURRENT EVIDENCE (review-33 #7): a v2 record whose observation
              * field is empty — truncation, never legitimate absence. */
             val observationFieldDamaged: Boolean,
+            /** AMBIGUOUS LEGACY ABSENCE (review-34 #8): a legacy record whose observation
+             * field is empty/missing in a format that COULD have carried one — absence
+             * cannot be established from the record alone. */
+            val observationAmbiguous: Boolean,
             /** The recorded source identity of a v2 relocation record (null = none). */
             val recordedSourcePath: String?,
+            /** COMPLETE PROOF VALIDATION (review-34 #9): the retained proof text parses
+             * under the FULL provenance grammar WITH the operation's target as its
+             * expected embedded location — validated before any registry mutation. */
+            val proofLocationValid: Boolean,
+            /** The location the retained proof text embeds (when it parses at all) — an
+             * independently identified affected path for the exclusion union. */
+            val embeddedProofLocation: String?,
         ) {
             val identitiesValid: Boolean
                 get() = proofUserId != null && proofDriveId != null && proofFileId != null &&
@@ -2314,23 +2326,37 @@ class DownloadOfflineFileManager(
         }
 
         /**
-         * THE ONE VALIDATED PROOFMOVE DECODER (review-33 #9): every consumer — the sweep's
-         * replay, [hasUnresolvedRecovery] and [pendingRecoveryFileIds] — parses the record
-         * through THIS function, so no reader can accept a shape another rejects. The
-         * LEGACY "1" record (three or four lines) keeps its documented semantics: a
-         * missing/empty fourth line is a pre-observation attempt's absence. The CURRENT
-         * "2" record (exactly five lines) requires every field: an empty observation
-         * field is damaged evidence ([observationFieldDamaged]), a fifth line containing
-         * a further newline is a broken record, and any other header, line count or
+         * THE ONE VALIDATED PROOFMOVE DECODER (review-33 #9, review-34 #9/#10): every
+         * consumer — the sweep's replay, [hasUnresolvedRecovery] and
+         * [pendingRecoveryFileIds] — parses the record through THIS function, so no reader
+         * can accept a shape another rejects. The retained proof is FULLY decoded: its
+         * grammar and its embedded location against the operation's target are established
+         * HERE ([proofLocationValid]), never inferred at the write site. The LEGACY "1"
+         * record (three or four lines): three lines are the pre-observation writer's
+         * legitimate absence; a four-line record with an EMPTY field is AMBIGUOUS
+         * ([observationAmbiguous] — it could have carried evidence). The CURRENT "2"
+         * record (exactly five lines) requires every field: an empty observation field is
+         * damaged evidence ([observationFieldDamaged]). Any other header, line count or
          * unreadable file returns null (the caller retains and fails closed by scope).
          */
         private fun parseProofMoveRecord(recordFile: IOFile): ParsedProofMoveRecord? = runCatching {
             val parts = recordFile.readText().split("\n", limit = 5)
             fun fields(proofText: String): List<String> = proofText.removePrefix(PROVENANCE_FRAME).split("|")
+            // THE COMPLETE PROOF DECODE (review-34 #9): the embedded location is parsed
+            // loose (any grammar) and strict (the operation's target expected) — the strict
+            // result decides [proofLocationValid], the loose one names the independently
+            // identified path for the exclusion union.
+            fun proofValidation(proofText: String, targetPath: String): Pair<Boolean, String?> {
+                val strict = runCatching { parseProvenanceText(proofText, expectedPath = targetPath) }.getOrNull()
+                val embedded = runCatching { parseProvenanceText(proofText) }.getOrNull()?.absolutePath
+                return (strict != null && strict.absolutePath == targetPath) to embedded
+            }
             when (parts.getOrNull(0)?.trim()) {
                 "1" -> {
                     if (parts.size != 3 && parts.size != 4) return@runCatching null
                     val proofFields = fields(parts[2])
+                    val observationField = parts.getOrNull(3)
+                    val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
                     ParsedProofMoveRecord(
                         version = 1,
                         targetPath = parts[1],
@@ -2339,9 +2365,14 @@ class DownloadOfflineFileManager(
                         proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
                         proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
                         proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
-                        observationText = parts.getOrNull(3)?.takeIf { it.isNotEmpty() && it != "A" },
+                        observationText = observationField?.takeIf { it.isNotEmpty() && it != "A" },
                         observationFieldDamaged = false,
+                        // THREE lines = the pre-observation writer's documented absence;
+                        // a FOUR-line record with an empty field is ambiguous (review-34 #8).
+                        observationAmbiguous = parts.size == 4 && observationField?.isEmpty() == true,
                         recordedSourcePath = null,
+                        proofLocationValid = locationValid,
+                        embeddedProofLocation = embeddedLocation,
                     )
                 }
                 "2" -> {
@@ -2350,6 +2381,7 @@ class DownloadOfflineFileManager(
                     if (sourceField.contains('\n')) return@runCatching null
                     val proofFields = fields(parts[2])
                     val observationField = parts[3]
+                    val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
                     ParsedProofMoveRecord(
                         version = 2,
                         targetPath = parts[1],
@@ -2364,7 +2396,10 @@ class DownloadOfflineFileManager(
                             else -> null
                         },
                         observationFieldDamaged = observationField.isEmpty(),
+                        observationAmbiguous = false,
                         recordedSourcePath = sourceField.takeIf { it.isNotEmpty() },
+                        proofLocationValid = locationValid,
+                        embeddedProofLocation = embeddedLocation,
                     )
                 }
                 else -> null
@@ -3066,43 +3101,53 @@ class DownloadOfflineFileManager(
                 // scope sidecar, and an unsidecarred record fails the pass closed.
                 if (recordFile.name.startsWith("proofmove_")) {
                     val parsed = parseProofMoveRecord(recordFile)
-                    if (parsed == null || parsed.observationFieldDamaged) {
-                        val scope = readScopeSidecar(recordFile) ?: return null
-                        if (scope.driveId == userDrive.driveId && scope.userId == userDrive.userId) {
-                            ids.add(scope.fileId)
-                        }
-                        continue
-                    }
-                    if (parsed.identitiesValid) {
-                        // THE DURABLE SCOPE INDEX IS CROSS-CHECKED (review-33 #9): the
-                        // body's parseable identity is authority only when the sidecar
-                        // AGREES on the complete account/drive/file identity and the target
-                        // path. On disagreement BOTH independently identified scopes join
-                        // this scope's exclusion set — a parseable-but-inconsistent body is
-                        // never permission for the original owner to proceed.
-                        val sidecar = readScopeSidecar(recordFile)
-                        val consistent = sidecar == null ||
-                            (sidecar.userId == parsed.proofUserId && sidecar.driveId == parsed.proofDriveId &&
-                                sidecar.fileId == parsed.proofFileId && sidecar.targetPath == parsed.targetPath)
-                        if (!consistent) {
-                            if (parsed.proofUserId == userDrive.userId && parsed.proofDriveId == userDrive.driveId) {
-                                ids.add(parsed.proofFileId ?: return null)
-                            }
-                            if (sidecar != null && sidecar.userId == userDrive.userId &&
-                                sidecar.driveId == userDrive.driveId
+                    // THE SHARED AUTHORITY RESULT (review-34 #10), as in
+                    // [hasUnresolvedRecovery]: explicit absent/invalid/valid index states;
+                    // a null sidecar read is never silently consistent.
+                    when (val sidecarAuthority = readScopeAuthority(recordFile)) {
+                        is ScopedAuthority.Invalid -> return null
+                        is ScopedAuthority.AbsentLegacy -> {
+                            val legacyScope = readScopeSidecar(recordFile)
+                            val bodyId = parsed?.takeIf { it.identitiesValid }?.proofFileId
+                            if (bodyId != null && parsed.proofUserId == userDrive.userId &&
+                                parsed.proofDriveId == userDrive.driveId
                             ) {
+                                ids.add(bodyId)
+                            } else if (legacyScope != null) {
+                                if (legacyScope.driveId == userDrive.driveId &&
+                                    legacyScope.userId == userDrive.userId
+                                ) {
+                                    ids.add(legacyScope.fileId)
+                                }
+                            } else if (parsed == null || !parsed.identitiesValid) {
+                                // Nothing independently identifies this operation's scope:
+                                // the whole per-scope enumeration fails closed.
+                                return null
+                            }
+                            continue
+                        }
+                        is ScopedAuthority.Resolved -> {
+                            val sidecar = sidecarAuthority.scope
+                            if (sidecar.driveId == userDrive.driveId && sidecar.userId == userDrive.userId) {
                                 ids.add(sidecar.fileId)
                             }
-                        } else if (parsed.proofUserId == userDrive.userId && parsed.proofDriveId == userDrive.driveId) {
-                            ids.add(parsed.proofFileId ?: return null)
-                        }
-                    } else {
-                        val scope = readScopeSidecar(recordFile) ?: return null
-                        if (scope.driveId == userDrive.driveId && scope.userId == userDrive.userId) {
-                            ids.add(scope.fileId)
+                            // THE DAMAGED BRANCH JOINS THE UNION (review-34 #10): a damaged
+                            // observation field never disqualifies the body's own identity;
+                            // a valid body that DISAGREES with the index excludes BOTH
+                            // independently identified scopes (review-33 #9).
+                            if (parsed != null && parsed.identitiesValid &&
+                                parsed.proofUserId == userDrive.userId &&
+                                parsed.proofDriveId == userDrive.driveId
+                            ) {
+                                val consistent = sidecar.userId == parsed.proofUserId &&
+                                    sidecar.driveId == parsed.proofDriveId &&
+                                    sidecar.fileId == parsed.proofFileId &&
+                                    sidecar.targetPath == parsed.targetPath
+                                if (!consistent) ids.add(parsed.proofFileId ?: return null)
+                            }
+                            continue
                         }
                     }
-                    continue
                 }
                 val record = readRecoveryRecord(recordFile)
                 if (record == null) {
@@ -3168,67 +3213,86 @@ class DownloadOfflineFileManager(
                     // (review-33 #7) is damaged evidence — it never decodes as absence and
                     // is scoped by its sidecar alone.
                     val parsed = parseProofMoveRecord(recordFile)
-                    if (parsed == null || parsed.observationFieldDamaged) {
-                        val scope = readScopeSidecar(recordFile) ?: return true
-                        val scopeIdentity = scope.fileId == fileId &&
-                            scope.driveId == userDrive.driveId && scope.userId == userDrive.userId
-                        val scopePath = targetPath != null && IOFile(scope.targetPath).absolutePath == targetPath
-                        if (scopeIdentity || scopePath) return true
-                        continue
-                    }
-                    val sidecar = readScopeSidecar(recordFile)
-                    val bodyIdentityMatches = parsed.proofUserId == userDrive.userId &&
-                        parsed.proofDriveId == userDrive.driveId && parsed.proofFileId == fileId
-                    val bodyPathMatches = targetPath != null && IOFile(parsed.targetPath).absolutePath == targetPath
-                    // THE RECORDED SOURCE GOVERNS TOO (review-33 #3): a v2 relocation
-                    // record moved the bytes FROM its recorded source — that vacated
-                    // location stays under the operation's exclusion until the sweep
-                    // resolves the state, so no other writer can occupy it meanwhile.
-                    val sourcePathMatches = targetPath != null && parsed.recordedSourcePath != null &&
-                        IOFile(parsed.recordedSourcePath).absolutePath == targetPath
-                    // THE DURABLE SCOPE INDEX IS CROSS-CHECKED (review-33 #9): the body's
-                    // parseable identity is authority only when the sidecar AGREES on the
-                    // complete account/drive/file identity and the target path. On
-                    // disagreement BOTH independently identified scopes govern — a
-                    // parseable-but-inconsistent body is never permission for the original
-                    // owner to proceed while the operation stays unresolved.
-                    if (parsed.identitiesValid && sidecar != null &&
-                        (sidecar.userId != parsed.proofUserId || sidecar.driveId != parsed.proofDriveId ||
-                            sidecar.fileId != parsed.proofFileId || sidecar.targetPath != parsed.targetPath)
-                    ) {
-                        val sidecarIdentityMatches = sidecar.fileId == fileId &&
-                            sidecar.driveId == userDrive.driveId && sidecar.userId == userDrive.userId
-                        val sidecarPathMatches = targetPath != null &&
-                            IOFile(sidecar.targetPath).absolutePath == targetPath
-                        if (bodyIdentityMatches || bodyPathMatches || sourcePathMatches ||
-                            sidecarIdentityMatches || sidecarPathMatches
-                        ) {
+                    // THE SHARED AUTHORITY RESULT (review-34 #10): the sidecar's explicit
+                    // absent/invalid/valid state — the same tri-state the replay uses —
+                    // decides here too; a null sidecar read is NEVER treated as consistency.
+                    when (val sidecarAuthority = readScopeAuthority(recordFile)) {
+                        is ScopedAuthority.Invalid ->
+                            // An index that EXISTS but cannot be decoded leaves the
+                            // operation's recorded scope unknown: nothing can be proven
+                            // outside it — fail closed, never silently consistent.
                             return true
+                        is ScopedAuthority.AbsentLegacy -> {
+                            // LEGACY NO-FRAMED-INDEX: the body is the primary authority; a
+                            // decodable unframed (pre-s2) index still joins the union.
+                            val legacyScope = readScopeSidecar(recordFile)
+                            if (parsed == null && legacyScope == null) return true
+                            val bodyIdentityMatches = parsed?.let {
+                                it.proofUserId == userDrive.userId &&
+                                    it.proofDriveId == userDrive.driveId && it.proofFileId == fileId
+                            } == true
+                            // THE UNION OF INDEPENDENTLY IDENTIFIED PATHS (review-34 #10):
+                            // the operation's target, its recorded source and the retained
+                            // proof's own embedded location each govern.
+                            val bodyPathMatches = parsed != null &&
+                                listOfNotNull(
+                                    parsed.targetPath,
+                                    parsed.recordedSourcePath,
+                                    parsed.embeddedProofLocation,
+                                ).any { candidate ->
+                                    targetPath != null && IOFile(candidate).absolutePath == targetPath
+                                }
+                            val legacyIdentityMatches = legacyScope?.let {
+                                it.fileId == fileId && it.driveId == userDrive.driveId &&
+                                    it.userId == userDrive.userId
+                            } == true
+                            val legacyPathMatches = legacyScope != null && targetPath != null &&
+                                IOFile(legacyScope.targetPath).absolutePath == targetPath
+                            if (bodyIdentityMatches || bodyPathMatches ||
+                                legacyIdentityMatches || legacyPathMatches
+                            ) {
+                                return true
+                            }
+                            // Without ANY decodable index, an unparseable identity fails
+                            // closed (the record's scope cannot be established).
+                            if (legacyScope == null && (parsed == null || !parsed.identitiesValid)) return true
+                            continue
                         }
-                        continue
+                        is ScopedAuthority.Resolved -> {
+                            val sidecar = sidecarAuthority.scope
+                            val sidecarIdentityMatches = sidecar.fileId == fileId &&
+                                sidecar.driveId == userDrive.driveId && sidecar.userId == userDrive.userId
+                            val sidecarPathMatches = targetPath != null &&
+                                IOFile(sidecar.targetPath).absolutePath == targetPath
+                            if (parsed == null) {
+                                // Structurally damaged body: the resolved sidecar decides
+                                // exactly like an ordinary corrupt record (review-33 #9).
+                                if (sidecarIdentityMatches || sidecarPathMatches) return true
+                                continue
+                            }
+                            val bodyIdentityMatches = parsed.proofUserId == userDrive.userId &&
+                                parsed.proofDriveId == userDrive.driveId && parsed.proofFileId == fileId
+                            val bodyPathMatches = listOfNotNull(
+                                parsed.targetPath,
+                                parsed.recordedSourcePath,
+                                parsed.embeddedProofLocation,
+                            ).any { candidate ->
+                                targetPath != null && IOFile(candidate).absolutePath == targetPath
+                            }
+                            // THE UNION OF INDEPENDENTLY IDENTIFIED SCOPES (review-34 #10):
+                            // a damaged observation field NEVER disqualifies the body's own
+                            // identity/paths — every identified scope governs, and a valid
+                            // body that DISAGREES with the index excludes both scopes.
+                            if (bodyIdentityMatches || bodyPathMatches ||
+                                sidecarIdentityMatches || sidecarPathMatches
+                            ) {
+                                return true
+                            }
+                            // Unparseable identity with a resolved index: the index's
+                            // decision is final (matched above, or demonstrably outside).
+                            continue
+                        }
                     }
-                    if (bodyPathMatches || sourcePathMatches) return true
-                    // THE CAPTURED IDENTITY MATCHES TOO (issues: round 31 #2, round 32 #3):
-                    // a valid proofmove record carries its owner's full captured
-                    // account/drive/file identity in the proof text — the previous
-                    // target-path-only match missed a check issued at ANOTHER location
-                    // (identity-only, or a different path) and let the governed source be
-                    // relocated/committed over. A VALID HEADER WITH A MALFORMED PROOF LINE
-                    // (unparseable identity fields) is NOT authority-free: it falls back to
-                    // the same independently established scoped exclusion as a damaged body
-                    // — the scope sidecar decides, and without one it fails closed — the
-                    // previous null-identity fall-through returned false and let activity
-                    // effects run despite the unresolved operation.
-                    if (!parsed.identitiesValid) {
-                        val scope = sidecar ?: return true
-                        val scopeIdentity = scope.fileId == fileId &&
-                            scope.driveId == userDrive.driveId && scope.userId == userDrive.userId
-                        val scopePath = targetPath != null && IOFile(scope.targetPath).absolutePath == targetPath
-                        if (scopeIdentity || scopePath) return true
-                        continue
-                    }
-                    if (bodyIdentityMatches) return true
-                    continue
                 }
                 val record = readRecoveryRecord(recordFile)
                 if (record == null) {
@@ -3305,6 +3369,11 @@ class DownloadOfflineFileManager(
                         // record with an empty observation field is truncation — the
                         // replay retains it instead of completing without evidence.
                         if (parsed.observationFieldDamaged) return@runCatching false
+                        // THE COMPLETE PROOF IS PRE-VALIDATED (review-34 #9): the retained
+                        // proof must parse under the full grammar WITH the operation's
+                        // target as its embedded location BEFORE any registry mutation —
+                        // the post-write readback supplements this, it never replaces it.
+                        if (!parsed.proofLocationValid) return@runCatching false
                         val target = IOFile(parsed.targetPath)
                         val proofText = parsed.proofText
                         val proofUserId = parsed.proofUserId
