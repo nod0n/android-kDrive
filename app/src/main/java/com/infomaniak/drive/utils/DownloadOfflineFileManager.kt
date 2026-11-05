@@ -2456,11 +2456,14 @@ class DownloadOfflineFileManager(
                         proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
                         observationText = observationField?.takeIf { it.isNotEmpty() && it != "A" },
                         observationFieldDamaged = false,
-                        // RETRACTION + RESTORED AMBIGUITY (review-37 #3): the historical writer
-                        // persisted read/parse failures as empty fields in complete records, and
-                        // a truncated final observation keeps the split count — emptiness and
-                        // line count prove nothing. An empty legacy field is AMBIGUOUS.
-                        observationAmbiguous = true,
+                        // RETRACTION + RESTORED AMBIGUITY (review-37 #3), THE EXPLICIT ABSENCE
+                        // DISCRIMINATOR (review-38 #4): the historical v1 writer emitted "A"
+                        // for AttemptedObservationCapture.Absent and rejected Invalid (3a52d5b2a),
+                        // so a validated "A" field is ABSENT — replay must not demand independent
+                        // evidence for it. Only the EARLIER ambiguous empty-field writer's
+                        // genuinely missing/empty field stays AMBIGUOUS: emptiness still never
+                        // reads as absence, and neither does any line count.
+                        observationAmbiguous = observationField.isNullOrEmpty(),
                         recordedSourcePath = null,
                         // LEGACY RECORDS CARRY NEITHER NEW AUTHORITY (review-34 #3/#4): a
                         // v1 record has no source-bound proof and no recorded preexisting
@@ -3528,15 +3531,17 @@ class DownloadOfflineFileManager(
                     // carried text (its own "1|" frame is validated at use — malformed
                     // contents retain the operation, never read as absence).
                     attemptedObservationText = v4[11].takeIf { it.isNotEmpty() && it != "A" },
-                    // RETRACTION + RESTORED AMBIGUITY (review-37 #3): the review-36 claim that
-                    // the writers fail Invalid captures is FALSE — the historical helper
-                    // (ce72bb8a1) mapped a read/parse FAILURE to null and the writer persisted
-                    // that null as an EMPTY field in otherwise complete records, and a
-                    // truncated final observation can keep its preceding newline. Emptiness,
-                    // line count and version prove NOTHING: an empty v4 field is AMBIGUOUS and
-                    // resolves only through independent upload/operation authority or the
-                    // validated rollback transition.
-                    attemptedObservationAmbiguous = true,
+                    // RETRACTION + RESTORED AMBIGUITY (review-37 #3), THE EXPLICIT ABSENCE
+                    // DISCRIMINATOR (review-38 #4): the review-36 claim that the writers fail
+                    // Invalid captures is FALSE — the historical helper (ce72bb8a1) mapped a
+                    // read/parse FAILURE to null and the writer persisted that null as an EMPTY
+                    // field in otherwise complete records, and a truncated final observation can
+                    // keep its preceding newline. Emptiness, line count and version prove
+                    // NOTHING: a genuinely empty v4 field is AMBIGUOUS and resolves only through
+                    // independently evidenced completion or the validated rollback transition.
+                    // But the v4/v5 writers emitted "A" for Absent explicitly (round 32 #5): a
+                    // validated "A" field is ABSENT, never ambiguous.
+                    attemptedObservationAmbiguous = v4[11].isEmpty(),
                     legacy = false,
                 )
             }
