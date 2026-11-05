@@ -587,7 +587,13 @@ object FileController {
                                         // over retained bytes lost the metadata every
                                         // consumer of those bytes needs.
                                         val bytesDisposed = file.deleteCaches(context!!, resolvedUserDrive)
-                                        if (bytesDisposed && !keepFiles.contains(fileId) && !folderStillNeeded) {
+                                        // THE PARENT NEVER OUTLIVES A RETAINED CHILD (review-37 #4):
+                                        // the children's aggregate is consulted BEFORE the parent's
+                                        // row is deleted — an ordinary child retained by a failed
+                                        // cache deletion keeps its required ancestor, ancestry and
+                                        // backlink, instead of the aggregate reporting damage after
+                                        // the deletion already happened.
+                                        if (bytesDisposed && !keepFiles.contains(fileId) && !folderStillNeeded && allRemoved) {
                                             realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                                         } else {
                                             allRemoved = false
@@ -601,11 +607,12 @@ object FileController {
                                 // re-processes the remote deletion then (issue: round 4 #6).
                                 OfflineFolderController.PreservationOutcome.PRESERVED -> allRemoved = false
                             }
-                        } else if (!keepFiles.contains(fileId) && !folderStillNeeded) {
+                        } else if (!keepFiles.contains(fileId) && !folderStillNeeded && allRemoved) {
+                            // THE SAME AGGREGATE GUARD (review-37 #4) on the kept-cache branch.
                             realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                         } else {
-                            // Kept caches or required ancestry: the row is intentionally
-                            // retained — the removal is not fully complete.
+                            // Kept caches, required ancestry, or a retained descendant: the row
+                            // is retained — the removal is not fully complete.
                             allRemoved = false
                         }
                     }
@@ -1728,8 +1735,17 @@ object FileController {
                 }
             }
 
-            if (replaceOldData) removeFile(MyShares.id, keepCaches, keepFiles, realm, userDrive = userDrive)
-            saveFiles(MyShares.file, files, replaceOldData, realm, userDrive)
+            // THE AGGREGATE OUTCOME IS CONSUMED (review-37 #4): the recursive removal reports
+            // its ACTUAL retention — a descendant whose cache deletion or preservation
+            // retained it survives, and the replacement's container save must not replace the
+            // retained membership (replaceOldData rewrites the container's children list,
+            // orphaning a survivor's required ancestry). The old container row is kept when
+            // the removal was incomplete and the save runs WITHOUT the destructive replace,
+            // preserving the retained membership; a later sync re-processes the replacement.
+            val removalComplete = if (replaceOldData) {
+                removeFile(MyShares.id, keepCaches, keepFiles, realm, userDrive = userDrive)
+            } else true
+            saveFiles(MyShares.file, files, replaceOldData && removalComplete, realm, userDrive)
         }
     }
 
