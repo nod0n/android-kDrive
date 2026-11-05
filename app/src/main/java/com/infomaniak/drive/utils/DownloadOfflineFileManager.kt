@@ -2225,12 +2225,6 @@ class DownloadOfflineFileManager(
                 val recoveryFile = IOFile(record.recoveryPath)
                 val target = IOFile(record.targetPath)
                 val recordScope = UserDrive(userId = record.userId, driveId = record.driveId)
-                // THE CAPTURED REALM FLAVOR AND DESTINATION KIND (issue: round 26 #5): the
-                // scope sidecar written before the record carries them; a legacy record
-                // without a sidecar keeps the ordinary offline defaults.
-                val capturedScopeSidecar = readScopeSidecar(record.recordFile)
-                val capturedShared = capturedScopeSidecar?.sharedWithMe == true
-                val capturedStorageKind = capturedScopeSidecar?.storageKind ?: "offline"
                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withFileLock(recordScope, record.fileId) {
                         runCatching { reconcileOneRecovery(context, record, recordScope, recoveryFile, target) }.getOrDefault(false)
@@ -2261,6 +2255,17 @@ class DownloadOfflineFileManager(
             recoveryFile: IOFile,
             target: IOFile,
         ): Boolean {
+            // THE CAPTURED REALM FLAVOR AND DESTINATION KIND (issue: round 26 #5), for
+            // every ownership validation in this arm set: the scope sidecar written before
+            // the record carries the destination's ACTUAL realm flavor and storage kind —
+            // a cache or shared-Realm destination is validated against its captured
+            // identity, never against a universally resolved ordinary offline path. A
+            // legacy record without a sidecar keeps the documented conservative defaults
+            // (the same ordinary-offline semantics its scope resolution already used);
+            // nothing here falls back to the current account or invents a scope.
+            val capturedScopeSidecar = readScopeSidecar(record.recordFile)
+            val capturedShared = capturedScopeSidecar?.sharedWithMe == true
+            val capturedStorageKind = capturedScopeSidecar?.storageKind ?: "offline"
             if (!recoveryFile.exists()) {
                 // The backup is gone: a completed publication (or completed restore)
                 // leaves the target with its own readable proof; anything else is
