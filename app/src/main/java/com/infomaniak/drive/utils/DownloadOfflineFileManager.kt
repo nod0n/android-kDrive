@@ -2391,7 +2391,13 @@ class DownloadOfflineFileManager(
          * unreadable file returns null (the caller retains and fails closed by scope).
          */
         private fun parseProofMoveRecord(recordFile: IOFile): ParsedProofMoveRecord? = runCatching {
-            val parts = recordFile.readText().split("\n", limit = 5)
+            // EACH VERSION'S ACTUAL FIELD COUNT (review-35 #2): the split limit must cover
+            // the CURRENT (v3) record's seven lines — the previous limit of five made every
+            // newly written v3 journal undecodable forever. A specified limit PRESERVES
+            // trailing empty fields (a v3 record legitimately ends with an empty
+            // previous-destination field); excess fields surface as a '\n' inside the last
+            // parts and are rejected explicitly by the per-version checks below.
+            val parts = recordFile.readText().split("\n", limit = 7)
             fun fields(proofText: String): List<String> = proofText.removePrefix(PROVENANCE_FRAME).split("|")
             // THE COMPLETE PROOF DECODE (review-34 #9): the embedded location is parsed
             // loose (any grammar) and strict (the operation's target expected) — the strict
@@ -2470,7 +2476,13 @@ class DownloadOfflineFileManager(
                     if (parts.size != 7) return@runCatching null
                     val sourceField = parts[4]
                     val previousDestinationField = parts[6]
-                    if (sourceField.contains('\n') || previousDestinationField.contains('\n')) {
+                    // EXCESS OR INTRA-FIELD NEWLINES ARE REJECTED EXPLICITLY (review-35 #2):
+                    // an eight-line record's seventh part carries the remainder, and a
+                    // corrupted record may embed a newline inside any single-line field —
+                    // neither ever decodes as a valid v3 journal.
+                    if (sourceField.contains('\n') || parts[5].contains('\n') ||
+                        previousDestinationField.contains('\n')
+                    ) {
                         return@runCatching null
                     }
                     val proofFields = fields(parts[2])
