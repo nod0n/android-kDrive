@@ -115,6 +115,16 @@ class DownloadOfflineFileManager(
      */
     private var verificationMetadataDeferred = false
 
+    /**
+     * THE HISTORICAL VERIFICATION'S CAPTURED OLD OBSERVATION (issue: round 24 #7): when a
+     * boundary substitution defers the metadata, the transfer fetches comparison bytes for
+     * the UNCOMMITTED historical row. The publication's supersession CAS then proves the
+     * row has not moved SINCE THE CAPTURE — the fetched response's identity difference is
+     * the very subject of the comparison, never a supersession. Null for ordinary
+     * transfers (the response itself is the CAS basis).
+     */
+    private var verificationBasis: File? = null
+
     suspend fun execute(
         context: Context,
         file: File,
@@ -127,6 +137,7 @@ class DownloadOfflineFileManager(
         lastDownloadedFile = null
         lastTransferSuperseded = false
         verificationMetadataDeferred = false
+        verificationBasis = null
 
         // CAPTURED CACHE PUBLICATION TOKEN (issue: round 22 #21): the pre-download cache
         // cleanup validates the cache's CURRENT self-certification, but a later writer can
@@ -217,6 +228,12 @@ class DownloadOfflineFileManager(
                     }
                     skipMetadataCommit = true
                     verificationMetadataDeferred = true
+                    // THE CAPTURED OLD OBSERVATION (issue: round 24 #7): the uncommitted
+                    // boundary result is the verification's CAS basis — the publication
+                    // proves the row has not moved since THIS state, and the staged
+                    // comparison (not the response's identity difference) decides
+                    // convergence.
+                    verificationBasis = commitFile
                 }
                 // The SAME complete-chain validation holds THROUGH the commit (issue: round
                 // 17 #8): a chain broken during preservation defers without the metadata
@@ -570,6 +587,7 @@ class DownloadOfflineFileManager(
         file: File,
         target: IOFile,
         staged: IOFile,
+        verificationBasis: File? = null,
     ): PublicationOutcome = publishStagedOfflineFile(
         userDrive = userDrive,
         isInheritedDownload = isInheritedDownload,
@@ -577,6 +595,7 @@ class DownloadOfflineFileManager(
         target = target,
         staged = staged,
         onPublishedLocked = { completePublishedFileLocked(context, file, target) },
+        verificationBasis = verificationBasis,
     )
 
     /**
@@ -707,7 +726,7 @@ class DownloadOfflineFileManager(
                 return@withContext ListenableWorker.Result.failure()
             }
             if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated) {
-                val outcome = publishStagedOfflineFile(context, file, offlineFile, staged)
+                val outcome = publishStagedOfflineFile(context, file, offlineFile, staged, verificationBasis = verificationBasis)
                 // Public superseded/conflict status for the bulk caller (issues: round 9 #8,
                 // round 14 #13).
                 lastTransferSuperseded = outcome in UNRESOLVED_PUBLICATION_OUTCOMES
@@ -1842,6 +1861,7 @@ class DownloadOfflineFileManager(
             target: IOFile,
             staged: IOFile,
             onPublishedLocked: (() -> Unit)? = null,
+            verificationBasis: File? = null,
         ): PublicationOutcome = withContext(Dispatchers.IO) {
             // ROOT-INTENT coordination for publication (issue: round 12 #8): an ancestry-
             // dependent publication must serialize with ancestry-changing writers (folder
@@ -1873,6 +1893,7 @@ class DownloadOfflineFileManager(
                 OfflineFileCoordination.withLocksFor(userDrive, listOfNotNull(file.id, preLockOwner?.id)) {
                     publishLockedCore(
                         userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
+                        verificationBasis,
                     ) { coroutineContext.ensureActive() }
                 }
             }
@@ -1895,8 +1916,15 @@ class DownloadOfflineFileManager(
             onPublishedLocked: (() -> Unit)?,
             lockedOwnerId: Int?,
             checkCancelled: () -> Unit,
+            verificationBasis: File? = null,
         ): PublicationOutcome {
             checkCancelled()
+            // HISTORICAL VERIFICATION BASIS (issue: round 24 #7): a verification transfer's
+            // authority is the CAPTURED OLD OBSERVATION (the uncommitted row state the
+            // verification was captured against), not the fetched response — the response's
+            // identity difference from the historical row is the very subject of the staged
+            // comparison, never a supersession. Ordinary transfers CAS against the response.
+            val casBasis = verificationBasis ?: file
             // Live intent: an inherited download requires a current pin or durable root
             // ancestry (a materialized inherited flag alone never authorizes retention); a
             // pin download accepts its own pending marker or explicit pin as the user's
@@ -1918,12 +1946,13 @@ class DownloadOfflineFileManager(
                 // moved the resolved offline path). Publishing at the old location and
                 // completing against the new row would desync bytes and metadata. The check
                 // and the rename form one compare-and-set: identity/revision writers take the
-                // same per-file lock before their transactions (round 10 #3).
+                // same per-file lock before their transactions (round 10 #3). In VERIFICATION
+                // mode the CAS basis is the captured old observation (issue: round 24 #7).
                 supersededGeneration = live != null && (
-                    live.revisedAt > file.revisedAt ||
-                        (live.revisedAt == 0L && live.lastModifiedAt > file.lastModifiedAt) ||
-                        live.parentId != file.parentId ||
-                        live.name != file.name ||
+                    live.revisedAt > casBasis.revisedAt ||
+                        (live.revisedAt == 0L && live.lastModifiedAt > casBasis.lastModifiedAt) ||
+                        live.parentId != casBasis.parentId ||
+                        live.name != casBasis.name ||
                         // Accepted content-generation identity (issues: round 12 #6, round
                         // 13 #9): the committed metadata and this transfer must describe the
                         // SAME revision. UNKNOWN version data (listing rows omit the
@@ -1932,8 +1961,8 @@ class DownloadOfflineFileManager(
                         // baseline (modification time AND size) decides otherwise, so a
                         // tied-timestamp same-size-differs revision still supersedes the
                         // staged bytes.
-                        ((live.version?.number ?: 0) > 0 && (file.version?.number ?: 0) > 0 &&
-                            live.version?.number != file.version?.number) ||
+                        ((live.version?.number ?: 0) > 0 && (casBasis.version?.number ?: 0) > 0 &&
+                            live.version?.number != casBasis.version?.number) ||
                         // Ambiguous version provenance (issue: round 14 #7): when exactly ONE
                         // side carries the authoritative version and the complete coarse
                         // baseline ties, timestamp/size equality alone cannot prove the same
@@ -1943,10 +1972,10 @@ class DownloadOfflineFileManager(
                         // identity: details routes carry the version expansion, so the
                         // worker's refetch and the deferred markers' refresh resolve it.
                         // Both sides UNKNOWN remains the documented coarse-baseline case.
-                        (((live.version?.number ?: 0) > 0) != ((file.version?.number ?: 0) > 0) &&
-                            live.lastModifiedAt == file.lastModifiedAt && live.size == file.size) ||
-                        live.lastModifiedAt != file.lastModifiedAt ||
-                        live.size != file.size ||
+                        (((live.version?.number ?: 0) > 0) != ((casBasis.version?.number ?: 0) > 0) &&
+                            live.lastModifiedAt == casBasis.lastModifiedAt && live.size == casBasis.size) ||
+                        live.lastModifiedAt != casBasis.lastModifiedAt ||
+                        live.size != casBasis.size ||
                         run {
                             val livePath = appContextForCheck?.let { ctx -> live.getOfflineFile(ctx, userDrive.userId)?.path }
                             livePath == null || livePath != target.path
@@ -1962,7 +1991,7 @@ class DownloadOfflineFileManager(
                 // The assignment precedes the conditional so the lambda's TAIL stays the
                 // Boolean the caller's `if (!intentOk)` needs (round-19 build fix).
                 unresolvedGeneration = live != null &&
-                    (live.version?.number ?: 0) <= 0 && (file.version?.number ?: 0) <= 0
+                    (live.version?.number ?: 0) <= 0 && (casBasis.version?.number ?: 0) <= 0
                 if (isInheritedDownload) {
                     pinned || ancestryCovers
                 } else {
@@ -2029,6 +2058,20 @@ class DownloadOfflineFileManager(
                     // its sole edit, and accepted metadata alone must not reclassify
                     // retained old-clean bytes as an edit.
                     else -> run {
+                        val currentTargetHash = UploadFile.sha256OrNull(target)
+                        // HISTORICAL VERIFICATION (issue: round 24 #7): the staged comparison
+                        // itself decides — EQUAL bytes converge (the retained generation IS
+                        // the fetched one: the publication proceeds and the conditional
+                        // metadata advance follows it), DIFFERENT or unreadable bytes are
+                        // RETAINED (a verification never replaces the historical copy with
+                        // the newer response; the ordinary flow owns that replacement on a
+                        // later pass).
+                        if (verificationBasis != null) {
+                            val stagedHash = UploadFile.sha256OrNull(staged)
+                            targetContentUnproven = false
+                            return@run currentTargetHash == null || stagedHash == null ||
+                                currentTargetHash != stagedHash
+                        }
                         // ONE COMPLETE CONTENT CLASSIFICATION, CLOSED OVER THE REALM
                         // (issues: round 22 #1, round 22 #5): the ownership comparison is
                         // computed INSIDE the scoped-realm block and only the Boolean
@@ -2044,7 +2087,6 @@ class DownloadOfflineFileManager(
                         //    content: unproven historical — RETAINED (a same-size same-mtime
                         //    historical edit was previously considered replaceable);
                         //  - NO identifying record at all: unknown historical — RETAINED.
-                        val currentTargetHash = UploadFile.sha256OrNull(target)
                         val ownerProof = readPublishedProvenance(appContext, target)
                         val ownerRowIdentifies = runCatching {
                             FileController.getRealmInstance(userDrive).use { ownerRealm ->
