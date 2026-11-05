@@ -38,8 +38,10 @@ import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.data.models.file.FileLastActivityBody
 import com.infomaniak.drive.data.models.file.LastFileAction
+import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
+import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.SyncUtils.syncImmediately
 import com.infomaniak.drive.utils.Utils
 import io.realm.Realm
@@ -849,7 +851,26 @@ object SyncOfflineUtils {
     private fun migrateOfflineIfNeeded(context: Context, file: File, ioFile: IOFile, userDrive: UserDrive) {
         val offlineDir = context.getString(R.string.EXPOSED_OFFLINE_DIR)
         val oldPath = IOFile(context.filesDir, "$offlineDir/${userDrive.userId}/${userDrive.driveId}/${file.id}")
-        if (oldPath.exists()) oldPath.renameTo(ioFile)
+        if (!oldPath.exists()) return
+        // THE FRESH BOUNDARY GUARD (review-35 #14): the migration's rename writes DIRECTLY
+        // over the recovery-managed target — a captured enumeration predates this exact
+        // boundary. Under the file lock, a fresh exclusion check (the file's identity plus
+        // BOTH the migrated source and destination paths) defers the migration; the sweep
+        // owns the unresolved state.
+        OfflineFileCoordination.withFileLock(userDrive, file.id) {
+            val recoveryGoverned = DownloadOfflineFileManager.hasUnresolvedRecovery(
+                context,
+                userDrive,
+                file.id,
+                oldPath.absolutePath,
+            ) || DownloadOfflineFileManager.hasUnresolvedRecovery(
+                context,
+                userDrive,
+                file.id,
+                ioFile.absolutePath,
+            )
+            if (!recoveryGoverned) oldPath.renameTo(ioFile)
+        }
     }
 
     /**

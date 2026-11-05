@@ -3523,21 +3523,26 @@ class DownloadOfflineFileManager(
                     when (val sidecarAuthority = readScopeAuthority(recordFile)) {
                         is ScopedAuthority.Invalid -> return null
                         is ScopedAuthority.AbsentLegacy -> {
+                            // THE IDENTITIES ARE INDEPENDENT (review-35 #14): the body's id
+                            // and a decodable legacy index's id EACH join the enumeration —
+                            // the previous else-if dropped the separately identified scope
+                            // whenever the body matched, letting the no-action Sync path run
+                            // migrateOfflineIfNeeded for it before its later final checks.
                             val legacyScope = readScopeSidecar(recordFile)
                             val bodyId = parsed?.takeIf { it.identitiesValid }?.proofFileId
                             if (bodyId != null && parsed.proofUserId == userDrive.userId &&
                                 parsed.proofDriveId == userDrive.driveId
                             ) {
                                 ids.add(bodyId)
-                            } else if (legacyScope != null) {
-                                if (legacyScope.driveId == userDrive.driveId &&
-                                    legacyScope.userId == userDrive.userId
-                                ) {
-                                    ids.add(legacyScope.fileId)
-                                }
-                            } else if (parsed == null || !parsed.identitiesValid) {
-                                // Nothing independently identifies this operation's scope:
-                                // the whole per-scope enumeration fails closed.
+                            }
+                            if (legacyScope != null && legacyScope.driveId == userDrive.driveId &&
+                                legacyScope.userId == userDrive.userId
+                            ) {
+                                ids.add(legacyScope.fileId)
+                            }
+                            if (bodyId == null && legacyScope == null) {
+                                // Neither the body nor the index identifies anything: the
+                                // whole per-scope enumeration fails closed.
                                 return null
                             }
                             continue
