@@ -801,13 +801,84 @@ class DownloadOfflineFileManager(
                             // fetched generation — otherwise this resumption has no
                             // operation to advance.
                             val bindingProof = readPublishedProvenance(context, offlineFile)
-                            val bindingHolds = bindingProof != null &&
+                                ?: return@withFileLock
+                            val bindingHolds =
                                 bindingProof.version == 0 &&
-                                bindingProof.identifies(live, userDrive) &&
-                                bindingProof.certifiesBytes(offlineFile) &&
-                                bindingProof.revisedAt == freshForAdvance.revisedAt &&
-                                bindingProof.lastModifiedAt == freshForAdvance.lastModifiedAt
+                                    bindingProof.identifies(live, userDrive) &&
+                                    bindingProof.certifiesBytes(offlineFile) &&
+                                    bindingProof.revisedAt == freshForAdvance.revisedAt &&
+                                    bindingProof.lastModifiedAt == freshForAdvance.lastModifiedAt
                             if (!bindingHolds) return@withFileLock
+                            // THE SPECIFIC DURABLE DEFERRED-OPERATION IDENTITY (issue: round
+                            // 29 masked flow A): owner/hash + two timestamps name a STATE,
+                            // never THE deferred attempt. The resumption continues the
+                            // attempt only when the destination's durable attempted
+                            // observation binds THIS record's publication id to THIS
+                            // destination, and the observation's COMPLETE attempted
+                            // generation (version, nullable size, the three timestamps —
+                            // the accepted observation the attempt was published for)
+                            // still equals the freshly fetched generation. A restoration
+                            // or a newer attempt wrote a fresh publication id and thereby
+                            // spent the old attempt's evidence.
+                            val attemptObservation = runCatching {
+                                IOFile(provenanceFileFor(context, offlineFile).path + ".obs")
+                                    .readText().trim().split("|")
+                            }.getOrNull()?.takeIf { it.size >= 8 && it[0] == "1" }
+                            val attemptIdentityHolds = attemptObservation != null &&
+                                attemptObservation.drop(7).joinToString("|") == offlineFile.absolutePath &&
+                                attemptObservation[1].toLongOrNull() == bindingProof.publicationId &&
+                                attemptObservation[2].toIntOrNull() == (freshForAdvance.version?.number ?: 0) &&
+                                attemptObservation[3].toLongOrNull() == freshForAdvance.size &&
+                                attemptObservation[4].toLongOrNull() == freshForAdvance.revisedAt &&
+                                attemptObservation[5].toLongOrNull() == freshForAdvance.lastModifiedAt &&
+                                attemptObservation[6].toLongOrNull() == freshForAdvance.updatedAt
+                            if (!attemptIdentityHolds) return@withFileLock
+                            // THE MOVED ROW'S COVERAGE AND ANCESTRY (issue: round 29 masked
+                            // flow A): the conditional advance re-points the row at the
+                            // certified generation — never over a row whose offline coverage
+                            // vanished mid-flight (the deferred state's owner is gone; the
+                            // unpin/root-removal paths own that resolution), and never when
+                            // the resulting ancestry would be unusable (an accepted advance
+                            // with a hole in the parent chain would commit a row whose
+                            // destination cannot be derived).
+                            val coverageStands = live.isOffline ||
+                                OfflineFolderController.isInsideActiveRoot(realm, live.id)
+                            val ancestryUsable = freshForAdvance.parentId <= 0 ||
+                                FileController.usableAncestryChain(realm, freshForAdvance.parentId)
+                            if (!coverageStands || !ancestryUsable) return@withFileLock
+                            // THE COMPLETE PRESERVATION/ADVANCEMENT PROTOCOL (issue: round 29
+                            // masked flow A): the row's OLD source (its current location,
+                            // when it differs from the certified destination) classifies
+                            // through the SAME authority pre-flight + content classification
+                            // the retirement uses — a proven edit registers under the row's
+                            // CURRENT identity and the advancement is SKIPPED; authority
+                            // that moved, foreign, uploaded-accounted, unreadable or
+                            // uncertain old bytes defer. Only ABSENT old bytes or the row's
+                            // own accounted clean generation (the tied-rename case the
+                            // resumption exists for) allow the conditional advance — never
+                            // the bare owner/hash+two-timestamp upsert.
+                            val liveOldPath = live.getOfflineFile(context, userDrive.userId)?.absolutePath
+                            val oldSourceDisposition = if (liveOldPath == null ||
+                                liveOldPath == offlineFile.absolutePath
+                            ) {
+                                OldSourceDisposition.Absent
+                            } else {
+                                classifyOldSourceWithAuthority(
+                                    realm = realm,
+                                    context = context,
+                                    userDrive = userDrive,
+                                    row = live,
+                                    basisPath = liveOldPath,
+                                    verifiedBasisHash = null, // a resume captures no verified basis hash
+                                )
+                            }
+                            when (oldSourceDisposition) {
+                                OldSourceDisposition.Absent, OldSourceDisposition.Clean -> Unit
+                                else -> return@withFileLock
+                            }
+                            // RE-CHECK AFTER THE CLASSIFICATION'S HASH/SNAPSHOT WORK (issue:
+                            // round 29 #2 protocol, shared with the retirement).
+                            ensureActive()
                             FileController.updateExistingFileIfNotOlder(
                                 newFile = freshForAdvance,
                                 realm = realm,
@@ -943,103 +1014,47 @@ class DownloadOfflineFileManager(
                                 ensureActive()
                                 var retirementAuthorized = true
                                 if (basisPath != null && basisPath != offlineFile.path) {
-                                    val basisCopy = IOFile(basisPath)
-                                    if (basisCopy.exists()) {
-                                        // AUTHORITY PRE-FLIGHT BEFORE ANY CLASSIFICATION OR
-                                        // SNAPSHOT (issues: round 29 #1): the live identity,
-                                        // the old location, exclusive ownership, non-foreign
-                                        // provenance, recovery exclusions and URI consumers
-                                        // are validated FIRST — the previous order registered
-                                        // every differing/unreadable source as the live row's
-                                        // edit BEFORE the ownership checks could reject a
-                                        // relocated row or a newly recovery-managed path, and
-                                        // the recovery-resolution override belonged to
-                                        // validated reconciliation, not this flow.
-                                        val currentBasisHash = UploadFile.sha256OrNull(basisCopy)
-                                        val basisUri = android.net.Uri.fromFile(basisCopy).toString()
-                                        val preAdvanceRow = liveRow?.let { realm.copyFromRealm(it, 1) }
-                                        val authorityHolds = preAdvanceRow != null &&
-                                            OfflineFolderController.exclusivePathOwner(
-                                                realm, context, userDrive, basisPath,
-                                            ) == preAdvanceRow.id &&
-                                            readPublishedProvenance(context, basisCopy)
-                                                ?.positivelyForeignTo(preAdvanceRow, userDrive) != true &&
-                                            !UploadFile.hasPendingUpload(uri = basisUri) &&
-                                            !UploadFile.hasRetainedUnsentUpload(uri = basisUri) &&
-                                            !hasUnresolvedRecovery(context, userDrive, file.id, basisPath)
-                                        when {
-                                            // AUTHORITY LOST: the row moved, the path was
-                                            // re-owned, a foreign record names it, a URI
-                                            // consumer or recovery owns it — nothing at A is
-                                            // this operation's to classify; the advancement is
-                                            // skipped so the row keeps its old owning
-                                            // location.
-                                            !authorityHolds -> {
-                                                retirementAuthorized = false
-                                                SentryLog.i(
-                                                    TAG,
-                                                    "Old-path authority lost for ${file.id}; advancement deferred",
-                                                )
-                                            }
-                                            // THE EXACT VERIFIED REVISION: the retirement
-                                            // candidate (subject to the advancement below).
-                                            currentBasisHash != null && currentBasisHash == verifiedBasisSourceHash -> Unit
-                                            // A READABLE DIFFERING REVISION WITH FULL
-                                            // AUTHORITY: classified through the COMMON content
-                                            // classification — a PROVEN edit registers as the
-                                            // row's snapshot (NO recovery-resolution override);
-                                            // foreign, clean and uncertain bytes are deferred
-                                            // unregistered. UNREADABLE bytes are UNCERTAIN,
-                                            // never a proven edit.
-                                            currentBasisHash != null -> {
-                                                // THE REGISTERED EDIT NEVER ADVANCES (issue: round 29
-                                                // audit of #1, preserving round-28 #2): a proven edit is
-                                                // registered under the row's CURRENT (pre-advance)
-                                                // identity and the advancement is SKIPPED — the owning
-                                                // metadata must stay with the retained bytes, so the
-                                                // registration's discovery trail survives. (The rewrite
-                                                // initially let a SUCCESSFUL registration advance and
-                                                // retire, discarding the location the snapshot was
-                                                // registered under.) Foreign, clean and uncertain bytes
-                                                // defer unregistered; UNREADABLE is the branch below.
-                                                val classifiedEdit = currentBasisHash != verifiedBasisSourceHash &&
-                                                    OfflineFolderController.protectionStateOf(
-                                                        preAdvanceRow ?: liveRow ?: return@withFileLock,
-                                                        basisCopy,
-                                                        userDrive,
-                                                    ) == OfflineFolderController.CopyProtection.DIRTY
-                                                if (classifiedEdit && preAdvanceRow != null) {
-                                                    runCatching {
-                                                        OfflineFolderController.registerDirtySnapshot(
-                                                            context = context,
-                                                            file = preAdvanceRow,
-                                                            offlineFile = basisCopy,
-                                                            userDrive = userDrive,
-                                                        )
-                                                    }
-                                                }
-                                                retirementAuthorized = false
-                                                SentryLog.i(
-                                                    TAG,
-                                                    "Old-path revision for ${file.id} classified; advancement deferred",
-                                                )
-                                            }
-                                            // UNREADABLE OLD BYTES (issue: round 29 #1):
-                                            // uncertain — the advancement defers, nothing is
-                                            // registered, nothing is deleted.
-                                            else -> {
-                                                retirementAuthorized = false
-                                                SentryLog.i(
-                                                    TAG,
-                                                    "Unreadable old-path bytes for ${file.id}; advancement deferred",
-                                                )
-                                            }
-                                        }
-                                        // RE-CHECK BEFORE THE COMMIT/UNLINK FOLLOWING
-                                        // POTENTIALLY LENGTHY HASH/SNAPSHOT WORK (issue:
-                                        // round 29 #2).
-                                        ensureActive()
+                                    // THE SHARED AUTHORITY PRE-FLIGHT + CLASSIFICATION (issues:
+                                    // round 29 #1 and masked flow A): the old source is validated
+                                    // and classified through the SAME boundary the no-spin resume
+                                    // uses — exclusive ownership, non-foreign provenance, URI
+                                    // consumers and recovery exclusions BEFORE any snapshot; the
+                                    // exact verified revision is the retirement candidate, a
+                                    // proven edit registers under the CURRENT identity and never
+                                    // advances, and foreign, clean, uncertain and unreadable
+                                    // bytes defer unregistered.
+                                    val classificationRow = liveRow?.let { realm.copyFromRealm(it, 1) }
+                                    val disposition = if (classificationRow == null) {
+                                        // NO LIVE ROW: nothing carries the old bytes' owning
+                                        // identity — the advancement defers.
+                                        OldSourceDisposition.Deferred
+                                    } else {
+                                        classifyOldSourceWithAuthority(
+                                            realm = realm,
+                                            context = context,
+                                            userDrive = userDrive,
+                                            row = classificationRow,
+                                            basisPath = basisPath,
+                                            verifiedBasisHash = verifiedBasisSourceHash,
+                                        )
                                     }
+                                    when (disposition) {
+                                        // THE EXACT VERIFIED REVISION under full current
+                                        // authority, or NO old bytes at all: the advancement
+                                        // (and the retirement of the exact verified source)
+                                        // is authorized.
+                                        OldSourceDisposition.VerifiedBasis, OldSourceDisposition.Absent -> Unit
+                                        else -> {
+                                            retirementAuthorized = false
+                                            SentryLog.i(
+                                                TAG,
+                                                "Old-path source for ${file.id} deferred ($disposition); advancement skipped",
+                                            )
+                                        }
+                                    }
+                                    // RE-CHECK BEFORE THE COMMIT/UNLINK FOLLOWING POTENTIALLY
+                                    // LENGTHY HASH/SNAPSHOT WORK (issue: round 29 #2).
+                                    ensureActive()
                                 }
                                 if (retirementAuthorized) {
                                     advanceAccepted = FileController.updateExistingFileIfNotOlder(
@@ -3101,6 +3116,100 @@ class DownloadOfflineFileManager(
                 runCatching { deletePublishedProvenance(context, stage) }
             }
         }.getOrDefault(false)
+
+        /** THE SHARED OLD-SOURCE DISPOSITION (issues: round 29 #1 and masked flow A): the
+         * retirement and the no-spin resume both validate the old source's authority BEFORE
+         * any classification and both classify readable revisions through the COMMON content
+         * classification — factored into one boundary so neither flow can drift back to
+         * snapshotting before validating, or advancing over a registered edit. */
+        private sealed class OldSourceDisposition {
+            /** No old bytes exist at the old path: nothing to preserve, nothing to retire. */
+            object Absent : OldSourceDisposition()
+
+            /** The old bytes are the row's OWN accounted generation (a certifying provenance
+             * record or proven-current metadata): no edit is stranded there. */
+            object Clean : OldSourceDisposition()
+
+            /** A proven edit was registered under the row's CURRENT (pre-advance) identity:
+             * the caller SKIPS its advancement so the owning metadata stays with the
+             * retained bytes (the registration's discovery trail survives). */
+            object RegisteredEdit : OldSourceDisposition()
+
+            /** The EXACT verified revision was found under full current authority: the
+             * retirement may advance and retire it. */
+            object VerifiedBasis : OldSourceDisposition()
+
+            /** Nothing at the old path is this operation's to classify: authority lost,
+             * foreign provenance, a URI consumer or recovery owning it, unreadable bytes,
+             * an unregistrable edit — the caller defers unconditionally. */
+            object Deferred : OldSourceDisposition()
+        }
+
+        /**
+         * THE SHARED RETIREMENT/RESUME AUTHORITY PRE-FLIGHT + OLD-SOURCE CLASSIFICATION
+         * (issues: round 29 #1 and masked flow A): the old location's exclusive ownership,
+         * non-foreign provenance, URI consumers and recovery exclusions are validated FIRST;
+         * a readable old revision then classifies through the COMMON content classification —
+         * the EXACT verified basis hash (when the caller captured one) is the retirement
+         * candidate, a PROVEN edit registers under the row's CURRENT (pre-advance) identity,
+         * and foreign, clean, uncertain and unreadable bytes defer unregistered. MUST run
+         * inside the caller's coordination (intent monitor + file lock); the hashing and
+         * snapshot work happen here, so the caller re-checks its executing context before
+         * committing anything the classification authorized.
+         */
+        private fun classifyOldSourceWithAuthority(
+            realm: Realm,
+            context: Context,
+            userDrive: UserDrive,
+            row: File,
+            basisPath: String,
+            verifiedBasisHash: String?,
+        ): OldSourceDisposition {
+            val basisCopy = IOFile(basisPath)
+            if (!basisCopy.exists()) return OldSourceDisposition.Absent
+            // AUTHORITY PRE-FLIGHT BEFORE ANY CLASSIFICATION OR SNAPSHOT (issue: round 29
+            // #1): the exclusive ownership, non-foreign provenance, URI-consumer and
+            // recovery exclusions are validated first — bytes the row no longer owns, a
+            // foreign record's content, a pending upload's source or recovery-managed
+            // state are never this operation's to classify, snapshot or retire.
+            val authorityHolds =
+                OfflineFolderController.exclusivePathOwner(realm, context, userDrive, basisPath) == row.id &&
+                    readPublishedProvenance(context, basisCopy)
+                        ?.positivelyForeignTo(row, userDrive) != true &&
+                    !UploadFile.hasPendingUpload(uri = android.net.Uri.fromFile(basisCopy).toString()) &&
+                    !UploadFile.hasRetainedUnsentUpload(uri = android.net.Uri.fromFile(basisCopy).toString()) &&
+                    !hasUnresolvedRecovery(context, userDrive, row.id, basisPath)
+            if (!authorityHolds) return OldSourceDisposition.Deferred
+            // UNREADABLE OLD BYTES ARE UNCERTAIN (issue: round 29 #1) — never a proven edit.
+            val currentBasisHash = UploadFile.sha256OrNull(basisCopy)
+                ?: return OldSourceDisposition.Deferred
+            // THE EXACT VERIFIED REVISION (issue: round 27 #3): the retirement candidate —
+            // only reachable when the caller captured a verified basis hash.
+            if (verifiedBasisHash != null && currentBasisHash == verifiedBasisHash) {
+                return OldSourceDisposition.VerifiedBasis
+            }
+            // A READABLE REVISION WITHOUT THE EXACT VERIFIED BASIS: classified through the
+            // COMMON content classification. A PROVEN edit registers under the row's
+            // CURRENT identity (NO recovery-resolution override); the registered edit never
+            // advances. Foreign, clean and uncertain bytes defer unregistered.
+            return when (OfflineFolderController.protectionStateOf(row, basisCopy, userDrive)) {
+                OfflineFolderController.CopyProtection.DIRTY -> {
+                    val registered = runCatching {
+                        OfflineFolderController.registerDirtySnapshot(
+                            context = context,
+                            file = row,
+                            offlineFile = basisCopy,
+                            userDrive = userDrive,
+                        )
+                    }.getOrDefault(false)
+                    if (registered) OldSourceDisposition.RegisteredEdit else OldSourceDisposition.Deferred
+                }
+                OfflineFolderController.CopyProtection.NONE -> OldSourceDisposition.Clean
+                // UPLOADED/PENDING bytes are another pipeline's accounted state, historical
+                // bytes are unproven — neither is this operation's to advance over.
+                else -> OldSourceDisposition.Deferred
+            }
+        }
 
         /**
          * Shared, coordinated publication of a staged file into its final offline location
