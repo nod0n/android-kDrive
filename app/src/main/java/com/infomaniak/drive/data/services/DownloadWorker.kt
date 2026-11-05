@@ -91,6 +91,15 @@ class DownloadWorker(context: Context, workerParams: WorkerParameters) : BaseDow
                 result = Result.retry()
             }
 
+            // TYPED UNRESOLVED ESTABLISHMENT (issue: round 24 #20): a discarded
+            // unestablishable generation previously returned a TERMINAL failure — the
+            // retry conversion below only handled successful results, so retaining the
+            // marker did not keep this executing work retryable. The manager's typed flag
+            // converts it into retryable work; the durable intent stays.
+            if (result == Result.failure() && downloadOfflineFileManager.lastTransferGenerationUnresolved) {
+                result = Result.retry()
+            }
+
             if (result == Result.failure() && fileId > 0) notifyDownloadFinished()
             applicationContext.cancelNotification(fileId)
         }

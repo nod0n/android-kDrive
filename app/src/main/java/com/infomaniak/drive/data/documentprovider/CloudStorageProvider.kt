@@ -927,28 +927,36 @@ class CloudStorageProvider : DocumentsProvider() {
                             SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
                         }.isSuccess
                     }
-                    if (stagedOk &&
+                    // TYPED GENERATION-BOUND RESPONSE BINDING (issues: round 23 #22, round
+                    // 24 #19/#20): the SAF publication previously published current-route
+                    // response bytes under the EARLIER metadata capture's version — R2
+                    // bytes returned after an R1 metadata fetch received an R1 proof. The
+                    // shared post-download establishment runs before the coordinated
+                    // plain-cache publication, OUTSIDE every lock; FAILED leaves the staged
+                    // bytes to the finally-cleanup and the open fails. The typed answer
+                    // travels into the publication: a COARSE_UNRESOLVED generation
+                    // publishes with an explicitly unresolved (version-0) proof and
+                    // returns PUBLISHED_UNRESOLVED.
+                    val establishment = if (stagedOk) {
                         runBlocking {
-                            // GENERATION-BOUND RESPONSE BINDING (issue: round 23 #22): the
-                            // SAF publication previously published current-route response
-                            // bytes under the EARLIER metadata capture's version — R2
-                            // bytes returned after an R1 metadata fetch received an R1
-                            // proof. The shared post-download establishment runs before
-                            // the coordinated plain-cache publication, OUTSIDE every
-                            // lock; an unestablishable generation leaves the staged bytes
-                            // to the finally-cleanup, the open fails, and no
-                            // known-version proof is issued from an unbound response.
                             DownloadOfflineFileManager.reestablishDownloadedGeneration(
                                 file = file,
                                 userDrive = userDrive,
                                 okHttpClient = okHttpClient,
                             )
                         }
-                    ) {
+                    } else DownloadOfflineFileManager.GenerationEstablishment.FAILED
+                    if (establishment != DownloadOfflineFileManager.GenerationEstablishment.FAILED) {
                         val outcome = runBlocking {
-                            DownloadOfflineFileManager.publishStagedCacheCopy(context, file, cacheFile, userDrive, staged)
+                            DownloadOfflineFileManager.publishStagedCacheCopy(
+                                context, file, cacheFile, userDrive, staged,
+                                generationResolved = establishment ==
+                                    DownloadOfflineFileManager.GenerationEstablishment.ESTABLISHED,
+                            )
                         }
-                        if (outcome == PublicationOutcome.PUBLISHED) {
+                        if (outcome == PublicationOutcome.PUBLISHED ||
+                            outcome == PublicationOutcome.PUBLISHED_UNRESOLVED
+                        ) {
                             return ParcelFileDescriptor.open(cacheFile, accessMode)
                         }
                     }

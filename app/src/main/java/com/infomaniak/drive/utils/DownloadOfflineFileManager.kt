@@ -104,6 +104,15 @@ class DownloadOfflineFileManager(
     var lastTransferSuperseded: Boolean = false
         private set
 
+    /**
+     * Whether this transfer's downloaded bytes were discarded because their generation could
+     * not be established (issue: round 24 #20): the worker converts that failure into
+     * RETRYABLE work instead of a terminal failure — the durable intent (the pending marker)
+     * stays, and WorkManager re-drives the transfer with fresh state.
+     */
+    var lastTransferGenerationUnresolved: Boolean = false
+        private set
+
     private var lastUpdateProgressMillis = System.currentTimeMillis()
 
     /**
@@ -136,6 +145,7 @@ class DownloadOfflineFileManager(
         currentFile = file
         lastDownloadedFile = null
         lastTransferSuperseded = false
+        lastTransferGenerationUnresolved = false
         verificationMetadataDeferred = false
         verificationBasis = null
 
@@ -712,13 +722,18 @@ class DownloadOfflineFileManager(
             // copy is discarded and the intent retained (the pending marker stays for the
             // re-drive); the next pass re-fetches the metadata and re-downloads. No
             // known-version proof is manufactured from an unbound response.
-            val generationEstablished = reestablishDownloadedGeneration(
+            val generation = reestablishDownloadedGeneration(
                 file = file,
                 userDrive = userDrive,
                 okHttpClient = okHttpClient,
             )
-            if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated && !generationEstablished) {
+            if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated && generation == GenerationEstablishment.FAILED) {
                 runCatching { staged.delete() }
+                // TYPED UNRESOLVED, RETRYABLE (issue: round 24 #20): a discarded
+                // unestablishable generation is deferred work, never a terminal failure —
+                // the worker converts this failure into a retry and the durable intent
+                // (the pending marker) stays.
+                lastTransferGenerationUnresolved = true
                 SentryLog.i(
                     downloadWorker.workerTag(),
                     "Download of ${file.id} discarded: its generation could not be established against the server",
@@ -1045,11 +1060,21 @@ class DownloadOfflineFileManager(
          * record without a computable byte identity is not written — it could authorize
          * nothing.
          */
-        private fun writePublishedProvenance(context: Context, target: IOFile, file: File, userDrive: UserDrive): Boolean {
+        private fun writePublishedProvenance(
+            context: Context,
+            target: IOFile,
+            file: File,
+            userDrive: UserDrive,
+            unresolvedRecord: Boolean = false,
+        ): Boolean {
             val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
             return runCatching {
                 val provenance = PublishedProvenance(
-                    version = file.version?.number ?: 0,
+                    // EXPLICITLY UNRESOLVED PROOF (issue: round 24 #19): a publication whose
+                    // generation could not be established (an unrestablishable route, or the
+                    // both-unknown coarse tie) records VERSION 0 — the copy stays non-current
+                    // and no known-generation claim is issued from metadata equality.
+                    version = if (unresolvedRecord) 0 else file.version?.number ?: 0,
                     lastModifiedAt = file.lastModifiedAt,
                     revisedAt = file.revisedAt,
                     updatedAt = file.updatedAt,
@@ -1071,8 +1096,14 @@ class DownloadOfflineFileManager(
          * verifiable at the staged path — a missing staged record is failure, never a
          * successful movement of "nothing", on BOTH the offline and the plain-cache paths.
          */
-        private fun prepareStagedProvenance(context: Context, staged: IOFile, file: File, userDrive: UserDrive): Boolean {
-            if (!writePublishedProvenance(context, staged, file, userDrive)) return false
+        private fun prepareStagedProvenance(
+            context: Context,
+            staged: IOFile,
+            file: File,
+            userDrive: UserDrive,
+            unresolvedRecord: Boolean = false,
+        ): Boolean {
+            if (!writePublishedProvenance(context, staged, file, userDrive, unresolvedRecord)) return false
             return readPublishedProvenance(context, staged) != null
         }
 
@@ -1862,6 +1893,7 @@ class DownloadOfflineFileManager(
             staged: IOFile,
             onPublishedLocked: (() -> Unit)? = null,
             verificationBasis: File? = null,
+            explicitUnresolvedGeneration: Boolean = false,
         ): PublicationOutcome = withContext(Dispatchers.IO) {
             // ROOT-INTENT coordination for publication (issue: round 12 #8): an ancestry-
             // dependent publication must serialize with ancestry-changing writers (folder
@@ -1893,7 +1925,7 @@ class DownloadOfflineFileManager(
                 OfflineFileCoordination.withLocksFor(userDrive, listOfNotNull(file.id, preLockOwner?.id)) {
                     publishLockedCore(
                         userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
-                        verificationBasis,
+                        verificationBasis, explicitUnresolvedGeneration,
                     ) { coroutineContext.ensureActive() }
                 }
             }
@@ -1917,6 +1949,7 @@ class DownloadOfflineFileManager(
             lockedOwnerId: Int?,
             checkCancelled: () -> Unit,
             verificationBasis: File? = null,
+            explicitUnresolvedGeneration: Boolean = false,
         ): PublicationOutcome {
             checkCancelled()
             // HISTORICAL VERIFICATION BASIS (issue: round 24 #7): a verification transfer's
@@ -1990,8 +2023,9 @@ class DownloadOfflineFileManager(
                 // prove, so they are skipped and a later details-resolved pass completes.
                 // The assignment precedes the conditional so the lambda's TAIL stays the
                 // Boolean the caller's `if (!intentOk)` needs (round-19 build fix).
-                unresolvedGeneration = live != null &&
-                    (live.version?.number ?: 0) <= 0 && (casBasis.version?.number ?: 0) <= 0
+                unresolvedGeneration = explicitUnresolvedGeneration ||
+                    (live != null &&
+                        (live.version?.number ?: 0) <= 0 && (casBasis.version?.number ?: 0) <= 0)
                 if (isInheritedDownload) {
                     pinned || ancestryCovers
                 } else {
@@ -2196,7 +2230,7 @@ class DownloadOfflineFileManager(
             // the registry directories are created and verified and the staged record reads
             // back — a publication whose provenance cannot be established never moves its
             // bytes, instead of replacing the target first and deleting it afterwards.
-            if (!prepareStagedProvenance(provenanceContext, staged, file, userDrive)) {
+            if (!prepareStagedProvenance(provenanceContext, staged, file, userDrive, unresolvedRecord = explicitUnresolvedGeneration)) {
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
             }
@@ -2477,6 +2511,7 @@ class DownloadOfflineFileManager(
             target: IOFile,
             userDrive: UserDrive,
             staged: IOFile,
+            generationResolved: Boolean = true,
         ): PublicationOutcome = try {
             OfflineFileCoordination.withFileLock(userDrive, file.id) {
                 // Cancellation re-check AFTER the blocking lock (issue: round 18 #23):
@@ -2500,8 +2535,10 @@ class DownloadOfflineFileManager(
                     // PREPARE the staged record BEFORE the bytes are replaced (issue:
                     // round 18 #2): the registry directories are created and verified
                     // and the staged record reads back — a missing staged record is
-                    // failure, never a successful move of "nothing".
-                    if (!prepareStagedProvenance(context, staged, file, userDrive)) {
+                    // failure, never a successful move of "nothing". An UNRESOLVED
+                    // generation records VERSION 0 (issue: round 24 #19/#20): no
+                    // known-generation proof is issued from metadata equality.
+                    if (!prepareStagedProvenance(context, staged, file, userDrive, unresolvedRecord = !generationResolved)) {
                         PublicationOutcome.FAILED
                     } else {
                         // Cancellation AFTER the registry I/O, BEFORE the first mutation
@@ -2563,7 +2600,12 @@ class DownloadOfflineFileManager(
                                 staged.renameTo(target) && movePublishedProvenance(context, staged, target) -> {
                                     runCatching { recoveryFile?.delete() }
                                     recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
-                                    PublicationOutcome.PUBLISHED
+                                    // TYPED UNRESOLVED (issue: round 24 #19/#20): an
+                                    // unestablished generation is PUBLISHED_UNRESOLVED —
+                                    // never an unconditional PUBLISHED the preview could
+                                    // report as 100 or SAF accept as a proven generation.
+                                    if (generationResolved) PublicationOutcome.PUBLISHED
+                                    else PublicationOutcome.PUBLISHED_UNRESOLVED
                                 }
                                 // A FAILED RENAME NEVER DELETES THE OLD TARGET (issue: round 19
                                 // #11): the rename touched nothing — the retained bytes stay, and
@@ -2638,54 +2680,58 @@ class DownloadOfflineFileManager(
          * never touched before the staged copy is complete.
          */
         /**
-         * Generation establishment for a completed download (issue: round 22 #23, round 23
-         * #22): the download route carries no revision token, so the only available
-         * establishment is a post-download details comparison — and a LATER details
-         * response is not response-bound identity (nothing here establishes a server
-         * guarantee excluding cached/stale or ABA observations). Coarse field equality is
-         * accepted ONLY when NEITHER side reported a version: a KNOWN claimed version with
-         * an unknown fresh version passes nothing (the fresh response that cannot report a
-         * version against a versioned claim establishes no generation). Every `false`
-         * means the bytes' generation is UNKNOWABLE — the caller discards the bytes and
-         * preserves the intent; no known-version proof is manufactured from an unbound
-         * response.
+         * TYPED generation establishment for a completed download (issues: round 22 #23,
+         * round 23 #22, round 24 #19/#20): the download route carries no revision token, so
+         * the only available establishment is a post-download details comparison — and a
+         * LATER details response is not response-bound identity (nothing here establishes a
+         * server guarantee excluding cached/stale or ABA observations). The three answers
+         * travel TYPED to every publication path: [ESTABLISHED] may issue a known-generation
+         * proof; [COARSE_UNRESOLVED] (both sides version-less coarse equality, or an
+         * unrestablishable route such as a public share) publishes with an explicitly
+         * UNRESOLVED version-0 proof and an unresolved outcome — never a known-generation
+         * claim from metadata equality; [FAILED] means the bytes' generation is UNKNOWABLE —
+         * the caller discards the bytes and preserves the intent.
          */
-        private fun downloadedGenerationEstablished(file: File, fresh: File): Boolean {
-            val freshVersion = fresh.version?.number ?: 0
-            val claimedVersion = file.version?.number ?: 0
-            return when {
-                freshVersion > 0 && claimedVersion > 0 ->
-                    freshVersion == claimedVersion && fresh.revisedAt == file.revisedAt
-                freshVersion <= 0 && claimedVersion <= 0 ->
-                    fresh.revisedAt == file.revisedAt &&
-                        fresh.lastModifiedAt == file.lastModifiedAt &&
-                        fresh.size == file.size
-                // KNOWN CLAIMED, UNKNOWN FRESH (issue: round 23 #22): the previous coarse
-                // fallback accepted this arm — a versioned claim meeting a version-less
-                // details response was "proved" by mutable field equality alone.
-                else -> false
-            }
-        }
+        internal enum class GenerationEstablishment { ESTABLISHED, COARSE_UNRESOLVED, FAILED }
 
         /**
          * The post-download details re-fetch (OUTSIDE every lock) that the worker's and the
-         * direct callers' generation binding runs before any publication (issue: round 22
-         * #23, round 23 #22). An indeterminate answer (transport failure, error response,
-         * identity mismatch, unestablishable comparison) is `false`, never a pass.
+         * direct callers' generation binding runs before any publication (issues: round 22
+         * #23, round 23 #22, round 24 #19/#20). An indeterminate answer (transport failure,
+         * error response, identity mismatch, unestablishable comparison) is [GenerationEstablishment.FAILED],
+         * never a pass; the both-unknown coarse tie is [GenerationEstablishment.COARSE_UNRESOLVED].
          */
         internal suspend fun reestablishDownloadedGeneration(
             file: File,
             userDrive: UserDrive,
             okHttpClient: OkHttpClient,
-        ): Boolean = runCatching {
+        ): GenerationEstablishment = runCatching {
             val postDownload = ApiRepository.getFileDetails(
                 file = File(id = file.id, driveId = userDrive.driveId),
                 okHttpClient = okHttpClient,
             )
             postDownload.data
                 ?.takeIf { postDownload.isSuccess() && it.id == file.id }
-                ?.let { fresh -> downloadedGenerationEstablished(file, fresh) }
-        }.getOrDefault(null) == true
+                ?.let { fresh ->
+                    val freshVersion = fresh.version?.number ?: 0
+                    val claimedVersion = file.version?.number ?: 0
+                    when {
+                        freshVersion > 0 && claimedVersion > 0 &&
+                            freshVersion == claimedVersion && fresh.revisedAt == file.revisedAt ->
+                            GenerationEstablishment.ESTABLISHED
+                        freshVersion <= 0 && claimedVersion <= 0 &&
+                            fresh.revisedAt == file.revisedAt &&
+                            fresh.lastModifiedAt == file.lastModifiedAt &&
+                            fresh.size == file.size ->
+                            // Both sides version-less: the coarse tie is the only evidence —
+                            // published, but with an explicitly UNRESOLVED (version-0) proof.
+                            GenerationEstablishment.COARSE_UNRESOLVED
+                        // KNOWN CLAIMED, UNKNOWN FRESH (issue: round 23 #22): a versioned
+                        // claim meeting a version-less details response establishes nothing.
+                        else -> GenerationEstablishment.FAILED
+                    }
+                } ?: GenerationEstablishment.FAILED
+        }.getOrDefault(GenerationEstablishment.FAILED)
 
         internal suspend fun publishDownloadedCopy(
             context: Context,
@@ -2717,35 +2763,52 @@ class DownloadOfflineFileManager(
                 // the staged path (issue: round 17 #1) and is re-keyed after the rename, and
                 // a record-commit failure fails closed.
                 val staged = IOFile(target.parentFile, "${target.name}.${UUID.randomUUID()}.part")
-                val stagedComplete = runCatching { writeStaged(staged) }
-                    .onFailure { exception ->
-                        SentryLog.e(TAG, "Staged cache transfer failed for ${target.path}", exception)
-                    }.isSuccess
-                if (!stagedComplete) {
+                try {
+                    val stagedComplete = runCatching { writeStaged(staged) }
+                        .onFailure { exception ->
+                            SentryLog.e(TAG, "Staged cache transfer failed for ${target.path}", exception)
+                        }.isSuccess
+                    if (!stagedComplete) {
+                        return PublicationOutcome.FAILED
+                    }
+                    // ONE CLEANUP LIFETIME (issue: round 24 #21): staging, client
+                    // acquisition, validation and publication run inside the try — a throw
+                    // or cancellation between them can no longer leave the staged bytes (or
+                    // a prepared record) behind; the finally cleans up every unpublished
+                    // artifact while cancellation propagates.
+                    // TYPED GENERATION BINDING, EVERY DIRECT CALLER (issues: round 23 #22,
+                    // round 24 #19/#20): the preview, dialog and SAF publications
+                    // previously published current-route response bytes under the EARLIER
+                    // metadata capture's version. An ESTABLISHED generation may issue a
+                    // known proof; a COARSE_UNRESOLVED one (both sides version-less, or the
+                    // public-share routes that cannot re-establish the generation at all)
+                    // publishes with an explicitly UNRESOLVED version-0 proof and an
+                    // unresolved outcome; FAILED discards the staged bytes and fails the
+                    // transfer — nothing is published, no intent/marker is consumed, and no
+                    // known-version proof is issued from an unbound response.
+                    val establishment = if (file.isPublicShared()) {
+                        GenerationEstablishment.COARSE_UNRESOLVED
+                    } else {
+                        reestablishDownloadedGeneration(
+                            file = file,
+                            userDrive = userDrive,
+                            okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
+                        )
+                    }
+                    when (establishment) {
+                        GenerationEstablishment.FAILED -> PublicationOutcome.FAILED
+                        else -> publishStagedCacheCopy(
+                            context, file, target, userDrive, staged,
+                            generationResolved = establishment == GenerationEstablishment.ESTABLISHED,
+                        )
+                    }
+                } finally {
+                    // Staging cleanup on EVERY path, cancellation included (issues: round
+                    // 18 #23, round 24 #21), INCLUDING the staged provenance record: a
+                    // prepared record whose bytes were never published must not linger.
                     runCatching { if (staged.exists()) staged.delete() }
-                    return PublicationOutcome.FAILED
+                    runCatching { deletePublishedProvenance(context, staged) }
                 }
-                // GENERATION-BOUND RESPONSE BINDING, EVERY DIRECT CALLER (issue: round 23
-                // #22): the preview, dialog and SAF publications previously published
-                // current-route response bytes under the EARLIER metadata capture's
-                // version — R2 bytes returned after an R1 metadata fetch received an R1
-                // proof. The worker's post-download establishment runs here too, OUTSIDE
-                // every lock, before any publication; an unestablishable generation
-                // discards the staged bytes and fails the transfer — nothing is
-                // published, no intent/marker is consumed, and no known-version proof is
-                // issued from an unbound response. (Public-share destinations are out of
-                // scope: the share routes cannot re-establish generation here at all.)
-                if (!file.isPublicShared() &&
-                    !reestablishDownloadedGeneration(
-                        file = file,
-                        userDrive = userDrive,
-                        okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
-                    )
-                ) {
-                    runCatching { if (staged.exists()) staged.delete() }
-                    return PublicationOutcome.FAILED
-                }
-                publishStagedCacheCopy(context, file, target, userDrive, staged)
             } else {
                 val appContext = Realm.getApplicationContext()
                 if (appContext == null) {
@@ -2753,36 +2816,46 @@ class DownloadOfflineFileManager(
                     return PublicationOutcome.FAILED
                 }
                 val staged = newStagedFile(appContext, file)
-                val outcome = runCatching {
-                    writeStaged(staged)
-                    // GENERATION-BOUND RESPONSE BINDING, EVERY DIRECT CALLER (issue:
-                    // round 23 #22): the same establishment as the worker and the plain
-                    // cache branch, OUTSIDE every lock, before any publication. An
-                    // unestablishable generation fails the transfer: the failure path
-                    // below discards the staged bytes and any prepared record, no
-                    // intent/marker is consumed, and no known-version proof is issued
-                    // from an unbound response. (Public-share destinations are out of
-                    // scope: the share routes cannot re-establish generation here.)
-                    if (!file.isPublicShared() &&
-                        !reestablishDownloadedGeneration(
-                            file = file,
-                            userDrive = userDrive,
-                            okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
-                        )
-                    ) {
-                        error("Downloaded generation could not be established for file ${file.id}")
-                    }
-                    publishStagedOfflineFile(userDrive, isInheritedDownload, file, target, staged)
-                }.onFailure { exception ->
-                    SentryLog.e(TAG, "Staged offline publication failed for ${target.path}", exception)
-                }.getOrDefault(PublicationOutcome.FAILED)
-
-                // Staging cleanup on EVERY path (issue: round 18 #23), INCLUDING the staged
-                // provenance record (issue: round 19 #11): a prepared record whose bytes
-                // were never published must not linger in the registry.
-                runCatching { if (staged.exists()) staged.delete() }
-                runCatching { deletePublishedProvenance(appContext, staged) }
-                outcome
+                try {
+                    runCatching {
+                        writeStaged(staged)
+                        // TYPED GENERATION BINDING, EVERY DIRECT CALLER (issues: round 23
+                        // #22, round 24 #19/#20), as in the plain-cache branch: FAILED fails
+                        // the transfer (no intent/marker consumed, no known-version proof
+                        // from an unbound response); COARSE_UNRESOLVED — including the
+                        // public-share routes that cannot re-establish the generation —
+                        // publishes with an explicitly UNRESOLVED version-0 proof and an
+                        // unresolved outcome.
+                        val establishment = if (file.isPublicShared()) {
+                            GenerationEstablishment.COARSE_UNRESOLVED
+                        } else {
+                            reestablishDownloadedGeneration(
+                                file = file,
+                                userDrive = userDrive,
+                                okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
+                            )
+                        }
+                        when {
+                            establishment == GenerationEstablishment.FAILED ->
+                                error("Downloaded generation could not be established for file ${file.id}")
+                            else -> publishStagedOfflineFile(
+                                userDrive, isInheritedDownload, file, target, staged,
+                                explicitUnresolvedGeneration =
+                                    establishment == GenerationEstablishment.COARSE_UNRESOLVED,
+                            )
+                        }
+                    }.onFailure { exception ->
+                        SentryLog.e(TAG, "Staged offline publication failed for ${target.path}", exception)
+                    }.getOrDefault(PublicationOutcome.FAILED)
+                } finally {
+                    // ONE CLEANUP LIFETIME (issue: round 24 #21): the cleanup runs in the
+                    // finally — a cancellation escaping writeStaged, the client acquisition
+                    // or the establishment can no longer skip it. Staging cleanup on EVERY
+                    // path (issue: round 18 #23), INCLUDING the staged provenance record
+                    // (issue: round 19 #11).
+                    runCatching { if (staged.exists()) staged.delete() }
+                    runCatching { deletePublishedProvenance(appContext, staged) }
+                }
             }
         }
 
