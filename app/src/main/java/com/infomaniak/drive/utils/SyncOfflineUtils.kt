@@ -39,6 +39,7 @@ import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.data.models.file.FileLastActivityBody
 import com.infomaniak.drive.data.models.file.LastFileAction
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.RelocationReceipt
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.OfflineFileCoordination
@@ -1299,7 +1300,7 @@ object SyncOfflineUtils {
         // THE OPERATION-SPECIFIC RECEIPT (review-37 #2): returned by THIS flow's successful
         // relocation and passed explicitly to the second preservation boundary and the
         // conditional commit — never a generic journal search.
-        var relocationReceipt: DownloadOfflineFileManager.RelocationReceipt? = null
+        var relocationReceipt: RelocationReceipt? = null
 
         if (pathChanged) {
             // A pending download marker leaves this refresh to the queued worker, which runs

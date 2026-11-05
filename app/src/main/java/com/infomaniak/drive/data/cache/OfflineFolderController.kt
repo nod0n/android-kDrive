@@ -27,6 +27,7 @@ import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.ProofRelocationFlow
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.RelocationReceipt
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
@@ -610,7 +611,7 @@ object OfflineFolderController {
         userDrive: UserDrive,
         newOfflineTarget: IOFile? = null,
         realm: Realm? = null,
-        onRelocationReceipt: ((DownloadOfflineFileManager.RelocationReceipt) -> Unit)? = null,
+        onRelocationReceipt: ((RelocationReceipt) -> Unit)? = null,
     ): Boolean {
         // SOURCE-OWNERSHIP GATE before any snapshot or deletion (issue: round 16 #3): when the
         // caller supplies its Realm, the old path must be EXCLUSIVELY claimed by this file's
@@ -864,7 +865,7 @@ object OfflineFolderController {
             FileController.isStaleReplacement(live, incoming, observed)
         },
         observedById: Map<Int, File> = emptyMap(),
-        relocationReceipt: DownloadOfflineFileManager.RelocationReceipt? = null,
+        relocationReceipt: RelocationReceipt? = null,
     ): List<File> {
         val context = Realm.getApplicationContext() ?: return remoteFiles
         if (remoteFiles.isEmpty()) return remoteFiles

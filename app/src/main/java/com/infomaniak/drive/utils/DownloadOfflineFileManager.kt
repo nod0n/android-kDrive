@@ -71,6 +71,7 @@ import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.coroutineContext
 import okhttp3.Request
 import okhttp3.Response
+import java.util.Date
 import java.util.UUID
 
 /**
@@ -3755,13 +3756,21 @@ class DownloadOfflineFileManager(
                 is ScopedAuthority.Resolved -> authority.scope.sharedWithMe
                 else -> return null
             }
+            // THE VALIDATED IDENTITY LOCALS (review-37 compile repair): the decoder's ids are
+            // nullable parse results and the receipt's identity fields are required Ints.
+            // identitiesValid above already implies them; the locals restate that validation
+            // compiler-visibly and FAIL CLOSED — a missing identity yields NO receipt (no
+            // exemption, no disposal), never !! and never an invented id.
+            val proofFileId = parsed.proofFileId ?: return null
+            val proofUserId = parsed.proofUserId ?: return null
+            val proofDriveId = parsed.proofDriveId ?: return null
             return RelocationReceipt(
                 targetPath = target.absolutePath,
                 sourcePath = parsed.recordedSourcePath,
                 publicationId = publicationIdOfRecordText(parsed.proofText),
-                fileId = parsed.proofFileId,
-                userId = parsed.proofUserId,
-                driveId = parsed.proofDriveId,
+                fileId = proofFileId,
+                userId = proofUserId,
+                driveId = proofDriveId,
                 sharedWithMe = sharedWithMe,
             )
         }

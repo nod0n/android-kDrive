@@ -45,6 +45,7 @@ import com.infomaniak.drive.data.models.file.SpecialFolder.SharedWithMe
 import com.infomaniak.drive.data.services.MqttClientWrapper
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.RelocationReceipt
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.RealmModules
@@ -672,7 +673,7 @@ object FileController {
                     // would roll the row back. The stale operation defers; the authoritative
                     // current identity stays and a later listing/details pass reconciles.
                     if (renameRequestStillCurrent(file.id, observedName, observedParentId, userDrive, realm)) {
-                        var preservedReceipt: DownloadOfflineFileManager.RelocationReceipt? = null
+                        var preservedReceipt: RelocationReceipt? = null
                         val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm) { receipt ->
                             preservedReceipt = receipt
                         }
@@ -753,7 +754,7 @@ object FileController {
         newName: String,
         userDrive: UserDrive?,
         customRealm: Realm?,
-        onRelocationReceipt: ((DownloadOfflineFileManager.RelocationReceipt) -> Unit)? = null,
+        onRelocationReceipt: ((RelocationReceipt) -> Unit)? = null,
     ): Boolean {
         val context = Realm.getApplicationContext() ?: return false
         val scope = userDrive ?: UserDrive()
