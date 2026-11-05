@@ -1420,7 +1420,15 @@ class DownloadOfflineFileManager(
             file: File,
             userDrive: UserDrive,
             unresolvedRecord: Boolean = false,
+            destination: IOFile = staged,
         ): Boolean {
+            // THE OBSERVATION BINDS THE ACTUAL PUBLICATION DESTINATION AND THE ATTEMPT'S
+            // IDENTITY (issues: round 29 #6/#7): the previous writer recorded the STAGING
+            // path, so the reader's location requirement rejected every observation its
+            // own publication produced — suppression could never fire. The location is the
+            // CALLER'S final target; the attempt identity is the freshly written record's
+            // publication id (a relocation keeps it; a restoration's fresh identity ends
+            // the binding, which is correct — a new attempt needs new evidence).
             if (!writePublishedProvenance(context, staged, file, userDrive, unresolvedRecord)) return false
             // THE DURABLE ATTEMPTED OBSERVATION (issues: round 28 #13 and its follow-up):
             // the unresolved record's version field is BY DESIGN zero (the unresolved
@@ -1432,17 +1440,27 @@ class DownloadOfflineFileManager(
             // byte provenance. It is evidence only for "can another attempt gain
             // anything", never a byte-generation proof.
             if (unresolvedRecord) {
+                val attemptId = readPublishedProvenance(context, staged)?.publicationId
+                    ?: return false
                 val observationText = (
                     listOf(
                         "1",
+                        attemptId.toString(),
                         (file.version?.number ?: 0).toString(),
                         file.size?.toString() ?: "",
                         file.revisedAt.toString(),
                         file.lastModifiedAt.toString(),
                         file.updatedAt.toString(),
-                    ) + staged.absolutePath
+                    ) + destination.absolutePath
                     ).joinToString("|")
-                if (!atomicWriteText(IOFile(provenanceFileFor(context, staged).path + ".obs"), observationText)) {
+                // ATOMIC WRITE AND READ-BACK (issue: round 29 #7): a failed or interrupted
+                // observation preparation FAILS the publication preparation (the staged
+                // state is cleaned by the caller) — no publication proceeds whose retry
+                // evidence could not be durably bound.
+                val observationFile = IOFile(provenanceFileFor(context, staged).path + ".obs")
+                if (!atomicWriteText(observationFile, observationText) ||
+                    runCatching { observationFile.readText().trim() }.getOrNull() != observationText
+                ) {
                     return false
                 }
             }
@@ -1606,6 +1624,10 @@ class DownloadOfflineFileManager(
 
         internal fun deletePublishedProvenance(context: Context, publishedFile: IOFile) {
             runCatching { provenanceFileFor(context, publishedFile).delete() }
+            // THE OBSERVATION DIES WITH ITS PUBLICATION (issue: round 29 #7): a disposed
+            // proof never lends its attempt's retry evidence to bytes later published at
+            // the same path.
+            runCatching { IOFile(provenanceFileFor(context, publishedFile).path + ".obs").delete() }
         }
 
         /**
@@ -2047,16 +2069,29 @@ class DownloadOfflineFileManager(
                 deletePublishedProvenance(context, source)
                 return false
             }
-            // THE ATTEMPTED OBSERVATION TRAVELS WITH THE RECORD (issue: round 28 #13):
-            // the durable remote-observation sidecar is re-keyed to the destination (an
-            // unresolved relocation keeps its retry evidence); the source's copy dies with
-            // the source record.
-            runCatching {
-                val sourceObs = IOFile(provenanceFileFor(context, source).path + ".obs")
-                val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
-                if (sourceObs.exists()) {
-                    targetObs.writeText(sourceObs.readText())
+            // THE ATTEMPTED OBSERVATION TRAVELS WITH THE RECORD, REWRITTEN AND VERIFIED
+            // (issues: round 28 #13, round 29 #6/#7): an AUTHORIZED RELOCATION re-binds
+            // the observation's location to the NEW destination (an unchanged copy would
+            // be rejected by its own reader) and keeps the attempt's publication id; the
+            // write is ATOMIC and read back — a failure RETAINS the recoverable state and
+            // fails the move (never an ignored writeText beside a successful
+            // publication).
+            val sourceObs = IOFile(provenanceFileFor(context, source).path + ".obs")
+            val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (sourceObs.exists()) {
+                val rebound = sourceObs.readText().trim().split("|").toMutableList()
+                if (rebound.size >= 7 && rebound[0] == "1") {
+                    val reboundText = (rebound.dropLast(1) + target.absolutePath).joinToString("|")
+                    if (!atomicWriteText(targetObs, reboundText) ||
+                        runCatching { targetObs.readText().trim() }.getOrNull() != reboundText
+                    ) {
+                        return false
+                    }
                     runCatching { sourceObs.delete() }
+                } else {
+                    // An unparseable observation is not durable evidence: the relocation
+                    // carries no binding and the move fails closed, retaining state.
+                    return false
                 }
             }
             deletePublishedProvenance(context, source)
@@ -3455,7 +3490,15 @@ class DownloadOfflineFileManager(
             // the registry directories are created and verified and the staged record reads
             // back — a publication whose provenance cannot be established never moves its
             // bytes, instead of replacing the target first and deleting it afterwards.
-            if (!prepareStagedProvenance(provenanceContext, staged, file, userDrive, unresolvedRecord = explicitUnresolvedGeneration)) {
+            if (!prepareStagedProvenance(
+                    provenanceContext,
+                    staged,
+                    file,
+                    userDrive,
+                    unresolvedRecord = explicitUnresolvedGeneration,
+                    destination = target,
+                )
+            ) {
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
             }
@@ -3781,7 +3824,15 @@ class DownloadOfflineFileManager(
                     // failure, never a successful move of "nothing". An UNRESOLVED
                     // generation records VERSION 0 (issue: round 24 #19/#20): no
                     // known-generation proof is issued from metadata equality.
-                    if (!prepareStagedProvenance(context, staged, file, userDrive, unresolvedRecord = !generationResolved)) {
+                    if (!prepareStagedProvenance(
+                            context,
+                            staged,
+                            file,
+                            userDrive,
+                            unresolvedRecord = !generationResolved,
+                            destination = target,
+                        )
+                    ) {
                         PublicationOutcome.FAILED
                     } else {
                         // Cancellation AFTER the registry I/O, BEFORE the first mutation
@@ -3979,13 +4030,18 @@ class DownloadOfflineFileManager(
             // THE OBSERVATION'S LOCATION MUST BE THIS DESTINATION (issue: round 28 #13
             // follow-up): a sidecar re-keyed by a relocation or a record at a reused path
             // is not this destination's attempt evidence.
-            val attemptedLocation = observation.drop(6).joinToString("|")
+            val attemptedLocation = observation.drop(7).joinToString("|")
             if (attemptedLocation != target.absolutePath) return@runCatching false
-            val attemptedVersion = observation[1].toIntOrNull() ?: return@runCatching false
-            val attemptedSize = observation[2].toLongOrNull()
-            val attemptedRevisedAt = observation[3].toLongOrNull() ?: return@runCatching false
-            val attemptedLastModifiedAt = observation[4].toLongOrNull() ?: return@runCatching false
-            val attemptedUpdatedAt = observation[5].toLongOrNull() ?: return@runCatching false
+            // THE ATTEMPT IDENTITY BINDING (issue: round 29 #6): the observation belongs
+            // to the SPECIFIC publication/attempt whose record now sits at the target — a
+            // restoration or re-publication writes a FRESH publication id and thereby ends
+            // the old attempt's binding (its suppression evidence is spent).
+            if (proof.publicationId != observation[1].toLongOrNull()) return@runCatching false
+            val attemptedVersion = observation[2].toIntOrNull() ?: return@runCatching false
+            val attemptedSize = observation[3].toLongOrNull()
+            val attemptedRevisedAt = observation[4].toLongOrNull() ?: return@runCatching false
+            val attemptedLastModifiedAt = observation[5].toLongOrNull() ?: return@runCatching false
+            val attemptedUpdatedAt = observation[6].toLongOrNull() ?: return@runCatching false
             row.revisedAt == attemptedRevisedAt &&
                 row.lastModifiedAt == attemptedLastModifiedAt &&
                 row.updatedAt == attemptedUpdatedAt &&
