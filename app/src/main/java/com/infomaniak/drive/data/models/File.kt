@@ -555,7 +555,11 @@ open class File(
      */
     fun deleteCaches(context: Context, userDrive: UserDrive): Boolean {
         if (isOffline || isInOfflineFolder) {
-            val offlineFile = getOfflineFile(context, userDrive.userId) ?: run {
+            // THE COMPLETE REALM FLAVOR (issue: round 28 #7): a shared row's offline path
+            // resolves through the CAPTURED shared graph — the ordinary lookup could
+            // return no path (allowing row removal without preserving shared bytes) or an
+            // ordinary row's different location.
+            val offlineFile = getOfflineFile(context, userDrive.userId, sharedWithMe = userDrive.sharedWithMe) ?: run {
                 // THE RECOVERY CHECK DOES NOT NEED THE TARGET (issue: round 25 #7): an
                 // unresolvable path with an unresolved recovery governing this IDENTITY
                 // retains the owning row — the previous order returned true for a null

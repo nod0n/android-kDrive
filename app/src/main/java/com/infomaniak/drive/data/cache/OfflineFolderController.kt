@@ -1057,7 +1057,15 @@ object OfflineFolderController {
     fun preserveInheritedCopyBeforeRemoval(file: File, userDrive: UserDrive, realm: Realm? = null): PreservationOutcome {
         val context = Realm.getApplicationContext() ?: return PreservationOutcome.PRESERVED
         if (file.isOffline || file.isFolder() || !file.isInOfflineFolder) return PreservationOutcome.CONTENT_SAFE
-        val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return PreservationOutcome.CONTENT_SAFE
+        // THE COMPLETE REALM FLAVOR + UNRESOLVED SHARED PATHS DEFER (issue: round 28 #7):
+        // a shared row's path resolves through the CAPTURED shared graph; a shared path
+        // that still cannot be resolved is UNRESOLVED — removal defers (PRESERVED), it is
+        // never "nothing to preserve" (the previous ordinary lookup could return no path
+        // and let a shared row be removed without its bytes being classified).
+        val offlineFile = file.getOfflineFile(context, userDrive.userId, sharedWithMe = userDrive.sharedWithMe)
+        if (offlineFile == null) {
+            return if (userDrive.sharedWithMe) PreservationOutcome.PRESERVED else PreservationOutcome.CONTENT_SAFE
+        }
         if (!offlineFile.exists()) return PreservationOutcome.CONTENT_SAFE
         // FRESH exclusive source ownership is MANDATORY inside this preservation API (issue:
         // round 18 #5, same class as the replacement decision): a caller without a Realm gets
@@ -1071,7 +1079,9 @@ object OfflineFolderController {
                     runCatching { freshRealm.refresh() }
                     val live = FileController.getFileById(freshRealm, file.id)
                         ?: return@withFileLock PreservationOutcome.PRESERVED
-                    val liveOfflinePath = live.getOfflineFile(context, userDrive.userId)?.path
+                    val liveOfflinePath = live.getOfflineFile(
+                        context, userDrive.userId, sharedWithMe = userDrive.sharedWithMe,
+                    )?.path
                     if (liveOfflinePath != offlineFile.path) return@withFileLock PreservationOutcome.PRESERVED
                     preserveWithFreshOwnership(context, live, offlineFile, userDrive, freshRealm)
                 }

@@ -1020,9 +1020,22 @@ object FolderFilesProvider {
                         } else {
                             when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(liveRow, userDrive, realm)) {
                                 OfflineFolderController.PreservationOutcome.CONTENT_SAFE -> {
-                                    runCatching { liveRow.deleteCaches(context, userDrive) }
-                                    realm.executeTransaction { if (liveRow.isValid) liveRow.deleteFromRealm() }
-                                    true
+                                    // THE ACTUAL DISPOSAL RESULT GATES THE ROW (issue:
+                                    // round 28 #8): a FALSE (retained bytes — e.g. a missing
+                                    // target whose pending recovery backup still needs its
+                                    // live owner) or THROWN disposal RETAINS the row, its
+                                    // required ancestry and the deferred outcome — the
+                                    // activity is not consumed and the recovery's live-owner
+                                    // validation is never stranded. The previous shape
+                                    // deleted the row unconditionally over a deferred false.
+                                    val bytesDisposed = runCatching {
+                                        liveRow.deleteCaches(context, userDrive)
+                                    }.getOrDefault(false)
+                                    if (!bytesDisposed) false
+                                    else {
+                                        realm.executeTransaction { if (liveRow.isValid) liveRow.deleteFromRealm() }
+                                        true
+                                    }
                                 }
                                 // Preservation pending: row, bytes and cursor retained.
                                 OfflineFolderController.PreservationOutcome.PRESERVED -> false
