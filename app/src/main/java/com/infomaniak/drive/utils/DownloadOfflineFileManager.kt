@@ -846,6 +846,30 @@ class DownloadOfflineFileManager(
                             val ancestryUsable = freshForAdvance.parentId <= 0 ||
                                 FileController.usableAncestryChain(realm, freshForAdvance.parentId)
                             if (!coverageStands || !ancestryUsable) return@withFileLock
+                            // THE INCOMING IDENTITY'S POST-COMMIT DESTINATION (issue: round
+                            // 30 #3): the attempted observation matches the recorded
+                            // generation fields, but that does not establish that the
+                            // INCOMING identity resolves — under the CURRENT fresh ancestry
+                            // — to the destination the attempt published to. A rename or
+                            // move within the same timestamp interval would otherwise be
+                            // accepted by the conditional upsert onto a location holding
+                            // neither the certified bytes nor their provenance. A differing
+                            // (or underivable) destination belongs to the normal relocation
+                            // protocol, never this bare advance — and the current source is
+                            // not labelled "absent" merely because it equals the previously
+                            // selected target: this validation runs BEFORE the old-source
+                            // step below.
+                            val incomingDestination = FileController.deriveIncomingOfflinePath(
+                                realm = realm,
+                                incoming = freshForAdvance,
+                                userDrive = userDrive,
+                                context = context,
+                            )
+                            if (incomingDestination == null ||
+                                incomingDestination.absolutePath != offlineFile.absolutePath
+                            ) {
+                                return@withFileLock
+                            }
                             // THE COMPLETE PRESERVATION/ADVANCEMENT PROTOCOL (issue: round 29
                             // masked flow A): the row's OLD source (its current location,
                             // when it differs from the certified destination) classifies

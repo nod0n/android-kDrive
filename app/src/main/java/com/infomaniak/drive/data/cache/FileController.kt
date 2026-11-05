@@ -152,6 +152,38 @@ object FileController {
     }
 
     /**
+     * THE INCOMING IDENTITY'S POST-COMMIT DESTINATION (issue: round 30 #3): the offline
+     * location the INCOMING metadata identity would resolve to AFTER its commit — its own
+     * stored path when carried, otherwise [incoming.parentId]'s CURRENT chain plus its
+     * name — derived through the same generation logic the live rows use ([generatePath]
+     * on the managed parent row), and assembled exactly like [File.getOfflineFile].
+     * Strictly READ-ONLY: no path persistence, no writes, no directories created. Returns
+     * null when the destination cannot be derived (a missing parent row, an incomplete
+     * chain) — the caller defers, never guessing.
+     */
+    internal fun deriveIncomingOfflinePath(
+        realm: Realm,
+        incoming: File,
+        userDrive: UserDrive,
+        context: Context,
+    ): IOFile? {
+        val remotePath = incoming.path.ifBlank {
+            if (incoming.parentId <= 0) return null
+            val parentRow = realm.where(File::class.java)
+                .equalTo(File::id.name, incoming.parentId)
+                .findFirst() ?: return null
+            val parentPath = generatePath(parentRow, userDrive)
+            if (parentPath.isBlank()) return null
+            "$parentPath/${incoming.name}"
+        }
+        if (remotePath.isBlank()) return null
+        val rootFolder = IOFile(File.getOfflineFolder(context), "${userDrive.userId}/${userDrive.driveId}")
+        val child = if (incoming.isFolder()) remotePath else remotePath.substringBeforeLast("/")
+        val folder = IOFile(rootFolder, child)
+        return if (incoming.isFolder()) folder else IOFile(folder, incoming.name)
+    }
+
+    /**
      * SYNCHRONOUS path persistence for flows whose own later step depends on the persisted
      * path within the same operation (issue: round 24 #14): the detached coroutine of
      * [generateAndSavePath] can complete only AFTER the caller finished — a cross-Realm
