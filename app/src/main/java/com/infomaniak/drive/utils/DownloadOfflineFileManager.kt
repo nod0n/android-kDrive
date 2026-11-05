@@ -1230,6 +1230,8 @@ class DownloadOfflineFileManager(
          * publicationId|location(re-joined).
          */
         private const val PROVENANCE_FRAME = "v2|"
+        private const val SIDECAR_FRAME = "s2|"
+        private val KNOWN_STORAGE_KINDS = setOf("offline", "cache", "converted")
 
         private fun PublishedProvenance.recordText(target: IOFile): String =
             PROVENANCE_FRAME + "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${contentHash ?: ""}|$publicationId|${target.absolutePath}"
@@ -1479,6 +1481,20 @@ class DownloadOfflineFileManager(
             true
         }.getOrDefault(false)
 
+        /**
+         * THE ACTUAL DESTINATION KIND of a publication target (issue: round 27 #9): the
+         * same resolution [File.getStoredFile] uses — the ordinary offline path, the
+         * onlyoffice CONVERTED-PDF cache, or the plain per-scope cache. A converted or
+         * plain-cache target is never mislabeled "offline" (its recovery could then never
+         * re-resolve its own destination).
+         */
+        private fun destinationStorageKind(context: Context, file: File, target: IOFile, userDrive: UserDrive): String =
+            when (target.absolutePath) {
+                file.getOfflineFile(context, userDrive.userId)?.absolutePath -> "offline"
+                file.getConvertedPdfCache(context, userDrive).absolutePath -> "converted"
+                else -> "cache"
+            }
+
         private class RecoveredScope(
             val userId: Int,
             val driveId: Int,
@@ -1512,25 +1528,64 @@ class DownloadOfflineFileManager(
             storageKind: String = "offline",
         ): Boolean = atomicWriteText(
             IOFile(recordFile.path + ".scope"),
-            "$userId|$driveId|$fileId|${if (sharedWithMe) 1 else 0}|$storageKind|$targetPath",
+            // EXPLICIT FRAMING (issue: round 27 #10): the previous unframed format was
+            // ambiguous — a legacy four-field record whose PATH contains '|' has six or
+            // more components and was misread as shared/kind fields. New sidecars carry
+            // the "s2|" frame; the location is always the re-joined tail.
+            "s2|$userId|$driveId|$fileId|${if (sharedWithMe) 1 else 0}|$storageKind|$targetPath",
         )
 
-        /** The parsed scope sidecar of [recordFile], or null when absent/undecodable. */
-        private fun readScopeSidecar(recordFile: IOFile): RecoveredScope? = runCatching {
-            val parts = IOFile(recordFile.path + ".scope").readText().trim().split("|")
-            require(parts.size >= 4)
-            if (parts.size >= 6) {
+        /**
+         * The parsed scope sidecar of [recordFile], or null when absent/undecodable
+         * (issue: round 27 #10): a framed "s2|" record parses its typed fields with
+         * VALIDATION (shared ∈ {0,1}, kind ∈ the known set — an invalid value is
+         * undecodable, never silently re-interpreted). An UNFRAMED record is legacy: the
+         * COMPLETE tail after the identity fields is the PATH (re-joined — it may contain
+         * '|'), with the documented conservative defaults; a six-field unframed record
+         * from the immediately preceding version is recognized ONLY when its shared/kind
+         * fields carry valid values. When [expectedFileId]/[expectedTargetPath] are
+         * supplied (the caller has the operation body), the sidecar's identity/path are
+         * CROSS-CHECKED against them — a mismatched index is undecodable for this
+         * operation (fail closed), never silently trusted.
+         */
+        private fun readScopeSidecar(
+            recordFile: IOFile,
+            expectedFileId: Int? = null,
+            expectedTargetPath: String? = null,
+        ): RecoveredScope? = runCatching {
+            val text = IOFile(recordFile.path + ".scope").readText().trim()
+            val framed = text.startsWith(SIDECAR_FRAME)
+            val parts = text.removePrefix(SIDECAR_FRAME).split("|")
+            val scope = if (framed) {
+                require(parts.size >= 6)
+                val shared = parts[3].trim()
+                val kind = parts[4].trim()
+                require(shared == "0" || shared == "1")
+                require(kind in KNOWN_STORAGE_KINDS)
+                RecoveredScope(
+                    userId = parts[0].trim().toInt(),
+                    driveId = parts[1].trim().toInt(),
+                    fileId = parts[2].trim().toInt(),
+                    sharedWithMe = shared == "1",
+                    storageKind = kind,
+                    targetPath = parts.drop(5).joinToString("|"),
+                )
+            } else if (parts.size >= 6 && parts[3].trim() in setOf("0", "1") &&
+                parts[4].trim() in KNOWN_STORAGE_KINDS
+            ) {
+                // LEGACY SIX-FIELD (the immediately preceding version's unframed format):
+                // recognized only through VALID typed values; the tail is the path.
                 RecoveredScope(
                     userId = parts[0].trim().toInt(),
                     driveId = parts[1].trim().toInt(),
                     fileId = parts[2].trim().toInt(),
                     sharedWithMe = parts[3].trim() == "1",
-                    storageKind = parts[4].trim().ifEmpty { "offline" },
+                    storageKind = parts[4].trim(),
                     targetPath = parts.drop(5).joinToString("|"),
                 )
             } else {
-                // LEGACY 4-FIELD SIDECAR: the pre-review-26 format named only an ordinary
-                // (non-shared, offline-path) scope — the defaults keep it decodable.
+                // LEGACY FOUR-FIELD: the COMPLETE tail is the path — never kind-split.
+                require(parts.size >= 4)
                 RecoveredScope(
                     userId = parts[0].trim().toInt(),
                     driveId = parts[1].trim().toInt(),
@@ -1538,6 +1593,11 @@ class DownloadOfflineFileManager(
                     targetPath = parts.drop(3).joinToString("|"),
                 )
             }
+            // THE CANONICAL CROSS-CHECK (issue: round 27 #10): the index must agree with
+            // the operation body it scopes.
+            if (expectedFileId != null && scope.fileId != expectedFileId) return@runCatching null
+            if (expectedTargetPath != null && scope.targetPath != expectedTargetPath) return@runCatching null
+            scope
         }.getOrNull()
 
         /**
@@ -1591,7 +1651,13 @@ class DownloadOfflineFileManager(
                 val row = FileController.getFileById(realm, recordFileId) ?: return@runCatching false
                 val ownedPath = when (storageKind) {
                     "cache" -> row.getCacheFile(context, realmScope).absolutePath
-                    else -> row.getOfflineFile(context, recordScope.userId)?.absolutePath
+                    "converted" -> row.getConvertedPdfCache(context, realmScope).absolutePath
+                    else ->
+                        // THE CAPTURED REALM FLAVOR RESOLVES THE PATH (issue: round 27
+                        // #9d): a shared row whose stored path is blank previously derived
+                        // its remote path through an ORDINARY UserDrive — the row was
+                        // invisible there and the resolution failed forever.
+                        row.getOfflineFile(context, recordScope.userId, sharedWithMe = sharedWithMe)?.absolutePath
                 }
                 val pathOwned = ownedPath == target.absolutePath
                 val exclusivelyOwned = storageKind == "cache" ||
@@ -1672,6 +1738,7 @@ class DownloadOfflineFileManager(
             target: IOFile,
             proofText: String,
             sharedWithMe: Boolean = false,
+            storageKind: String = "offline",
         ): Boolean = runCatching {
             val recordFile = proofRelocationRecordFile(context, target)
             // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
@@ -1687,7 +1754,7 @@ class DownloadOfflineFileManager(
                 fileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull() ?: 0,
                 targetPath = target.absolutePath,
                 sharedWithMe = sharedWithMe,
-                storageKind = "offline",
+                storageKind = storageKind,
             )
             if (!sidecarWritten) return@runCatching false
             atomicWriteText(recordFile, listOf("1", target.absolutePath, proofText).joinToString("\n"))
@@ -1698,6 +1765,7 @@ class DownloadOfflineFileManager(
             source: IOFile,
             target: IOFile,
             sharedWithMe: Boolean = false,
+            storageKind: String = "offline",
         ): Boolean {
             val provenance = readPublishedProvenance(context, source)
             if (provenance == null) {
@@ -1708,8 +1776,13 @@ class DownloadOfflineFileManager(
             // (issue: round 23 #14): every failure path below leaves a durable record of
             // the original proof and its exact destination; only a VERIFIED destination
             // proof disposes it.
-            val relocationStateWritten =
-                writeProofRelocationRecord(context, target, provenance.recordText(target), sharedWithMe = sharedWithMe)
+            val relocationStateWritten = writeProofRelocationRecord(
+                context,
+                target,
+                provenance.recordText(target),
+                sharedWithMe = sharedWithMe,
+                storageKind = storageKind,
+            )
             if (!relocationStateWritten) {
                 // Without recoverable state the source proof is NOT destroyed: the old
                 // record stays at the source path (the caller's bytes have not moved yet
@@ -1855,8 +1928,7 @@ class DownloadOfflineFileManager(
             // ACTUAL realm flavor and storage kind — an interrupted cache or shared-Realm
             // publication is later validated against its captured destination, never
             // against a universally resolved ordinary offline path.
-            val capturedStorageKind =
-                if (target.absolutePath == file.getOfflineFile(context, userDrive.userId)?.absolutePath) "offline" else "cache"
+            val capturedStorageKind = destinationStorageKind(context, file, target, userDrive)
             if (!writeScopeSidecar(
                     recordFile,
                     userDrive.userId,
@@ -2198,7 +2270,11 @@ class DownloadOfflineFileManager(
                                 // THE CAPTURED REALM FLAVOR (issue: round 26 #5): the sidecar
                                 // names the destination's realm — a shared-scope relocation
                                 // validates its owner in the shared realm.
-                                val moveScopeShared = readScopeSidecar(recordFile)?.sharedWithMe == true
+                                val moveScopeShared = readScopeSidecar(
+                                    recordFile,
+                                    expectedFileId = proofFileId,
+                                    expectedTargetPath = target.absolutePath,
+                                )?.sharedWithMe == true
                                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                                     OfflineFileCoordination.withFileLock(scope, proofFileId) {
                                         val targetHash = UploadFile.sha256OrNull(target)
@@ -2311,16 +2387,24 @@ class DownloadOfflineFileManager(
                 }
                 if (!resolved) allResolved = false
             }
-            // ORPHAN SIDECAR RECONCILIATION (issue: round 26 #8): a scope index whose
-            // record body no longer exists has nothing left to scope — the operation was
-            // disposed (or its record never completed its interrupted write). The index is
-            // removed so uniquely named indexes cannot accumulate permanently; a pending
-            // operation's index (its body still present) is never touched. An undeletable
+            // ORPHAN SIDECAR RECONCILIATION (issues: round 26 #8, round 27 #11): a scope
+            // index whose record body no longer exists has nothing left to scope — the
+            // operation was disposed (or its record never completed its interrupted
+            // write). The classification is SERIALIZED WITH OPERATION CREATION/DISPOSAL
+            // under the intent monitor — the writers publish the sidecar BEFORE the body
+            // (a corrupt body must stay scoped), so an unsynchronized sweep could delete
+            // the index of an operation being created right now, losing the captured
+            // destination flavor/kind for a later crash. Under the monitor, every
+            // coordinated writer's (sidecar, body) pair is atomic relative to this
+            // classification; the body-absence recheck runs inside it too. A pending
+            // operation's index (its body still present) is never touched; an undeletable
             // orphan is harmless (it is never enumerated) and does not fail the pass.
             runCatching {
-                stagingDirectory(context).listFiles { f -> f.name.endsWith(".scope") }?.forEach { sidecar ->
-                    if (!IOFile(sidecar.path.removeSuffix(".scope")).exists()) {
-                        runCatching { sidecar.delete() }
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    stagingDirectory(context).listFiles { f -> f.name.endsWith(".scope") }?.forEach { sidecar ->
+                        if (!IOFile(sidecar.path.removeSuffix(".scope")).exists()) {
+                            runCatching { sidecar.delete() }
+                        }
                     }
                 }
             }
@@ -2342,7 +2426,16 @@ class DownloadOfflineFileManager(
             // legacy record without a sidecar keeps the documented conservative defaults
             // (the same ordinary-offline semantics its scope resolution already used);
             // nothing here falls back to the current account or invents a scope.
-            val capturedScopeSidecar = readScopeSidecar(record.recordFile)
+            // THE CANONICAL CROSS-CHECK (issue: round 27 #10): the index must agree with
+            // the record body it scopes — a mismatched sidecar is undecodable for this
+            // operation (the conservative defaults below are the documented legacy
+            // semantics, and the identity fields always come from the record itself,
+            // never the sidecar).
+            val capturedScopeSidecar = readScopeSidecar(
+                record.recordFile,
+                expectedFileId = record.fileId,
+                expectedTargetPath = record.targetPath,
+            )
             val capturedShared = capturedScopeSidecar?.sharedWithMe == true
             val capturedStorageKind = capturedScopeSidecar?.storageKind ?: "offline"
             if (!recoveryFile.exists()) {
@@ -2470,25 +2563,41 @@ class DownloadOfflineFileManager(
                 // be read register its partial target as an edit before the backup's
                 // deletion.
                 if (prefixRead != false || targetLength == 0L) return false
+                // THE CAPTURED REALM FLAVOR AND DESTINATION KIND (issue: round 27 #9c):
+                // the intervening-edit branch resolves the row and its path through the
+                // SAME captured scope the record's sidecar names — the previous
+                // ordinary-realm lookup and offline-path resolution could never match a
+                // shared or cache/converted destination, leaving an attributable live
+                // owner excluded indefinitely.
+                val armScope = UserDrive(
+                    userId = recordScope.userId,
+                    driveId = recordScope.driveId,
+                    sharedWithMe = capturedShared,
+                )
                 val rowOwnsTarget = runCatching {
-                    FileController.getRealmInstance(recordScope).use { realm ->
+                    FileController.getRealmInstance(armScope).use { realm ->
                         runCatching { realm.refresh() }
                         val row = FileController.getFileById(realm, record.fileId)
-                        row != null && row.getOfflineFile(context, recordScope.userId)?.absolutePath == target.absolutePath &&
+                        val ownedPath = when (capturedStorageKind) {
+                            "cache" -> row?.getCacheFile(context, armScope)?.absolutePath
+                            "converted" -> row?.getConvertedPdfCache(context, armScope)?.absolutePath
+                            else -> row?.getOfflineFile(context, recordScope.userId, sharedWithMe = capturedShared)?.absolutePath
+                        }
+                        row != null && ownedPath == target.absolutePath &&
                             appContextForOwnership()?.let { ctx ->
-                                OfflineFolderController.exclusivePathOwner(realm, ctx, recordScope, target.path)
+                                OfflineFolderController.exclusivePathOwner(realm, ctx, armScope, target.path)
                             } == row.id
                     }
                 }.getOrDefault(false)
                 if (!newerThanBackedUp || !rowOwnsTarget) return false
                 val preserved = OfflineFolderController.registerDirtySnapshot(
                     context = context,
-                    file = FileController.getRealmInstance(recordScope).use { realm ->
+                    file = FileController.getRealmInstance(armScope).use { realm ->
                         runCatching { realm.refresh() }
                         FileController.getFileById(realm, record.fileId)?.let { realm.copyFromRealm(it, 1) }
                     } ?: return false,
                     offlineFile = target,
-                    userDrive = recordScope,
+                    userDrive = armScope,
                     allowPendingRecoveryResolution = true,
                 )
                 if (!preserved) return false
@@ -3111,7 +3220,14 @@ class DownloadOfflineFileManager(
                 // #2): provenance and bytes are published together — a failed move now
                 // RESTORES the recoverable old bytes and their proof (issue: round 20 #10)
                 // instead of deleting the new bytes with the old ones already gone.
-                if (!movePublishedProvenance(provenanceContext, staged, target, sharedWithMe = userDrive.sharedWithMe)) {
+                if (!movePublishedProvenance(
+                        provenanceContext,
+                        staged,
+                        target,
+                        sharedWithMe = userDrive.sharedWithMe,
+                        storageKind = destinationStorageKind(context, file, target, userDrive),
+                    )
+                ) {
                     val restored = recoveryFile != null && restoreRecoveryCopy(
                         context = provenanceContext,
                         recoveryFile = recoveryFile,
@@ -3402,7 +3518,13 @@ class DownloadOfflineFileManager(
                             deletePublishedProvenance(context, target)
                             when {
                                 staged.renameTo(target) &&
-                                    movePublishedProvenance(context, staged, target, sharedWithMe = userDrive.sharedWithMe) -> {
+                                    movePublishedProvenance(
+                                        context,
+                                        staged,
+                                        target,
+                                        sharedWithMe = userDrive.sharedWithMe,
+                                        storageKind = destinationStorageKind(context, file, target, userDrive),
+                                    ) -> {
                                     runCatching { recoveryFile?.delete() }
                                     recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
                                     // TYPED UNRESOLVED (issue: round 24 #19/#20): an

@@ -522,8 +522,12 @@ open class File(
         return IOFile(folder, id.toString())
     }
 
-    fun getOfflineFile(context: Context, userId: Int = AccountUtils.currentUserId): IOFile? {
-        val userDrive = UserDrive(userId, driveId)
+    fun getOfflineFile(context: Context, userId: Int = AccountUtils.currentUserId, sharedWithMe: Boolean = false): IOFile? {
+        // THE CAPTURED REALM FLAVOR (issue: round 27 #9d): the path derivation's
+        // metadata resolution must read the realm the row actually lives in — a shared
+        // row's blank stored path previously resolved through the ORDINARY realm and
+        // failed forever.
+        val userDrive = UserDrive(userId, driveId, sharedWithMe)
         val rootFolder = IOFile(getOfflineFolder(context), "${userId}/$driveId")
         val path = getRemotePath(userDrive)
 
