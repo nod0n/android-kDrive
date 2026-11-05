@@ -212,6 +212,29 @@ internal suspend fun downloadFile(
         else -> AccountUtils.getHttpClient(userDrive.userId)
     }
 
+    // THE SHARED PRE-TRANSFER POLICY (issue: round 28 #14): the preview consults the same
+    // captured-scope suppression decision as the worker, the dialog and SAF — an
+    // already-published explicitly unresolved copy covering the CURRENT remote generation
+    // is not re-downloaded on every open. The outcome is the caller-handled deferred
+    // SKIPPED_CONFLICT: the destination is untouched, completion is NOT reported (this
+    // function's own outcome contract — only PUBLISHED/SKIPPED_PROTECTED emit 100), and
+    // the existing copy remains READABLE-UNVERIFIED access — distinct from verified
+    // completion. Evidence (a metadata advance, a lost or non-certifying record)
+    // re-justifies the transfer. Public-share previews keep their own authentication flow
+    // (no row-scoped publication record governs them).
+    if (!isPublicShared) {
+        val suppressed = runCatching {
+            DownloadOfflineFileManager.unresolvedPublicationAlreadyCoversCurrentGeneration(
+                context = context,
+                file = file,
+                target = externalOutputFile,
+                userDrive = userDrive,
+                okHttpClient = okHttpClient,
+            )
+        }.getOrDefault(false)
+        if (suppressed) return PublicationOutcome.SKIPPED_CONFLICT
+    }
+
     DownloadOfflineFileManager.downloadFileResponseAsync(
         fileUrl = downloadUrl,
         downloadInterceptor = downloadProgressInterceptor,

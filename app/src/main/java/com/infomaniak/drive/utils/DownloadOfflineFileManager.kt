@@ -1377,6 +1377,30 @@ class DownloadOfflineFileManager(
             unresolvedRecord: Boolean = false,
         ): Boolean {
             if (!writePublishedProvenance(context, staged, file, userDrive, unresolvedRecord)) return false
+            // THE DURABLE ATTEMPTED OBSERVATION (issues: round 28 #13 and its follow-up):
+            // the unresolved record's version field is BY DESIGN zero (the unresolved
+            // marker), which discarded the attempted generation's real version; the retry
+            // decision needs the COMPLETE available remote observation — version, NULLABLE
+            // size, the three timestamps, AND THE CAPTURED LOCATION (the destination the
+            // attempt was published to; a relocated or path-reused record must never
+            // compare another destination's observation) — persisted SEPARATELY from the
+            // byte provenance. It is evidence only for "can another attempt gain
+            // anything", never a byte-generation proof.
+            if (unresolvedRecord) {
+                val observationText = (
+                    listOf(
+                        "1",
+                        (file.version?.number ?: 0).toString(),
+                        file.size?.toString() ?: "",
+                        file.revisedAt.toString(),
+                        file.lastModifiedAt.toString(),
+                        file.updatedAt.toString(),
+                    ) + staged.absolutePath
+                    ).joinToString("|")
+                if (!atomicWriteText(IOFile(provenanceFileFor(context, staged).path + ".obs"), observationText)) {
+                    return false
+                }
+            }
             return readPublishedProvenance(context, staged) != null
         }
 
@@ -3789,8 +3813,13 @@ class DownloadOfflineFileManager(
             // never a byte-generation proof.
             val observation = runCatching {
                 IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim().split("|")
-            }.getOrNull()?.takeIf { it.size >= 6 && it[0] == "1" }
+            }.getOrNull()?.takeIf { it.size >= 7 && it[0] == "1" }
                 ?: return@runCatching false
+            // THE OBSERVATION'S LOCATION MUST BE THIS DESTINATION (issue: round 28 #13
+            // follow-up): a sidecar re-keyed by a relocation or a record at a reused path
+            // is not this destination's attempt evidence.
+            val attemptedLocation = observation.drop(6).joinToString("|")
+            if (attemptedLocation != target.absolutePath) return@runCatching false
             val attemptedVersion = observation[1].toIntOrNull() ?: return@runCatching false
             val attemptedSize = observation[2].toLongOrNull()
             val attemptedRevisedAt = observation[3].toLongOrNull() ?: return@runCatching false
