@@ -325,8 +325,26 @@ class DownloadOfflineFileManager(
         // destination — foreign or unknown ownership defers like a conflict, so the bulk
         // retains the root's incompleteness instead of completing F over another row's
         // protected bytes.
+        // THE CAPTURED OLD PHYSICAL SOURCE IS THE VERIFICATION SUBJECT (issue: round 26
+        // #11): in verification mode the retained historical row still OWNS the captured
+        // basis location (A) while the fetched identity names the accepted rename's
+        // destination (B) — resolving the owner ONLY at B rejected the verification before
+        // its comparison could ever run (a hashless historical copy at A stayed deferred on
+        // every retry after a remote rename; threading a verification basis into the later
+        // publication never made that path reachable). The gate therefore also admits the
+        // row when it exclusively owns the CAPTURED BASIS location; the verification's own
+        // publication CAS still validates the basis comparison and the conditional identity
+        // relocation under the coordinated locks.
         val destinationOwner = FileController.getRealmInstance(userDrive).use { realm ->
             OfflineFolderController.destinationOwnerRow(realm, context, userDrive, file, offlineFile)
+                ?: verificationBasis
+                    ?.takeIf { it.id == file.id }
+                    ?.getOfflineFile(context, userDrive.userId)
+                    ?.let { basisOffline ->
+                        OfflineFolderController.destinationOwnerRow(
+                            realm, context, userDrive, verificationBasis!!, basisOffline,
+                        )
+                    }
         }
         if (destinationOwner == null || destinationOwner.id != file.id) {
             lastTransferSuperseded = true
@@ -1263,23 +1281,32 @@ class DownloadOfflineFileManager(
         }
 
         internal fun readPublishedProvenance(context: Context, publishedFile: IOFile): PublishedProvenance? = runCatching {
-            parseProvenanceText(provenanceFileFor(context, publishedFile).readText().trim())
+            parseProvenanceText(
+                provenanceFileFor(context, publishedFile).readText().trim(),
+                expectedPath = publishedFile.absolutePath,
+            )
         }.getOrNull()?.takeIf { it.absolutePath == publishedFile.absolutePath }
 
         /**
          * Parses one provenance record text (issues: round 20 #3, round 24 #11, round 25
-         * #12): an explicit "v2|" frame selects the framed format (the publication identity
-         * at a KNOWN body index); anything else is LEGACY, whose format is NEVER inferred
-         * from the total split count — a nine-field legacy record whose path contains '|'
-         * stays legacy and its location is the re-joined remainder. The LOCATION identity
-         * check (the record must name the exact path it was read at) is the caller's.
+         * #12, round 26 #15): an explicit "v2|" frame selects the framed format (the
+         * publication identity at a KNOWN body index). Anything else is LEGACY, and the
+         * format is NEVER inferred from the total split count — a path containing '|'
+         * changes the count under every grammar. The three actual legacy grammars are the
+         * eight-field hashless record, the nine-field hash record, and the unframed
+         * TEN-field record with a publication id that the immediately preceding version
+         * wrote; each candidate's location is the re-joined remainder, and THE EXPECTED
+         * CANONICAL PATH decides between them (the caller validates the record names the
+         * exact path it was read at — an ambiguous component count is resolved by that
+         * identity, never by field position alone). Without an expected path the most
+         * specific grammar wins; the caller's location check still guards.
          */
-        private fun parseProvenanceText(text: String): PublishedProvenance {
+        private fun parseProvenanceText(text: String, expectedPath: String? = null): PublishedProvenance {
             val framed = text.startsWith(PROVENANCE_FRAME)
             val parts = text.removePrefix(PROVENANCE_FRAME).split("|")
-            val provenance = if (framed) {
+            if (framed) {
                 require(parts.size >= 10)
-                PublishedProvenance(
+                return PublishedProvenance(
                     version = parts[0].trim().toInt(),
                     lastModifiedAt = parts[1].trim().toLong(),
                     revisedAt = parts[2].trim().toLong(),
@@ -1292,23 +1319,62 @@ class DownloadOfflineFileManager(
                     // The location is the LAST field and re-joins any '|' inside it.
                     absolutePath = parts.drop(9).joinToString("|"),
                 )
-            } else {
-                require(parts.size >= 8)
-                val legacyHashless = parts.size == 8
-                PublishedProvenance(
-                    version = parts[0].trim().toInt(),
-                    lastModifiedAt = parts[1].trim().toLong(),
-                    revisedAt = parts[2].trim().toLong(),
-                    updatedAt = parts[3].trim().toLong(),
-                    userId = parts[4].trim().toInt(),
-                    driveId = parts[5].trim().toInt(),
-                    fileId = parts[6].trim().toInt(),
-                    contentHash = if (legacyHashless) null else parts[7].trim().takeIf { it.isNotEmpty() },
-                    publicationId = 0L,
-                    absolutePath = (if (legacyHashless) parts.drop(7) else parts.drop(8)).joinToString("|"),
+            }
+            require(parts.size >= 8)
+            val candidates = buildList {
+                if (parts.size >= 10) {
+                    // TEN-FIELD legacy grammar (the preceding version's unframed format):
+                    // the publication identity is PRESERVED, never zeroed.
+                    add(
+                        PublishedProvenance(
+                            version = parts[0].trim().toInt(),
+                            lastModifiedAt = parts[1].trim().toLong(),
+                            revisedAt = parts[2].trim().toLong(),
+                            updatedAt = parts[3].trim().toLong(),
+                            userId = parts[4].trim().toInt(),
+                            driveId = parts[5].trim().toInt(),
+                            fileId = parts[6].trim().toInt(),
+                            contentHash = parts[7].trim().takeIf { it.isNotEmpty() },
+                            publicationId = parts[8].trim().toLongOrNull() ?: 0L,
+                            absolutePath = parts.drop(9).joinToString("|"),
+                        )
+                    )
+                }
+                if (parts.size >= 9) {
+                    // NINE-FIELD legacy grammar: hash present, no publication id.
+                    add(
+                        PublishedProvenance(
+                            version = parts[0].trim().toInt(),
+                            lastModifiedAt = parts[1].trim().toLong(),
+                            revisedAt = parts[2].trim().toLong(),
+                            updatedAt = parts[3].trim().toLong(),
+                            userId = parts[4].trim().toInt(),
+                            driveId = parts[5].trim().toInt(),
+                            fileId = parts[6].trim().toInt(),
+                            contentHash = parts[7].trim().takeIf { it.isNotEmpty() },
+                            publicationId = 0L,
+                            absolutePath = parts.drop(8).joinToString("|"),
+                        )
+                    )
+                }
+                // EIGHT-FIELD legacy grammar: hashless, the location from field seven on.
+                add(
+                    PublishedProvenance(
+                        version = parts[0].trim().toInt(),
+                        lastModifiedAt = parts[1].trim().toLong(),
+                        revisedAt = parts[2].trim().toLong(),
+                        updatedAt = parts[3].trim().toLong(),
+                        userId = parts[4].trim().toInt(),
+                        driveId = parts[5].trim().toInt(),
+                        fileId = parts[6].trim().toInt(),
+                        contentHash = null,
+                        publicationId = 0L,
+                        absolutePath = parts.drop(7).joinToString("|"),
+                    )
                 )
             }
-            return provenance
+            return expectedPath?.let { expected -> candidates.firstOrNull { it.absolutePath == expected } }
+                ?: candidates.first()
         }
 
         /**
@@ -1319,7 +1385,7 @@ class DownloadOfflineFileManager(
          * break). Null when the retained text is unparseable (the caller retains state).
          */
         private fun refreshedRecordText(recordText: String, target: IOFile): String? = runCatching {
-            parseProvenanceText(recordText)
+            parseProvenanceText(recordText, expectedPath = target.absolutePath)
                 .copy(publicationId = newPublicationId())
                 .recordText(target)
         }.getOrNull()
@@ -2298,17 +2364,21 @@ class DownloadOfflineFileManager(
                 // UNRESOLVED: never auto-uploaded, never overwritten; the recovery state
                 // is retained for a later sweep.
                 val newerThanBackedUp = target.lastModified() > record.oldTargetMtimeMillis
-                // AMBIGUOUS LEGACY RESTORE OUTPUT IS NEVER AN EDIT (issue: round 25 #3): an
-                // older build's IN-PLACE restore could leave a readable strict prefix of the
-                // complete backup at the target with a filesystem timestamp NEWER than the
-                // backup. Neither ownership nor the timestamp distinguishes that output from
-                // a genuine user truncation — auto-registering it uploads partial restore
-                // output and the sweep then DISCARDS the complete backup. Records from the
-                // in-place era (v1–v3) retain BOTH the ambiguous target and the complete
-                // backup unresolved; staged restores (this code) cannot produce partial
-                // output, so a non-legacy record's prefix-shaped target is a genuine
-                // external edit and the proven-edit arm below applies.
-                if (record.legacy && filePrefixMatches(target, recoveryFile)) return false
+                // RESTORE-PROTOCOL AMBIGUITY IS NEVER AN EDIT (issues: round 25 #3, round 26
+                // #3): EVERY record version (v1–v3) may describe an interrupted IN-PLACE
+                // restore — the earlier builds restored with recoveryFile.copyTo(target,
+                // overwrite = true) while already writing v2/v3 records, so `legacy` cannot
+                // identify the restoration protocol. A changed target that is a readable
+                // STRICT PREFIX of the complete backup — or EMPTY (zero-byte partial output,
+                // which the prefix comparison rejects by length) — cannot be distinguished
+                // from a genuine user truncation by ownership or timestamp: auto-registering
+                // it uploads partial restore output and the sweep then DISCARDS the complete
+                // backup. The ambiguous output and the complete backup are BOTH retained
+                // unresolved; only independent operation evidence (the expected-publication
+                // arm above) or a verified resolution outside this arm may resolve them.
+                val targetLength = runCatching { target.length() }.getOrDefault(-1L)
+                val prefixShaped = filePrefixMatches(target, recoveryFile)
+                if (prefixShaped || targetLength == 0L) return false
                 val rowOwnsTarget = runCatching {
                     FileController.getRealmInstance(recordScope).use { realm ->
                         runCatching { realm.refresh() }
