@@ -3639,10 +3639,18 @@ class DownloadOfflineFileManager(
             )
             val row = fresh.data?.takeIf { fresh.isSuccess() && it.id == file.id }
                 ?: return@runCatching false // indeterminate: allow the re-drive
-            // NEW EVIDENCE = a changed remote generation since the unresolved publication
-            // (revision or modification baseline moved): re-download it; equal generations
-            // add nothing the transfer could establish.
-            row.revisedAt == proof.revisedAt && row.lastModifiedAt == proof.lastModifiedAt
+            // NEW EVIDENCE = a changed remote observation since the unresolved publication
+            // (issue: round 27 #15): the COMPLETE available observation is compared — the
+            // record's attempted generation (revisedAt, lastModifiedAt AND updatedAt)
+            // plus the observed SIZE against the certified bytes' length. The previous
+            // two-timestamp equality suppressed genuine advances that preserved both
+            // (a new version or size sharing second-resolution timestamps). A version-only
+            // advance preserving EVERY other observable remains indistinguishable without
+            // a response-bound route — part of the documented #14 structural blocker.
+            row.revisedAt == proof.revisedAt &&
+                row.lastModifiedAt == proof.lastModifiedAt &&
+                row.updatedAt == proof.updatedAt &&
+                row.size == target.length()
         }.getOrDefault(false)
 
         /**

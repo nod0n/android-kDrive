@@ -153,6 +153,25 @@ class DownloadProgressViewModel : ViewModel() {
                 // the previous default global client authenticated the request against the
                 // CURRENTLY ACTIVE account instead.
                 val okHttpClient = AccountUtils.getHttpClient(userDrive.userId)
+                // THE SHARED PRE-TRANSFER BOUNDARY (issue: round 27 #16): direct dialog
+                // downloads run the SAME captured-scope no-spin decision as the worker —
+                // an already-published explicitly unresolved copy covering the CURRENT
+                // generation is not re-downloaded (the body transfer repeats otherwise on
+                // every invocation). The dialog defers (null progress — never a false
+                // success); readable retained content stays distinct from verified
+                // completion, and evidence (a metadata advance, a lost or non-certifying
+                // record) re-justifies the transfer exactly as for the worker.
+                if (DownloadOfflineFileManager.unresolvedPublicationAlreadyCoversCurrentGeneration(
+                        context = context,
+                        file = file,
+                        target = outputFile,
+                        userDrive = userDrive,
+                        okHttpClient = okHttpClient,
+                    )
+                ) {
+                    downloadProgressLiveData.postValue(null)
+                    return@runCatching
+                }
                 val apiResponse = DownloadOfflineFileManager.downloadFileResponse(
                     fileUrl = ApiRoutes.downloadFile(file),
                     okHttpClient = okHttpClient,
