@@ -1857,14 +1857,29 @@ class DownloadOfflineFileManager(
         ): ScopedAuthority {
             val sidecarFile = IOFile(recordFile.path + ".scope")
             if (!sidecarFile.exists()) return ScopedAuthority.AbsentLegacy
-            // AN UNFRAMED SIDECAR IS LEGACY AUTHORITY (issue: round 29 #4): the
-            // pre-framing formats (four-field and six-field) carry no verified
-            // kind/flavor — treating them as Resolved kept their ordinary-offline
-            // defaults as authority and legacy cache/shared operations never converged.
-            // They REQUIRE resolution like an absent index; only the framed s2| form is
-            // captured authority.
-            val framed = runCatching { sidecarFile.readText().trim().startsWith(SIDECAR_FRAME) }.getOrDefault(false)
-            if (!framed) return ScopedAuthority.AbsentLegacy
+            // READ-ONCE FOUR-WAY CLASSIFICATION (issue: round 30 #5): ONE read decides —
+            // an UNREADABLE or malformed index is INVALID (never permission to infer
+            // replacement authority); an unframed text is legacy-requires-resolution ONLY
+            // when it successfully parses as a documented historical format AND passes its
+            // body cross-check; a framed index must still decode and cross-check. The
+            // previous single-read Boolean folded a read failure and arbitrary garbage
+            // into "legacy", letting a damaged CURRENT index enter the resolver, be
+            // overwritten with inferred authority and replay.
+            val text = runCatching { sidecarFile.readText().trim() }.getOrNull()
+                ?: return ScopedAuthority.Invalid
+            if (!text.startsWith(SIDECAR_FRAME)) {
+                return if (readScopeSidecar(recordFile, expectedFileId, expectedTargetPath) != null) {
+                    // A successfully parsed, body-cross-checked HISTORICAL format:
+                    // legacy authority requiring resolution (the framed s2| form is the
+                    // only captured authority).
+                    ScopedAuthority.AbsentLegacy
+                } else {
+                    // Unframed but undecodable (or failing its cross-check): invalid —
+                    // the replay defers, the index is never overwritten with inferred
+                    // authority.
+                    ScopedAuthority.Invalid
+                }
+            }
             val scope = readScopeSidecar(recordFile, expectedFileId, expectedTargetPath)
                 ?: return ScopedAuthority.Invalid
             return ScopedAuthority.Resolved(scope)
@@ -2083,6 +2098,26 @@ class DownloadOfflineFileManager(
             atomicWriteText(recordFile, listOf("1", target.absolutePath, proofText).joinToString("\n"))
         }.getOrDefault(false)
 
+        /**
+         * THE OBSERVATION'S FIXED-PREFIX PARSE (issue: round 30 #6): the location is the
+         * ENTIRE tail after the fixed prefix — a destination containing '|' occupies
+         * several components and must never be recovered by position from the end. Returns
+         * the fixed prefix fields and the location tail, or null for an unparseable
+         * observation. The current format carries the attempt id at prefix[1] (seven fixed
+         * fields); a pre-attempt-id legacy observation (six fixed fields) has no attempt id
+         * to validate — the reader's publication-id binding stays the authority.
+         */
+        private fun parseObservationBinding(text: String): Pair<List<String>, String>? {
+            val fields = text.split("|")
+            return when {
+                fields.size >= 8 && fields[0] == "1" && fields[1].toLongOrNull() != null ->
+                    fields.take(7) to fields.drop(7).joinToString("|")
+                fields.size == 7 && fields[0] == "1" ->
+                    fields.take(6) to fields.drop(6).joinToString("|")
+                else -> null
+            }
+        }
+
         internal fun movePublishedProvenance(
             context: Context,
             source: IOFile,
@@ -2147,20 +2182,36 @@ class DownloadOfflineFileManager(
             val sourceObs = IOFile(provenanceFileFor(context, source).path + ".obs")
             val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
             if (sourceObs.exists()) {
-                val rebound = sourceObs.readText().trim().split("|").toMutableList()
-                if (rebound.size >= 7 && rebound[0] == "1") {
-                    val reboundText = (rebound.dropLast(1) + target.absolutePath).joinToString("|")
-                    if (!atomicWriteText(targetObs, reboundText) ||
-                        runCatching { targetObs.readText().trim() }.getOrNull() != reboundText
-                    ) {
-                        return false
-                    }
-                    runCatching { sourceObs.delete() }
-                } else {
-                    // An unparseable observation is not durable evidence: the relocation
-                    // carries no binding and the move fails closed, retaining state.
+                // FIXED-PREFIX REBIND (issue: round 30 #6): the parsed TAIL — the whole
+                // destination path, '|' characters included — is replaced with the new
+                // destination; the previous last-component replacement corrupted every
+                // pipe-containing path's binding ("/folder/a|b" became
+                // "/folder/a|/folder/a|b") and its suppression never fired again. The
+                // rebound text is written atomically, read back AND RE-PARSED: the
+                // resulting destination and — for the current format — the attempt id are
+                // validated against the moved record, not merely compared as text.
+                val parsed = runCatching { sourceObs.readText().trim() }.getOrNull()
+                    ?.let { parseObservationBinding(it) }
+                    ?: return false
+                val (prefix, _) = parsed
+                val reboundText = (prefix + target.absolutePath).joinToString("|")
+                val reboundParsed = parseObservationBinding(reboundText)
+                if (reboundParsed?.second != target.absolutePath ||
+                    (prefix.size == 7 && reboundParsed.first[1].toLongOrNull() != provenance.publicationId)
+                ) {
                     return false
                 }
+                if (!atomicWriteText(targetObs, reboundText)) {
+                    return false
+                }
+                // THE READ-BACK IS RE-PARSED, NOT MERELY COMPARED (issue: round 30 #6).
+                val writtenBack = runCatching { targetObs.readText().trim() }.getOrNull()
+                if (writtenBack != reboundText ||
+                    parseObservationBinding(writtenBack ?: "")?.second != target.absolutePath
+                ) {
+                    return false
+                }
+                runCatching { sourceObs.delete() }
             }
             deletePublishedProvenance(context, source)
             runCatching { proofRelocationRecordFile(context, target).delete() }
