@@ -1641,23 +1641,52 @@ class DownloadOfflineFileManager(
                 )
                 recordFile.writeText(provenance.recordText(target))
                 if (readPublishedProvenance(context, target) == null) return@runCatching false
-                // RETIRE THE PREVIOUS PUBLICATION'S OBSERVATION (review-33 #8): the new
-                // verified-uploaded proof carries a NEW publication id, and the id-binding
-                // capture correctly rejects an observation belonging to a DIFFERENT
-                // publication — a stale observation of the REPLACED generation would
-                // otherwise block every later legitimate move of the reconciled file (a
-                // normal upload lifecycle, not a damaged-file scenario). A failed
+                // RETIRE THE PREVIOUS PUBLICATION'S OBSERVATION (review-33 #8, idempotent
+                // review-34 #7): the new verified-uploaded proof carries a NEW publication
+                // id — EVERY pre-existing observation predates it and is retired; a failed
                 // retirement fails this write (the caller defers and keeps the snapshot
                 // owned for the retry), so success never leaves the new proof bound to a
-                // dead attempt's evidence.
-                val previousObservation = IOFile(provenanceFileFor(context, target).path + ".obs")
-                if (previousObservation.exists() &&
-                    !runCatching { previousObservation.delete() }.getOrDefault(false)
-                ) {
+                // dead attempt's evidence. The retirement is IDEMPOTENT: a repair retry
+                // after a failed deletion re-runs it.
+                if (!retireAllPrecedingObservations(context, target)) {
                     return@runCatching false
                 }
                 true
             }.getOrDefault(false)
+
+        /** THE WRITER'S OBSERVATION RETIREMENT (review-33 #8, idempotent review-34 #7): a
+         * freshly written proof is a NEW publication — every pre-existing observation
+         * predates it and is retired. A failed deletion returns false so the caller
+         * defers with the upload ownership retained. */
+        internal fun retireAllPrecedingObservations(context: Context, target: IOFile): Boolean = runCatching {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            !observationFile.exists() || runCatching { observationFile.delete() }.getOrDefault(false)
+        }.getOrDefault(false)
+
+        /** THE REPAIR-TIME STALE OBSERVATION RESOLUTION (review-34 #7): an observation
+         * bound to a REPLACED publication (CURRENT format, id different from the current
+         * proof's) is retired idempotently here — on repair retries the early-success
+         * shortcut no longer bypasses a previously failed retirement. Returns true when
+         * no stale observation remains (or none ever existed); a legacy or damaged
+         * observation is ambiguous evidence that never blocks a legitimate move and is
+         * left alone (review-34 #8); a failed deletion returns false so the caller
+         * defers. */
+        internal fun staleObservationResolved(
+            context: Context,
+            target: IOFile,
+            currentPublicationId: Long?,
+        ): Boolean = runCatching {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!observationFile.exists()) return@runCatching true
+            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
+                ?.let { parseObservationBinding(it) }
+            when {
+                parsed == null -> true
+                parsed.format == ObservationFormat.CURRENT && parsed.publicationId == currentPublicationId -> true
+                parsed.format == ObservationFormat.CURRENT -> runCatching { observationFile.delete() }.getOrDefault(false)
+                else -> true
+            }
+        }.getOrDefault(false)
         }
 
         internal fun readPublishedProvenance(context: Context, publishedFile: IOFile): PublishedProvenance? = runCatching {

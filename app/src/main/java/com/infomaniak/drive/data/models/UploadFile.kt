@@ -569,6 +569,24 @@ open class UploadFile(
                         if (existingProof?.certifiesBytes(original) == true &&
                             liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds
                         ) {
+                            // COMPLETE SUCCESS REQUIRES THE OBSERVATION STATE TOO (review-34
+                            // #7): a previous pass that wrote the proof but FAILED its
+                            // observation retirement left a stale observation bound to the
+                            // replaced publication — the early return must not bypass the
+                            // idempotent repair. The stale observation is retired HERE (on
+                            // repair retries, even when the baseline and byte proof already
+                            // match); a failed deletion defers with the upload ownership
+                            // retained.
+                            val staleResolved = provenanceContext != null &&
+                                DownloadOfflineFileManager.staleObservationResolved(
+                                    provenanceContext,
+                                    original,
+                                    existingProof.publicationId,
+                                )
+                            if (staleResolved) {
+                                return@withFileLock
+                            }
+                            deferred = true
                             return@withFileLock
                         }
                         // VERIFIED-UPLOADED-BUT-NOT-CURRENT IDENTITY (issue: round 20 #13):
