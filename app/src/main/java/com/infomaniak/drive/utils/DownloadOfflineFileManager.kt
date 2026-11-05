@@ -1743,7 +1743,11 @@ class DownloadOfflineFileManager(
                         row.getOfflineFile(context, recordScope.userId, sharedWithMe = sharedWithMe)?.absolutePath
                 }
                 val pathOwned = ownedPath == target.absolutePath
-                val exclusivelyOwned = storageKind == "cache" ||
+                // ID-KEYED DESTINATIONS ARE STRUCTURALLY EXCLUSIVE (issue: round 28 #9):
+                // the plain cache and the converted-PDF cache are both keyed by the row's
+                // own id — the name-derived offline path-conflict query does not apply to
+                // either (a converted target previously failed it forever).
+                val exclusivelyOwned = storageKind != "offline" ||
                     appContextForOwnership()?.let { ctx ->
                         OfflineFolderController.exclusivePathOwner(realm, ctx, realmScope, target.path)
                     } == row.id
@@ -1896,6 +1900,18 @@ class DownloadOfflineFileManager(
                 disposeRecoveryRecord(recordFile)
                 deletePublishedProvenance(context, source)
                 return false
+            }
+            // THE ATTEMPTED OBSERVATION TRAVELS WITH THE RECORD (issue: round 28 #13):
+            // the durable remote-observation sidecar is re-keyed to the destination (an
+            // unresolved relocation keeps its retry evidence); the source's copy dies with
+            // the source record.
+            runCatching {
+                val sourceObs = IOFile(provenanceFileFor(context, source).path + ".obs")
+                val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
+                if (sourceObs.exists()) {
+                    targetObs.writeText(sourceObs.readText())
+                    runCatching { sourceObs.delete() }
+                }
             }
             deletePublishedProvenance(context, source)
             runCatching { proofRelocationRecordFile(context, target).delete() }
@@ -2353,11 +2369,18 @@ class DownloadOfflineFileManager(
                                 // THE CAPTURED REALM FLAVOR (issue: round 26 #5): the sidecar
                                 // names the destination's realm — a shared-scope relocation
                                 // validates its owner in the shared realm.
-                                val moveScopeShared = readScopeSidecar(
+                                val moveScope = readScopeSidecar(
                                     recordFile,
                                     expectedFileId = proofFileId,
                                     expectedTargetPath = target.absolutePath,
-                                )?.sharedWithMe == true
+                                )
+                                val moveScopeShared = moveScope?.sharedWithMe == true
+                                // THE CAPTURED DESTINATION KIND RIDES EVERY REPLAY (issue:
+                                // round 28 #9): the previous arm forwarded only the realm
+                                // flavor and let both ownership validations default to
+                                // "offline" — a cache/converted relocation could never
+                                // satisfy an offline-path ownership query.
+                                val moveScopeKind = moveScope?.storageKind ?: "offline"
                                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                                     OfflineFileCoordination.withFileLock(scope, proofFileId) {
                                         val targetHash = UploadFile.sha256OrNull(target)
@@ -2394,6 +2417,7 @@ class DownloadOfflineFileManager(
                                                     currentOwnerHolds(
                                                         context, scope, proofFileId, target,
                                                         sharedWithMe = moveScopeShared,
+                                                        storageKind = moveScopeKind,
                                                     )
                                                 if (supersededByVerified) {
                                                     disposeRecoveryRecord(recordFile)
@@ -2402,6 +2426,7 @@ class DownloadOfflineFileManager(
                                             !currentOwnerHolds(
                                                 context, scope, proofFileId, target,
                                                 sharedWithMe = moveScopeShared,
+                                                storageKind = moveScopeKind,
                                             ) ->
                                                 // The path's ownership moved since the record was
                                                 // written: the retained proof is never written over
@@ -2667,9 +2692,15 @@ class DownloadOfflineFileManager(
                             else -> row?.getOfflineFile(context, recordScope.userId, sharedWithMe = capturedShared)?.absolutePath
                         }
                         row != null && ownedPath == target.absolutePath &&
-                            appContextForOwnership()?.let { ctx ->
-                                OfflineFolderController.exclusivePathOwner(realm, ctx, armScope, target.path)
-                            } == row.id
+                            // DESTINATION-APPROPRIATE OWNERSHIP (issue: round 28 #9): an
+                            // ID-keyed cache/converted destination is structurally
+                            // exclusive; only offline paths run the name-based
+                            // path-conflict query (which previously failed cache targets
+                            // forever).
+                            (capturedStorageKind != "offline" ||
+                                appContextForOwnership()?.let { ctx ->
+                                    OfflineFolderController.exclusivePathOwner(realm, ctx, armScope, target.path)
+                                } == row.id)
                     }
                 }.getOrDefault(false)
                 if (!newerThanBackedUp || !rowOwnsTarget) return false
@@ -3735,18 +3766,29 @@ class DownloadOfflineFileManager(
             )
             val row = fresh.data?.takeIf { fresh.isSuccess() && it.id == file.id }
                 ?: return@runCatching false // indeterminate: allow the re-drive
-            // NEW EVIDENCE = a changed remote observation since the unresolved publication
-            // (issue: round 27 #15): the COMPLETE available observation is compared — the
-            // record's attempted generation (revisedAt, lastModifiedAt AND updatedAt)
-            // plus the observed SIZE against the certified bytes' length. The previous
-            // two-timestamp equality suppressed genuine advances that preserved both
-            // (a new version or size sharing second-resolution timestamps). A version-only
-            // advance preserving EVERY other observable remains indistinguishable without
-            // a response-bound route — part of the documented #14 structural blocker.
-            row.revisedAt == proof.revisedAt &&
-                row.lastModifiedAt == proof.lastModifiedAt &&
-                row.updatedAt == proof.updatedAt &&
-                row.size == target.length()
+            // THE PERSISTED ATTEMPTED OBSERVATION DECIDES (issue: round 28 #13): the
+            // complete durable remote observation — version, NULLABLE size, and the three
+            // timestamps — is read from the observation sidecar written beside the record
+            // (an absent sidecar means the attempt predates it: another transfer is
+            // allowed). The record's own version stays zero by design (the unresolved
+            // marker); the ATTEMPTED version now survives it, so a known version-number
+            // advance with equal timestamps and size is no longer suppressed. This
+            // evidence decides only whether another attempt can gain anything — it is
+            // never a byte-generation proof.
+            val observation = runCatching {
+                IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim().split("|")
+            }.getOrNull()?.takeIf { it.size >= 6 && it[0] == "1" }
+                ?: return@runCatching false
+            val attemptedVersion = observation[1].toIntOrNull() ?: return@runCatching false
+            val attemptedSize = observation[2].toLongOrNull()
+            val attemptedRevisedAt = observation[3].toLongOrNull() ?: return@runCatching false
+            val attemptedLastModifiedAt = observation[4].toLongOrNull() ?: return@runCatching false
+            val attemptedUpdatedAt = observation[5].toLongOrNull() ?: return@runCatching false
+            row.revisedAt == attemptedRevisedAt &&
+                row.lastModifiedAt == attemptedLastModifiedAt &&
+                row.updatedAt == attemptedUpdatedAt &&
+                row.size == attemptedSize &&
+                (row.version?.number ?: 0) == attemptedVersion
         }.getOrDefault(false)
 
         /**

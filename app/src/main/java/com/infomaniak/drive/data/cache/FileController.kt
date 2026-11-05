@@ -767,7 +767,20 @@ object FileController {
                     while (queue.isNotEmpty()) {
                         val node = queue.removeFirst()
                         if (!seenIds.add(node.id)) continue
-                        val children = node.children.createSnapshot().filter { it.parentId == node.id }
+                        // DURABLE PARENT-ID MEMBERSHIP IS UNIONED WITH THE CHILDREN LIST
+                        // (issue: round 28 #6): the list is explicitly cleared and rebuilt
+                        // on a FIRST listing page — durable rows from later pages (or from
+                        // a pre-pagination commit) can still name this parent while being
+                        // absent from the list, and omitting them dropped them from BOTH
+                        // the lock set and the ancestor-retention calculation (an unmarked
+                        // ancestor was then removable over a descendant that still required
+                        // its ancestry). The backlink query is the complete durable
+                        // membership; the union is the destructive enumeration.
+                        val listed = node.children.createSnapshot().filter { it.parentId == node.id }
+                        val durable = sectionRealm.where(File::class.java)
+                            .equalTo(File::parentId.name, node.id)
+                            .findAll().createSnapshot()
+                        val children = (listed + durable).distinctBy { it.id }
                         graph[node.id] = GraphNode(
                             id = node.id,
                             parentId = node.parentId,

@@ -902,6 +902,27 @@ class CloudStorageProvider : DocumentsProvider() {
                 return ParcelFileDescriptor.open(cacheFile, accessMode)
             }
 
+            // THE SHARED PRE-TRANSFER POLICY (issue: round 28 #14): a readable copy whose
+            // explicitly unresolved publication covers the CURRENT remote generation is
+            // SERVED READABLE (this row's own published bytes) — the next open no longer
+            // rejects it through the proven-current check and re-downloads the same
+            // content on every access. This is READABLE-UNVERIFIED access, distinct from
+            // verified completion: no proven-current claim is made, and evidence (a
+            // metadata advance, a lost or non-certifying record) re-justifies the transfer
+            // exactly as for the worker and the dialog.
+            runCatching {
+                if (DownloadOfflineFileManager.unresolvedPublicationAlreadyCoversCurrentGeneration(
+                        context = context,
+                        file = file,
+                        target = cacheFile,
+                        userDrive = userDrive,
+                        okHttpClient = runBlocking { AccountUtils.getHttpClient(userDrive.userId) },
+                    )
+                ) {
+                    return ParcelFileDescriptor.open(cacheFile, accessMode)
+                }
+            }
+
             // Download data file
             val okHttpClient = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
             val response = DownloadOfflineFileManager.downloadFileResponse(
