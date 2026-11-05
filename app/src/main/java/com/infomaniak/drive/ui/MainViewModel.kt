@@ -763,6 +763,52 @@ class MainViewModel(
                                                     if (!transferSeen.add(node.id)) continue
                                                     node.children.forEach { transferStack.add(it) }
                                                     if (node.isFolder() || !(node.isOffline || node.isInOfflineFolder)) continue
+                                                    // SOURCE FIRST (issues: round 25 #1/#2): the source
+                                                    // row, bytes and CONTENT CLASSIFICATION are resolved
+                                                    // and decided BEFORE any destination effect — the
+                                                    // previous order staged, renamed, and only then
+                                                    // inspected the source proof, letting an mtime-only
+                                                    // fallback register foreign or unproven historical
+                                                    // bytes as an edit under the destination identity.
+                                                    val sourceRow = FileController.getFileById(currentDriveRealm, node.id)
+                                                    val sourceBytes = sourceRow
+                                                        ?.getOfflineFile(application, userDrive.userId)
+                                                        ?.takeIf { it.exists() }
+                                                    val sourceHash = sourceBytes?.let { UploadFile.sha256OrNull(it) }
+                                                    val sourceClaimed = sourceBytes == null || runCatching {
+                                                        val sourceUri = Uri.fromFile(sourceBytes).toString()
+                                                        UploadFile.hasPendingUpload(uri = sourceUri) ||
+                                                            UploadFile.hasRetainedUnsentUpload(uri = sourceUri)
+                                                    }.getOrDefault(true)
+                                                    val sourceProof = if (sourceBytes != null) {
+                                                        DownloadOfflineFileManager.readPublishedProvenance(application, sourceBytes)
+                                                    } else null
+                                                    // POSITIVE SOURCE CONTENT CLASSIFICATION (issue: round
+                                                    // 25 #2): only a POSITIVELY ESTABLISHED edit may be
+                                                    // registered under the destination identity — a
+                                                    // positively foreign record and unknown/hashless
+                                                    // historical bytes are never auto-uploaded on an
+                                                    // mtime comparison; certified clean bytes are
+                                                    // relocatable published content, and proven drift is
+                                                    // the established edit.
+                                                    val sourceClassifiedEdit = sourceRow != null && sourceBytes != null &&
+                                                        sourceHash != null && run {
+                                                        val anchored = (sourceRow.publishedCleanBaseline ?: 0L) > 0L
+                                                        when {
+                                                            sourceProof?.positivelyForeignTo(sourceRow, userDrive) == true -> false
+                                                            sourceProof?.identifies(sourceRow, userDrive) == true &&
+                                                                sourceProof.contentHash == sourceHash -> false
+                                                            sourceProof?.identifies(sourceRow, userDrive) == true &&
+                                                                sourceProof.contentHash != null &&
+                                                                sourceProof.contentHash != sourceHash -> true
+                                                            anchored && sourceProof == null &&
+                                                                OfflineFolderPolicy.isLocallyModified(
+                                                                    offlineFileLastModifiedMillis = sourceBytes.lastModified(),
+                                                                    remoteLastModifiedAtSeconds = sourceRow.effectivePublishedBaseline,
+                                                                ) -> true
+                                                            else -> false
+                                                        }
+                                                    }
                                                     val destinationBytes = sharedRealmOfflineFile(application, node, sharedScope)
                                                     val destinationExists = destinationBytes != null && destinationBytes.exists()
                                                     val destinationProof = if (destinationExists) {
@@ -780,10 +826,7 @@ class MainViewModel(
                                                     // STRICT VERIFIED-USABLE DESTINATION CONTENT (issue:
                                                     // round 24 #13): a proof that CERTIFIES the current
                                                     // bytes for this row, or EXACT unsent-revision
-                                                    // ownership proven over them. The bare identifying
-                                                    // proof and the pending marker are pending work or
-                                                    // unproven history — never evidence that the source
-                                                    // data is safely replaceable.
+                                                    // ownership proven over them.
                                                     val destinationVerified = destinationHash != null && (
                                                         (destinationProof?.identifies(node, sharedScope) == true &&
                                                             destinationProof.contentHash != null &&
@@ -799,16 +842,28 @@ class MainViewModel(
                                                                 originalFileId = node.id,
                                                             )
                                                         )
-                                                    if (destinationVerified) continue
-                                                    val sourceRow = FileController.getFileById(currentDriveRealm, node.id)
-                                                    val sourceBytes = sourceRow
-                                                        ?.getOfflineFile(application, userDrive.userId)
-                                                        ?.takeIf { it.exists() }
-                                                    val sourceClaimed = sourceBytes == null || runCatching {
-                                                        val sourceUri = Uri.fromFile(sourceBytes).toString()
-                                                        UploadFile.hasPendingUpload(uri = sourceUri) ||
-                                                            UploadFile.hasRetainedUnsentUpload(uri = sourceUri)
-                                                    }.getOrDefault(true)
+                                                    // THE PER-NODE PRESERVATION OUTCOME (issue: round 25
+                                                    // #1): the source's EXACT CURRENT revision must exist
+                                                    // at the destination or in a VERIFIED durable
+                                                    // snapshot before the source may ever be unlinked —
+                                                    // a valid OLD destination generation never preserves
+                                                    // a NEWER unsent source revision (the explicit-pin
+                                                    // R2-over-R1 trace). Different destination content
+                                                    // retains the source until preservation succeeds.
+                                                    val sourcePreserved = sourceHash == null ||
+                                                        destinationHash == sourceHash ||
+                                                        (destinationExists && destinationBytes != null &&
+                                                            UploadFile.hasDurableOriginalRevisionOwnership(
+                                                                fileName = node.name,
+                                                                remoteFolder = node.parentId,
+                                                                driveId = sharedScope.driveId,
+                                                                userId = sharedScope.userId,
+                                                                fileModifiedAt = Date(destinationBytes.lastModified()),
+                                                                fileSize = destinationBytes.length(),
+                                                                contentHash = sourceHash,
+                                                                originalFileId = node.id,
+                                                            ))
+                                                    if (sourcePreserved && destinationVerified) continue
                                                     // REPLACE AUTHORITY BEFORE ANY EFFECT (issue: round 24
                                                     // #12): the staged transfer replaces the destination
                                                     // only when it is ABSENT or byte-CONVERGENT with the
@@ -816,10 +871,12 @@ class MainViewModel(
                                                     // drifted destination is never replaced by a bare
                                                     // rename (retained destination edits and foreign or
                                                     // ambiguous residue survive).
-                                                    val sourceHash = if (sourceBytes != null && !sourceClaimed) {
-                                                        UploadFile.sha256OrNull(sourceBytes)
-                                                    } else null
-                                                    val destinationReplaceable = sourceHash != null && (
+                                                    // A PENDING/RETAINED-UNSENT UPLOAD OWNS ITS BYTES
+                                                    // (prior-round preservation): claimed source bytes
+                                                    // are never copied by this walk — the upload flow
+                                                    // resolves their relocation; the destination keeps
+                                                    // (or receives) its own intent.
+                                                    val destinationReplaceable = sourceHash != null && !sourceClaimed && (
                                                         !destinationExists || destinationHash == sourceHash
                                                         )
                                                     // STAGED, VERIFIED TRANSFER (issues: round 23 #13, round
@@ -857,12 +914,16 @@ class MainViewModel(
                                                                     destinationBytes,
                                                                 )
                                                             if (!proofMoved) {
-                                                                val sourceDirty = sourceRow != null &&
-                                                                    OfflineFolderPolicy.isLocallyModified(
-                                                                        offlineFileLastModifiedMillis = sourceBytes.lastModified(),
-                                                                        remoteLastModifiedAtSeconds = sourceRow.effectivePublishedBaseline,
-                                                                    )
-                                                                if (sourceDirty) {
+                                                                // POSITIVE EDIT REGISTRATION ONLY (issue:
+                                                                // round 25 #2): the classification was
+                                                                // established BEFORE any destination effect
+                                                                // from the source's own proof, anchor and
+                                                                // bytes — an mtime comparison alone is
+                                                                // NEVER authority to register foreign or
+                                                                // ambiguous historical bytes as this
+                                                                // destination's edit (they stay unproven
+                                                                // and retained).
+                                                                if (sourceClassifiedEdit) {
                                                                     // UNSENT-REVISION OWNERSHIP AT THE DESTINATION
                                                                     // (issue: round 24 #13): a dirty edit's
                                                                     // transferred bytes are registered as the
@@ -896,7 +957,15 @@ class MainViewModel(
                                                             runCatching { if (stagedTransfer.exists()) stagedTransfer.delete() }
                                                         }
                                                     }.getOrDefault(false)
-                                                    if (!transferred && !destinationVerified) {
+                                                    // THE PRESERVATION GAP IS A DURABLE INTENT (issue:
+                                                    // round 25 #1): a node whose source revision is
+                                                    // not yet preserved (valid old destination
+                                                    // generation over a newer unsent source) keeps
+                                                    // the pending marker — the source bytes stay in
+                                                    // place and the final verification's
+                                                    // preservation arm keeps the source metadata
+                                                    // until a worker or snapshot resolves them.
+                                                    if (!transferred && (!destinationVerified || !sourcePreserved)) {
                                                         FileController.markFileAsOffline(
                                                             customRealm = sharedRealm,
                                                             fileId = node.id,
@@ -984,7 +1053,30 @@ class MainViewModel(
                                                                 originalFileId = node.id,
                                                             )
                                                         )
-                                                    if (!nodeVerified) ownedCopiesOk = false
+                                                    // THE SOURCE'S EXACT REVISION IS PRESERVED (issue:
+                                                    // round 25 #1): verified DESTINATION content alone
+                                                    // never authorizes removing a NEWER unsent source
+                                                    // revision — the source's current bytes must be the
+                                                    // destination's bytes, or durably owned by a
+                                                    // verified snapshot over the destination's copy.
+                                                    val sourceRow = FileController.getFileById(currentDriveRealm, node.id)
+                                                    val sourceBytes = sourceRow
+                                                        ?.getOfflineFile(application, userDrive.userId)
+                                                        ?.takeIf { it.exists() }
+                                                    val sourceHash = sourceBytes?.let { UploadFile.sha256OrNull(it) }
+                                                    val sourcePreserved = sourceHash == null || nodeHash == sourceHash ||
+                                                        (nodeBytes != null && sourceHash != null &&
+                                                            UploadFile.hasDurableOriginalRevisionOwnership(
+                                                                fileName = node.name,
+                                                                remoteFolder = node.parentId,
+                                                                driveId = sharedScope.driveId,
+                                                                userId = sharedScope.userId,
+                                                                fileModifiedAt = Date(nodeBytes.lastModified()),
+                                                                fileSize = nodeBytes.length(),
+                                                                contentHash = sourceHash,
+                                                                originalFileId = node.id,
+                                                            ))
+                                                    if (!nodeVerified || !sourcePreserved) ownedCopiesOk = false
                                                 }
                                             }
                                         }
@@ -1005,6 +1097,7 @@ class MainViewModel(
                                 // longer lives in). Every required flagged row's shared path
                                 // is resolved and persisted SYNCHRONOUSLY, under this
                                 // section's locks, before the source metadata is removed.
+                                var requiredPathsPersisted = true
                                 runCatching {
                                     // THE CAPTURED SCOPE'S OWN REALM INSTANCE (round-24 build
                                     // correction): the merge's sharedRealm session closed with
@@ -1026,21 +1119,47 @@ class MainViewModel(
                                                     sharedWithMe = true,
                                                 )
                                                 val resolvedPath = FileController.generateAndSavePath(node.id, nodeScope)
-                                                FileController.persistResolvedPath(node.id, nodeScope, resolvedPath)
+                                                // EVERY REQUIRED PATH PERSISTS WITH READ-BACK
+                                                // BEFORE THE SOURCE UNLINK (issue: round 25 #13):
+                                                // ALL required shared path persistence (the
+                                                // synchronous persist AND the row's stored path
+                                                // reading back as the resolved value) must
+                                                // succeed — the previous walk ignored the persist
+                                                // result, so a failed or deferred write left the
+                                                // relocated shared row pathless while the source
+                                                // metadata was removed anyway.
+                                                val persisted = resolvedPath.isNotBlank() &&
+                                                    FileController.persistResolvedPath(node.id, nodeScope, resolvedPath) &&
+                                                    runCatching { pathRealm.refresh() }.isSuccess &&
+                                                    FileController.getFileById(pathRealm, node.id)?.path == resolvedPath
+                                                if (!persisted) {
+                                                    requiredPathsPersisted = false
+                                                    break
+                                                }
                                             }
                                         }
                                     }
                                 }.onFailure(Sentry::captureException)
-                                // The source backlink is removed only AFTER the destination's
-                                // committed graph verified (issue: round 21 #8).
-                                FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
-                                    runCatching { localFolder.children.remove(file) }
+                                // THE UNLINK GATE (issue: round 25 #13): an unresolved required
+                                // path RETAINS the source metadata (row, ancestry and bytes) —
+                                // the move re-processes on a later pass.
+                                if (requiredPathsPersisted) {
+                                    // The source backlink is removed only AFTER the destination's
+                                    // committed graph verified (issue: round 21 #8).
+                                    FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
+                                        runCatching { localFolder.children.remove(file) }
+                                    }
+                                    FileController.removeFile(
+                                        fileId = file.id,
+                                        customRealm = currentDriveRealm,
+                                        userDrive = userDrive,
+                                    )
+                                } else {
+                                    // A required shared path failed to persist durably (issue:
+                                    // round 25 #13): the source metadata is retained and the
+                                    // move re-processes on a later pass.
+                                    SentryLog.i("MainViewModel", "Deferred shared move of ${file.id}: a required shared path did not persist durably")
                                 }
-                                FileController.removeFile(
-                                    fileId = file.id,
-                                    customRealm = currentDriveRealm,
-                                    userDrive = userDrive,
-                                )
                             } else {
                                 // The row keeps its OLD identity and location in this realm;
                                 // the offline sync re-processes the move until the shared
