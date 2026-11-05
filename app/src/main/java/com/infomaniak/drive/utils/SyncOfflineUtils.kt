@@ -882,6 +882,19 @@ object SyncOfflineUtils {
                         freshDestination.absolutePath,
                     )
                     if (recoveryGoverned) return@use
+                    // TYPED EXCLUSIVE DESTINATION OWNERSHIP (review-37 #10): the fresh
+                    // resolution alone never establishes exclusivity — duplicate retained
+                    // claims (F and G both deriving the same path) or a failed ownership
+                    // resolution defer EVEN WHEN the destination is physically absent.
+                    if (!DownloadOfflineFileManager.destinationExclusivelyOwnedForMigration(
+                            context,
+                            userDrive,
+                            file.id,
+                            freshDestination,
+                        )
+                    ) {
+                        return@use
+                    }
                     // EXISTING-DESTINATION CLASSIFICATION (review-36 #11): a destination that
                     // already holds content belongs to the CURRENT resolution — the stale
                     // ID-named old copy never replaces it; the migration defers instead.

@@ -2869,6 +2869,25 @@ class DownloadOfflineFileManager(
             }
         }
 
+        /** THE MIGRATION'S TYPED EXCLUSIVE OWNERSHIP (review-37 #10): the legacy-storage
+         * migration may publish its old copy only when the destination is proven UNCLAIMED
+         * or EXCLUSIVELY the migrating row's — duplicate retained claims or a failed
+         * ownership resolution defer EVEN WHEN the destination is physically absent
+         * (physical absence is not proof of an unowned destination). */
+        internal fun destinationExclusivelyOwnedForMigration(
+            context: Context,
+            userDrive: UserDrive,
+            fileId: Int,
+            target: IOFile,
+        ): Boolean = destinationOwnershipPermits(
+            context,
+            userDrive,
+            fileId,
+            target,
+            sharedWithMe = userDrive.sharedWithMe,
+            storageKind = "offline",
+        )
+
         /** THE DESTINATION'S PRE-PREPARATION AUTHORITY (review-35 #6): an ABSENT
          * destination can still be governed — another row's recovery may own this path (its
          * bytes retained in a backup) and another live row may claim it. Returns true only
