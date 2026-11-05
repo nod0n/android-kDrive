@@ -913,7 +913,6 @@ object SyncOfflineUtils {
             // a cancelled snapshot of revision A is not ownership of revision B that merely
             // retained A's modification date — B registers normally.
             val registrationName = remoteFile?.name ?: liveRow.name
-            val registrationFolder = remoteFile?.parentId ?: liveRow.parentId
             // An UNREADABLE source is unresolved, not handled (issue: round 21 #26): the
             // previous `true` consumed a dirty rename/move activity without preserving or
             // committing its new identity — the cursor stays until a fresh, exact
@@ -1053,10 +1052,12 @@ object SyncOfflineUtils {
                 // logged rather than ignored.
                 // THE ANCESTRY AUTHORITY HOLDS THROUGH ACCEPTANCE (issue: round 23 #10):
                 // a chain broken during the registration I/O defers the metadata commit —
-                // the durable snapshot registration exists, the action is consumed, and
-                // the acceptance retries on a later pass with the resolved ancestry.
-                if (registrationFolder > 0 && !FileController.destinationChainExists(realm, registrationFolder)) {
+                // the durable snapshot registration exists, and the ACTION IS RETAINED
+                // (issue: round 24 #1): a later pass re-attempts the acceptance with the
+                // resolved ancestry instead of consuming the activity unadvanced.
+                val advanced = if (registrationFolder > 0 && !FileController.destinationChainExists(realm, registrationFolder)) {
                     SentryLog.i("SyncOffline", "Upload advance deferred for ${localFile.id}: its destination ancestry broke during registration")
+                    false
                 } else FileController.updateExistingFileIfNotSuperseded(
                     newFile = remoteFile,
                     realm = realm,
@@ -1066,6 +1067,13 @@ object SyncOfflineUtils {
                 )
                 if (!advanced) {
                     SentryLog.i("SyncOffline", "Upload advance rejected for ${localFile.id}; snapshot ownership retained")
+                    // A REJECTED OR DEFERRED ADVANCE RETAINS THE ACTION (issue: round 24 #1):
+                    // the acceptance is not manufactured — the cursor stays so a later pass
+                    // re-attempts the conditional metadata acceptance with the resolved
+                    // ancestry. The snapshot's durable registration persists, so the pending
+                    // upload is still dispatched below; only the action's consumption waits.
+                    context.syncImmediately(isAutomaticTrigger = false)
+                    return false
                 }
             }
 

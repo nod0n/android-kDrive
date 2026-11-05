@@ -140,7 +140,12 @@ object OfflineFolderUtils {
                 val tokens = HashMap<Int, Pair<Int, String?>>()
                 subtreeObservedById.values.forEach { observed ->
                     if (!observed.isFolder()) {
-                        val record = DownloadOfflineFileManager.readPublishedProvenance(context, observed)
+                        // The provenance registry is keyed by the SCOPED java.io.File (issue:
+                        // round 24 #1): the model row is resolved to its own offline path under
+                        // the walk's captured scope before the record is read — never the
+                        // active account.
+                        val record = observed.getOfflineFile(context, userDrive.userId)
+                            ?.let { DownloadOfflineFileManager.readPublishedProvenance(context, it) }
                         tokens[observed.id] = (record?.version ?: 0) to record?.contentHash
                     }
                 }
@@ -246,6 +251,11 @@ object OfflineFolderUtils {
         val allPages = mutableListOf<File>()
         var lastResponse: CursorApiResponse<List<File>>? = null
         var cursor: String? = null
+        // THE EXECUTING CONTEXT IS CAPTURED ONCE (issue: round 24 #1): the non-suspending
+        // checkCancelled callback below cannot read the suspend `coroutineContext` property —
+        // the walk's actual context is captured here, before the first request, and every
+        // callback invocation checks THIS job.
+        val walkContext = coroutineContext
 
         // REQUEST-TIME ROOT GENERATION (issue: round 18 #25): captured BEFORE the first
         // listing request — the absent-child cleanup's freshness horizon is the REQUEST's,
@@ -360,7 +370,7 @@ object OfflineFolderUtils {
             folderQueue = folderQueue,
             visitedFolderIds = visitedFolderIds,
             observedById = observedById,
-            checkCancelled = { coroutineContext.ensureActive() },
+            checkCancelled = { walkContext.ensureActive() },
         )
 
         // Fully listed: children confirmed absent from this authoritative listing are reconciled
