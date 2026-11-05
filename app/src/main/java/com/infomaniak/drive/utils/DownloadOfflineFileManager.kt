@@ -2125,8 +2125,17 @@ class DownloadOfflineFileManager(
             proofText: String,
             sharedWithMe: Boolean = false,
             storageKind: String = "offline",
-            attemptedObservationText: String? = null,
+            attemptedObservation: AttemptedObservationCapture = AttemptedObservationCapture.Absent,
         ): Boolean = runCatching {
+            // DAMAGED EVIDENCE IS NEVER PERSISTED AS ABSENCE (issue: round 31 #4), as in
+            // the publication recovery record: a relocation whose source observation
+            // cannot be presented validly fails the record write — before any proof move —
+            // and the state is retained.
+            val attemptedObservationText = when (attemptedObservation) {
+                is AttemptedObservationCapture.Absent -> ""
+                is AttemptedObservationCapture.Valid -> attemptedObservation.text
+                AttemptedObservationCapture.Invalid -> return@runCatching false
+            }
             val recordFile = proofRelocationRecordFile(context, target)
             // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
             // scope index exists before the record, so an interrupted or later-corrupted
@@ -2150,26 +2159,41 @@ class DownloadOfflineFileManager(
             // record carries none; the replay treats it as absent).
             atomicWriteText(
                 recordFile,
-                listOf("1", target.absolutePath, proofText, attemptedObservationText ?: "").joinToString("\n"),
+                listOf("1", target.absolutePath, proofText, attemptedObservationText).joinToString("\n"),
             )
         }.getOrDefault(false)
 
         /**
-         * THE OBSERVATION'S FIXED-PREFIX PARSE (issue: round 30 #6): the location is the
-         * ENTIRE tail after the fixed prefix — a destination containing '|' occupies
-         * several components and must never be recovered by position from the end. Returns
-         * the fixed prefix fields and the location tail, or null for an unparseable
-         * observation. The current format carries the attempt id at prefix[1] (seven fixed
-         * fields); a pre-attempt-id legacy observation (six fixed fields) has no attempt id
-         * to validate — the reader's publication-id binding stays the authority.
+         * THE OBSERVATION'S FIXED-PREFIX PARSE (issue: round 30 #6, refined round 31 #4):
+         * the location is the ENTIRE tail after the fixed prefix — a destination containing
+         * '|' occupies several components and must never be recovered by position from the
+         * end. EVERY typed prefix field is validated (the attempt id, the version, the
+         * nullable size and all three timestamps) — a frame-and-count match alone admitted
+         * damaged evidence whose generation fields could not be trusted at replay.
+         * Returns the fixed prefix fields and the location tail, or null for an
+         * unparseable observation. The current format carries the attempt id at prefix[1]
+         * (seven fixed fields); a pre-attempt-id legacy observation (six fixed fields) has
+         * no attempt id to validate — the reader's publication-id binding stays the
+         * authority.
          */
         private fun parseObservationBinding(text: String): Pair<List<String>, String>? {
             val fields = text.split("|")
+            val currentFormat = fields.size >= 8 && fields[0] == "1" &&
+                fields[1].toLongOrNull() != null &&
+                fields[2].toIntOrNull() != null &&
+                (fields[3].isEmpty() || fields[3].toLongOrNull() != null) &&
+                fields[4].toLongOrNull() != null &&
+                fields[5].toLongOrNull() != null &&
+                fields[6].toLongOrNull() != null
+            val legacyFormat = fields.size == 7 && fields[0] == "1" &&
+                fields[1].toIntOrNull() != null &&
+                (fields[2].isEmpty() || fields[2].toLongOrNull() != null) &&
+                fields[3].toLongOrNull() != null &&
+                fields[4].toLongOrNull() != null &&
+                fields[5].toLongOrNull() != null
             return when {
-                fields.size >= 8 && fields[0] == "1" && fields[1].toLongOrNull() != null ->
-                    fields.take(7) to fields.drop(7).joinToString("|")
-                fields.size == 7 && fields[0] == "1" ->
-                    fields.take(6) to fields.drop(6).joinToString("|")
+                currentFormat -> fields.take(7) to fields.drop(7).joinToString("|")
+                legacyFormat -> fields.take(6) to fields.drop(6).joinToString("|")
                 else -> null
             }
         }
@@ -2196,10 +2220,15 @@ class DownloadOfflineFileManager(
                 provenance.recordText(target),
                 sharedWithMe = sharedWithMe,
                 storageKind = storageKind,
-                // THE OBSERVATION RIDES THE RELOCATION STATE (issue: round 30 #7):
-                // captured from the source BEFORE any rebind, so a crash between the
-                // relocation record and the observation move is recoverable with BOTH.
-                attemptedObservationText = readAttemptedObservationText(context, source),
+                // THE OBSERVATION RIDES THE RELOCATION STATE (issues: round 30 #7, round
+                // 31 #4): captured from the source BEFORE any rebind — an unresolved
+                // source record (version 0) whose observation cannot be presented validly
+                // fails the relocation record write and the state is retained.
+                attemptedObservation = captureAttemptedObservation(
+                    context,
+                    source,
+                    unresolvedRecord = readPublishedProvenance(context, source)?.version == 0,
+                ),
             )
             if (!relocationStateWritten) {
                 // Without recoverable state the source proof is NOT destroyed: the old
@@ -2363,15 +2392,46 @@ class DownloadOfflineFileManager(
          * validate against the exact backed-up generation. A backup without a computable
          * hash is never kept (it could not be verified against anything).
          */
+        /** THE OBSERVATION CAPTURE TRI-STATE (issue: round 31 #4): absence, a VALID
+         * carried observation, and an unreadable/damaged one are DISTINCT facts — the
+         * previous single-null capture turned damaged evidence into "no observation
+         * required" and let recovery report success without usable attempt evidence. */
+        private sealed class AttemptedObservationCapture {
+            /** The attempt published no observation (a RESOLVED generation's operation). */
+            object Absent : AttemptedObservationCapture()
+
+            /** A valid observation was read and fully typed-validated. */
+            class Valid(val text: String) : AttemptedObservationCapture()
+
+            /** An observation SHOULD exist (the attempt was unresolved) but is absent,
+             * unreadable or invalid: the operation fails closed, never persists an empty
+             * placeholder. */
+            object Invalid : AttemptedObservationCapture()
+        }
+
         /**
-         * THE CARRIED ATTEMPTED OBSERVATION (issue: round 30 #7): a recovery operation
-         * persists the staged attempt's observation text BEFORE the replacement, so an
-         * interrupted publication can re-establish the proof AND its retry evidence
-         * together. Null when the attempt published no observation (a resolved generation).
+         * THE CARRIED ATTEMPTED OBSERVATION CAPTURE (issue: round 30 #7, refined round 31
+         * #4): a recovery/proof-move operation captures the staged attempt's observation
+         * BEFORE the replacement. [unresolvedRecord] decides whether an observation MUST
+         * exist — a missing, unreadable or invalid one is [AttemptedObservationCapture.Invalid]
+         * (the record write then fails closed), never a silent absence.
          */
-        private fun readAttemptedObservationText(context: Context, publishedFile: IOFile): String? =
-            runCatching { IOFile(provenanceFileFor(context, publishedFile).path + ".obs").readText().trim() }
-                .getOrNull()?.takeIf { it.isNotEmpty() && parseObservationBinding(it) != null }
+        private fun captureAttemptedObservation(
+            context: Context,
+            publishedFile: IOFile,
+            unresolvedRecord: Boolean,
+        ): AttemptedObservationCapture {
+            if (!unresolvedRecord) return AttemptedObservationCapture.Absent
+            val text = runCatching { IOFile(provenanceFileFor(context, publishedFile).path + ".obs").readText().trim() }
+                .getOrNull()
+            return when {
+                text.isNullOrEmpty() -> AttemptedObservationCapture.Invalid
+                else -> {
+                    val parsed = parseObservationBinding(text)
+                    if (parsed != null) AttemptedObservationCapture.Valid(text) else AttemptedObservationCapture.Invalid
+                }
+            }
+        }
 
         /**
          * THE REPLAYED OBSERVATION BINDING (issue: round 30 #7): the carried observation is
@@ -2387,6 +2447,12 @@ class DownloadOfflineFileManager(
             observationText: String?,
             proof: PublishedProvenance,
         ): Boolean {
+            // AN ABSENT CARRIED OBSERVATION IS LEGITIMATE ONLY FOR ONE SHAPE (issue: round
+            // 31 #4): a resolved generation's operation carried none — null means absent,
+            // never "the evidence could not be read". A v4/proof-move operation that
+            // created an observation persists it VALID; a non-null text that fails to
+            // parse here is on-disk corruption and RETAINS the operation instead of
+            // authorizing disposal or replay.
             if (observationText == null) return true
             val parsed = parseObservationBinding(observationText) ?: return false
             val reboundText = (parsed.first + target.absolutePath).joinToString("|")
@@ -2411,14 +2477,21 @@ class DownloadOfflineFileManager(
             backupHash: String,
             expectedPublicationHash: String?,
             expectedPublicationRecordText: String?,
-            attemptedObservationText: String?,
+            attemptedObservation: AttemptedObservationCapture,
         ): Boolean = runCatching {
-            // RECORD v4 (issue: round 30 #7): the operation's ATTEMPTED OBSERVATION rides
-            // the record beside the expected proof — an interrupted publication can then
-            // re-establish the destination proof AND the durable retry evidence together,
-            // and the disposal happens only once BOTH are established (the previous v3
-            // replay reconstructed a self-certifying proof while the observation was still
-            // stranded at the staged key, leaving suppression without its evidence).
+            // RECORD v4 (issue: round 30 #7, refined round 31 #4): the operation's
+            // ATTEMPTED OBSERVATION rides the record beside the expected proof — an
+            // interrupted publication can then re-establish the destination proof AND the
+            // durable retry evidence together, and the disposal happens only once BOTH are
+            // established. DAMAGED evidence is never persisted as absence: an operation
+            // that created an observation but cannot present it validly FAILS the record
+            // here — before any byte is replaced — instead of writing an empty field whose
+            // replay would later read as "no observation required".
+            val attemptedObservationText = when (attemptedObservation) {
+                is AttemptedObservationCapture.Absent -> ""
+                is AttemptedObservationCapture.Valid -> attemptedObservation.text
+                AttemptedObservationCapture.Invalid -> return@runCatching false
+            }
             val recordFile = recoveryRecordFile(context, recoveryFile)
             // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
             // scope index exists before the record itself, and names the destination's
@@ -2452,7 +2525,7 @@ class DownloadOfflineFileManager(
                     backupHash,
                     expectedPublicationHash ?: "",
                     expectedPublicationRecordText ?: "",
-                    attemptedObservationText ?: "",
+                    attemptedObservationText,
                 ).joinToString("\n")
             )
         }.getOrDefault(false)
@@ -2679,7 +2752,7 @@ class DownloadOfflineFileManager(
                     // record — identities/paths demonstrably outside it progress; inside
                     // it (or without a sidecar) fails closed. The previous blanket
                     // fail-closed blocked unrelated files and accounts forever.
-                    val parts = runCatching { recordFile.readText().split("\n", limit = 3) }.getOrNull()
+                    val parts = runCatching { recordFile.readText().split("\n", limit = 4) }.getOrNull()
                     if (parts == null || parts.size < 3 || parts[0].trim() != "1") {
                         val scope = readScopeSidecar(recordFile) ?: return true
                         val scopeIdentity = scope.fileId == fileId &&
@@ -2689,6 +2762,19 @@ class DownloadOfflineFileManager(
                         continue
                     }
                     if (targetPath != null && IOFile(parts[1]).absolutePath == targetPath) return true
+                    // THE CAPTURED IDENTITY MATCHES TOO (issue: round 31 #2): a valid
+                    // proofmove record carries its owner's full captured
+                    // account/drive/file identity in the proof text — the previous
+                    // target-path-only match missed a check issued at ANOTHER location
+                    // (identity-only, or a different path) and let the governed source be
+                    // relocated/committed over.
+                    val proofFields = parts[2].removePrefix(PROVENANCE_FRAME).split("|")
+                    val proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull()
+                    val proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull()
+                    val proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull()
+                    if (proofUserId == userDrive.userId && proofDriveId == userDrive.driveId && proofFileId == fileId) {
+                        return true
+                    }
                     continue
                 }
                 val record = readRecoveryRecord(recordFile)
@@ -3057,13 +3143,23 @@ class DownloadOfflineFileManager(
                 // has superseded the attempt — its observation evidence is spent and is
                 // deliberately not rewritten (the binding reader would reject it anyway).
                 if (record.attemptedObservationText != null) {
-                    val carriedAttemptId = parseObservationBinding(record.attemptedObservationText)
-                        ?.first?.getOrNull(1)?.toLongOrNull()
-                    if (carriedAttemptId != null && carriedAttemptId == targetProof.publicationId &&
+                    val carried = parseObservationBinding(record.attemptedObservationText)
+                    val carriedAttemptId = carried?.first?.getOrNull(1)?.toLongOrNull()
+                    if (carried == null || carriedAttemptId == null) {
+                        // DAMAGED CARRIED EVIDENCE NEVER AUTHORIZES DISPOSAL (issue: round
+                        // 31 #4): supersession is inferred from VALIDATED publication
+                        // identities only — an unparseable carried observation retains the
+                        // operation state.
+                        return false
+                    }
+                    if (carriedAttemptId == targetProof.publicationId &&
                         !establishRecoveredObservation(context, target, record.attemptedObservationText, targetProof)
                     ) {
                         return false
                     }
+                    // carriedAttemptId != the target proof's publication id: a NEWER
+                    // publication (validated identity) has superseded the attempt — its
+                    // observation evidence is spent and is deliberately not rewritten.
                 }
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
@@ -3976,10 +4072,15 @@ class DownloadOfflineFileManager(
                     backupHash,
                     expectedPublicationHash,
                     expectedPublicationRecordText,
-                    // THE OBSERVATION RIDES THE RECOVERY (issue: round 30 #7): captured
-                    // from the staged attempt BEFORE the replacement, so an interrupted
-                    // publication can re-establish proof and evidence together.
-                    attemptedObservationText = readAttemptedObservationText(provenanceContext, staged),
+                    // THE OBSERVATION RIDES THE RECOVERY (issues: round 30 #7, round 31
+                    // #4): captured from the staged attempt BEFORE the replacement; a
+                    // missing/unreadable/invalid observation of an unresolved attempt
+                    // fails the record write instead of being persisted as absence.
+                    attemptedObservation = captureAttemptedObservation(
+                        provenanceContext,
+                        staged,
+                        unresolvedRecord = explicitUnresolvedGeneration,
+                    ),
                 ))
             if (!recoveryOk || !recoveryRecorded) {
                 runCatching { recoveryFile?.delete() }
@@ -4308,8 +4409,13 @@ class DownloadOfflineFileManager(
                                 backupHash,
                                 expectedPublicationHash,
                                 expectedPublicationRecordText,
-                                // THE OBSERVATION RIDES THE RECOVERY (issue: round 30 #7).
-                                attemptedObservationText = readAttemptedObservationText(context, staged),
+                                // THE OBSERVATION RIDES THE RECOVERY (issues: round 30 #7,
+                                // round 31 #4), as in the coordinated arm.
+                                attemptedObservation = captureAttemptedObservation(
+                                    context,
+                                    staged,
+                                    unresolvedRecord = !generationResolved,
+                                ),
                             ))
                         if (!recoveryOk || !recoveryRecorded) {
                             runCatching { recoveryFile?.delete() }
