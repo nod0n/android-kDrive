@@ -857,19 +857,30 @@ class DownloadOfflineFileManager(
                             // own accounted clean generation (the tied-rename case the
                             // resumption exists for) allow the conditional advance — never
                             // the bare owner/hash+two-timestamp upsert.
+                            // RECOVERY BEFORE ANY SHORTCUT (issue: round 30 #1): a
+                            // destination governed by an unresolved durable recovery defers —
+                            // the sweep owns that state, and a metadata advance over it is
+                            // never this resumption's business.
+                            if (hasUnresolvedRecovery(context, userDrive, live.id, offlineFile.absolutePath)) {
+                                return@withFileLock
+                            }
                             val liveOldPath = live.getOfflineFile(context, userDrive.userId)?.absolutePath
-                            val oldSourceDisposition = if (liveOldPath == null ||
-                                liveOldPath == offlineFile.absolutePath
-                            ) {
-                                OldSourceDisposition.Absent
-                            } else {
-                                classifyOldSourceWithAuthority(
+                            val oldSourceDisposition = when {
+                                // AN UNRESOLVABLE CURRENT LOCATION IS NOT "ABSENT" (issue:
+                                // round 30 #1): the physical ownership of the row's own bytes
+                                // is UNKNOWN — the resumption defers and the row is retained;
+                                // a later pass re-derives (the identity-governed recovery case
+                                // is already excluded by the destination check above).
+                                liveOldPath == null -> OldSourceDisposition.Deferred
+                                liveOldPath == offlineFile.absolutePath -> OldSourceDisposition.Absent
+                                else -> classifyOldSourceWithAuthority(
                                     realm = realm,
                                     context = context,
                                     userDrive = userDrive,
                                     row = live,
                                     basisPath = liveOldPath,
                                     verifiedBasisHash = null, // a resume captures no verified basis hash
+                                    checkCancelled = { ensureActive() },
                                 )
                             }
                             when (oldSourceDisposition) {
@@ -1036,6 +1047,7 @@ class DownloadOfflineFileManager(
                                             row = classificationRow,
                                             basisPath = basisPath,
                                             verifiedBasisHash = verifiedBasisSourceHash,
+                                            checkCancelled = { ensureActive() },
                                         )
                                     }
                                     when (disposition) {
@@ -1074,6 +1086,14 @@ class DownloadOfflineFileManager(
                                     // IDENTITY (issue: round 25 #9): only the exact verified
                                     // revision, under full current authority, is retired.
                                     if (advanceAccepted && basisPath != null && basisPath != offlineFile.path) {
+                                        // THE EXECUTING CONTEXT BEFORE THE FINAL UNLINK
+                                        // (issue: round 30 #4): the Realm commit above can be
+                                        // followed by cancellation — the unlink (the one
+                                        // destructive step left) must not run over it. A
+                                        // cancellation here retains the old source: the
+                                        // committed advance stands, and the next pass re-runs
+                                        // the retirement under full authority.
+                                        ensureActive()
                                         val basisCopy = IOFile(basisPath)
                                         if (basisCopy.exists()) {
                                             deletePublishedProvenance(context, basisCopy)
@@ -3215,7 +3235,19 @@ class DownloadOfflineFileManager(
             row: File,
             basisPath: String,
             verifiedBasisHash: String?,
+            checkCancelled: () -> Unit,
         ): OldSourceDisposition {
+            // RECOVERY BEFORE THE EXISTENCE SHORTCUT (issue: round 30 #1): a missing or
+            // unreadable old location with a governing unresolved recovery is that
+            // recovery's state — an interrupted publication's sole retained revision can
+            // sit in a durable backup while the old path itself is MISSING. Treating the
+            // missing path as "absent" (nothing to preserve) would let the caller advance
+            // the metadata and strand the backup (its restore requires the live owner to
+            // still resolve to the recorded path). The check runs by identity AND the
+            // available path, before any null/existence decision.
+            if (hasUnresolvedRecovery(context, userDrive, row.id, basisPath)) {
+                return OldSourceDisposition.Deferred
+            }
             val basisCopy = IOFile(basisPath)
             if (!basisCopy.exists()) return OldSourceDisposition.Absent
             // AUTHORITY PRE-FLIGHT BEFORE ANY CLASSIFICATION OR SNAPSHOT (issue: round 29
@@ -3231,6 +3263,8 @@ class DownloadOfflineFileManager(
                     !UploadFile.hasRetainedUnsentUpload(uri = android.net.Uri.fromFile(basisCopy).toString()) &&
                     !hasUnresolvedRecovery(context, userDrive, row.id, basisPath)
             if (!authorityHolds) return OldSourceDisposition.Deferred
+            // THE EXECUTING CONTEXT AFTER THE PRE-FLIGHT READS (issue: round 30 #4).
+            checkCancelled()
             // UNREADABLE OLD BYTES ARE UNCERTAIN (issue: round 29 #1) — never a proven edit.
             val currentBasisHash = UploadFile.sha256OrNull(basisCopy)
                 ?: return OldSourceDisposition.Deferred
@@ -3239,12 +3273,22 @@ class DownloadOfflineFileManager(
             if (verifiedBasisHash != null && currentBasisHash == verifiedBasisHash) {
                 return OldSourceDisposition.VerifiedBasis
             }
+            // THE EXECUTING CONTEXT AFTER THE EXPENSIVE HASH (issue: round 30 #4).
+            checkCancelled()
             // A READABLE REVISION WITHOUT THE EXACT VERIFIED BASIS: classified through the
             // COMMON content classification. A PROVEN edit registers under the row's
             // CURRENT identity (NO recovery-resolution override); the registered edit never
             // advances. Foreign, clean and uncertain bytes defer unregistered.
             return when (OfflineFolderController.protectionStateOf(row, basisCopy, userDrive)) {
                 OfflineFolderController.CopyProtection.DIRTY -> {
+                    // THE EXECUTING CONTEXT IMMEDIATELY BEFORE THE REGISTRATION (issue:
+                    // round 30 #4): cancellation during the classification must not be
+                    // followed by a durable snapshot/upload registration. A registration
+                    // that already started either completes or fails inside its own
+                    // coordination — it is never treated as permission to advance (the
+                    // registered-edit disposition skips the caller's advancement either
+                    // way).
+                    checkCancelled()
                     val registered = runCatching {
                         OfflineFolderController.registerDirtySnapshot(
                             context = context,

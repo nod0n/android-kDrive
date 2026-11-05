@@ -797,8 +797,29 @@ object OfflineFolderController {
                 // applied there, not staleness.
                 if (isStale(oldRow, remoteFile, observedById[remoteFile.id])) return@withFileLock oldRow
                 if (oldRow.isFolder()) return@withFileLock remoteFile
-                val oldOffline = oldRow.getOfflineFile(context, userDrive.userId)?.takeIf { it.exists() }
-                    ?: return@withFileLock remoteFile
+                // RECOVERY BEFORE THE MISSING/UNRESOLVED SHORTCUT (issue: round 30 #1): an
+                // old location that is ABSENT (an interrupted recovery can hold the sole
+                // retained revision in a durable backup while the path itself is missing)
+                // or unresolvable is NOT automatically "nothing to preserve" — a governing
+                // unresolved recovery RETAINS THE OLD ROW (its restore requires the live
+                // owner to still resolve to the recorded path; committing the incoming
+                // metadata here would strand the retained revision). The check runs by
+                // identity AND the available path; only a recovery-free unknown state
+                // hands over to the incoming metadata.
+                val resolvedOldOffline = oldRow.getOfflineFile(context, userDrive.userId)
+                val oldOffline = resolvedOldOffline?.takeIf { it.exists() }
+                if (oldOffline == null) {
+                    if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                            context,
+                            userDrive,
+                            oldRow.id,
+                            resolvedOldOffline?.absolutePath,
+                        )
+                    ) {
+                        return@withFileLock oldRow
+                    }
+                    return@withFileLock remoteFile
+                }
                 // SOURCE-OWNERSHIP GATE, before ANY preservation side effect (issue: round 16
                 // #3): the bytes at the old row's path must be EXCLUSIVELY claimed by this
                 // file's row. A path reused by another row (a stale duplicate claiming the
