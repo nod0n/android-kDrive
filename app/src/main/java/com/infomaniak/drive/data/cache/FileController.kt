@@ -528,7 +528,7 @@ object FileController {
                                         // and ancestry — is retained too; deleting the row
                                         // over retained bytes lost the metadata every
                                         // consumer of those bytes needs.
-                                        val bytesDisposed = file.deleteCaches(context!!, resolvedUserDrive.userId)
+                                        val bytesDisposed = file.deleteCaches(context!!, resolvedUserDrive)
                                         if (bytesDisposed && !keepFiles.contains(fileId) && !folderStillNeeded) {
                                             realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                                         }
@@ -713,79 +713,133 @@ object FileController {
     ) {
         if (filesToDelete.isEmpty()) return
 
-        // TWO-PHASE REMOVAL (issue: round 25 #7): the previous single pass deleted a
-        // PARENT row before discovering that a descendant had to be retained — the
-        // retained descendant then lost the required ownership metadata and ancestry
-        // above it. Phase one flattens the graph breadth-first; phase two processes
-        // DEEPEST-FIRST so every parent's decision sees its descendants' actual outcomes.
-        // THE SUPPLIED REALM IS THE GRAPH (issue: round 26 #10): children are enumerated
-        // TRANSACTION-FRESH from the CALLER'S realm instance — the previous
-        // getFileByUidOrId(file.id, userDrive) opened its own instance on the CAPTURED
-        // (or default/current) scope, so a document belonging to another captured
-        // account/shared scope was traversed against the WRONG graph and its metadata
-        // removed without ever discovering retained descendants. When no realm is
-        // supplied the captured-scope instance is used, as before.
-        val ordered = mutableListOf<File>()
-        val seenIds = mutableSetOf<Int>()
-        val childrenIdsById = mutableMapOf<Int, List<Int>>()
         val capturedUserId = userDrive?.userId ?: AccountUtils.currentUserId
-        val pending = ArrayDeque(filesToDelete)
-        filesToDelete.clear()
-        runCatching {
-            // A SUPPLIED REALM IS BORROWED, NEVER CLOSED (the caller's use block owns its
-            // lifecycle); only a self-opened instance is closed here.
-            if (realm != null) {
-                while (pending.isNotEmpty()) {
-                    val file = pending.removeFirst()
-                    if (!seenIds.add(file.id)) continue
-                    ordered.add(file)
-                    val children = getFileById(realm, file.id)?.children ?: emptyList()
-                    childrenIdsById[file.id] = children.map { it.id }
-                    children.forEach { pending.add(it) }
-                }
-            } else {
-                getRealmInstance(userDrive ?: UserDrive(capturedUserId)).use { traversalRealm ->
-                    while (pending.isNotEmpty()) {
-                        val file = pending.removeFirst()
-                        if (!seenIds.add(file.id)) continue
-                        ordered.add(file)
-                        val children = getFileById(traversalRealm, file.id)?.children ?: emptyList()
-                        childrenIdsById[file.id] = children.map { it.id }
-                        children.forEach { pending.add(it) }
-                    }
-                }
-            }
-        }.onFailure(Sentry::captureException)
-        val retainedIds = mutableSetOf<Int>()
-        // COORDINATED FINAL CLASSIFICATION AND DELETION (issue: round 26 #10): the
-        // deepest-first byte/row decisions run under the intent monitor and ONE ascending
-        // lock set over every affected identity — the previous unlocked phase two could
-        // interleave with a concurrent publication or move between an outcome's
-        // classification and its row deletion.
         val deletionScope = userDrive ?: UserDrive(capturedUserId)
-        val affectedIds = ordered.map { it.id }.distinct().sorted()
-        if (affectedIds.isEmpty()) return
+
+        // THE COMPLETE FRESH GRAPH UNDER THE INTENT PROTOCOL (issues: round 26 #10, round
+        // 27 #5/#6/#7): enumeration, boundary validation, locking and deletion run in ONE
+        // continuous coordinated section. The previous shape collected managed rows BEFORE
+        // the monitor (a self-opened traversal Realm closed under them — managed children
+        // were touched after close), locked a PRE-COLLECTED graph without validating
+        // current membership (a concurrent move could relocate a collected descendant
+        // outside the deletion boundary, or add one the lock set never covered), and
+        // never ran the inherited-preservation hook — an inherited leaf's unregistered
+        // edit (or a retained-unsent upload's sole source) was deleted without a durable
+        // snapshot. Enumeration failure defers ALL deletion (a partial graph never
+        // deletes).
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
-            OfflineFileCoordination.withLocksFor(deletionScope, affectedIds) {
-                for (file in ordered.reversed()) {
-                    // DEFERRED REMOVAL OUTCOME (issue: round 24 #4), as in removeFile: when
-                    // the byte deletion RETAINED the bytes (pending upload, unresolved
-                    // recovery), the owning row is retained too. THE CAPTURED SCOPE rides
-                    // the recursive deletion (issue: round 25 #7) — never the default
-                    // active account.
-                    val bytesDisposed = file.deleteCaches(context, capturedUserId)
-                    // A REQUIRED ANCESTOR (issue: round 25 #7): a parent whose subtree
-                    // retained anything keeps its row and metadata — deleting the row over
-                    // a retained descendant strands the descendant's ownership.
-                    val subtreeRetains = !bytesDisposed ||
-                        (childrenIdsById[file.id]?.any { it in retainedIds } == true)
-                    if (subtreeRetains) {
-                        retainedIds.add(file.id)
-                    } else {
-                        updateFile(file.id, realm, userDrive) { localFile -> localFile.deleteFromRealm() }
+            runCatching {
+                // THE ORIGINAL DELETION BOUNDARY (issue: round 27 #7): each request root's
+                // captured (id, parentId) — a root whose live parent no longer matches was
+                // relocated mid-flight, and this request's authority does not follow it.
+                val requestRoots = filesToDelete.map { Triple(it.id, it.parentId, it.name) }.distinctBy { it.first }
+                filesToDelete.clear()
+                // A SUPPLIED REALM IS BORROWED, NEVER CLOSED; a self-opened captured-scope
+                // instance serves the WHOLE section and closes after it — every row access
+                // happens inside this lifetime.
+                val borrowed = realm != null
+                val sectionRealm = realm ?: getRealmInstance(deletionScope)
+                try {
+                    runCatching { sectionRealm.refresh() }
+                    // BOUNDARY REVALIDATION under the monitor: every request root must
+                    // still exist at its captured parent.
+                    val rooted = requestRoots.mapNotNull { (rootId, rootParentId, _) ->
+                        val liveRoot = getFileById(sectionRealm, rootId)
+                        when {
+                            liveRoot == null -> null // vanished: nothing to delete beneath it
+                            liveRoot.parentId != rootParentId -> return@runCatching // relocated boundary: defer all
+                            else -> liveRoot
+                        }
                     }
+                    // PHASE ONE — breadth-first enumeration of the LIVE graph, children
+                    // reduced to IDS immediately (issue: round 27 #6): no managed object
+                    // outlives its Realm.
+                    data class GraphNode(
+                        val id: Int,
+                        val parentId: Int,
+                        val isFolder: Boolean,
+                        val isMarkedForBytes: Boolean,
+                        val childIds: List<Int>,
+                    )
+                    val graph = LinkedHashMap<Int, GraphNode>()
+                    val queue = ArrayDeque(rooted)
+                    val seenIds = mutableSetOf<Int>()
+                    while (queue.isNotEmpty()) {
+                        val node = queue.removeFirst()
+                        if (!seenIds.add(node.id)) continue
+                        val children = node.children.createSnapshot().filter { it.parentId == node.id }
+                        graph[node.id] = GraphNode(
+                            id = node.id,
+                            parentId = node.parentId,
+                            isFolder = node.isFolder(),
+                            isMarkedForBytes = node.isOffline || node.isInOfflineFolder,
+                            childIds = children.map { it.id },
+                        )
+                        children.forEach { queue.add(it) }
+                    }
+                    // PHASE TWO — the complete ordered lock set over EVERY enumerated id
+                    // (issue: round 27 #7): a concurrent writer that needs any of them
+                    // waits; a writer that does not need them cannot affect this graph's
+                    // membership (its effects land outside the boundary or after release,
+                    // where the per-candidate revalidation below still defers).
+                    val affectedIds = graph.keys.sorted()
+                    if (affectedIds.isEmpty()) return@runCatching
+                    OfflineFileCoordination.withLocksFor(deletionScope, affectedIds) {
+                        val retainedIds = mutableSetOf<Int>()
+                        for (id in graph.keys.reversed()) { // deepest-first: parents see descendants' outcomes
+                            val node = graph[id] ?: continue
+                            // PER-CANDIDATE REVALIDATION (issue: round 27 #7): the row must
+                            // still exist AT THE ENUMERATED PARENT — a relocation that
+                            // slipped between enumeration and locking defers this
+                            // candidate (its row now belongs to another boundary).
+                            val freshRow = getFileById(sectionRealm, id) ?: continue
+                            if (freshRow.parentId != node.parentId) {
+                                retainedIds.add(id)
+                                continue
+                            }
+                            // THE INHERITED-PRESERVATION HOOK BEFORE EVERY UNLINK (issue:
+                            // round 27 #5): a pending upload, a retained-unsent sole
+                            // source, a dirty copy (snapshotted first) or unproven
+                            // historical bytes retain the row and its required ancestors —
+                            // bytes are never removed without a durable preservation
+                            // outcome. The hook runs with the section's current Realm
+                            // under the ALREADY-HELD monitor (no nested acquisition).
+                            if (!node.isFolder && node.isMarkedForBytes) {
+                                when (OfflineFolderController.preserveInheritedCopyBeforeRemoval(
+                                    freshRow,
+                                    deletionScope,
+                                    sectionRealm,
+                                )) {
+                                    OfflineFolderController.PreservationOutcome.PRESERVED -> {
+                                        retainedIds.add(id)
+                                        continue
+                                    }
+                                    OfflineFolderController.PreservationOutcome.CONTENT_SAFE -> Unit
+                                }
+                            }
+                            // DEFERRED REMOVAL OUTCOME (issue: round 24 #4): when the byte
+                            // deletion RETAINED the bytes (pending upload, unresolved
+                            // recovery, failed deletion), the owning row is retained too.
+                            // THE CAPTURED SCOPE rides every byte resolution (issue: round
+                            // 26 #10) — never the default active account.
+                            val bytesDisposed = freshRow.deleteCaches(context, deletionScope)
+                            // A REQUIRED ANCESTOR (issue: round 25 #7): a parent whose
+                            // subtree retained anything keeps its row and metadata.
+                            val subtreeRetains = !bytesDisposed ||
+                                (node.childIds.any { it in retainedIds })
+                            if (subtreeRetains) {
+                                retainedIds.add(id)
+                            } else {
+                                sectionRealm.executeTransaction { tx ->
+                                    getFileById(tx, id)?.deleteFromRealm()
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    if (!borrowed) sectionRealm.close()
                 }
-            }
+            }.onFailure(Sentry::captureException)
         }
     }
 

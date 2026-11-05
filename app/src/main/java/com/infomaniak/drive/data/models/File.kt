@@ -549,16 +549,16 @@ open class File(
      * identity and ancestry are the metadata every consumer of the retained bytes needs);
      * a Unit return previously let removal flows delete the row over retained bytes.
      */
-    fun deleteCaches(context: Context, userId: Int = AccountUtils.currentUserId): Boolean {
+    fun deleteCaches(context: Context, userDrive: UserDrive): Boolean {
         if (isOffline || isInOfflineFolder) {
-            val offlineFile = getOfflineFile(context, userId) ?: run {
+            val offlineFile = getOfflineFile(context, userDrive.userId) ?: run {
                 // THE RECOVERY CHECK DOES NOT NEED THE TARGET (issue: round 25 #7): an
                 // unresolvable path with an unresolved recovery governing this IDENTITY
                 // retains the owning row — the previous order returned true for a null
                 // path and let the row (the retained bytes' required metadata) be deleted.
                 return !DownloadOfflineFileManager.hasUnresolvedRecovery(
                     context,
-                    UserDrive(userId, driveId),
+                    UserDrive(userDrive.userId, driveId),
                     id,
                     null,
                 )
@@ -573,13 +573,16 @@ open class File(
             // its live owner — the previous exists-gated check let the row be deleted over
             // a pending backup, stranding it).
             if (offlineFile.exists() &&
-                UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())
+                (UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) ||
+                    // A RETAINED-UNSENT UPLOAD'S SOLE SOURCE IS THE ORIGINAL URI (issue:
+                    // round 27 #5): its bytes are as live as a pending upload's.
+                    UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(offlineFile).toString()))
             ) {
                 return false
             }
             if (DownloadOfflineFileManager.hasUnresolvedRecovery(
                     context,
-                    UserDrive(userId, driveId),
+                    UserDrive(userDrive.userId, driveId),
                     id,
                     offlineFile.absolutePath,
                 )
@@ -597,14 +600,18 @@ open class File(
             }
             return true
         } else {
-            val cacheFile = getCacheFile(context)
+            // THE CAPTURED SCOPE RESOLVES THE ACTUAL CACHE DESTINATION (issue: round 27
+            // #8): the previous getCacheFile(context) defaulted to the CURRENT account and
+            // drive — a deletion for captured account A continued after a switch to B and
+            // removed B's cache/provenance for a same-id row while A's row was deleted.
+            val cacheFile = getCacheFile(context, userDrive)
             // THE PLAIN-CACHE BRANCH CARRIES THE SAME EXCLUSION BEFORE ANY EXISTS TEST
             // (issues: round 25 #7, round 26 #9): an unresolved recovery governs the
             // identity whether or not the cache bytes are currently present — a missing
             // target with a pending backup retains the row.
             if (DownloadOfflineFileManager.hasUnresolvedRecovery(
                     context,
-                    UserDrive(userId, driveId),
+                    UserDrive(userDrive.userId, userDrive.driveId),
                     id,
                     cacheFile.absolutePath,
                 )
