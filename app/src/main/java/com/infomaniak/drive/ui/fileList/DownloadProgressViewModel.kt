@@ -101,6 +101,11 @@ class DownloadProgressViewModel : ViewModel() {
                 UploadFile.sha256OrNull(outputFile) != null &&
                 (file.size == null || outputFile.length() == file.size)
             if ((file.isOffline || file.isInOfflineFolder) && retainedUsable &&
+                // THE SCOPED CLASSIFICATION IS NOT BYPASSED (issue: round 24 #6): a
+                // positively foreign provenance on this path is a conflict — preservation
+                // alone never completes the dialog over another identity's bytes.
+                file.storedOfflineCopyState(context, outputFile, userDrive) !=
+                StoredOfflineCopyState.FOREIGN_CONFLICT &&
                 OfflineFolderController.decisionForReplacingOwnedCopy(file, outputFile, userDrive) ==
                 OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL
             ) {
@@ -193,6 +198,11 @@ class DownloadProgressViewModel : ViewModel() {
                             }
                             val livePath = liveRow?.getOfflineFile(context, userDrive.userId)?.path
                             val targetUri = Uri.fromFile(outputFile).toString()
+                            // THE SCOPED CLASSIFICATION IS NOT BYPASSED (issue: round 24
+                            // #6): the OR arms below never complete the dialog over a
+                            // POSITIVELY FOREIGN path — a foreign provenance record is a
+                            // conflict regardless of any upload-record ownership.
+                            val scopedState = liveRow?.storedOfflineCopyState(context, outputFile, userDrive)
                             liveRow != null &&
                                 (liveRow.isOffline || liveRow.isInOfflineFolder) &&
                                 livePath == outputFile.path &&
@@ -211,7 +221,8 @@ class DownloadProgressViewModel : ViewModel() {
                                 // content-state proof, an exact upload-record identity
                                 // (name/folder/mtime/hash/fileId), or the durable snapshot
                                 // ownership validated with the current content hash.
-                                (liveRow.isOfflineAndProvenCurrent(context, outputFile, userDrive) ||
+                                scopedState != StoredOfflineCopyState.FOREIGN_CONFLICT &&
+                                (scopedState == StoredOfflineCopyState.PROVEN_CURRENT ||
                                     (UploadFile.sha256OrNull(outputFile)?.let { currentHash ->
                                         UploadFile.hasUploadRecordFor(
                                             fileName = liveRow.name,

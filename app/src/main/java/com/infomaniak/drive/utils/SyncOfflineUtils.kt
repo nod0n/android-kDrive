@@ -470,6 +470,15 @@ object SyncOfflineUtils {
                         }
                         if (stale) return@withFileLock
                         val freshIoFile = freshRow.getOfflineFile(context, userDrive.userId)
+                        // FRESH RECOVERY EXCLUSION (issue: round 24 #4): a destructive
+                        // action never deletes recovery-managed bytes — the sweep owns
+                        // their resolution, and the deletion defers (cursor retained).
+                        if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                                context, userDrive, fileAction.fileId, freshIoFile?.absolutePath
+                            )
+                        ) {
+                            return@withFileLock
+                        }
                         if (freshRow.isOffline) {
                             // Explicit pins keep the existing remote-wins behavior.
                             freshIoFile?.delete()
@@ -529,8 +538,13 @@ object SyncOfflineUtils {
                 // PENDING-RECOVERY EXCLUSION (issue: round 22 #3): unresolved recovery
                 // defers the action (the cursor stays) — the file's bytes may be partial
                 // output of an interrupted restore and are never classified, registered or
-                // replaced until the recovery resolves.
-                if (localFile.id in pendingRecoveryIds) {
+                // replaced until the recovery resolves. FRESH RE-READ UNDER THE FINAL
+                // LOCKS (issue: round 24 #4): the captured set predates the activity HTTP —
+                // a recovery created since (or one the sweep has not resolved) still
+                // defers every arm of this section.
+                if (localFile.id in pendingRecoveryIds ||
+                    DownloadOfflineFileManager.hasUnresolvedRecovery(context, userDrive, localFile.id, null)
+                ) {
                     false
                 } else {
                     // Stale-action consumption BEFORE any side effect, on the fresh row (issue:
@@ -840,6 +854,13 @@ object SyncOfflineUtils {
             // would drop a dirty rename/move identity without preserving or committing it —
             // the cursor stays until a fresh, exact registration succeeds.
             if (OfflineFolderController.exclusivePathOwner(realm, context, userDrive, freshSource.path) != liveRow.id) {
+                return false
+            }
+            // FRESH RECOVERY EXCLUSION UNDER THE FINAL LOCKS (issue: round 24 #4): the
+            // registration is its own snapshot implementation — it re-checks the durable
+            // recovery state here, by identity AND by the source path, before any
+            // snapshot side effect; the chunk-captured set alone predates the HTTP window.
+            if (DownloadOfflineFileManager.hasUnresolvedRecovery(context, userDrive, localFile.id, freshSource.absolutePath)) {
                 return false
             }
             // UPLOAD-NEED revalidation against the FRESH bytes (issue: round 16 #5): branch

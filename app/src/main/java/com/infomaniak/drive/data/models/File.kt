@@ -513,29 +513,40 @@ open class File(
         return IOFile(folder, id.toString())
     }
 
-    fun deleteCaches(context: Context, userId: Int = AccountUtils.currentUserId) {
+    /**
+     * Deletes the row's cached/offline bytes. Returns FALSE when the bytes were RETAINED
+     * (issue: round 24 #4): a pending upload still reads them, or an unresolved durable
+     * recovery governs them — the caller must then also retain the owning row (its owner
+     * identity and ancestry are the metadata every consumer of the retained bytes needs);
+     * a Unit return previously let removal flows delete the row over retained bytes.
+     */
+    fun deleteCaches(context: Context, userId: Int = AccountUtils.currentUserId): Boolean {
         if (isOffline || isInOfflineFolder) {
-            getOfflineFile(context, userId)?.apply {
-                // Never drop the bytes backing a pending upload when the cache row goes away
-                // (issue #1902); the upload still reads from this file.
-                // DELETION-BOUNDARY RECOVERY EXCLUSION (issue: round 23 #3): bytes governed
-                // by an unresolved durable recovery are recovery-managed state — deleting
-                // them destroys the recovery's subject. The re-read fails closed.
-                if (exists() && !UploadFile.hasPendingUpload(uri = Uri.fromFile(this).toString()) &&
-                    !DownloadOfflineFileManager.hasUnresolvedRecovery(
+            val offlineFile = getOfflineFile(context, userId) ?: return true
+            // Never drop the bytes backing a pending upload when the cache row goes away
+            // (issue #1902); the upload still reads from this file.
+            // DELETION-BOUNDARY RECOVERY EXCLUSION (issue: round 23 #3): bytes governed
+            // by an unresolved durable recovery are recovery-managed state — deleting
+            // them destroys the recovery's subject. The re-read fails closed.
+            if (offlineFile.exists() && (UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) ||
+                    DownloadOfflineFileManager.hasUnresolvedRecovery(
                         context,
                         UserDrive(userId, driveId),
                         id,
-                        absolutePath,
+                        offlineFile.absolutePath,
                     )
-                ) {
-                    // The published generation's record dies with the bytes (issue: round 18
-                    // #12): every byte-deletion path clears matching provenance — an orphaned
-                    // record must never lend its generation to bytes later published here.
-                    DownloadOfflineFileManager.deletePublishedProvenance(context, this)
-                    delete()
-                }
+                    )
+            ) {
+                return false
             }
+            if (offlineFile.exists()) {
+                // The published generation's record dies with the bytes (issue: round 18
+                // #12): every byte-deletion path clears matching provenance — an orphaned
+                // record must never lend its generation to bytes later published here.
+                DownloadOfflineFileManager.deletePublishedProvenance(context, offlineFile)
+                offlineFile.delete()
+            }
+            return true
         } else {
             getCacheFile(context).apply {
                 if (exists()) {
@@ -543,6 +554,7 @@ open class File(
                     delete()
                 }
             }
+            return true
         }
     }
 

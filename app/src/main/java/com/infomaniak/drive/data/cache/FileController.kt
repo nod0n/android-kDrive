@@ -495,8 +495,15 @@ object FileController {
                                             offlinePath,
                                         ) == file.id
                                     if (pathOwned) {
-                                        file.deleteCaches(context!!, resolvedUserDrive.userId)
-                                        if (!keepFiles.contains(fileId) && !folderStillNeeded) {
+                                        // DEFERRED REMOVAL OUTCOME (issue: round 24 #4): when
+                                        // the byte deletion RETAINED the bytes (a pending
+                                        // upload still reads them, or an unresolved recovery
+                                        // governs them), the owning row — its owner identity
+                                        // and ancestry — is retained too; deleting the row
+                                        // over retained bytes lost the metadata every
+                                        // consumer of those bytes needs.
+                                        val bytesDisposed = file.deleteCaches(context!!, resolvedUserDrive.userId)
+                                        if (bytesDisposed && !keepFiles.contains(fileId) && !folderStillNeeded) {
                                             realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
                                         }
                                     }
@@ -684,8 +691,13 @@ object FileController {
         val children = getFileByUidOrId(file.id, userDrive)?.children ?: emptyList()
 
         filesToDelete.addAll(children)
-        file.deleteCaches(context)
-        updateFile(file.id, realm, userDrive) { localFile -> localFile.deleteFromRealm() }
+        // DEFERRED REMOVAL OUTCOME (issue: round 24 #4), as in removeFile: when the byte
+        // deletion retained the bytes (pending upload, unresolved recovery), the owning
+        // row is retained too — its metadata is what reconciles the retained bytes later.
+        val bytesDisposed = file.deleteCaches(context)
+        if (bytesDisposed) {
+            updateFile(file.id, realm, userDrive) { localFile -> localFile.deleteFromRealm() }
+        }
 
         deleteFileAndChildrenRec(filesToDelete, realm, userDrive, context)
     }

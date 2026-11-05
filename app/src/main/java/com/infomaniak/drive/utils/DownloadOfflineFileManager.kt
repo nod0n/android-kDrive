@@ -318,9 +318,15 @@ class DownloadOfflineFileManager(
                     run {
                         val liveProof = readPublishedProvenance(context, liveOffline)
                         val liveHash = UploadFile.sha256OrNull(liveOffline)
-                        liveProof?.positivelyForeignTo(live, userDrive) != true &&
+                        // A FAILED READ IS UNRESOLVED, NOT "NOT CERTIFIED" (issue: round
+                        // 24 #9): unreadable bytes can never be positively established —
+                        // the previous null-hash fall-through let an existing unreadable
+                        // file with an anchored baseline and a newer mtime clear the
+                        // marker and return success.
+                        liveHash != null &&
+                            liveProof?.positivelyForeignTo(live, userDrive) != true &&
                             !(liveProof?.identifies(live, userDrive) == true &&
-                                liveProof.contentHash != null && liveHash != null &&
+                                liveProof.contentHash != null &&
                                 liveProof.contentHash == liveHash) &&
                             OfflineFolderPolicy.isLocallyModified(
                                 offlineFileLastModifiedMillis = liveOffline.lastModified(),
@@ -804,6 +810,12 @@ class DownloadOfflineFileManager(
                     if (!live.isOffline && !live.isInOfflineFolder) return@use false
                     val liveOffline = live.getOfflineFile(context, userDrive.userId) ?: return@use false
                     if (readPublishedProvenance(context, liveOffline)?.positivelyForeignTo(live, userDrive) == true) {
+                        return@use false
+                    }
+                    // FRESH RECOVERY EXCLUSION (issue: round 24 #9): an unresolved durable
+                    // recovery governing this row or its path defers the early success —
+                    // the sweep owns the bytes, and no intent is consumed over them.
+                    if (hasUnresolvedRecovery(context, userDrive, live.id, liveOffline.absolutePath)) {
                         return@use false
                     }
                     if (!condition(live, liveOffline)) return@use false
@@ -1970,6 +1982,15 @@ class DownloadOfflineFileManager(
             // The existing copy may have been edited, registered for upload, or re-owned by
             // another row during the transfer: those bytes always win over the freshly
             // downloaded ones (issue: round 6 #3).
+            // PENDING-RECOVERY EXCLUSION OUTSIDE TARGET EXISTENCE (issues: round 23 #3,
+            // round 24 #4): the check ACTUALLY runs before the existence branch now — a
+            // missing target with an unresolved recovery is recovery-managed state (a crash
+            // removed the bytes mid-recovery) and the publication must never treat the path
+            // as free. Re-read under the publication's final locks, by identity AND by
+            // target path; an enumeration failure fails CLOSED.
+            val appContextForRecovery = Realm.getApplicationContext()
+            val pendingRecoveryExcludes = appContextForRecovery != null &&
+                hasUnresolvedRecovery(appContextForRecovery, userDrive, file.id, target.absolutePath)
             if (target.exists()) {
                 val appContext = Realm.getApplicationContext()
                 val liveOwner = appContext?.let { ctx ->
@@ -1986,17 +2007,6 @@ class DownloadOfflineFileManager(
                 val registryConflict = appContext != null &&
                     readPublishedProvenance(appContext, target)
                         ?.positivelyForeignTo(file, userDrive) == true
-                // PENDING-RECOVERY EXCLUSION (issue: round 22 #3): an unresolved durable
-                // recovery for this file keeps its target out of replacement entirely —
-                // the recovery sweep owns the resolution, and the intent is RETAINED
-                // (SKIPPED_CONFLICT below never clears the marker).
-                // PENDING-RECOVERY EXCLUSION OUTSIDE TARGET EXISTENCE (issue: round 23 #3):
-                // re-read under the publication's final locks, by identity AND by target
-                // path — a missing target with an unresolved recovery is recovery-managed
-                // state (a crash deleted the bytes mid-recovery), and the publication must
-                // never treat the path as free. An enumeration failure fails CLOSED.
-                val pendingRecoveryExcludes = appContext != null &&
-                    hasUnresolvedRecovery(appContext, userDrive, file.id, target.absolutePath)
                 // NON-DESTRUCTIVE STAGED COMPARISON ELIGIBILITY (issue: round 22 #6): set by
                 // the classification below when the retained bytes carry no content proof —
                 // the freshly staged copy may then CERTIFY them without replacing them first.
@@ -2090,20 +2100,31 @@ class DownloadOfflineFileManager(
                     // and the sweep resolves the file (issue: round 22 #3).
                     if (pendingRecoveryExcludes) return PublicationOutcome.SKIPPED_CONFLICT
                     // Usable protected content FOR THIS FILE vs a destination conflict
-                    // (issues: round 14 #13, round 23 #6): the protection proves F's own
-                    // VERIFIED-USABLE content only when the destination's owner row is F
-                    // itself AND the content is positively owned — a pending or
-                    // retained-unsent upload whose exact record owns the bytes. PRESERVED
-                    // is not USABLE: an unproven (unknown/hashless-classified) or unreadable
-                    // retained target is preserved but must NOT fulfill the transfer — the
-                    // intent is RETAINED (the marker stays) and the outcome is a conflict,
-                    // so the dialog never reports 100 and the bulk counts the work
-                    // unresolved. Unknown ownership and a CHANGED owner are preservation
-                    // reasons for OTHER content: they defer as a conflict too.
+                    // (issues: round 14 #13, round 23 #6, round 24 #6): the protection
+                    // proves F's own VERIFIED-USABLE content only when the destination's
+                    // owner row is F itself AND the content is POSITIVELY owned — the
+                    // exact upload-record identity (name/folder/mtime/size/hash/fileId)
+                    // proven over the CURRENT bytes. URI presence, a recovery exclusion
+                    // and preservation alone never fulfill the transfer: a truncated or
+                    // unreadable original whose record no longer matches is preserved but
+                    // stays a conflict — the intent is RETAINED (the marker stays), the
+                    // dialog never reports 100 and the bulk counts the work unresolved.
                     val ownedByThisFile = liveOwner != null && liveOwner.id == file.id && liveOwner.id == lockedOwnerId
                     val protectedContentUsable = ownedByThisFile &&
-                        (UploadFile.hasPendingUpload(uri = Uri.fromFile(target).toString()) ||
-                            UploadFile.hasRetainedUnsentUpload(uri = Uri.fromFile(target).toString()))
+                        run {
+                            val currentProtectedHash = UploadFile.sha256OrNull(target)
+                            currentProtectedHash != null &&
+                                UploadFile.hasDurableOriginalRevisionOwnership(
+                                    fileName = liveOwner.name,
+                                    remoteFolder = liveOwner.parentId,
+                                    driveId = userDrive.driveId,
+                                    userId = userDrive.userId,
+                                    fileModifiedAt = java.util.Date(target.lastModified()),
+                                    fileSize = target.length(),
+                                    contentHash = currentProtectedHash,
+                                    originalFileId = file.id,
+                                )
+                        }
                     return if (ownedByThisFile && protectedContentUsable) {
                         // The transfer's own generation and intent were validated INSIDE this
                         // section (superseded/intent checks above) — clearing THIS transfer's
@@ -2115,6 +2136,12 @@ class DownloadOfflineFileManager(
                         PublicationOutcome.SKIPPED_CONFLICT
                     }
                 }
+            } else if (pendingRecoveryExcludes) {
+                // MISSING TARGET UNDER UNRESOLVED RECOVERY (issue: round 24 #4): the path
+                // is recovery-managed state — never treated as free. The sweep owns the
+                // resolution; the durable intent is retained (no marker clear).
+                runCatching { staged.delete() }
+                return PublicationOutcome.SKIPPED_CONFLICT
             }
 
             staged.setLastModified(file.getLastModifiedInMilliSecond())
@@ -2417,6 +2444,15 @@ class DownloadOfflineFileManager(
                 // into an ordinary outcome) and the staged bytes are cleaned up in
                 // the finally below.
                 coroutineContext.ensureActive()
+                // PLAIN-CACHE RECOVERY EXCLUSION (issue: round 24 #4): the plain-cache
+                // publication previously had no equivalent of the coordinated
+                // publication's pending-recovery exclusion — an unresolved durable
+                // recovery governing this row or its path keeps those bytes out of
+                // replacement here too: the staged copy is discarded by the finally and
+                // the transfer fails without consuming any intent.
+                if (hasUnresolvedRecovery(context, userDrive, file.id, target.absolutePath)) {
+                    return@withFileLock PublicationOutcome.FAILED
+                }
                 runCatching {
                     staged.setLastModified(file.getLastModifiedInMilliSecond())
                     // PREPARE the staged record BEFORE the bytes are replaced (issue:
