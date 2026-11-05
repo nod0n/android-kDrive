@@ -2428,11 +2428,11 @@ class DownloadOfflineFileManager(
                         proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
                         observationText = observationField?.takeIf { it.isNotEmpty() && it != "A" },
                         observationFieldDamaged = false,
-                        // THE WRITER-CONTRACT EVIDENCE (review-36 #10): an empty field in a
-                        // structurally complete legacy record is the writer's Absent — the
-                        // writers fail Invalid captures, so a required-and-lost observation
-                        // never persisted (truncation destroys lines and is undecodable).
-                        observationAmbiguous = false,
+                        // RETRACTION + RESTORED AMBIGUITY (review-37 #3): the historical writer
+                        // persisted read/parse failures as empty fields in complete records, and
+                        // a truncated final observation keeps the split count — emptiness and
+                        // line count prove nothing. An empty legacy field is AMBIGUOUS.
+                        observationAmbiguous = true,
                         recordedSourcePath = null,
                         // LEGACY RECORDS CARRY NEITHER NEW AUTHORITY (review-34 #3/#4): a
                         // v1 record has no source-bound proof and no recorded preexisting
@@ -3241,20 +3241,51 @@ class DownloadOfflineFileManager(
             }
         }.getOrDefault(false)
 
-        /** THE AMBIGUITY-AWARE OBSERVATION RESOLUTION (review-34 #8): a carried text
-         * establishes as always; an AMBIGUOUS legacy absence establishes nothing and
-         * succeeds only when the evidence already exists at the target (validated repair);
-         * an explicit absence (the "A" marker / a pre-observation format) succeeds without
-         * establishment. */
+        /** THE INDEPENDENT UPLOAD AUTHORITY (review-37 #3): neither line count, emptiness nor
+         * version establishes absence — a legacy-ambiguous observation converges only when
+         * INDEPENDENT durable evidence proves the operation legitimately carried none: the
+         * bytes are an exact uploaded revision owned by the record's own row. */
+        private fun legacyAmbiguityResolvedByUploadAuthority(
+            context: Context,
+            bytesFile: IOFile,
+            fileId: Int,
+            userDrive: UserDrive,
+        ): Boolean = runCatching {
+            val bytesHash = UploadFile.sha256OrNull(bytesFile) ?: return@runCatching false
+            FileController.getRealmInstance(userDrive).use { realm ->
+                runCatching { realm.refresh() }
+                val row = FileController.getFileById(realm, fileId) ?: return@runCatching false
+                UploadFile.hasDurableOriginalRevisionOwnership(
+                    fileName = row.name,
+                    remoteFolder = row.parentId,
+                    driveId = userDrive.driveId,
+                    userId = userDrive.userId,
+                    fileModifiedAt = Date(bytesFile.lastModified()),
+                    fileSize = bytesFile.length(),
+                    contentHash = bytesHash,
+                    originalFileId = fileId,
+                )
+            }
+        }.getOrDefault(false)
+
+        /** THE AMBIGUITY-AWARE OBSERVATION RESOLUTION (review-34 #8, review-37 #3): a carried
+         * text establishes as always; an ambiguous legacy absence converges through
+         * INDEPENDENT evidence — the validated target evidence, or the upload authority over
+         * the record's own row — and otherwise RETAINS; an explicit absence (the "A" marker)
+         * succeeds without establishment. No emptiness, line count or version participates. */
         private fun observationEvidenceComplete(
             context: Context,
             target: IOFile,
             carriedText: String?,
             ambiguous: Boolean,
             expectedPublicationId: Long?,
+            fileId: Int? = null,
+            userDrive: UserDrive? = null,
         ): Boolean = when {
             carriedText != null -> establishRecoveredObservation(context, target, carriedText, expectedPublicationId)
-            ambiguous -> targetObservationEvidenceComplete(context, target, expectedPublicationId)
+            ambiguous -> targetObservationEvidenceComplete(context, target, expectedPublicationId) ||
+                (fileId != null && userDrive != null &&
+                    legacyAmbiguityResolvedByUploadAuthority(context, target, fileId, userDrive))
             else -> true
         }
 
@@ -3444,14 +3475,15 @@ class DownloadOfflineFileManager(
                     // carried text (its own "1|" frame is validated at use — malformed
                     // contents retain the operation, never read as absence).
                     attemptedObservationText = v4[11].takeIf { it.isNotEmpty() && it != "A" },
-                    // THE WRITER-CONTRACT EVIDENCE (review-36 #10): the record writers FAIL the
-                    // whole write when a REQUIRED observation cannot be presented — so an
-                    // EMPTY field in a structurally complete v4 record proves the capture was
-                    // Absent at write time (the version-0 verified-uploaded proofs and the
-                    // historical relocation writer's empty-for-absent are legitimate). A lost
-                    // or truncated observation destroys LINES, making the record undecodable
-                    // and retained. Legacy emptiness therefore resolves as explicit absence.
-                    attemptedObservationAmbiguous = false,
+                    // RETRACTION + RESTORED AMBIGUITY (review-37 #3): the review-36 claim that
+                    // the writers fail Invalid captures is FALSE — the historical helper
+                    // (ce72bb8a1) mapped a read/parse FAILURE to null and the writer persisted
+                    // that null as an EMPTY field in otherwise complete records, and a
+                    // truncated final observation can keep its preceding newline. Emptiness,
+                    // line count and version prove NOTHING: an empty v4 field is AMBIGUOUS and
+                    // resolves only through independent upload/operation authority or the
+                    // validated rollback transition.
+                    attemptedObservationAmbiguous = true,
                     legacy = false,
                 )
             }
@@ -4061,10 +4093,10 @@ class DownloadOfflineFileManager(
                                                 // disposed only when BOTH are established.
                                                 // AMBIGUITY-AWARE (review-34 #8, converged review-35
                                                 // #13): a three-line legacy record's absence is
-                                                // legitimate; a four-line record with an empty field
-                                                // requires the evidence at the target ONLY for an
-                                                // UNRESOLVED generation (version-0 proof) — a
-                                                // resolved generation's observation was optional.
+                                                // legitimate; an ambiguous empty field converges
+                                                // ONLY through independent evidence — the validated
+                                                // target evidence or the upload authority (review-37
+                                                // #3); otherwise the replay retains.
                                                 val observationEstablished = proofEstablished && runCatching {
                                                     observationEvidenceComplete(
                                                         context,
@@ -4072,6 +4104,12 @@ class DownloadOfflineFileManager(
                                                         parsed.observationText,
                                                         parsed.observationAmbiguous,
                                                         retainedPublicationId,
+                                                        fileId = proofFileId,
+                                                        userDrive = UserDrive(
+                                                            userId = proofUserId,
+                                                            driveId = proofDriveId,
+                                                            sharedWithMe = moveScopeShared,
+                                                        ),
                                                     )
                                                 }.getOrDefault(false)
                                                 if (proofEstablished && observationEstablished) {
@@ -4179,6 +4217,12 @@ class DownloadOfflineFileManager(
                                                                 parsed.observationText,
                                                                 parsed.observationAmbiguous,
                                                                 publicationIdOfRecordText(sourceProofText),
+                                                                fileId = proofFileId,
+                                                                userDrive = UserDrive(
+                                                                    userId = proofUserId,
+                                                                    driveId = proofDriveId,
+                                                                    sharedWithMe = moveScopeShared,
+                                                                ),
                                                             )
                                                         ) {
                                                             return@runCatching false
@@ -4342,6 +4386,8 @@ class DownloadOfflineFileManager(
                             record.attemptedObservationText,
                             record.attemptedObservationAmbiguous,
                             expectedPublicationId,
+                            fileId = record.fileId,
+                            userDrive = operationScope,
                         )
                     }
                 if (!missingBackupComplete) return false
@@ -4392,16 +4438,23 @@ class DownloadOfflineFileManager(
                             // deliberately not rewritten.
                         }
                     }
-                    // AMBIGUOUS LEGACY EVIDENCE (review-34 #8, resolved review-36 #10): the
-                    // writers fail Invalid captures, so structurally complete records never
-                    // carry a lost required observation — an ambiguous flag here protects
-                    // only genuinely unknown legacy evidence, which requires the validated
-                    // target evidence; a SUPERSEDED target spends the evidence either way.
+                    // AMBIGUOUS LEGACY EVIDENCE (review-34 #8, review-37 #3): emptiness, line
+                    // count and version prove nothing — an ambiguous absence converges ONLY
+                    // through independent evidence (the validated target evidence, or the
+                    // upload authority over the record's own row) and otherwise retains; a
+                    // SUPERSEDED target spends the evidence either way.
                     record.attemptedObservationAmbiguous -> {
                         when {
                             expectedPublicationId == null -> return false
                             targetProof.publicationId != expectedPublicationId -> Unit
-                            else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId)) {
+                            else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId) &&
+                                !legacyAmbiguityResolvedByUploadAuthority(
+                                    context,
+                                    target,
+                                    record.fileId,
+                                    UserDrive(userId = record.userId, driveId = record.driveId),
+                                )
+                            ) {
                                 return false
                             }
                         }
@@ -4451,17 +4504,23 @@ class DownloadOfflineFileManager(
                     // publication id, parsed from its persisted expected proof) BEFORE the
                     // recovery state is disposed; a failed observation write retains the
                     // whole operation state, never half of it.
-                    // THE AMBIGUITY-AWARE RESOLUTION (review-34 #8, resolved review-36 #10),
-                    // as in every recovery disposal: a carried text establishes; an ambiguous
-                    // legacy absence requires the evidence at the target; an explicit absence
-                    // succeeds. The writers' fail-closed contract already resolves legacy
-                    // emptiness — no version test participates.
+                    // THE AMBIGUITY-AWARE RESOLUTION (review-34 #8, review-37 #3), as in every
+                    // recovery disposal: a carried text establishes; an ambiguous legacy
+                    // absence converges through independent evidence (the validated target
+                    // evidence or the upload authority) and otherwise retains; an explicit
+                    // absence succeeds. No emptiness, line count or version participates.
                     if (!observationEvidenceComplete(
                             context,
                             target,
                             record.attemptedObservationText,
                             record.attemptedObservationAmbiguous,
                             publicationIdOfRecordText(record.expectedPublicationRecordText),
+                            fileId = record.fileId,
+                            userDrive = UserDrive(
+                                userId = record.userId,
+                                driveId = record.driveId,
+                                sharedWithMe = capturedShared,
+                            ),
                         )
                     ) {
                         return false
