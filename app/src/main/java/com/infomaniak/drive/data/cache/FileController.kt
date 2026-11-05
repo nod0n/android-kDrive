@@ -461,7 +461,12 @@ object FileController {
         userDrive: UserDrive? = null,
         originFolderId: Int? = null,
         originParentId: Int? = null,
-    ) {
+    ): Boolean {
+        // THE AGGREGATE ACTUAL OUTCOME (review-36 #8): the recursive removal reports whether
+        // EVERY retained descendant and the row itself actually retired — a child whose
+        // cache deletion failed or whose preservation retained it survives, and the caller
+        // keeps the required ancestor and backlink instead of predicting from flags.
+        var allRemoved = true
         val block: (Realm) -> Unit? = { realm ->
             // REQUEST-TIME BOUNDARY ANCESTRY (issue: round 22 #10): the boundary's expected
             // parent is captured at the TOP-LEVEL call — before any section and before the
@@ -480,7 +485,7 @@ object FileController {
             if (recursive) {
                 getFileById(realm, fileId)?.children?.createSnapshot()?.forEach {
                     if (!keepFiles.contains(it.id)) {
-                        removeFile(
+                        val childRemoved = removeFile(
                             it.id,
                             keepFileCaches,
                             keepFiles,
@@ -489,6 +494,7 @@ object FileController {
                             originFolderId = originFolderId ?: fileId,
                             originParentId = requestBoundaryParentId,
                         )
+                        if (!childRemoved) allRemoved = false
                     }
                 }
             }
@@ -508,7 +514,10 @@ object FileController {
                         // A refresh failure STOPS the removal (issue: round 17 #9 doctrine):
                         // preservation and deletion must never run on a stale Realm; the row
                         // stays and a later pass retries.
-                        runCatching { realm.refresh() }.onFailure { return@withFileLock }
+                        runCatching { realm.refresh() }.onFailure {
+                            allRemoved = false
+                            return@withFileLock
+                        }
                         val file = getFileById(realm, fileId) ?: return@withFileLock
                         // ORIGINAL REMOVAL AUTHORITY (issue: round 21 #5): a recursive call
                         // is authorized by the ORIGINAL boundary's removal only while the
@@ -518,6 +527,7 @@ object FileController {
                         // its current copy and row are another location's content now.
                         // Fresh path ownership alone never establishes deletion authority.
                         if (originFolderId != null && !ancestryReachesBoundary(realm, file.parentId, originFolderId)) {
+                            allRemoved = false
                             return@withFileLock
                         }
                         // BOUNDARY ANCESTRY AUTHORITY (issue: round 22 #10): the boundary row
@@ -529,6 +539,7 @@ object FileController {
                         // or deletion effect — including the boundary's own row removal.
                         val boundaryRow = if (originFolderId == null) file else getFileById(realm, originFolderId)
                         if (requestBoundaryParentId != null && boundaryRow?.parentId != requestBoundaryParentId) {
+                            allRemoved = false
                             return@withFileLock
                         }
                         val resolvedUserDrive = userDrive ?: UserDrive(driveId = file.driveId)
@@ -578,20 +589,29 @@ object FileController {
                                         val bytesDisposed = file.deleteCaches(context!!, resolvedUserDrive)
                                         if (bytesDisposed && !keepFiles.contains(fileId) && !folderStillNeeded) {
                                             realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                                        } else {
+                                            allRemoved = false
                                         }
+                                    } else {
+                                        allRemoved = false
                                     }
                                 }
                                 // Preservation pending: retain bytes AND the row (with its durable
                                 // metadata and ancestry) until the upload completes; the next sync
                                 // re-processes the remote deletion then (issue: round 4 #6).
-                                OfflineFolderController.PreservationOutcome.PRESERVED -> Unit
+                                OfflineFolderController.PreservationOutcome.PRESERVED -> allRemoved = false
                             }
                         } else if (!keepFiles.contains(fileId) && !folderStillNeeded) {
                             realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                        } else {
+                            // Kept caches or required ancestry: the row is intentionally
+                            // retained — the removal is not fully complete.
+                            allRemoved = false
                         }
                     }
                 }
             }.onFailure { exception ->
+                allRemoved = false
                 Sentry.captureException(exception) { scope ->
                     scope.setExtra("with custom realm", "${customRealm != null}")
                     scope.setExtra("recursive", "$recursive")
@@ -600,6 +620,7 @@ object FileController {
             Unit
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
+        return allRemoved
     }
 
     /**

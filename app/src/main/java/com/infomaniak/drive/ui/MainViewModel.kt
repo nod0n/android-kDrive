@@ -1491,28 +1491,30 @@ class MainViewModel(
                                         sourceRow.children.forEach { sourceGraphWalker.add(it) }
                                     }
                                     if (sourceGraphUnblocked) {
-                                        // THE REMOVAL IS ALL-OR-NOTHING (review-35 #9): the
-                                        // recovery-aware removal may RETAIN the row (a preservation
-                                        // failure or a recovery decision) — the backlink is
-                                        // retired only when the source row is ACTUALLY GONE, in the
-                                        // same metadata outcome; a retained row keeps its required
-                                        // ancestry and backlink for the later pass.
-                                        FileController.removeFile(
+                                        // THE REMOVAL IS ALL-OR-NOTHING (review-35 #9, aggregated
+                                        // review-36 #8): removeFile reports its ACTUAL recursive
+                                        // outcome — any descendant whose cache deletion or
+                                        // preservation retained it survives, and the aggregate is
+                                        // false. The backlink retires only when the WHOLE removal
+                                        // succeeded; a surviving descendant keeps the required
+                                        // ancestor, its ancestry and its backlink in the same
+                                        // metadata outcome (never a preflight prediction alone).
+                                        val removalComplete = FileController.removeFile(
                                             fileId = file.id,
                                             customRealm = currentDriveRealm,
                                             userDrive = userDrive,
                                         )
-                                        if (FileController.getFileById(currentDriveRealm, file.id) == null) {
+                                        if (removalComplete) {
                                             // The source backlink is removed only AFTER the destination's
                                             // committed graph verified (issue: round 21 #8) AND the source
-                                            // row actually retired (review-35 #9).
+                                            // subtree actually retired (review-35 #9, review-36 #8).
                                             FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
                                                 runCatching { localFolder.children.remove(file) }
                                             }
                                         } else {
                                             SentryLog.i(
                                                 "MainViewModel",
-                                                "Deferred source unlink of ${file.id}: the recovery-aware removal retained the row",
+                                                "Deferred source unlink of ${file.id}: the recursive removal retained a descendant",
                                             )
                                         }
                                     } else {
