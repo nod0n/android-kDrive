@@ -4191,7 +4191,7 @@ class DownloadOfflineFileManager(
             if (!(proof.identifies(file, userDrive) && proof.certifiesBytes(target))) {
                 return@runCatching false
             }
-            val fresh = ApiRepository.getFileDetails(
+            val fresh = ApiRepository.getFileDetailsSuspend(
                 file = File(id = file.id, driveId = userDrive.driveId),
                 okHttpClient = okHttpClient,
             )
@@ -4244,7 +4244,7 @@ class DownloadOfflineFileManager(
             userDrive: UserDrive,
             okHttpClient: OkHttpClient,
         ): GenerationEstablishment = runCatching {
-            val postDownload = ApiRepository.getFileDetails(
+            val postDownload = ApiRepository.getFileDetailsSuspend(
                 file = File(id = file.id, driveId = userDrive.driveId),
                 okHttpClient = okHttpClient,
             )

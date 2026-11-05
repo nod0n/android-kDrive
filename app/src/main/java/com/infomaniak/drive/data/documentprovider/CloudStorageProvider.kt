@@ -368,27 +368,47 @@ class CloudStorageProvider : DocumentsProvider() {
         }
         val context = context ?: return null
 
-        fun getRemoteFile(localFile: File?, fileId: Int, driveId: Int): File? {
-            val okHttpClient = runBlocking { AccountUtils.getHttpClient(getUserId(documentId).toInt()) }
-            return ApiRepository.getFileDetails(localFile ?: File(id = fileId, driveId = driveId), okHttpClient).data
-        }
-
-        val isWrite = mode.indexOf('w') != -1
-        val accessMode = ParcelFileDescriptor.parseMode(mode)
-        val fileId = getFileIdFromDocumentId(documentId)
-        val userDrive = createUserDrive(documentId)
-        val localFile = FileController.getFileByUidOrId(fileId, userDrive)
-
-        val updatedFile = runCatching {
-            getRemoteFile(localFile, fileId, userDrive.driveId)
-        }.getOrNull() ?: localFile
-
-        return updatedFile?.let {
-            if (isWrite) {
-                writeDataFile(context, updatedFile, userDrive, accessMode)
-            } else {
-                getDataFile(context, updatedFile, userDrive, accessMode)
+        // THE PROVIDER OPERATION'S EXECUTING JOB (issue: round 29 #10): the request's
+        // CancellationSignal is connected to one job that this operation's blocking bridge
+        // runs under — cancelling the signal cancels the job, which cancels the suspend
+        // details HTTP itself (Call.await's invokeOnCancellation cancels the OkHttp call).
+        // The listener uses the REAL CancellationSignal API (setOnCancelListener), and
+        // signal.throwIfCanceled() re-checks at the stage boundaries the job cannot
+        // observe.
+        val requestJob = kotlinx.coroutines.SupervisorJob()
+        signal?.setOnCancelListener { requestJob.cancel() }
+        try {
+            fun getRemoteFile(localFile: File?, fileId: Int, driveId: Int): File? {
+                val okHttpClient = runBlocking { AccountUtils.getHttpClient(getUserId(documentId).toInt()) }
+                return runBlocking(requestJob) {
+                    ApiRepository.getFileDetailsSuspend(localFile ?: File(id = fileId, driveId = driveId), okHttpClient).data
+                }
             }
+
+            val isWrite = mode.indexOf('w') != -1
+            val accessMode = ParcelFileDescriptor.parseMode(mode)
+            val fileId = getFileIdFromDocumentId(documentId)
+            val userDrive = createUserDrive(documentId)
+            val localFile = FileController.getFileByUidOrId(fileId, userDrive)
+
+            val updatedFile = runCatching {
+                getRemoteFile(localFile, fileId, userDrive.driveId)
+            }.getOrNull() ?: localFile
+            // THE POST-HTTP BOUNDARY CHECK (issue: round 29 #10): a cancellation during the
+            // details request must not be followed by further download/publication or
+            // descriptor opening.
+            signal?.throwIfCanceled()
+
+            return updatedFile?.let {
+                if (isWrite) {
+                    writeDataFile(context, updatedFile, userDrive, accessMode)
+                } else {
+                    getDataFile(context, updatedFile, userDrive, accessMode, signal)
+                }
+            }
+        } finally {
+            signal?.setOnCancelListener(null)
+            requestJob.cancel()
         }
     }
 
@@ -871,10 +891,20 @@ class CloudStorageProvider : DocumentsProvider() {
         file: File,
         userDrive: UserDrive,
         accessMode: Int,
+        signal: CancellationSignal?,
     ): ParcelFileDescriptor? {
         val cacheFile = file.getCacheFile(context, userDrive)
         val offlineFile = file.getOfflineFile(context, userDrive.userId)
 
+        // THE EXECUTING BRIDGE JOB (issue: round 29 #10): the operation's CancellationSignal
+        // is connected to one job that every blocking bridge below runs under — cancelling
+        // the signal cancels the job, which cancels the suspend HTTP (Call.await's
+        // invokeOnCancellation cancels the OkHttp call), aborts the streamed body copy
+        // (copyToCancellable) and fails the publication's in-lock ensureActive checks. The
+        // listener uses the REAL CancellationSignal API (setOnCancelListener);
+        // signal.throwIfCanceled() re-checks at the stage boundaries the job cannot observe.
+        val bridgeJob = kotlinx.coroutines.SupervisorJob()
+        signal?.setOnCancelListener { bridgeJob.cancel() }
         try {
             // Get offline file if it's intact
             if (offlineFile != null && file.isOfflineAndReadable(context, offlineFile, userDrive)) {
@@ -911,16 +941,17 @@ class CloudStorageProvider : DocumentsProvider() {
             // metadata advance, a lost or non-certifying record) re-justifies the transfer
             // exactly as for the worker and the dialog.
             runCatching {
-                // THE SYNC PROVIDER BOUNDARY (compile repair, round 28): openDocument /
-                // getDataFile run on BINDER threads (never Main), hold NO monitor, file
-                // lock or Realm transaction at this point, and this function's established
-                // idiom for its network work is already runBlocking (getRemoteFile, the
-                // download client below). The gate itself acquires no coordination
-                // primitives — file provenance I/O plus one details request — so a
-                // blocking bridge here is the legitimate execution boundary, consistent
-                // with the worker (suspend), the preview (suspend) and the dialog
-                // (viewModelScope) callers.
-                val policySuppressed = runBlocking {
+                // THE SYNC PROVIDER BOUNDARY (issue: round 29 #10): openDocument /
+                // getDataFile are DocumentsProvider entry points dispatched by the
+                // ContentProvider machinery — this source does not establish WHICH thread
+                // that dispatch uses, so no blanket threading claim is made here. The
+                // function's established idiom for its network work is runBlocking
+                // (getRemoteFile, the download request below), and the gate itself
+                // acquires no coordination primitives — file provenance I/O plus one
+                // CANCELLABLE details request under the bridge job — consistent with the
+                // worker (suspend), the preview (suspend) and the dialog (viewModelScope)
+                // callers.
+                val policySuppressed = runBlocking(bridgeJob) {
                     DownloadOfflineFileManager.unresolvedPublicationAlreadyCoversCurrentGeneration(
                         context = context,
                         file = file,
@@ -934,15 +965,21 @@ class CloudStorageProvider : DocumentsProvider() {
                 }
             }
 
-            // Download data file
+            // Download data file — THE CANCELLABLE REQUEST (issue: round 29 #10): the
+            // previous blocking execute() ran to completion regardless of the signal; the
+            // suspend request under the bridge job cancels the HTTP call itself, and the
+            // post-response boundary check stops a cancelled open before staging.
             val okHttpClient = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
-            val response = DownloadOfflineFileManager.downloadFileResponse(
-                fileUrl = ApiRoutes.downloadFile(file),
-                okHttpClient = okHttpClient,
-                downloadInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor(onProgress = { progress ->
-                    SentryLog.i(TAG, "open currentProgress: $progress")
-                })
-            )
+            val response = runBlocking(bridgeJob) {
+                DownloadOfflineFileManager.downloadFileResponseAsync(
+                    fileUrl = ApiRoutes.downloadFile(file),
+                    okHttpClient = okHttpClient,
+                    downloadInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor(onProgress = { progress ->
+                        SentryLog.i(TAG, "open currentProgress: $progress")
+                    })
+                )
+            }
+            signal?.throwIfCanceled()
 
             if (response.isSuccessful) {
                 // STAGED PUBLICATION (issues: round 16 #12, round 18 #11): the download is
@@ -958,7 +995,7 @@ class CloudStorageProvider : DocumentsProvider() {
                     "${cacheFile.name}.${java.util.UUID.randomUUID()}.part",
                 )
                 try {
-                    val stagedOk = runBlocking {
+                    val stagedOk = runBlocking(bridgeJob) {
                         runCatching {
                             DownloadOfflineFileManager.saveRemoteData(TAG, response, staged)
                         }.onFailure { exception ->
@@ -976,7 +1013,7 @@ class CloudStorageProvider : DocumentsProvider() {
                     // publishes with an explicitly unresolved (version-0) proof and
                     // returns PUBLISHED_UNRESOLVED.
                     val establishment = if (stagedOk) {
-                        runBlocking {
+                        runBlocking(bridgeJob) {
                             DownloadOfflineFileManager.reestablishDownloadedGeneration(
                                 file = file,
                                 userDrive = userDrive,
@@ -985,7 +1022,11 @@ class CloudStorageProvider : DocumentsProvider() {
                         }
                     } else GenerationEstablishment.FAILED
                     if (establishment != GenerationEstablishment.FAILED) {
-                        val outcome = runBlocking {
+                        // THE POST-ESTABLISHMENT BOUNDARY CHECK (issue: round 29 #10): a
+                        // cancellation that landed during the establishment HTTP must not
+                        // reach the publication.
+                        signal?.throwIfCanceled()
+                        val outcome = runBlocking(bridgeJob) {
                             DownloadOfflineFileManager.publishStagedCacheCopy(
                                 context, file, cacheFile, userDrive, staged,
                                 generationResolved = establishment == GenerationEstablishment.ESTABLISHED,
@@ -994,6 +1035,10 @@ class CloudStorageProvider : DocumentsProvider() {
                         if (outcome == PublicationOutcome.PUBLISHED ||
                             outcome == PublicationOutcome.PUBLISHED_UNRESOLVED
                         ) {
+                            // THE FINAL OPEN BOUNDARY CHECK (issue: round 29 #10): a
+                            // cancellation that landed inside the publication's lock waits
+                            // must not end in a descriptor over freshly replaced bytes.
+                            signal?.throwIfCanceled()
                             return ParcelFileDescriptor.open(cacheFile, accessMode)
                         }
                     }
@@ -1004,8 +1049,16 @@ class CloudStorageProvider : DocumentsProvider() {
                     runCatching { if (staged.exists()) staged.delete() }
                 }
             }
+        } catch (exception: android.os.OperationCanceledException) {
+            // THE CANCELLED OPEN (issue: round 29 #10): the signal cancelled the operation
+            // — a quiet failure (the client asked for it), not an error report.
+        } catch (exception: kotlinx.coroutines.CancellationException) {
+            // The bridge job was cancelled (by the signal): the same quiet failure.
         } catch (exception: Exception) {
             SentryLog.e(TAG, "An error has occurred on getDataFile", exception)
+        } finally {
+            signal?.setOnCancelListener(null)
+            bridgeJob.cancel()
         }
 
         return null

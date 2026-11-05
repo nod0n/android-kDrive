@@ -366,6 +366,20 @@ object ApiRepository : ApiRepositoryCore() {
         return callApi(ApiRoutes.getFileDetails(file), GET, okHttpClient = okHttpClient)
     }
 
+    /**
+     * THE CANCELLABLE DETAILS VARIANT (issue: round 29 #10): the blocking
+     * [getFileDetails]' `execute()` cannot be aborted by a cancelled caller — a
+     * cancelled coroutine (a DocumentsProvider's CancellationSignal bridge, a stopped
+     * worker) left the request running to completion. The suspend variant awaits the
+     * OkHttp [Call], whose cancellation cancels the HTTP request itself
+     * (`Call.await`'s invokeOnCancellation). Same route, same method, same response
+     * mapping — only the execution/cancellation boundary differs.
+     */
+    suspend fun getFileDetailsSuspend(
+        file: File,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<File> = callApiSuspend(ApiRoutes.getFileDetails(file), GET, okHttpClient = okHttpClient)
+
     fun getFileCount(file: File): ApiResponse<FileCount> {
         return callApi(ApiRoutes.getFileCount(file), GET)
     }
