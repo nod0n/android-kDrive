@@ -3235,7 +3235,7 @@ class DownloadOfflineFileManager(
                         staged,
                         target,
                         sharedWithMe = userDrive.sharedWithMe,
-                        storageKind = destinationStorageKind(context, file, target, userDrive),
+                        storageKind = destinationStorageKind(provenanceContext, file, target, userDrive),
                     )
                 ) {
                     val restored = recoveryFile != null && restoreRecoveryCopy(
@@ -3529,11 +3529,11 @@ class DownloadOfflineFileManager(
                             when {
                                 staged.renameTo(target) &&
                                     movePublishedProvenance(
-                                        provenanceContext,
+                                        context,
                                         staged,
                                         target,
                                         sharedWithMe = userDrive.sharedWithMe,
-                                        storageKind = destinationStorageKind(provenanceContext, file, target, userDrive),
+                                        storageKind = destinationStorageKind(context, file, target, userDrive),
                                     ) -> {
                                     runCatching { recoveryFile?.delete() }
                                     recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
