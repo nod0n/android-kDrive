@@ -44,6 +44,7 @@ import com.infomaniak.drive.data.models.file.SpecialFolder.RecentChanges
 import com.infomaniak.drive.data.models.file.SpecialFolder.SharedWithMe
 import com.infomaniak.drive.data.services.MqttClientWrapper
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.OfflineFileCoordination
 import com.infomaniak.drive.utils.RealmModules
@@ -714,7 +715,22 @@ object FileController {
             runCatching { realm.refresh() }.onFailure { return@renameBlock false }
             val liveRow = getFileProxyById(file.id, customRealm = realm) ?: return@renameBlock true
             if (liveRow.isFolder()) return@renameBlock true
-            val oldOffline = liveRow.getOfflineFile(context, scope.userId)?.takeIf { it.exists() }
+            // RECOVERY EXCLUSION BEFORE EVERY SHORTCUT (review-33 #2): the check runs on
+            // the FRESH row immediately after its lookup — BEFORE the absent-source
+            // shortcut (bytes retained in an unresolved recovery backup made the absence
+            // a false preservation success, and the committed rename broke recovery's
+            // recorded target) and BEFORE the historical anchoring below.
+            val resolvedOldOffline = liveRow.getOfflineFile(context, scope.userId)
+            if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                    context,
+                    scope,
+                    liveRow.id,
+                    resolvedOldOffline?.absolutePath,
+                )
+            ) {
+                return@renameBlock false
+            }
+            val oldOffline = resolvedOldOffline?.takeIf { it.exists() }
                 ?: return@renameBlock true
             val newOffline = oldOffline.parentFile?.let { parent -> IOFile(parent, newName) }
                 ?: return@renameBlock false

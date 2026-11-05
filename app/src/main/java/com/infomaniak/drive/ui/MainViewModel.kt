@@ -583,6 +583,23 @@ class MainViewModel(
                                                                         break
                                                                     }
                                                                     if (node.isFile) {
+                                                                        // EVERY DESCENDANT'S RECOVERY STATE IS
+                                                                        // EXCLUDED (review-33 #2): the directory
+                                                                        // rename relocates every descendant copy —
+                                                                        // an unresolved recovery governing any
+                                                                        // affected identity or old path defers the
+                                                                        // WHOLE merge, so governed bytes are never
+                                                                        // relocated before the sweep resolves them.
+                                                                        if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                                                                                application,
+                                                                                sharedScope,
+                                                                                preRoot.id,
+                                                                                node.absolutePath,
+                                                                            )
+                                                                        ) {
+                                                                            subtreeOk = false
+                                                                            break
+                                                                        }
                                                                         relocatedPairs +=
                                                                             node to IOFile(node.path.replaceFirst(oldBytes.path, newBytes.path))
                                                                     }
