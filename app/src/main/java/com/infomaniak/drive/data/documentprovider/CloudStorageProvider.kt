@@ -508,14 +508,25 @@ class CloudStorageProvider : DocumentsProvider() {
             ParcelFileDescriptor.AutoCloseOutputStream(writePipe).use { writeStream ->
                 runCatching {
                     val okHttpClient = AccountUtils.getHttpClient(userId.toInt())
-                    val response = DownloadOfflineFileManager.downloadFileResponseAsync(thumbnailUrl, okHttpClient)
-
-                    if (response.isSuccessful && DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
-                        writeStream.loadFromFile(outputFile)
-                    } else if (outputFile.exists()) {
-                        writeStream.loadFromFile(outputFile)
-                    } else {
-                        writePipe.closeWithError("No thumbnail available")
+                    // THE SHARED CONSUMPTION LIFETIME (issue: round 32 #8): the thumbnail
+                    // consumes through the call-owning lifetime with its CAPTURED client —
+                    // the raw helper retained the actual call only until the headers (and
+                    // the unsuccessful branch leaked the response); here the response is
+                    // owned through the whole consumption and closed on every path, and a
+                    // cancellation interrupts the transfer at the actual call. The typed
+                    // cached-thumbnail/error branches are unchanged.
+                    DownloadOfflineFileManager.withDownloadResponse(
+                        fileUrl = thumbnailUrl,
+                        okHttpClient = okHttpClient,
+                        downloadInterceptor = null,
+                    ) { response ->
+                        if (response.isSuccessful && DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
+                            writeStream.loadFromFile(outputFile)
+                        } else if (outputFile.exists()) {
+                            writeStream.loadFromFile(outputFile)
+                        } else {
+                            writePipe.closeWithError("No thumbnail available")
+                        }
                     }
 
                 }.cancellable().onFailure { exception ->

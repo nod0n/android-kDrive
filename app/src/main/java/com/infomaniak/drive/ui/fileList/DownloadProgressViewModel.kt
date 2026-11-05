@@ -181,18 +181,25 @@ class DownloadProgressViewModel : ViewModel() {
                     downloadProgressLiveData.postValue(null)
                     return@runCatching
                 }
-                val apiResponse = DownloadOfflineFileManager.downloadFileResponse(
+                // THE SHARED CONSUMPTION LIFETIME (issue: round 32 #8): the dialog
+                // consumes through the call-owning lifetime with its CAPTURED client — the
+                // previous blocking execute() had neither actual-call cancellation nor
+                // response-wide ownership (the enclosing .cancellable() could not interrupt
+                // it), and its unsuccessful branch leaked the response. The typed
+                // completion/deferred behavior is unchanged; a cancellation now interrupts
+                // the actual call and propagates through the cancellable boundary.
+                DownloadOfflineFileManager.withDownloadResponse(
                     fileUrl = ApiRoutes.downloadFile(file),
                     okHttpClient = okHttpClient,
                     downloadInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor { progress ->
                         downloadProgressLiveData.postValue(progress)
+                    },
+                ) { apiResponse ->
+                    if (apiResponse.isSuccessful) {
+                        saveData(context, file, outputFile, apiResponse, userDrive)
+                    } else {
+                        downloadProgressLiveData.postValue(null)
                     }
-                )
-
-                if (apiResponse.isSuccessful) {
-                    saveData(context, file, outputFile, apiResponse, userDrive)
-                } else {
-                    downloadProgressLiveData.postValue(null)
                 }
             }.cancellable().onFailure { exception ->
                 if (exception !is java.io.IOException) SentryLog.e(TAG, "downloadFile failed", exception)

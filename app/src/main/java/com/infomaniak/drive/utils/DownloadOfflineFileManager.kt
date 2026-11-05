@@ -595,64 +595,72 @@ class DownloadOfflineFileManager(
             }
         } ?: return@withContext CachePromotionOutcome.FAILED
 
-        val published = runCatching {
-            publishStagedOfflineFile(context, file, offlineFile, staged)
-        }.onFailure { exception ->
-            // CANCELLATION IS NEVER A FAILED PROMOTION (issue: round 31 #6): the
-            // enclosing catch must not consume the cancellation now rethrown by the
-            // publication's inner boundaries into an ordinary outcome.
-            if (exception is CancellationException) throw exception
-            SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
-        }.getOrDefault(PublicationOutcome.FAILED)
-        // Cache promotion is a transfer path too: its superseded/conflict outcomes must reach
-        // the bulk caller like the network branch's (issues: round 10 #7, round 14 #13), or
-        // the batch clears pending work and reports the root synchronized.
-        // Unresolved outcomes propagate to Bulk completion (issue: round 17 #7): an
-        // invalidated transfer's root incompleteness is retained like a conflict.
-        lastTransferSuperseded = published in UNRESOLVED_PUBLICATION_OUTCOMES
-
-        runCatching { if (staged.exists()) staged.delete() }
+        try {
+            val published = runCatching {
+                publishStagedOfflineFile(context, file, offlineFile, staged)
+            }.onFailure { exception ->
+                // CANCELLATION IS NEVER A FAILED PROMOTION (issue: round 31 #6): the
+                // enclosing catch must not consume the cancellation now rethrown by the
+                // publication's inner boundaries into an ordinary outcome.
+                if (exception is CancellationException) throw exception
+                SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
+            }.getOrDefault(PublicationOutcome.FAILED)
+            // Cache promotion is a transfer path too: its superseded/conflict outcomes must reach
+            // the bulk caller like the network branch's (issues: round 10 #7, round 14 #13), or
+            // the batch clears pending work and reports the root synchronized.
+            // Unresolved outcomes propagate to Bulk completion (issue: round 17 #7): an
+            // invalidated transfer's root incompleteness is retained like a conflict.
+            lastTransferSuperseded = published in UNRESOLVED_PUBLICATION_OUTCOMES
         // TYPED promotion outcomes for the CALLER (issue: round 19 #24): the previous
         // Boolean collapsed PUBLISHED (this transfer's intent token WAS fulfilled — the
         // marker may clear) into the same `true` as the conflicts and supersessions
         // (whose pending marker the caller then ERASED, contradicting their own
         // retain-the-marker contract).
-        when (published) {
-            // Completion (flag write, media scan, invalidation) and the EXACT file-intent
-            // consumption already ran inside the per-file lock via the publication's
-            // coordinated commit (issues: round 5 #2, round 20 #20) — the caller runs no
-            // post-publication marker clear.
-            PublicationOutcome.PUBLISHED -> CachePromotionOutcome.FULFILLED
-            // Skipped outcomes leave the existing bytes and timestamps untouched (issue:
-            // round 4 #1). Marker completion is NOT unconditional here (issue: round 17 #7):
-            // SKIPPED_PROTECTED-for-this-file cleared its marker INSIDE the validating
-            // section (publishLockedCore, under the locks, generation+intent validated);
-            // SKIPPED_INVALIDATED never clears — a revived root or newer request that
-            // established pending work after the skip decision owns its marker.
-            PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
-                filesDownloaded += 1
-                CachePromotionOutcome.DEFERRED
+            when (published) {
+                // Completion (flag write, media scan, invalidation) and the EXACT file-intent
+                // consumption already ran inside the per-file lock via the publication's
+                // coordinated commit (issues: round 5 #2, round 20 #20) — the caller runs no
+                // post-publication marker clear.
+                PublicationOutcome.PUBLISHED -> CachePromotionOutcome.FULFILLED
+                // Skipped outcomes leave the existing bytes and timestamps untouched (issue:
+                // round 4 #1). Marker completion is NOT unconditional here (issue: round 17 #7):
+                // SKIPPED_PROTECTED-for-this-file cleared its marker INSIDE the validating
+                // section (publishLockedCore, under the locks, generation+intent validated);
+                // SKIPPED_INVALIDATED never clears — a revived root or newer request that
+                // established pending work after the skip decision owns its marker.
+                PublicationOutcome.SKIPPED_PROTECTED, PublicationOutcome.SKIPPED_INVALIDATED -> {
+                    filesDownloaded += 1
+                    CachePromotionOutcome.DEFERRED
+                }
+                PublicationOutcome.SKIPPED_CONFLICT -> {
+                    // The destination holds protected content owned by another row (issue: round
+                    // 14 #13): deferred — the pending marker STAYS so the work and the root's
+                    // incompleteness are retained until the conflict resolves.
+                    CachePromotionOutcome.DEFERRED
+                }
+                PublicationOutcome.SKIPPED_SUPERSEDED -> {
+                    // A newer generation owns the file's pending state and completion (issue:
+                    // round 8 #9): this transfer's skip clears no marker and runs no completion.
+                    CachePromotionOutcome.DEFERRED
+                }
+                // THE DEFERRED-READABLE SUPPRESSION OUTCOME (issues: round 29 masked flow B):
+                // the pre-transfer suppression decided no transfer adds anything — the durable
+                // unresolved state stands, no marker clear, no completion.
+                PublicationOutcome.SKIPPED_READABLE_DEFERRED -> CachePromotionOutcome.DEFERRED
+                // UNRESOLVED generation (issue: round 20 #14): the bytes are published but the
+                // generation is unproven — the promotion is NOT fulfilled (the marker stays,
+                // the root's incompleteness is retained via the unresolved-outcome set).
+                PublicationOutcome.PUBLISHED_UNRESOLVED -> CachePromotionOutcome.DEFERRED
+                PublicationOutcome.FAILED -> CachePromotionOutcome.FAILED
             }
-            PublicationOutcome.SKIPPED_CONFLICT -> {
-                // The destination holds protected content owned by another row (issue: round
-                // 14 #13): deferred — the pending marker STAYS so the work and the root's
-                // incompleteness are retained until the conflict resolves.
-                CachePromotionOutcome.DEFERRED
-            }
-            PublicationOutcome.SKIPPED_SUPERSEDED -> {
-                // A newer generation owns the file's pending state and completion (issue:
-                // round 8 #9): this transfer's skip clears no marker and runs no completion.
-                CachePromotionOutcome.DEFERRED
-            }
-            // THE DEFERRED-READABLE SUPPRESSION OUTCOME (issues: round 29 masked flow B):
-            // the pre-transfer suppression decided no transfer adds anything — the durable
-            // unresolved state stands, no marker clear, no completion.
-            PublicationOutcome.SKIPPED_READABLE_DEFERRED -> CachePromotionOutcome.DEFERRED
-            // UNRESOLVED generation (issue: round 20 #14): the bytes are published but the
-            // generation is unproven — the promotion is NOT fulfilled (the marker stays,
-            // the root's incompleteness is retained via the unresolved-outcome set).
-            PublicationOutcome.PUBLISHED_UNRESOLVED -> CachePromotionOutcome.DEFERRED
-            PublicationOutcome.FAILED -> CachePromotionOutcome.FAILED
+        } finally {
+            // THE OUTER STAGING FINALLY SPANS CREATION THROUGH PUBLICATION (issue: round
+            // 32 #9): the cancellation rethrow skips any statement AFTER the publication —
+            // entering withContext rejects the cancelled context BEFORE its body (and its
+            // inner finally) runs — so the stage is cleaned OUTSIDE the publication, with
+            // any associated provenance/observation.
+            runCatching { if (staged.exists()) staged.delete() }
+            Realm.getApplicationContext()?.let { ctx -> runCatching { deletePublishedProvenance(ctx, staged) } }
         }
     }
 
@@ -4430,6 +4438,7 @@ class DownloadOfflineFileManager(
             // coordinated core; missing or mismatched provenance fails and the caller
             // enqueues a fresh download.
             val staged = newStagedFile(context, authoritativeFile)
+            try {
             // THE CAPTURED PROMOTION TOKEN (issue: round 23 #20): captured ATOMICALLY WITH
             // STAGING — inside the same monitor+lock section that copies the cache — so a
             // writer that replaces the cache after the section (certifying different bytes
@@ -4448,7 +4457,6 @@ class DownloadOfflineFileManager(
                 }
             }
             if (!stagedOk) {
-                runCatching { if (staged.exists()) staged.delete() }
                 SentryLog.i(TAG, "Cache promotion refused for ${offlineFile.path}: unproven generation")
                 return PublicationOutcome.FAILED
             }
@@ -4490,8 +4498,16 @@ class DownloadOfflineFileManager(
                 SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
             }.getOrDefault(PublicationOutcome.FAILED)
 
-            runCatching { if (staged.exists()) staged.delete() }
-            return outcome
+            outcome
+            } finally {
+                // THE OUTER STAGING FINALLY SPANS CREATION THROUGH PUBLICATION (issue:
+                // round 32 #9), as in the worker promotion: a cancellation during the
+                // staging copy or before the publication's withContext body entry skips
+                // every later statement — the stage (and any associated provenance/
+                // observation) is cleaned OUTSIDE the publication here.
+                runCatching { if (staged.exists()) staged.delete() }
+                Realm.getApplicationContext()?.let { ctx -> runCatching { deletePublishedProvenance(ctx, staged) } }
+            }
         }
 
         /**
@@ -5063,22 +5079,35 @@ class DownloadOfflineFileManager(
             downloadInterceptor: Interceptor?,
             consume: suspend (Response) -> T,
         ): T = coroutineScope {
-            val response = downloadFileResponseAsync(
-                fileUrl = fileUrl,
-                okHttpClient = okHttpClient,
-                downloadInterceptor = downloadInterceptor,
-            )
+            // THE ACTUAL CALL IS RETAINED (issue: round 32 #7): the lifetime constructs the
+            // request and the call itself — a helper that created and discarded the call
+            // left only the Response, so the cancellation watcher could close the body but
+            // never reach the transport's call (a blocked read competes with the close and
+            // is not interrupted by it).
+            @OptIn(ManualAuthorizationRequired::class)
+            val request = Request.Builder().url(fileUrl).headers(HttpUtils.getHeaders(contentType = null)).get().build()
+            val call = okHttpClient.newBuilder().apply {
+                downloadInterceptor?.let { interceptor -> addInterceptor(interceptor) }
+            }.build().newCall(request)
+            val response = call.await()
             val consumptionWatcher = launch(Dispatchers.IO, CoroutineStart.UNDISPATCHED) {
                 try {
                     awaitCancellation()
                 } finally {
-                    withContext(NonCancellable) { runCatching { response.close() } }
+                    // CANCELLATION TIME, NOT COMPLETION TIME (issues: round 30 #9, round 32
+                    // #7): the watcher cancels the ACTUAL call — aborting the connection
+                    // and interrupting a blocked read — and closes the response.
+                    withContext(NonCancellable) {
+                        runCatching { call.cancel() }
+                        runCatching { response.close() }
+                    }
                 }
             }
             try {
                 consume(response)
             } finally {
                 consumptionWatcher.cancel()
+                // GUARANTEED CLOSURE ON EVERY PATH (issues: round 31 #7, round 32 #7).
                 runCatching { response.close() }
             }
         }
