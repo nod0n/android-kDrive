@@ -56,9 +56,14 @@ import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.NotificationUtils.downloadProgressNotification
 import io.realm.Realm
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.invoke
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
@@ -947,7 +952,20 @@ class DownloadOfflineFileManager(
             return@withContext ListenableWorker.Result.failure()
         }
 
-        val response = downloadFileResponseAsync(
+        // Download into a unique, app-owned staged file (issue: round 3 #2): never a sibling of
+        // the offline path (a user file could live there), never shared between concurrent
+        // workers. In-progress bytes are never visible at the offline path.
+        val staged = newStagedFile(context, file)
+        lastDownloadedFile = staged
+        makeSureFileExists(staged) ?: return@withContext ListenableWorker.Result.failure()
+
+        // THE SHARED CONSUMPTION LIFETIME (issue: round 31 #7): the response is awaited
+        // and its ENTIRE body consumption runs inside the lifetime that retains and
+        // interrupts the transfer — a cancellation while the copy is blocked in a read
+        // reaches the transfer, and the response closes on every path (the previous
+        // header-only await left the call unowned during the body read, and the
+        // not-successful path leaked the response entirely).
+        val remoteDataHasBeenSaved = withDownloadResponse(
             fileUrl = ApiRoutes.downloadFile(file),
             okHttpClient = okHttpClient,
             downloadInterceptor = downloadProgressInterceptor(
@@ -969,20 +987,17 @@ class DownloadOfflineFileManager(
 
                     SentryLog.d(downloadWorker.workerTag(), "download $progress%")
                 },
-            )
-        )
-
-        if (!response.isSuccessful) return@withContext ListenableWorker.Result.failure()
-
-        // Download into a unique, app-owned staged file (issue: round 3 #2): never a sibling of
-        // the offline path (a user file could live there), never shared between concurrent
-        // workers. In-progress bytes are never visible at the offline path.
-        val staged = newStagedFile(context, file)
-        lastDownloadedFile = staged
-        makeSureFileExists(staged) ?: return@withContext ListenableWorker.Result.failure()
+            ),
+        ) { response ->
+            if (!response.isSuccessful) {
+                false
+            } else {
+                saveRemoteData(downloadWorker.workerTag(), response, staged)
+            }
+        }
 
         runCatching {
-            val remoteDataHasBeenSaved = saveRemoteData(downloadWorker.workerTag(), response, staged)
+            // (The body consumption lives in the shared lifetime above.)
 
             // Validate before publishing (size when the remote metadata carries one), then hand
             // over to the final coordinated publication (intent, pending uploads, target
@@ -4862,6 +4877,45 @@ class DownloadOfflineFileManager(
             return okHttpClient.newBuilder().apply {
                 downloadInterceptor?.let { interceptor -> addInterceptor(interceptor) }
             }.build().newCall(request).await()
+        }
+
+        /**
+         * THE SHARED DOWNLOAD CONSUMPTION LIFETIME (issue: round 31 #7): awaits the
+         * response AND owns the transfer through the caller's ENTIRE body consumption —
+         * the shared download API previously retained the actual call only until the
+         * headers arrived, so a cancellation while a worker/preview consumer was blocked
+         * in `InputStream.read` could not reach the call (between-reads checks cannot
+         * interrupt it). A watcher sibling on an EXPLICIT dispatcher (structured children
+         * are cancelled at CANCELLATION TIME, never at completion) closes the response
+         * while the read is blocked, interrupting it. The lifetime's own finally closes
+         * the response on every path (double close is safe), so no caller-shaped window
+         * leaks an undelivered or half-consumed response. The worker, the preview and the
+         * SAF bridge all consume through this lifetime.
+         */
+        internal suspend fun <T> withDownloadResponse(
+            fileUrl: String,
+            okHttpClient: OkHttpClient,
+            downloadInterceptor: Interceptor?,
+            consume: suspend (Response) -> T,
+        ): T = coroutineScope {
+            val response = downloadFileResponseAsync(
+                fileUrl = fileUrl,
+                okHttpClient = okHttpClient,
+                downloadInterceptor = downloadInterceptor,
+            )
+            val consumptionWatcher = launch(Dispatchers.IO, CoroutineStart.UNDISPATCHED) {
+                try {
+                    awaitCancellation()
+                } finally {
+                    withContext(NonCancellable) { runCatching { response.close() } }
+                }
+            }
+            try {
+                consume(response)
+            } finally {
+                consumptionWatcher.cancel()
+                runCatching { response.close() }
+            }
         }
 
         suspend fun saveRemoteData(

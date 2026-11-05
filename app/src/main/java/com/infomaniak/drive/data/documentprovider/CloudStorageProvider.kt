@@ -1026,44 +1026,27 @@ class CloudStorageProvider : DocumentsProvider() {
                 // copy could then publish mixed bytes under the previously validated
                 // generation, which the post-write invalidation could not retract.
                 val stagedOk = runBlocking(operationJob) {
-                    val response = DownloadOfflineFileManager.downloadFileResponseAsync(
+                    // THE SHARED CONSUMPTION LIFETIME (issue: round 31 #7): the SAF bridge
+                    // consumes through the shared lifetime instead of its own inline
+                    // watcher — the response is awaited and its ENTIRE consumption runs
+                    // inside the lifetime that retains and interrupts the transfer, and
+                    // the response closes on every path.
+                    DownloadOfflineFileManager.withDownloadResponse(
                         fileUrl = ApiRoutes.downloadFile(file),
                         okHttpClient = okHttpClient,
                         downloadInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor(onProgress = { progress ->
                             SentryLog.i(TAG, "open currentProgress: $progress")
-                        })
-                    )
-                    // OWNERSHIP THROUGH CONSUMPTION, STABLE API (issue: round 30 #9): the
-                    // await's cancellation handler is spent once the response arrived — a
-                    // cancellation DURING the body consumption must still reach the
-                    // transfer. A watcher sibling on an EXPLICIT dispatcher observes this
-                    // operation's cancellation — structured children are cancelled at
-                    // CANCELLATION TIME, not at completion (a completion-time handler
-                    // could never run while the read blocks, and the internal onCancelling
-                    // completion hook is deliberately not used) — and CLOSES the response,
-                    // interrupting the blocked read; the use below closes it on every exit
-                    // (double close is safe).
-                    val bodyOwnership = launch(Dispatchers.IO, CoroutineStart.UNDISPATCHED) {
-                        try {
-                            awaitCancellation()
-                        } finally {
-                            withContext(NonCancellable) { runCatching { response.close() } }
-                        }
-                    }
-                    try {
-                        response.use { ownedResponse ->
-                            // THE POST-HTTP CHECK INSIDE THE OWNED SCOPE (issue: round 30
-                            // #9): a cancellation after the response can no longer leak it.
-                            signal?.throwIfCanceled()
-                            if (!ownedResponse.isSuccessful) return@use false
-                            runCatching {
-                                DownloadOfflineFileManager.saveRemoteData(TAG, ownedResponse, staged)
-                            }.onFailure { exception ->
-                                SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
-                            }.isSuccess
-                        }
-                    } finally {
-                        bodyOwnership.cancel()
+                        }),
+                    ) { response ->
+                        // THE POST-HTTP CHECK INSIDE THE OWNED SCOPE (issue: round 30
+                        // #9): a cancellation after the response can no longer leak it.
+                        signal?.throwIfCanceled()
+                        if (!response.isSuccessful) return@withDownloadResponse false
+                        runCatching {
+                            DownloadOfflineFileManager.saveRemoteData(TAG, response, staged)
+                        }.onFailure { exception ->
+                            SentryLog.e(TAG, "Staged SAF download failed for ${cacheFile.path}", exception)
+                        }.isSuccess
                     }
                 }
                 // TYPED GENERATION-BOUND RESPONSE BINDING (issues: round 23 #22, round

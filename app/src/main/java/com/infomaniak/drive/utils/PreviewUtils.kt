@@ -243,13 +243,19 @@ internal suspend fun downloadFile(
         if (suppressed) return PublicationOutcome.SKIPPED_READABLE_DEFERRED
     }
 
-    DownloadOfflineFileManager.downloadFileResponseAsync(
+    // THE SHARED CONSUMPTION LIFETIME (issue: round 31 #7): the response is awaited and
+    // its ENTIRE consumption (the staged body copy inside publishDownloadedCopy) runs
+    // inside the lifetime that retains and interrupts the transfer — a cancellation while
+    // the copy is blocked in a read reaches the transfer, and the response closes on
+    // every path (the previous header-only await left the call unowned during the body
+    // read).
+    DownloadOfflineFileManager.withDownloadResponse(
         fileUrl = downloadUrl,
-        downloadInterceptor = downloadProgressInterceptor,
         okHttpClient = okHttpClient,
-    ).use {
-        if (!it.isSuccessful) {
-            val errorCode = JsonParser.parseString(it.bodyAsStringOrNull()).asJsonObject.getAsJsonPrimitive("error").asString
+        downloadInterceptor = downloadProgressInterceptor,
+    ) { response ->
+        if (!response.isSuccessful) {
+            val errorCode = JsonParser.parseString(response.bodyAsStringOrNull()).asJsonObject.getAsJsonPrimitive("error").asString
             if (errorCode == "password_protected_error") {
                 throw PasswordProtectedException()
             } else {
@@ -257,7 +263,7 @@ internal suspend fun downloadFile(
             }
         }
 
-        if (shouldBePdf && it.body?.contentType()?.toString() != "application/pdf") {
+        if (shouldBePdf && response.body?.contentType()?.toString() != "application/pdf") {
             throw UnsupportedOperationException("File not supported")
         }
 
@@ -268,7 +274,7 @@ internal suspend fun downloadFile(
             userDrive = userDrive,
             isInheritedDownload = file.isInOfflineFolder && !file.isOffline,
             coordinated = coordinated,
-        ) { staged -> createTempFile(it, staged) }
+        ) { staged -> createTempFile(response, staged) }
         if (outcome == PublicationOutcome.FAILED) {
             throw Exception("Download error")
         }
@@ -280,7 +286,7 @@ internal suspend fun downloadFile(
         if (outcome == PublicationOutcome.PUBLISHED || outcome == PublicationOutcome.SKIPPED_PROTECTED) {
             onProgress(PROGRESS_COMPLETE)
         }
-        return outcome
+        outcome
     }
 }
 
