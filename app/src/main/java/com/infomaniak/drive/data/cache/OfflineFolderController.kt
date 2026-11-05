@@ -755,6 +755,18 @@ object OfflineFolderController {
                                         target,
                                         expectedObservationLocation = oldOfflineFile.absolutePath,
                                         requireObservation = false,
+                                        // THE CAPTURED SCOPE IS EXPLICIT (review-33 #5): the
+                                        // operation's sidecar records the caller's ACTUAL realm
+                                        // flavor and the relocation's offline destination kind —
+                                        // a silently-defaulted ordinary Realm made a shared-scope
+                                        // relocation's replay unvalidatable forever.
+                                        sharedWithMe = userDrive.sharedWithMe,
+                                        storageKind = "offline",
+                                        // THE PUBLISHED-SOURCE RELOCATION CONTRACT (review-33
+                                        // #4): the source bytes have not moved yet — a
+                                        // preparation failure preserves the source proof and
+                                        // disposes only the destination preparation.
+                                        flow = DownloadOfflineFileManager.ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION,
                                         // THE RECORDED SOURCE IDENTITY (review-33 #3): the v2
                                         // relocation record carries the old location so the
                                         // sweep's conditional move-completion can validate the

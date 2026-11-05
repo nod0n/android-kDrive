@@ -590,40 +590,86 @@ class MainViewModel(
                                                                 if (!subtreeOk) {
                                                                     false
                                                                 } else {
-                                                                    val renamed = oldBytes.renameTo(newBytes)
-                                                                    if (renamed) {
-                                                                        relocatedPairs.forEach { (oldCopy, newCopy) ->
-                                                                            if (oldCopy.path != newCopy.path) {
-                                                                                val proofMoved = runCatching {
-                                                                                    DownloadOfflineFileManager.movePublishedProvenance(
+                                                                    // EVERY RELOCATION IS PREPARED BEFORE THE
+                                                                    // DIRECTORY RENAME (review-33 #6): the
+                                                                    // published-source contract validates each
+                                                                    // copy's observation against its OLD path and
+                                                                    // writes the recoverable state before any byte
+                                                                    // effect — a preparation failure defers the
+                                                                    // merge with NO byte effects (previously the
+                                                                    // rename was accepted and each failure only
+                                                                    // logged).
+                                                                    val preparedPairs = mutableListOf<Pair<IOFile, IOFile>>()
+                                                                    var preparedAll = true
+                                                                    for ((oldCopy, newCopy) in relocatedPairs) {
+                                                                        if (oldCopy.path == newCopy.path) continue
+                                                                        val prepared = runCatching {
+                                                                            DownloadOfflineFileManager.preparePublishedSourceRelocation(
+                                                                                application,
+                                                                                oldCopy,
+                                                                                newCopy,
+                                                                                sharedWithMe = sharedScope.sharedWithMe,
+                                                                            )
+                                                                        }.getOrDefault(false)
+                                                                        if (prepared) {
+                                                                            preparedPairs += oldCopy to newCopy
+                                                                        } else {
+                                                                            preparedAll = false
+                                                                            break
+                                                                        }
+                                                                    }
+                                                                    if (!preparedAll) {
+                                                                        // THE ABORT DISPOSES ONLY THE PREPARATIONS
+                                                                        // (review-33 #4): the source proofs were never
+                                                                        // touched and the byte effects never started.
+                                                                        preparedPairs.forEach { (_, newCopy) ->
+                                                                            runCatching {
+                                                                                DownloadOfflineFileManager.disposePreparedProofRelocation(
+                                                                                    application,
+                                                                                    newCopy,
+                                                                                )
+                                                                            }
+                                                                        }
+                                                                        false
+                                                                    } else {
+                                                                        val renamed = oldBytes.renameTo(newBytes)
+                                                                        var relocationsComplete = renamed
+                                                                        if (renamed) {
+                                                                            preparedPairs.forEach { (oldCopy, newCopy) ->
+                                                                                val completed = runCatching {
+                                                                                    DownloadOfflineFileManager.completePreparedProofMove(
                                                                                         application,
                                                                                         oldCopy,
                                                                                         newCopy,
-                                                                                        sharedWithMe = sharedScope.sharedWithMe,
                                                                                     )
                                                                                 }.getOrDefault(false)
-                                                                                if (!proofMoved) {
-                                                                                    // PROOF-FAILURE RECOVERY STATE
-                                                                                    // (issue: round 22 #12): the
-                                                                                    // rename already moved the bytes —
-                                                                                    // the failed relocation leaves the
-                                                                                    // copy UNPROVEN at the new path
-                                                                                    // (never falsely proven, and no
-                                                                                    // stranded old-path record:
-                                                                                    // movePublishedProvenance
-                                                                                    // invalidates the source record in
-                                                                                    // every outcome), and the walk's
-                                                                                    // verification re-establishes the
-                                                                                    // proof.
+                                                                                if (!completed) {
+                                                                                    // THE RETAINED STATE IS REPLAYED BY THE
+                                                                                    // SWEEP (review-33 #3): the recorded source
+                                                                                    // identity lets recovery complete the move
+                                                                                    // while the rows still resolve the old
+                                                                                    // paths; the merge DEFERS this pass.
+                                                                                    relocationsComplete = false
                                                                                     SentryLog.i(
                                                                                         TAG,
-                                                                                        "Provenance relocation failed during shared tree rename; ${oldCopy.name} stays unproven",
+                                                                                        "Proof relocation incomplete during shared tree rename; ${oldCopy.name} deferred to recovery",
+                                                                                    )
+                                                                                }
+                                                                            }
+                                                                        } else {
+                                                                            preparedPairs.forEach { (_, newCopy) ->
+                                                                                runCatching {
+                                                                                    DownloadOfflineFileManager.disposePreparedProofRelocation(
+                                                                                        application,
+                                                                                        newCopy,
                                                                                     )
                                                                                 }
                                                                             }
                                                                         }
+                                                                        // THE FAILURE IS PROPAGATED (review-33 #6): a
+                                                                        // deferral, never a logged success.
+                                                                        renamed && relocationsComplete
                                                                     }
-                                                                    renamed
                                                                 }
                                                             }.getOrDefault(false)
                                                             else -> OfflineFolderController.reconcileMovedInheritedCopy(
@@ -938,62 +984,52 @@ class MainViewModel(
                                                             if (!stagedOk) return@runCatching false
                                                             stagedTransfer.setLastModified(sourceBytes.lastModified())
                                                             destinationBytes.parentFile?.mkdirs()
-                                                            if (!stagedTransfer.renameTo(destinationBytes)) return@runCatching false
-                                                            // THE PROOF DECISION IS THE TRANSFER'S OUTCOME,
-                                                            // NEVER AN IGNORED SIDE CALL (issue: round 24
-                                                            // #12/#13): a proof that did not travel (absent,
-                                                            // foreign, or a failed move) leaves the
-                                                            // transferred bytes UNPROVEN — the durable
-                                                            // resolution below re-establishes ownership; the
-                                                            // final verification never accepts them bare.
+                                                            // THE RELOCATION IS PREPARED BEFORE THE BYTE EFFECT
+                                                            // (review-33 #6): the published-source contract
+                                                            // validates the source's proof and observation
+                                                            // (against the SOURCE binding) and writes the
+                                                            // recoverable state BEFORE the destination bytes
+                                                            // are published. A missing, foreign or
+                                                            // unpreparable proof aborts the transfer — no byte
+                                                            // effect without its recoverable state — and the
+                                                            // durable intent below defers the row.
                                                             val sourceProof = DownloadOfflineFileManager.readPublishedProvenance(application, sourceBytes)
-                                                            val proofMoved = sourceProof != null &&
+                                                            val relocationPrepared = sourceProof != null &&
                                                                 !sourceProof.positivelyForeignTo(node, sharedScope) &&
-                                                                DownloadOfflineFileManager.movePublishedProvenance(
+                                                                runCatching {
+                                                                    DownloadOfflineFileManager.preparePublishedSourceRelocation(
+                                                                        application,
+                                                                        sourceBytes,
+                                                                        destinationBytes,
+                                                                        sharedWithMe = sharedScope.sharedWithMe,
+                                                                    )
+                                                                }.getOrDefault(false)
+                                                            if (!relocationPrepared) return@runCatching false
+                                                            if (!stagedTransfer.renameTo(destinationBytes)) {
+                                                                // THE RENAME TOUCHED NOTHING (review-33 #6): the
+                                                                // caller's own preparation is disposed and the
+                                                                // intact source keeps its proof.
+                                                                runCatching {
+                                                                    DownloadOfflineFileManager.disposePreparedProofRelocation(
+                                                                        application,
+                                                                        destinationBytes,
+                                                                    )
+                                                                }
+                                                                return@runCatching false
+                                                            }
+                                                            // THE OBSERVATION RE-BINDS WITH THE PROOF (review-33
+                                                            // #6): an incomplete completion RETAINS the durable
+                                                            // relocation state (the sweep's conditional
+                                                            // move-completion resolves it — review-33 #3); the
+                                                            // transferred bytes stay PROVEN by the prepared
+                                                            // destination record, so no edit is manufactured.
+                                                            runCatching {
+                                                                DownloadOfflineFileManager.completePreparedProofMove(
                                                                     application,
                                                                     sourceBytes,
                                                                     destinationBytes,
-                                                                    sharedWithMe = sharedScope.sharedWithMe,
                                                                 )
-                                                            if (!proofMoved) {
-                                                                // POSITIVE EDIT REGISTRATION ONLY (issue:
-                                                                // round 25 #2): the classification was
-                                                                // established BEFORE any destination effect
-                                                                // from the source's own proof, anchor and
-                                                                // bytes — an mtime comparison alone is
-                                                                // NEVER authority to register foreign or
-                                                                // ambiguous historical bytes as this
-                                                                // destination's edit (they stay unproven
-                                                                // and retained).
-                                                                if (sourceClassifiedEdit) {
-                                                                    // UNSENT-REVISION OWNERSHIP AT THE DESTINATION
-                                                                    // (issue: round 24 #13): a dirty edit's
-                                                                    // transferred bytes are registered as the
-                                                                    // DESTINATION row's durable snapshot — the
-                                                                    // upload carries the revision to the new
-                                                                    // location and the verification's
-                                                                    // exact-ownership arm can accept it; the bare
-                                                                    // marker would let a worker download over
-                                                                    // the unsent edit.
-                                                                    runCatching {
-                                                                        OfflineFolderController.registerDirtySnapshot(
-                                                                            context = application,
-                                                                            file = node,
-                                                                            offlineFile = destinationBytes,
-                                                                            userDrive = sharedScope,
-                                                                        )
-                                                                    }.onFailure(Sentry::captureException)
-                                                                } else {
-                                                                    // Clean unproven bytes: the durable download
-                                                                    // intent makes the worker establish a PROVEN
-                                                                    // publication at the destination.
-                                                                    FileController.markFileAsOffline(
-                                                                        customRealm = sharedRealm,
-                                                                        fileId = node.id,
-                                                                        isMarkedAsOffline = true,
-                                                                    )
-                                                                }
-                                                            }
+                                                            }.onFailure(Sentry::captureException)
                                                             true
                                                         } finally {
                                                             runCatching { if (stagedTransfer.exists()) stagedTransfer.delete() }

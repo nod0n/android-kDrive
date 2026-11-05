@@ -2356,6 +2356,24 @@ class DownloadOfflineFileManager(
         }.getOrNull()
 
         /**
+         * THE TWO RELOCATION CONTRACTS (review-33 #6): a staged publication and a
+         * published-source relocation have DIFFERENT source semantics, and preparation
+         * failure must be handled per contract.
+         */
+        internal enum class ProofRelocationFlow {
+            /** STAGED PUBLICATION: the source bytes were ALREADY renamed onto the target
+             * (the staged path is vacated) — a preparation failure retains the relocation
+             * state for the sweep's replay onto the moved bytes and invalidates the
+             * vacated source record, which must never survive to lend its generation. */
+            STAGED_PUBLICATION,
+
+            /** PUBLISHED-SOURCE RELOCATION: the source bytes are STILL AT THE SOURCE — a
+             * preparation failure preserves the source proof on EVERY path (review-33 #4)
+             * and disposes only the operation's own destination preparation. */
+            PUBLISHED_SOURCE_RELOCATION,
+        }
+
+        /**
          * THE PREPARED PROOF-MOVE PHASE 1 (issues: round 23 #14, round 32 #4): the
          * relocation state (scope sidecar, retained proof, captured observation) and the
          * DESTINATION proof are written and verified BEFORE any byte moves — a proof or
@@ -2373,6 +2391,7 @@ class DownloadOfflineFileManager(
             requireObservation: Boolean,
             sharedWithMe: Boolean = false,
             storageKind: String = "offline",
+            flow: ProofRelocationFlow = ProofRelocationFlow.STAGED_PUBLICATION,
             recordedSourcePath: String = "",
         ): Boolean {
             val provenance = readPublishedProvenance(context, source)
@@ -2416,19 +2435,42 @@ class DownloadOfflineFileManager(
             }.getOrDefault(false)
             if (!written) {
                 // A partial write must never lend a truncated generation (issue: round 22
-                // #12). The relocation state RETAINS the original proof for the sweep; the
-                // source record is invalidated only when the relocation state exists (the
-                // sweep re-writes the destination proof — a record at the vacated source
-                // path must never survive to lend its generation).
-                disposeRecoveryRecord(recordFile)
-                deletePublishedProvenance(context, source)
+                // #12); the failure handling is PER CONTRACT (review-33 #4/#6).
+                when (flow) {
+                    // STAGED PUBLICATION (the round-23 contract): the source bytes are
+                    // already at the target — the vacated source record is invalidated (a
+                    // record at the vacated source path must never survive to lend its
+                    // generation) and the relocation state RETAINS the original proof for
+                    // the sweep's replay onto the moved bytes.
+                    ProofRelocationFlow.STAGED_PUBLICATION -> {
+                        disposeRecoveryRecord(recordFile)
+                        deletePublishedProvenance(context, source)
+                    }
+                    // PUBLISHED-SOURCE RELOCATION (review-33 #4): the source bytes have
+                    // NOT moved — preparation preserves the source proof on EVERY failure
+                    // and disposes ONLY its own destination preparation (the partial
+                    // destination record and the relocation state). Nothing at the source
+                    // is touched: the caller's bytes keep their classification evidence.
+                    ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION -> {
+                        disposeRecoveryRecord(recordFile)
+                        runCatching { disposeRecoveryRecord(proofRelocationRecordFile(context, target)) }
+                    }
+                }
                 return false
             }
             // VERIFIED DESTINATION PROOF (issue: round 23 #14): the written record must
             // read back before any state is disposed.
             if (readPublishedProvenance(context, target) == null) {
-                disposeRecoveryRecord(recordFile)
-                deletePublishedProvenance(context, source)
+                when (flow) {
+                    ProofRelocationFlow.STAGED_PUBLICATION -> {
+                        disposeRecoveryRecord(recordFile)
+                        deletePublishedProvenance(context, source)
+                    }
+                    ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION -> {
+                        disposeRecoveryRecord(recordFile)
+                        runCatching { disposeRecoveryRecord(proofRelocationRecordFile(context, target)) }
+                    }
+                }
                 return false
             }
             return true
@@ -2497,7 +2539,45 @@ class DownloadOfflineFileManager(
                 requireObservation = requireObservation,
                 sharedWithMe = sharedWithMe,
                 storageKind = storageKind,
+                flow = ProofRelocationFlow.STAGED_PUBLICATION,
             ) && completePreparedProofMove(context, source, target)
+
+        /**
+         * THE PUBLISHED-SOURCE RELOCATION CONTRACT (review-33 #6): an ALREADY-PUBLISHED
+         * source's proof and observation travel to [target] — the source observation
+         * correctly names its OLD SOURCE PATH, so the carried observation validates against
+         * [source] (never the final target, which is the STAGED publication's contract).
+         * The relocation state, with the recorded source identity, is prepared BEFORE the
+         * caller's byte effects; the observation is re-bound to the destination only in
+         * [completePreparedProofMove]. Returns true only when the preparation verified.
+         */
+        internal fun preparePublishedSourceRelocation(
+            context: Context,
+            source: IOFile,
+            target: IOFile,
+            sharedWithMe: Boolean,
+        ): Boolean = prepareProofRelocation(
+            context,
+            source,
+            target,
+            expectedObservationLocation = source.absolutePath,
+            requireObservation = false,
+            sharedWithMe = sharedWithMe,
+            storageKind = "offline",
+            flow = ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION,
+            recordedSourcePath = source.absolutePath,
+        )
+
+        /**
+         * DISPOSES THE CALLER'S OWN DESTINATION PREPARATION (review-33 #6): an abort
+         * BEFORE the byte effects removes the relocation state and the prepared
+         * destination record. The source proof was never touched by a relocation-flow
+         * preparation (review-33 #4) and is left entirely alone here.
+         */
+        internal fun disposePreparedProofRelocation(context: Context, target: IOFile) {
+            runCatching { disposeRecoveryRecord(proofRelocationRecordFile(context, target)) }
+            runCatching { deletePublishedProvenance(context, target) }
+        }
 
         /**
          * The EXACT cache publication token captured at staging or edit initiation (issue:
