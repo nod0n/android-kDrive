@@ -533,6 +533,13 @@ class MainViewModel(
                                     // reconciliation defers the whole merge (the source realm
                                     // keeps its row; the sync retries).
                                     if (mergeAllowed) {
+                                        // COMPLETED RELOCATIONS RETAIN THEIR JOURNALS UNTIL THE
+                                        // METADATA COMMIT (review-34 #3): each child completion
+                                        // succeeds while the rows still resolve the old paths —
+                                        // the state is disposed only after the merge transaction
+                                        // commits, so a failed or interrupted merge leaves every
+                                        // child's owner-checked rollback authority intact.
+                                        val completedRelocationTargets = mutableListOf<IOFile>()
                                         sharedRealm.where(File::class.java)
                                             .equalTo(File::id.name, file.id)
                                             .findFirst()?.let { preRoot ->
@@ -620,6 +627,17 @@ class MainViewModel(
                                                                     var preparedAll = true
                                                                     for ((oldCopy, newCopy) in relocatedPairs) {
                                                                         if (oldCopy.path == newCopy.path) continue
+                                                                        // DESTINATION CONFLICTS ARE VALIDATED
+                                                                        // BEFORE PREPARATION (review-34 #4): a
+                                                                        // destination file at the pair's new
+                                                                        // path is an existing publication the
+                                                                        // merge keeps — preparing over it
+                                                                        // would overwrite its evidence before
+                                                                        // any byte effect.
+                                                                        if (newCopy.exists()) {
+                                                                            preparedAll = false
+                                                                            break
+                                                                        }
                                                                         val prepared = runCatching {
                                                                             DownloadOfflineFileManager.preparePublishedSourceRelocation(
                                                                                 application,
@@ -658,9 +676,16 @@ class MainViewModel(
                                                                                         application,
                                                                                         oldCopy,
                                                                                         newCopy,
+                                                                                        // THE JOURNAL OUTLIVES THE
+                                                                                        // COMPLETION (review-34 #3):
+                                                                                        // disposal follows the merge
+                                                                                        // commit, never this child.
+                                                                                        disposeOnSuccess = false,
                                                                                     )
                                                                                 }.getOrDefault(false)
-                                                                                if (!completed) {
+                                                                                if (completed) {
+                                                                                    completedRelocationTargets += newCopy
+                                                                                } else {
                                                                                     // THE RETAINED STATE IS REPLAYED BY THE
                                                                                     // SWEEP (review-33 #3): the recorded source
                                                                                     // identity lets recovery complete the move
@@ -813,6 +838,18 @@ class MainViewModel(
                                             }.onFailure(Sentry::captureException)
                                         }
                                     }.onFailure(Sentry::captureException).isSuccess
+                                    // THE COMMITTED MERGE DISPOSES THE RETAINED JOURNALS (review-34
+                                    // #3): the rows now agree with the bytes, proofs and observations
+                                    // at the destinations, so the journals clear; a failed or
+                                    // interrupted merge retains every child's state for the sweep's
+                                    // owner-checked rollback.
+                                    if (mergeOk) {
+                                        completedRelocationTargets.forEach { completedTarget ->
+                                            runCatching {
+                                                DownloadOfflineFileManager.disposeCompletedRelocationState(application, completedTarget)
+                                            }
+                                        }
+                                    }
                                     // REQUIRED-CONTENT TRANSFER OR DURABLE REPLACEMENT WORK
                                     // (issue: round 22 #13): merged descendants carry their
                                     // offline flags, but their bytes remain at the SOURCE-derived

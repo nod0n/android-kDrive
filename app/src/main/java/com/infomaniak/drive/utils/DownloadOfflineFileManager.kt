@@ -2182,6 +2182,8 @@ class DownloadOfflineFileManager(
             storageKind: String = "offline",
             attemptedObservation: AttemptedObservationCapture = AttemptedObservationCapture.Absent,
             recordedSourcePath: String = "",
+            recordedSourceProofText: String = "",
+            previousDestinationRecordText: String = "",
         ): Boolean = runCatching {
             // DAMAGED EVIDENCE IS NEVER PERSISTED AS ABSENCE (issue: round 31 #4), as in
             // the publication recovery record: a relocation whose source observation
@@ -2217,16 +2219,29 @@ class DownloadOfflineFileManager(
             // state retains the attempt's observation beside the proof, so the replay
             // re-establishes BOTH at the destination before disposal. FIFTH LINE: THE
             // RECORDED SOURCE (review-33 #3) — the relocation's old identity, empty for a
-            // staged publication that has no source authority.
-            // RECORD v2 (review-33 #7): the current operation format is VERSIONED — a v2
-            // record REQUIRES its complete field set (the observation field must be the
-            // explicit "A" marker or a carried observation, never empty). A truncated or
-            // empty-fielded v2 record is DAMAGED CURRENT EVIDENCE on read — retained and
-            // fail-closed — never decoded as legitimate absence; only the legacy "1"
-            // records keep the conservative empty-means-absent semantics.
+            // staged publication that has no source authority. SIXTH LINE: THE
+            // SOURCE-BOUND PROOF (review-34 #3) — the rollback authority that restores the
+            // source's exact generation evidence. SEVENTH LINE: THE PREEXISTING
+            // DESTINATION PROOF (review-34 #4) — captured before the destination write so
+            // an abort restores it exactly.
+            // RECORD v3 (review-33 #7, review-34 #3/#4): the current operation format is
+            // VERSIONED — a v3 record REQUIRES its complete field set (the observation
+            // field must be the explicit "A" marker or a carried observation, never
+            // empty). A truncated or empty-fielded v3 record is DAMAGED CURRENT EVIDENCE
+            // on read — retained and fail-closed — never decoded as legitimate absence;
+            // only the legacy "1" records keep the conservative empty-means-absent
+            // semantics, and the "2" records stay parseable as the pre-rollback format.
             atomicWriteText(
                 recordFile,
-                listOf("2", target.absolutePath, proofText, attemptedObservationText, recordedSourcePath).joinToString("\n"),
+                listOf(
+                    "3",
+                    target.absolutePath,
+                    proofText,
+                    attemptedObservationText,
+                    recordedSourcePath,
+                    recordedSourceProofText,
+                    previousDestinationRecordText,
+                ).joinToString("\n"),
             )
         }.getOrDefault(false)
 
@@ -2310,8 +2325,15 @@ class DownloadOfflineFileManager(
              * field is empty/missing in a format that COULD have carried one — absence
              * cannot be established from the record alone. */
             val observationAmbiguous: Boolean,
-            /** The recorded source identity of a v2 relocation record (null = none). */
+            /** The recorded source identity of a v2/v3 relocation record (null = none). */
             val recordedSourcePath: String?,
+            /** THE SOURCE-BOUND PROOF (review-34 #3): the rollback authority — the
+             * source's exact generation evidence, present only in v3 records. */
+            val recordedSourceProofText: String?,
+            /** THE PREEXISTING DESTINATION PROOF (review-34 #4): captured before the
+             * destination write; an abort restores it exactly (null = no restore
+             * contract — v1/v2, or the destination carried no record). */
+            val previousDestinationRecordText: String?,
             /** COMPLETE PROOF VALIDATION (review-34 #9): the retained proof text parses
              * under the FULL provenance grammar WITH the operation's target as its
              * expected embedded location — validated before any registry mutation. */
@@ -2398,6 +2420,45 @@ class DownloadOfflineFileManager(
                         observationFieldDamaged = observationField.isEmpty(),
                         observationAmbiguous = false,
                         recordedSourcePath = sourceField.takeIf { it.isNotEmpty() },
+                        recordedSourceProofText = null,
+                        previousDestinationRecordText = null,
+                        proofLocationValid = locationValid,
+                        embeddedProofLocation = embeddedLocation,
+                    )
+                }
+                "3" -> {
+                    // RECORD v3 (review-34 #3/#4): exactly seven lines — the target-bound
+                    // proof, the carried observation, the recorded source identity, the
+                    // SOURCE-BOUND proof (the rollback authority) and the preexisting
+                    // destination proof (the abort restore). A missing or extra line is a
+                    // broken record.
+                    if (parts.size != 7) return@runCatching null
+                    val sourceField = parts[4]
+                    val previousDestinationField = parts[6]
+                    if (sourceField.contains('\n') || previousDestinationField.contains('\n')) {
+                        return@runCatching null
+                    }
+                    val proofFields = fields(parts[2])
+                    val observationField = parts[3]
+                    val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
+                    ParsedProofMoveRecord(
+                        version = 3,
+                        targetPath = parts[1],
+                        proofText = parts[2],
+                        proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
+                        proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
+                        proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
+                        proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
+                        observationText = when {
+                            observationField == "A" -> null
+                            observationField.isNotEmpty() -> observationField
+                            else -> null
+                        },
+                        observationFieldDamaged = observationField.isEmpty(),
+                        observationAmbiguous = false,
+                        recordedSourcePath = sourceField.takeIf { it.isNotEmpty() },
+                        recordedSourceProofText = parts[5].takeIf { it.isNotEmpty() },
+                        previousDestinationRecordText = previousDestinationField.takeIf { it.isNotEmpty() },
                         proofLocationValid = locationValid,
                         embeddedProofLocation = embeddedLocation,
                     )
@@ -2447,15 +2508,24 @@ class DownloadOfflineFileManager(
         ): Boolean {
             val provenance = readPublishedProvenance(context, source)
             if (provenance == null) {
-                deletePublishedProvenance(context, target)
+                // AN UNPROVEN SOURCE NEVER MUTATES THE DESTINATION (review-34 #4): the
+                // destination's existing publication — another record's evidence included —
+                // is left exactly as found; the caller aborts without any effect.
                 return false
             }
+            // THE PREEXISTING DESTINATION PROOF IS CAPTURED BEFORE THE WRITE (review-34
+            // #4): an abort must restore the destination's exact previous evidence, never
+            // leave the operation's prepared record nor destroy what was there.
+            val previousDestinationRecordText = if (flow == ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION) {
+                runCatching { provenanceFileFor(context, target).readText().trim() }.getOrNull()?.takeIf { it.isNotEmpty() } ?: ""
+            } else ""
             // THE RELOCATION STATE EXISTS BEFORE THE DESTINATION WRITE IS ATTEMPTED
             // (issue: round 23 #14): every failure path below leaves a durable record of
             // the original proof and its exact destination; only a VERIFIED destination
-            // proof disposes it. The recorded SOURCE identity rides the v2 record
-            // (review-33 #3) — the sweep's conditional move-completion validates the
-            // recorded old identity when the live row has not advanced yet.
+            // proof disposes it. The recorded SOURCE identity and the SOURCE-BOUND proof
+            // ride the v3 record (review-33 #3, review-34 #3) — the sweep's owner-checked
+            // rollback validates the recorded old identity when the live row has not
+            // advanced yet.
             val relocationStateWritten = writeProofRelocationRecord(
                 context,
                 target,
@@ -2469,6 +2539,10 @@ class DownloadOfflineFileManager(
                     requireObservation = requireObservation,
                 ),
                 recordedSourcePath = recordedSourcePath,
+                recordedSourceProofText = if (flow == ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION) {
+                    provenance.recordText(source)
+                } else "",
+                previousDestinationRecordText = previousDestinationRecordText,
             )
             if (!relocationStateWritten) {
                 // Without recoverable state the source proof is NOT destroyed: the old
@@ -2497,13 +2571,24 @@ class DownloadOfflineFileManager(
                         disposeRecoveryRecord(recordFile)
                         deletePublishedProvenance(context, source)
                     }
-                    // PUBLISHED-SOURCE RELOCATION (review-33 #4): the source bytes have
-                    // NOT moved — preparation preserves the source proof on EVERY failure
-                    // and disposes ONLY its own destination preparation (the partial
-                    // destination record and the relocation state). Nothing at the source
-                    // is touched: the caller's bytes keep their classification evidence.
+                    // PUBLISHED-SOURCE RELOCATION (review-33 #4, review-34 #4): the source
+                    // bytes have NOT moved — preparation preserves the source proof on
+                    // EVERY failure, RESTORES the destination's exact preexisting proof
+                    // (or removes the operation's own prepared record when none existed)
+                    // and disposes only its own relocation state. Nothing at the source is
+                    // touched: the caller's bytes keep their classification evidence. A
+                    // failed restore RETAINS the state for the sweep's retry.
                     ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION -> {
-                        disposeRecoveryRecord(recordFile)
+                        val stateParsed = parseProofMoveRecord(proofRelocationRecordFile(context, target))
+                        if (!resolveAbortedDestinationRecord(
+                                context,
+                                target,
+                                provenance.publicationId,
+                                stateParsed?.previousDestinationRecordText,
+                            )
+                        ) {
+                            return false
+                        }
                         runCatching { disposeRecoveryRecord(proofRelocationRecordFile(context, target)) }
                     }
                 }
@@ -2518,7 +2603,16 @@ class DownloadOfflineFileManager(
                         deletePublishedProvenance(context, source)
                     }
                     ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION -> {
-                        disposeRecoveryRecord(recordFile)
+                        val stateParsed = parseProofMoveRecord(proofRelocationRecordFile(context, target))
+                        if (!resolveAbortedDestinationRecord(
+                                context,
+                                target,
+                                provenance.publicationId,
+                                stateParsed?.previousDestinationRecordText,
+                            )
+                        ) {
+                            return false
+                        }
                         runCatching { disposeRecoveryRecord(proofRelocationRecordFile(context, target)) }
                     }
                 }
@@ -2526,6 +2620,52 @@ class DownloadOfflineFileManager(
             }
             return true
         }
+
+        /** THE DESTINATION-ABORT RESOLUTION (review-34 #4): an aborted or unresolvable
+         * relocation restores the destination's EXACT preexisting proof — recorded in the
+         * v3 operation state — or removes the operation's own prepared record when the
+         * destination carried none. A record belonging to a LATER publication is left
+         * intact. Returns true when the destination is coherent (or was left to a later
+         * publication's own lifecycle); false retains the operation for a verified retry. */
+        private fun resolveAbortedDestinationRecord(
+            context: Context,
+            target: IOFile,
+            operationPublicationId: Long?,
+            previousDestinationRecordText: String?,
+        ): Boolean {
+            val destinationRecord = readPublishedProvenance(context, target)
+            val recordIsOurs = destinationRecord != null &&
+                destinationRecord.publicationId == operationPublicationId
+            if (!recordIsOurs) return true
+            val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
+            return if (previousDestinationRecordText.isNullOrEmpty()) {
+                runCatching { recordFile.delete() }.getOrDefault(false)
+            } else {
+                runCatching { atomicWriteText(recordFile, previousDestinationRecordText) }.getOrDefault(false) &&
+                    readPublishedProvenance(context, target) != null
+            }
+        }
+
+        /** DESTINATION EXCLUSIVITY FOR THE ROLLBACK (review-34 #3): the vacated
+         * destination path must not be claimed by ANOTHER row before the operation reverts
+         * its bytes and evidence away from it — the fallback no longer relies on the
+         * source-side ownership check alone. */
+        private fun destinationPathUnclaimed(
+            context: Context,
+            scope: UserDrive,
+            fileId: Int,
+            target: IOFile,
+            sharedWithMe: Boolean,
+            storageKind: String,
+        ): Boolean = runCatching {
+            val realmScope = UserDrive(userId = scope.userId, driveId = scope.driveId, sharedWithMe = sharedWithMe)
+            FileController.getRealmInstance(realmScope).use { realm ->
+                runCatching { realm.refresh() }
+                storageKind != "offline" || appContextForOwnership()?.let { ctx ->
+                    OfflineFolderController.exclusivePathOwner(realm, ctx, realmScope, target.path)
+                }.let { it == null || it == fileId }
+            }
+        }.getOrDefault(false)
 
         /**
          * THE PREPARED PROOF-MOVE PHASE 2 (issues: round 28 #13, round 30 #6, round 32
@@ -2540,6 +2680,7 @@ class DownloadOfflineFileManager(
             context: Context,
             source: IOFile,
             target: IOFile,
+            disposeOnSuccess: Boolean = true,
         ): Boolean {
             val sourceObs = IOFile(provenanceFileFor(context, source).path + ".obs")
             val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
@@ -2568,8 +2709,20 @@ class DownloadOfflineFileManager(
                 runCatching { sourceObs.delete() }
             }
             deletePublishedProvenance(context, source)
-            runCatching { proofRelocationRecordFile(context, target).delete() }
+            // THE STATE OUTLIVES THE COMPLETION WHEN THE CALLER'S METADATA COMMIT IS STILL
+            // PENDING (review-34 #3): the subtree relocation completes its children while
+            // the rows still resolve to the old paths — disposal happens only after that
+            // commit succeeds, so a failed merge retains every child's rollback authority.
+            if (disposeOnSuccess) runCatching { proofRelocationRecordFile(context, target).delete() }
             return true
+        }
+
+        /** DISPOSES A COMPLETED RELOCATION'S STATE (review-34 #3): called after the
+         * caller's metadata commit succeeded, for completions retained via
+         * [completePreparedProofMove] with disposeOnSuccess = false. The rows, bytes,
+         * proof and observation agree at the destination — only the journal is cleared. */
+        internal fun disposeCompletedRelocationState(context: Context, target: IOFile) {
+            runCatching { proofRelocationRecordFile(context, target).delete() }
         }
 
         internal fun movePublishedProvenance(
@@ -2620,14 +2773,30 @@ class DownloadOfflineFileManager(
         )
 
         /**
-         * DISPOSES THE CALLER'S OWN DESTINATION PREPARATION (review-33 #6): an abort
-         * BEFORE the byte effects removes the relocation state and the prepared
-         * destination record. The source proof was never touched by a relocation-flow
-         * preparation (review-33 #4) and is left entirely alone here.
+         * DISPOSES THE CALLER'S OWN DESTINATION PREPARATION (review-33 #6, review-34 #4):
+         * an abort BEFORE the byte effects RESTORES the destination's exact preexisting
+         * proof (recorded in the v3 state) or removes the operation's own prepared record
+         * when none existed, then disposes the relocation state. An undecodable state (or
+         * a failed restore) cannot authorize destination mutations — the state is retained
+         * for the sweep's verified retry. The source proof was never touched by a
+         * relocation-flow preparation (review-33 #4) and is left entirely alone here.
          */
         internal fun disposePreparedProofRelocation(context: Context, target: IOFile) {
-            runCatching { disposeRecoveryRecord(proofRelocationRecordFile(context, target)) }
-            runCatching { deletePublishedProvenance(context, target) }
+            val stateFile = proofRelocationRecordFile(context, target)
+            val parsed = parseProofMoveRecord(stateFile)
+            if (parsed == null) {
+                return
+            }
+            if (!resolveAbortedDestinationRecord(
+                    context,
+                    target,
+                    publicationIdOfRecordText(parsed.proofText),
+                    parsed.previousDestinationRecordText,
+                )
+            ) {
+                return
+            }
+            runCatching { disposeRecoveryRecord(stateFile) }
         }
 
         /**
@@ -3439,11 +3608,22 @@ class DownloadOfflineFileManager(
                                 // sweep (issue: round 24 #5).
                                 false
                             !target.exists() ->
-                                // The destination bytes are gone — the relocation has no
-                                // subject (a rollback or a later writer removed them). The
-                                // retained proof text cannot recreate bytes: the superseded
-                                // relocation state is disposed unverified.
-                                disposeRecoveryRecord(recordFile)
+                                // THE DESTINATION IS RESTORED, NOT JUST ABANDONED (review-34
+                                // #4): the operation's own prepared record is reverted to the
+                                // exact preexisting destination proof (or removed when none
+                                // existed); a later publication's record is left intact. A
+                                // failed revert retains the state for a verified retry.
+                                if (!resolveAbortedDestinationRecord(
+                                        context,
+                                        target,
+                                        publicationIdOfRecordText(parsed.proofText),
+                                        parsed.previousDestinationRecordText,
+                                    )
+                                ) {
+                                    false
+                                } else {
+                                    disposeRecoveryRecord(recordFile)
+                                }
                             else -> {
                                 val scope = UserDrive(userId = proofUserId, driveId = proofDriveId)
                                 // THE CAPTURED REALM FLAVOR (issue: round 26 #5): the sidecar
@@ -3529,48 +3709,21 @@ class DownloadOfflineFileManager(
                                                 } else false
                                             }
                                             else -> {
-                                                // OWNER RESOLUTION WITH THE RECORDED OLD IDENTITY
-                                                // (review-33 #3): the direct relocation's interrupted
-                                                // post-rename state has the bytes AND the prepared
-                                                // proof at the destination while the live ROW still
-                                                // resolves to the recorded source — the metadata change
-                                                // is exactly what this operation's own exclusion
-                                                // prevents. Requiring the destination owner there
-                                                // deadlocked the operation forever; the recorded old
-                                                // identity authorizes the CONDITIONAL MOVE-COMPLETION.
+                                                // COHERENT COMPLETION OR OWNER-CHECKED ROLLBACK
+                                                // (review-34 #3): the state is disposed only when the
+                                                // row, bytes, proof and observation AGREE — at the
+                                                // destination (the row advanced: normal completion) or
+                                                // at the recorded source (the row never advanced:
+                                                // owner-checked rollback). Review-33's dispose-on-
+                                                // fallback left the row at a MISSING source with the
+                                                // journal gone.
                                                 val ownerAtTarget = currentOwnerHolds(
                                                     context, scope, proofFileId, target,
                                                     sharedWithMe = moveScopeShared,
                                                     storageKind = moveScopeKind,
                                                 )
-                                                var completionViaSource: IOFile? = null
-                                                val ownerResolved = ownerAtTarget || run {
-                                                    val recordedSource = parsed.recordedSourcePath
-                                                    if (recordedSource == null) {
-                                                        false
-                                                    } else {
-                                                        val sourceFile = IOFile(recordedSource)
-                                                        // FRESH OWNERSHIP CHECKS (review-33 #3): the live
-                                                        // row must STILL exclusively resolve to the recorded
-                                                        // source, and the source path must be VACATED (the
-                                                        // rename happened; nothing else was placed there).
-                                                        val sourceAbsent = !sourceFile.exists()
-                                                        sourceAbsent && currentOwnerHolds(
-                                                            context, scope, proofFileId, sourceFile,
-                                                            sharedWithMe = moveScopeShared,
-                                                            storageKind = moveScopeKind,
-                                                        ).also { holds -> if (holds) completionViaSource = sourceFile }
-                                                    }
-                                                }
                                                 when {
-                                                    !ownerResolved ->
-                                                        // The path's ownership moved since the record was
-                                                        // written: the retained proof is never written over
-                                                        // another owner's state (issue: round 25 #4) — and
-                                                        // neither the destination nor the recorded source
-                                                        // authorizes the completion.
-                                                        false
-                                                    else -> runCatching {
+                                                    ownerAtTarget -> runCatching {
                                                 // THE EXPECTED PUBLICATION IDENTITY (issue: round
                                                 // 26 #4): a target that already carries a
                                                 // self-certifying proof with a DIFFERENT
@@ -3618,22 +3771,84 @@ class DownloadOfflineFileManager(
                                                     )
                                                 }.getOrDefault(false)
                                                 if (proofEstablished && observationEstablished) {
-                                                    // THE RECORDED OLD IDENTITY'S DISPOSAL (review-33
-                                                    // #3): completing through the recorded source also
-                                                    // retires the vacated source's stranded proof and
-                                                    // observation — the source-side disposal the
-                                                    // interrupted process never reached. The live row's
-                                                    // later metadata advance is no longer excluded.
-                                                    completionViaSource?.let { vacatedSource ->
-                                                        runCatching {
-                                                            IOFile(provenanceFileFor(context, vacatedSource).path + ".obs").delete()
-                                                        }
-                                                        deletePublishedProvenance(context, vacatedSource)
-                                                    }
+                                                    // The row, bytes, proof and observation agree at the
+                                                    // destination — only now is the journal cleared.
                                                     disposeRecoveryRecord(recordFile)
                                                 }
                                                 proofEstablished && observationEstablished
-                                            }.getOrDefault(false)
+                                                    }.getOrDefault(false)
+                                                    else -> runCatching {
+                                                        // THE OWNER-CHECKED ROLLBACK (review-34 #3): the
+                                                        // interrupted relocation has its bytes at the
+                                                        // destination while the live row still resolves to
+                                                        // the recorded source — the metadata change its own
+                                                        // exclusion prevents. The rollback restores a
+                                                        // COHERENT state at the recorded source instead of
+                                                        // disposing over the disagreement.
+                                                        val recordedSource = parsed.recordedSourcePath
+                                                        val sourceProofText = parsed.recordedSourceProofText
+                                                        if (recordedSource == null || sourceProofText.isNullOrEmpty()) {
+                                                            // No rollback authority (legacy or v2 record):
+                                                            // the state is retained, never disposed
+                                                            // incoherently.
+                                                            return@runCatching false
+                                                        }
+                                                        val sourceFile = IOFile(recordedSource)
+                                                        // FRESH OWNERSHIP CHECKS (review-33 #3, review-34
+                                                        // #3): the live row must STILL exclusively resolve
+                                                        // to the recorded source, the source path must be
+                                                        // VACATED, and the destination path must not be
+                                                        // claimed by another row.
+                                                        val sourceAbsent = !sourceFile.exists()
+                                                        val ownerAtSource = sourceAbsent && currentOwnerHolds(
+                                                            context, scope, proofFileId, sourceFile,
+                                                            sharedWithMe = moveScopeShared,
+                                                            storageKind = moveScopeKind,
+                                                        )
+                                                        val destinationUnclaimed = destinationPathUnclaimed(
+                                                            context, scope, proofFileId, target,
+                                                            sharedWithMe = moveScopeShared,
+                                                            storageKind = moveScopeKind,
+                                                        )
+                                                        if (!(ownerAtSource && destinationUnclaimed)) {
+                                                            return@runCatching false
+                                                        }
+                                                        // RESUME-SAFE ORDER: the source's proof and
+                                                        // observation establish FIRST (idempotent on retry),
+                                                        // the bytes return second, the destination's aborted
+                                                        // evidence is removed third.
+                                                        val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
+                                                        val sourceProofEstablished = sourceRecordFile != null && runCatching {
+                                                            atomicWriteText(sourceRecordFile, sourceProofText)
+                                                        }.getOrDefault(false) &&
+                                                            readPublishedProvenance(context, sourceFile) != null
+                                                        if (!sourceProofEstablished) return@runCatching false
+                                                        if (!observationEvidenceComplete(
+                                                                context,
+                                                                sourceFile,
+                                                                parsed.observationText,
+                                                                parsed.observationAmbiguous,
+                                                                publicationIdOfRecordText(sourceProofText),
+                                                            )
+                                                        ) {
+                                                            return@runCatching false
+                                                        }
+                                                        if (!target.renameTo(sourceFile)) return@runCatching false
+                                                        // Only the operation's OWN prepared destination
+                                                        // evidence is removed; a later publication's record
+                                                        // is left intact.
+                                                        val destinationRecord = readPublishedProvenance(context, target)
+                                                        if (destinationRecord != null &&
+                                                            destinationRecord.publicationId == publicationIdOfRecordText(parsed.proofText)
+                                                        ) {
+                                                            deletePublishedProvenance(context, target)
+                                                            runCatching {
+                                                                IOFile(provenanceFileFor(context, target).path + ".obs").delete()
+                                                            }
+                                                        }
+                                                        disposeRecoveryRecord(recordFile)
+                                                        true
+                                                    }.getOrDefault(false)
                                                 }
                                             }
                                         }
