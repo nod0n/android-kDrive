@@ -644,7 +644,10 @@ object FileController {
                     // would roll the row back. The stale operation defers; the authoritative
                     // current identity stays and a later listing/details pass reconciles.
                     if (renameRequestStillCurrent(file.id, observedName, observedParentId, userDrive, realm)) {
-                        val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm)
+                        var relocatedTo: IOFile? = null
+                        val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm) { relocatedTarget ->
+                            relocatedTo = relocatedTarget
+                        }
                         if (preserved) {
                             // The SAME immutable observation is rechecked INSIDE the
                             // committing transaction (issue: round 17 #9): a newer committed
@@ -652,6 +655,23 @@ object FileController {
                             updateFile(file.id, realm, userDrive = userDrive) { localFile ->
                                 if (localFile.name == observedName && localFile.parentId == observedParentId) {
                                     localFile.name = newName
+                                }
+                            }
+                            // THE JOURNAL OUTLIVES THE COMMIT (review-35 #4): the relocation
+                            // journal is disposed only after the committed row verifiably
+                            // resolves to the published destination — a process stop before
+                            // this commit leaves the journal for the sweep's coherent
+                            // completion or owner-checked rollback.
+                            val appContext = Realm.getApplicationContext()
+                            val commitScope = userDrive ?: UserDrive()
+                            relocatedTo?.let { relocatedTarget ->
+                                if (appContext != null) {
+                                    DownloadOfflineFileManager.disposeRelocationJournalAfterCommit(
+                                        appContext,
+                                        commitScope,
+                                        file.id,
+                                        relocatedTarget.absolutePath,
+                                    )
                                 }
                             }
                         }
@@ -704,6 +724,7 @@ object FileController {
         newName: String,
         userDrive: UserDrive?,
         customRealm: Realm?,
+        onRelocatedTo: ((IOFile) -> Unit)? = null,
     ): Boolean {
         val context = Realm.getApplicationContext() ?: return false
         val scope = userDrive ?: UserDrive()
@@ -744,7 +765,7 @@ object FileController {
             }
             // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
             OfflineFolderController.anchorHistoricalBaseline(context, realm, liveRow, oldOffline, scope)
-            OfflineFolderController.reconcileMovedInheritedCopy(
+            val relocated = OfflineFolderController.reconcileMovedInheritedCopy(
                 context = context,
                 oldOfflineFile = oldOffline,
                 oldIdentityName = liveRow.name,
@@ -757,6 +778,11 @@ object FileController {
                 newOfflineTarget = newOffline,
                 realm = realm,
             )
+            // THE COMMITTED DESTINATION IS REPORTED (review-35 #4): the caller disposes the
+            // retained relocation journal only after its own metadata commit verifies the
+            // committed row resolves to this exact destination.
+            if (relocated) onRelocatedTo?.invoke(newOffline)
+            return relocated
         }
         return customRealm?.let(block) ?: getRealmInstance(scope).use(block)
     }

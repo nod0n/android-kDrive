@@ -806,10 +806,22 @@ object OfflineFolderController {
                                     return@runCatching false
                                 }
                                 // THE PROOF AND OBSERVATION COMPLETE TOGETHER (issue: round
-                                // 32 #4): a failure here RETAINS the durable relocation state
-                                // (the sweep replays it onto the already-moved bytes) — never
-                                // bytes-without-provenance and no prepared recovery.
-                                DownloadOfflineFileManager.completePreparedProofMove(context, oldOfflineFile, target)
+                                // 32 #4); THE JOURNAL OUTLIVES THIS RECONCILIATION (review-35
+                                // #4): the completion retains its journal (disposeOnSuccess =
+                                // false) because the caller's METADATA COMMIT has not happened
+                                // yet — a process stop before that commit leaves the row at the
+                                // old location with the bytes at the new one, and only the
+                                // journal gives recovery its coherent completion (row committed)
+                                // or owner-checked rollback (row not committed). The identity-
+                                // changing caller disposes after ITS commit verifies the
+                                // committed row resolves to the published destination; every
+                                // other caller converges through the sweep.
+                                DownloadOfflineFileManager.completePreparedProofMove(
+                                    context,
+                                    oldOfflineFile,
+                                    target,
+                                    disposeOnSuccess = false,
+                                )
                             }.getOrDefault(false)
                         }
                     }

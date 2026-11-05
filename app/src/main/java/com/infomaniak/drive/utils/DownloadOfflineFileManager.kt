@@ -2878,6 +2878,32 @@ class DownloadOfflineFileManager(
             runCatching { proofRelocationRecordFile(context, target).delete() }
         }
 
+        /** THE COMMIT-VERIFIED JOURNAL DISPOSAL (review-35 #4): an identity-changing
+         * caller disposes its retained relocation journal only after its metadata commit
+         * succeeded AND the committed row verifiably resolves to the published
+         * destination; otherwise the journal stays for the sweep's coherent completion
+         * (row committed) or owner-checked rollback (row not committed). */
+        internal fun disposeRelocationJournalAfterCommit(
+            context: Context,
+            userDrive: UserDrive,
+            fileId: Int,
+            targetPath: String,
+        ) {
+            val target = IOFile(targetPath)
+            if (!currentOwnerHolds(
+                    context,
+                    userDrive,
+                    fileId,
+                    target,
+                    sharedWithMe = userDrive.sharedWithMe,
+                    storageKind = "offline",
+                )
+            ) {
+                return
+            }
+            disposeCompletedRelocationState(context, target)
+        }
+
         internal fun movePublishedProvenance(
             context: Context,
             source: IOFile,
