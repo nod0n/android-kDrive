@@ -601,7 +601,7 @@ object OfflineFolderController {
      * bare replacement metadata (issue: round 16 #2); [newIdentity] is the fresh remote File.
      * Directory rows are not file content and must not be passed here (issue: round 4 #12).
      */
-    fun reconcileMovedInheritedCopy(
+    internal fun reconcileMovedInheritedCopy(
         context: Context,
         oldOfflineFile: IOFile,
         oldIdentityName: String,
@@ -854,7 +854,7 @@ object OfflineFolderController {
      * coordination and performs file I/O. Without an application context the input is returned
      * unchanged (no preservation possible — same as the pre-feature behavior).
      */
-    fun reconcileOwnedCopiesBeforeCommit(
+    internal fun reconcileOwnedCopiesBeforeCommit(
         realm: Realm,
         remoteFiles: List<File>,
         userDrive: UserDrive,
