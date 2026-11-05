@@ -911,14 +911,25 @@ class CloudStorageProvider : DocumentsProvider() {
             // metadata advance, a lost or non-certifying record) re-justifies the transfer
             // exactly as for the worker and the dialog.
             runCatching {
-                if (DownloadOfflineFileManager.unresolvedPublicationAlreadyCoversCurrentGeneration(
+                // THE SYNC PROVIDER BOUNDARY (compile repair, round 28): openDocument /
+                // getDataFile run on BINDER threads (never Main), hold NO monitor, file
+                // lock or Realm transaction at this point, and this function's established
+                // idiom for its network work is already runBlocking (getRemoteFile, the
+                // download client below). The gate itself acquires no coordination
+                // primitives — file provenance I/O plus one details request — so a
+                // blocking bridge here is the legitimate execution boundary, consistent
+                // with the worker (suspend), the preview (suspend) and the dialog
+                // (viewModelScope) callers.
+                val policySuppressed = runBlocking {
+                    DownloadOfflineFileManager.unresolvedPublicationAlreadyCoversCurrentGeneration(
                         context = context,
                         file = file,
                         target = cacheFile,
                         userDrive = userDrive,
-                        okHttpClient = runBlocking { AccountUtils.getHttpClient(userDrive.userId) },
+                        okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
                     )
-                ) {
+                }
+                if (policySuppressed) {
                     return ParcelFileDescriptor.open(cacheFile, accessMode)
                 }
             }
