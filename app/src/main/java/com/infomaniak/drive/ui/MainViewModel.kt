@@ -868,7 +868,27 @@ class MainViewModel(
                                                                         contentHash = sourceHash,
                                                                         originalFileId = node.id,
                                                                     ))))
-                                                    if (sourcePreserved && destinationVerified) continue
+                                                    // THE SOURCE'S OWN AUTHORIZATION BEFORE ANY EARLY
+                                                    // SUCCESS (issue: round 27 #13): byte equality with
+                                                    // the destination never authorizes removing a source
+                                                    // whose path is exclusively owned by ANOTHER row or
+                                                    // carries POSITIVELY FOREIGN provenance — the
+                                                    // ownership/classification gate runs BEFORE the
+                                                    // early-continue (and again in the final unlink
+                                                    // authorization), so a foreign-owned source at an
+                                                    // already-verified destination defers like any other.
+                                                    val sourceExclusivelyOwned = sourceRow != null && sourceBytes != null &&
+                                                        sourceHash != null &&
+                                                        OfflineFolderController.exclusivePathOwner(
+                                                            realm = currentDriveRealm,
+                                                            context = application,
+                                                            userDrive = userDrive,
+                                                            claimedPath = sourceBytes.absolutePath,
+                                                        ) == sourceRow.id
+                                                    val sourceAuthorized = sourceBytes == null ||
+                                                        (sourceExclusivelyOwned &&
+                                                            sourceProof?.positivelyForeignTo(sourceRow, userDrive) != true)
+                                                    if (sourcePreserved && destinationVerified && sourceAuthorized) continue
                                                     // REPLACE AUTHORITY BEFORE ANY EFFECT (issues: round 24
                                                     // #12, round 26 #2): the staged transfer replaces the
                                                     // destination only when it is ABSENT or byte-
@@ -881,14 +901,6 @@ class MainViewModel(
                                                     // ENTIRE transfer — its bytes are never staged, never
                                                     // renamed, never registered; a pending/retained-unsent
                                                     // upload likewise keeps ownership of its bytes.
-                                                    val sourceExclusivelyOwned = sourceRow != null && sourceBytes != null &&
-                                                        sourceHash != null &&
-                                                        OfflineFolderController.exclusivePathOwner(
-                                                            realm = currentDriveRealm,
-                                                            context = application,
-                                                            userDrive = userDrive,
-                                                            claimedPath = sourceBytes.absolutePath,
-                                                        ) == sourceRow.id
                                                     val destinationReplaceable = sourceExclusivelyOwned && !sourceClaimed && (
                                                         sourceClassifiedEdit ||
                                                             (sourceProof?.identifies(sourceRow, userDrive) == true &&
@@ -1097,7 +1109,25 @@ class MainViewModel(
                                                                         contentHash = sourceHash,
                                                                         originalFileId = node.id,
                                                                     ))))
-                                                    if (!nodeVerified || !sourcePreserved) ownedCopiesOk = false
+                                                    // THE SOURCE'S OWN AUTHORIZATION AS UNLINK
+                                                    // AUTHORITY (issue: round 27 #13): byte equality with
+                                                    // the destination does not authorize removing a
+                                                    // foreign-owned source — the final verification
+                                                    // repeats the exclusive-ownership and nonforeign
+                                                    // classification the staging gate used.
+                                                    val sourceUnlinkAuthorized = sourceBytes == null ||
+                                                        (sourceRow != null && sourceHash != null &&
+                                                            OfflineFolderController.exclusivePathOwner(
+                                                                realm = currentDriveRealm,
+                                                                context = application,
+                                                                userDrive = userDrive,
+                                                                claimedPath = sourceBytes.absolutePath,
+                                                            ) == sourceRow.id &&
+                                                            DownloadOfflineFileManager.readPublishedProvenance(
+                                                                application,
+                                                                sourceBytes,
+                                                            )?.positivelyForeignTo(sourceRow, userDrive) != true)
+                                                    if (!nodeVerified || !sourcePreserved || !sourceUnlinkAuthorized) ownedCopiesOk = false
                                                 }
                                             }
                                         }
