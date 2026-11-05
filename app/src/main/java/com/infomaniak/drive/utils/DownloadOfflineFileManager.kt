@@ -2716,19 +2716,35 @@ class DownloadOfflineFileManager(
             previousDestinationRecordText: String?,
             phaseProvenOperationOwned: Boolean = false,
         ): Boolean {
+            // THE PRIOR-DESTINATION PAYLOAD IS PREVALIDATED BEFORE ANY MUTATION BRANCH
+            // (review-35 #7, review-37 #7): a restore writes only a record that fully parses
+            // FOR THIS TARGET — including the absent, unreadable, malformed and phase-repair
+            // fast paths below.
+            if (!previousDestinationRecordText.isNullOrEmpty()) {
+                val priorValid = runCatching {
+                    parseProvenanceText(previousDestinationRecordText, expectedPath = target.absolutePath)
+                }.getOrNull()?.let { it.absolutePath == target.absolutePath } == true
+                if (!priorValid) return false
+            }
             val destinationFile = provenanceFileFor(context, target)
             // TRI-STATE DESTINATION EVIDENCE (review-35 #5): ABSENT (nothing of ours to
-            // revert), UNREADABLE (uncertain — the journal is RETAINED, never treated as
-            // "not ours -> success"), READABLE (operation-owned -> restore-or-delete, or
-            // positively superseding -> left intact).
+            // revert), UNREADABLE/MALFORMED (uncertain — the journal is RETAINED, never
+            // treated as "not ours -> success"), READABLE (operation-owned ->
+            // restore-or-delete, or positively superseding -> left intact).
             if (!destinationFile.exists()) return true
             val currentText = runCatching { destinationFile.readText().trim() }.getOrNull()
-            if (currentText.isNullOrEmpty()) {
-                // THE PHASE-PROVEN REPAIR (review-36 #5): unreadable evidence normally
-                // retains (uncertainty protected) — but when the phase authority proves the
-                // damage is THIS operation's own pre-byte preparation write (the source
-                // bytes still certified at the recorded source), the captured prior
-                // evidence is conditionally restored instead of retaining recovery forever.
+            val destinationRecord = currentText?.takeIf { it.isNotEmpty() }?.let {
+                runCatching { parseProvenanceText(it, expectedPath = target.absolutePath) }.getOrNull()
+                    ?.takeIf { it.absolutePath == target.absolutePath }
+            }
+            if (destinationRecord == null) {
+                // THE PHASE-PROVEN REPAIR (review-36 #5, extended review-37 #6): unreadable
+                // OR NONEMPTY MALFORMED evidence normally retains (uncertainty protected) —
+                // but when the phase authority proves the damage is THIS operation's own
+                // pre-byte preparation write, the captured prior evidence is conditionally
+                // restored instead of retaining recovery forever. Historical non-atomic
+                // preparation could leave a truncated NONEMPTY proof; the atomic writer
+                // prevents future torn writes and does not repair supported historical state.
                 if (!phaseProvenOperationOwned) return false
                 val repairFile = verifiedProvenanceFileFor(context, target) ?: return false
                 return if (previousDestinationRecordText.isNullOrEmpty()) {
@@ -2738,19 +2754,6 @@ class DownloadOfflineFileManager(
                         runCatching { repairFile.readText().trim() }.getOrNull() == previousDestinationRecordText
                 }
             }
-            // THE PRIOR-DESTINATION PAYLOAD IS PREVALIDATED (review-35 #7): a restore
-            // writes only a record that fully parses FOR THIS TARGET, and the readback
-            // must equal it exactly.
-            if (!previousDestinationRecordText.isNullOrEmpty()) {
-                val priorValid = runCatching {
-                    parseProvenanceText(previousDestinationRecordText, expectedPath = target.absolutePath)
-                }.getOrNull()?.let { it.absolutePath == target.absolutePath } == true
-                if (!priorValid) return false
-            }
-            val destinationRecord = runCatching {
-                parseProvenanceText(currentText, expectedPath = target.absolutePath)
-            }.getOrNull()?.takeIf { it.absolutePath == target.absolutePath }
-            if (destinationRecord == null) return false
             if (destinationRecord.publicationId != operationPublicationId) return true
             val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
             return if (previousDestinationRecordText.isNullOrEmpty()) {
@@ -3991,8 +3994,39 @@ class DownloadOfflineFileManager(
                                                             expectedPath = parsed.recordedSourcePath,
                                                         )
                                                     }.getOrNull()?.takeIf { it.absolutePath == parsed.recordedSourcePath }
-                                                    sourceHash != null && sourceProof != null &&
-                                                        sourceHash == sourceProof.contentHash
+                                                    val targetProof = runCatching {
+                                                        parseProvenanceText(parsed.proofText, expectedPath = parsed.targetPath)
+                                                    }.getOrNull()?.takeIf { it.absolutePath == parsed.targetPath }
+                                                    // THE COMPLETE OPERATION TUPLE (review-37 #7): the
+                                                    // phase authority demands the same immutable
+                                                    // generation and publication in both payloads —
+                                                    // owner fields, content hash, version, all three
+                                                    // timestamps and publication id — after normalizing
+                                                    // only the location.
+                                                    val tupleEqual = sourceProof != null && targetProof != null &&
+                                                        sourceProof.userId == parsed.proofUserId &&
+                                                        sourceProof.driveId == parsed.proofDriveId &&
+                                                        sourceProof.fileId == parsed.proofFileId &&
+                                                        sourceProof.contentHash != null &&
+                                                        sourceProof.contentHash == parsed.proofContentHash &&
+                                                        sourceProof.version == targetProof.version &&
+                                                        sourceProof.lastModifiedAt == targetProof.lastModifiedAt &&
+                                                        sourceProof.revisedAt == targetProof.revisedAt &&
+                                                        sourceProof.updatedAt == targetProof.updatedAt &&
+                                                        sourceProof.publicationId == targetProof.publicationId
+                                                    // FRESH SOURCE OWNERSHIP (review-37 #7): the copy flow
+                                                    // KEEPS its source bytes after destination publication —
+                                                    // source hash equality alone never proves the pre-byte
+                                                    // phase. The live row must STILL exclusively resolve to
+                                                    // the recorded source under the captured coordination.
+                                                    val sourceOwnership = sourceHash != null &&
+                                                        sourceProof != null && sourceHash == sourceProof.contentHash &&
+                                                        currentOwnerHolds(
+                                                            context, scope, proofFileId, sourceFile,
+                                                            sharedWithMe = moveScopeShared,
+                                                            storageKind = moveScopeKind,
+                                                        )
+                                                    tupleEqual && sourceOwnership
                                                 }.getOrDefault(false)
                                                 if (!resolveAbortedDestinationRecord(
                                                         context,
