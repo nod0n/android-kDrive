@@ -624,6 +624,21 @@ object OfflineFolderController {
         // Copy ownership and mutation coordination (issue: round 4 #4): move reconciliation
         // competes with publication, cleanup and upload registration for the same bytes.
         OfflineFileCoordination.withFileLock(userDrive, newIdentity.id) {
+            // DEFENSIVE RECOVERY EXCLUSION before any relocation effect (issue: round 32
+            // #2): a direct caller may have skipped the shared boundary's fresh check — an
+            // unresolved durable recovery governing this identity or the old path owns the
+            // bytes and their location, and relocating them before the sweep resolves
+            // leaves the restore unable to re-establish the recorded owner/location. The
+            // whole reconciliation defers (the caller retains the old row/location).
+            if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                    context,
+                    userDrive,
+                    newIdentity.id,
+                    oldOfflineFile.absolutePath,
+                )
+            ) {
+                return false
+            }
             val fileModifiedAt = Date(oldOfflineFile.lastModified())
             // ONE FRESH SCOPE+OWNERSHIP+CONTENT CLASSIFICATION decides the destructive
             // arms (issues: round 22 #4, round 23 #4) — computed BEFORE any destructive

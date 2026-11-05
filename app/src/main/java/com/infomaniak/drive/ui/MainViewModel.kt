@@ -382,9 +382,21 @@ class MainViewModel(
                                 preserved = true
                             } else if (freshSource != null && freshSource.exists() && folderProxy != null) {
                                 preserved = moveIfOfflineFileOrDelete(freshRow, freshSource, folderProxy, userDrive, currentDriveRealm)
+                            } else {
+                                // RECOVERY BEFORE THE MISSING-SOURCE SHORTCUT (issue: round
+                                // 32 #2): an absent or unresolvable old location with a
+                                // governing unresolved recovery defers the move (the row and
+                                // its ancestry stay); recovery-free absence proceeds exactly
+                                // as before.
+                                val resolvedOldPath = freshRow?.getStoredFile(getContext(), userDrive)?.absolutePath
+                                if (DownloadOfflineFileManager.hasUnresolvedRecovery(getContext(), userDrive, file.id, resolvedOldPath)) {
+                                    preserved = false
+                                }
                             }
-                            // No stored file at the old location (or destination unresolvable with
-                            // nothing owned): nothing to preserve — the identity commit proceeds.
+                            // No stored file at the old location (or destination unresolvable
+                            // with nothing owned): nothing to preserve — the identity commit
+                            // proceeds, EXCEPT under a governing unresolved recovery (the
+                            // branch above defers and retains the row).
                         }
 
                         // SOURCE UNLINK DELAYED UNTIL DESTINATION VERIFICATION (issue:
@@ -1755,6 +1767,12 @@ class MainViewModel(
         userDrive: UserDrive,
         realm: Realm,
     ): Boolean {
+        // RECOVERY EXCLUSION BEFORE EVERY SHORTCUT AND EFFECT (issue: round 32 #2): a
+        // governed unresolved recovery owns these bytes and their location — the plain-row
+        // delete shortcut and the relocation below never run before the sweep resolves.
+        if (DownloadOfflineFileManager.hasUnresolvedRecovery(application, userDrive, file.id, ioFile.absolutePath)) {
+            return false
+        }
         if (!file.isOffline && !file.isInOfflineFolder) {
             ioFile.delete()
             return true

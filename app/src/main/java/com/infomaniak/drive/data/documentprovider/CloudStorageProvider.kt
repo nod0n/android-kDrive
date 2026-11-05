@@ -711,9 +711,23 @@ class CloudStorageProvider : DocumentsProvider() {
                                     deletable
                                 }
                                 else -> {
-                                    val oldOffline =
-                                        freshFile.getOfflineFile(appContext, userDrive.userId)?.takeIf { it.exists() }
+                                    // RECOVERY BEFORE THE MISSING/EXISTING SHORTCUTS (issue:
+                                    // round 32 #2): a governed unresolved recovery owns the old
+                                    // location whether its bytes are ABSENT (the sole retained
+                                    // revision can sit in the durable backup) or present — the
+                                    // source row is never deleted and the bytes never relocated
+                                    // before the sweep resolves; recovery-owned absence defers
+                                    // and RETAINS the row.
+                                    val resolvedOldOffline = freshFile.getOfflineFile(appContext, userDrive.userId)
+                                    val recoveryGoverned = DownloadOfflineFileManager.hasUnresolvedRecovery(
+                                        appContext,
+                                        userDrive,
+                                        freshFile.id,
+                                        resolvedOldOffline?.absolutePath,
+                                    )
+                                    val oldOffline = resolvedOldOffline?.takeIf { it.exists() }
                                     val preservedNow = when {
+                                        recoveryGoverned -> false
                                         oldOffline == null -> true // nothing owned at the old location
                                         freshTargetParent == null -> false
                                         else -> {

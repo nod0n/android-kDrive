@@ -2713,7 +2713,7 @@ class DownloadOfflineFileManager(
         internal fun pendingRecoveryFileIds(context: Context, userDrive: UserDrive): Set<Int>? {
             val files = runCatching {
                 stagingDirectory(context)
-                    .listFiles { f -> f.name.endsWith(".recovery") && !f.name.startsWith("proofmove_") }
+                    .listFiles { f -> f.name.endsWith(".recovery") }
             }.getOrNull()
             // ENUMERATION FAILURE IS UNRESOLVED, NEVER ABSENCE (issue: round 24 #3): the
             // previous mapNotNull chain also made a null listing and every UNREADABLE
@@ -2722,6 +2722,31 @@ class DownloadOfflineFileManager(
             if (files == null) return null
             val ids = mutableSetOf<Int>()
             for (recordFile in files) {
+                // PROOF-MOVE OPERATIONS JOIN THE PER-FILE EXCLUSION PROTOCOL (issue: round
+                // 32 #3): the previous filter excluded proof-move records entirely, so a
+                // captured per-file exclusion set missed a relocation's owner while its
+                // state was unresolved — Sync's activity effects ran over governed bytes.
+                // A valid proof is matched by its captured identity; a malformed payload
+                // falls back to the scope sidecar, and an unsidecarred record fails the
+                // pass closed.
+                if (recordFile.name.startsWith("proofmove_")) {
+                    val parts = runCatching { recordFile.readText().split("\n", limit = 4) }.getOrNull()
+                    val proofFields = parts?.getOrNull(2)?.removePrefix(PROVENANCE_FRAME)?.split("|")
+                    val proofUserId = proofFields?.getOrNull(4)?.trim()?.toIntOrNull()
+                    val proofDriveId = proofFields?.getOrNull(5)?.trim()?.toIntOrNull()
+                    val proofFileId = proofFields?.getOrNull(6)?.trim()?.toIntOrNull()
+                    if (proofUserId != null && proofDriveId != null && proofFileId != null) {
+                        if (proofUserId == userDrive.userId && proofDriveId == userDrive.driveId) {
+                            ids.add(proofFileId)
+                        }
+                    } else {
+                        val scope = readScopeSidecar(recordFile) ?: return null
+                        if (scope.driveId == userDrive.driveId && scope.userId == userDrive.userId) {
+                            ids.add(scope.fileId)
+                        }
+                    }
+                    continue
+                }
                 val record = readRecoveryRecord(recordFile)
                 if (record == null) {
                     // UNDECODABLE RECORD, INDEPENDENTLY SCOPED (issue: round 25 #6): the
@@ -2793,16 +2818,29 @@ class DownloadOfflineFileManager(
                         continue
                     }
                     if (targetPath != null && IOFile(parts[1]).absolutePath == targetPath) return true
-                    // THE CAPTURED IDENTITY MATCHES TOO (issue: round 31 #2): a valid
-                    // proofmove record carries its owner's full captured
+                    // THE CAPTURED IDENTITY MATCHES TOO (issues: round 31 #2, round 32 #3):
+                    // a valid proofmove record carries its owner's full captured
                     // account/drive/file identity in the proof text — the previous
                     // target-path-only match missed a check issued at ANOTHER location
                     // (identity-only, or a different path) and let the governed source be
-                    // relocated/committed over.
+                    // relocated/committed over. A VALID HEADER WITH A MALFORMED PROOF LINE
+                    // (unparseable identity fields) is NOT authority-free: it falls back to
+                    // the same independently established scoped exclusion as a damaged body
+                    // — the scope sidecar decides, and without one it fails closed — the
+                    // previous null-identity fall-through returned false and let activity
+                    // effects run despite the unresolved operation.
                     val proofFields = parts[2].removePrefix(PROVENANCE_FRAME).split("|")
                     val proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull()
                     val proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull()
                     val proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull()
+                    if (proofUserId == null || proofDriveId == null || proofFileId == null) {
+                        val scope = readScopeSidecar(recordFile) ?: return true
+                        val scopeIdentity = scope.fileId == fileId &&
+                            scope.driveId == userDrive.driveId && scope.userId == userDrive.userId
+                        val scopePath = targetPath != null && IOFile(scope.targetPath).absolutePath == targetPath
+                        if (scopeIdentity || scopePath) return true
+                        continue
+                    }
                     if (proofUserId == userDrive.userId && proofDriveId == userDrive.driveId && proofFileId == fileId) {
                         return true
                     }
