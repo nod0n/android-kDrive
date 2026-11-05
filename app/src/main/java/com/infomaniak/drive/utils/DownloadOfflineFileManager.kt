@@ -2978,7 +2978,26 @@ class DownloadOfflineFileManager(
                         continue
                     }
                     if (parsed.identitiesValid) {
-                        if (parsed.proofUserId == userDrive.userId && parsed.proofDriveId == userDrive.driveId) {
+                        // THE DURABLE SCOPE INDEX IS CROSS-CHECKED (review-33 #9): the
+                        // body's parseable identity is authority only when the sidecar
+                        // AGREES on the complete account/drive/file identity and the target
+                        // path. On disagreement BOTH independently identified scopes join
+                        // this scope's exclusion set — a parseable-but-inconsistent body is
+                        // never permission for the original owner to proceed.
+                        val sidecar = readScopeSidecar(recordFile)
+                        val consistent = sidecar == null ||
+                            (sidecar.userId == parsed.proofUserId && sidecar.driveId == parsed.proofDriveId &&
+                                sidecar.fileId == parsed.proofFileId && sidecar.targetPath == parsed.targetPath)
+                        if (!consistent) {
+                            if (parsed.proofUserId == userDrive.userId && parsed.proofDriveId == userDrive.driveId) {
+                                ids.add(parsed.proofFileId ?: return null)
+                            }
+                            if (sidecar != null && sidecar.userId == userDrive.userId &&
+                                sidecar.driveId == userDrive.driveId
+                            ) {
+                                ids.add(sidecar.fileId)
+                            }
+                        } else if (parsed.proofUserId == userDrive.userId && parsed.proofDriveId == userDrive.driveId) {
                             ids.add(parsed.proofFileId ?: return null)
                         }
                     } else {
@@ -3061,16 +3080,38 @@ class DownloadOfflineFileManager(
                         if (scopeIdentity || scopePath) return true
                         continue
                     }
-                    if (targetPath != null && IOFile(parsed.targetPath).absolutePath == targetPath) return true
+                    val sidecar = readScopeSidecar(recordFile)
+                    val bodyIdentityMatches = parsed.proofUserId == userDrive.userId &&
+                        parsed.proofDriveId == userDrive.driveId && parsed.proofFileId == fileId
+                    val bodyPathMatches = targetPath != null && IOFile(parsed.targetPath).absolutePath == targetPath
                     // THE RECORDED SOURCE GOVERNS TOO (review-33 #3): a v2 relocation
                     // record moved the bytes FROM its recorded source — that vacated
                     // location stays under the operation's exclusion until the sweep
                     // resolves the state, so no other writer can occupy it meanwhile.
-                    if (targetPath != null && parsed.recordedSourcePath != null &&
+                    val sourcePathMatches = targetPath != null && parsed.recordedSourcePath != null &&
                         IOFile(parsed.recordedSourcePath).absolutePath == targetPath
+                    // THE DURABLE SCOPE INDEX IS CROSS-CHECKED (review-33 #9): the body's
+                    // parseable identity is authority only when the sidecar AGREES on the
+                    // complete account/drive/file identity and the target path. On
+                    // disagreement BOTH independently identified scopes govern — a
+                    // parseable-but-inconsistent body is never permission for the original
+                    // owner to proceed while the operation stays unresolved.
+                    if (parsed.identitiesValid && sidecar != null &&
+                        (sidecar.userId != parsed.proofUserId || sidecar.driveId != parsed.proofDriveId ||
+                            sidecar.fileId != parsed.proofFileId || sidecar.targetPath != parsed.targetPath)
                     ) {
-                        return true
+                        val sidecarIdentityMatches = sidecar.fileId == fileId &&
+                            sidecar.driveId == userDrive.driveId && sidecar.userId == userDrive.userId
+                        val sidecarPathMatches = targetPath != null &&
+                            IOFile(sidecar.targetPath).absolutePath == targetPath
+                        if (bodyIdentityMatches || bodyPathMatches || sourcePathMatches ||
+                            sidecarIdentityMatches || sidecarPathMatches
+                        ) {
+                            return true
+                        }
+                        continue
                     }
+                    if (bodyPathMatches || sourcePathMatches) return true
                     // THE CAPTURED IDENTITY MATCHES TOO (issues: round 31 #2, round 32 #3):
                     // a valid proofmove record carries its owner's full captured
                     // account/drive/file identity in the proof text — the previous
@@ -3083,18 +3124,14 @@ class DownloadOfflineFileManager(
                     // previous null-identity fall-through returned false and let activity
                     // effects run despite the unresolved operation.
                     if (!parsed.identitiesValid) {
-                        val scope = readScopeSidecar(recordFile) ?: return true
+                        val scope = sidecar ?: return true
                         val scopeIdentity = scope.fileId == fileId &&
                             scope.driveId == userDrive.driveId && scope.userId == userDrive.userId
                         val scopePath = targetPath != null && IOFile(scope.targetPath).absolutePath == targetPath
                         if (scopeIdentity || scopePath) return true
                         continue
                     }
-                    if (parsed.proofUserId == userDrive.userId && parsed.proofDriveId == userDrive.driveId &&
-                        parsed.proofFileId == fileId
-                    ) {
-                        return true
-                    }
+                    if (bodyIdentityMatches) return true
                     continue
                 }
                 val record = readRecoveryRecord(recordFile)
