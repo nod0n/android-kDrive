@@ -176,7 +176,10 @@ object OfflineFolderUtils {
 
             // Re-assert the pending marker on the root folder itself: it drives the folder row
             // progress indicator until this walk finishes.
-            FileController.updateFile(rootFolderId, realm) { it.isMarkedAsOffline = true }
+            FileController.updateFile(rootFolderId, realm) {
+                it.isMarkedAsOffline = true
+                it.bumpOfflineIntentGeneration()
+            }
 
             walk@ while (folderQueue.isNotEmpty()) {
                 ensureActive()
@@ -520,6 +523,7 @@ object OfflineFolderUtils {
                                                 !UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()))
                                         ) {
                                             freshRow.isMarkedAsOffline = true
+                                            freshRow.bumpOfflineIntentGeneration()
                                             fileIds.add(freshRow.id)
                                         }
                                     }
@@ -662,6 +666,7 @@ object OfflineFolderUtils {
                 localFile.isInOfflineFolder = true
                 if (needsDownload) {
                     localFile.isMarkedAsOffline = true
+                    localFile.bumpOfflineIntentGeneration()
                     fileIds.add(localFile.id)
                 }
             }
@@ -817,13 +822,24 @@ object OfflineFolderUtils {
         // SAME bytes since the request changes the token — and the durable intent stamp
         // (bumped by every marker transition) plus the marker flag must be unchanged: a
         // re-pin after the request is newer work's business.
-        val currentRecordToken = runCatching {
-            publicationTokenOf(predicateContext, candidate, predicateUserDrive.userId)
-        }.getOrNull()
+        // BYTE-PUBLICATION TOKENS APPLY TO FILES ONLY (issue: round 26 #14): the capture
+        // populates publication tokens only for non-folder rows — a DIRECTORY has no byte
+        // publication, so no token can ever match and requiring one made every directory
+        // candidate fail unconditionally (its stale inherited coverage survived
+        // authoritative absence forever). A folder's identity, marker/generation and
+        // ancestry validation above remain full-strength.
+        val currentRecordToken = if (candidate.isFolder()) {
+            null
+        } else {
+            runCatching {
+                publicationTokenOf(predicateContext, candidate, predicateUserDrive.userId)
+            }.getOrNull()
+        }
         val requestRecordToken = subtreeRecordTokensById[candidate.id]
-        val recordTokenHolds = requestRecordToken != null &&
-            currentRecordToken != null &&
-            currentRecordToken == requestRecordToken
+        val recordTokenHolds = candidate.isFolder() ||
+            (requestRecordToken != null &&
+                currentRecordToken != null &&
+                currentRecordToken == requestRecordToken)
         val candidateTokenHolds = requestObservation != null &&
             requestObservation.parentId == candidate.parentId &&
             FileController.isSameObservation(candidate, requestObservation) &&

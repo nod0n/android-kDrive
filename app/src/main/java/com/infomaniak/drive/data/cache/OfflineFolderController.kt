@@ -1110,6 +1110,9 @@ object OfflineFolderController {
         FileController.updateFile(folderId, realm) { file ->
             file.isInOfflineFolder = isInOfflineFolder
             file.isMarkedAsOffline = isMarkedAsOffline
+            // THE MONOTONIC INTENT GENERATION (issue: round 26 #12): every intent writer
+            // bumps — the root-folder flag writer included.
+            file.bumpOfflineIntentGeneration()
         }
     }
 
@@ -1257,6 +1260,7 @@ object OfflineFolderController {
                     isStillClearable?.let { clearable -> if (!clearable(realm, liveRow)) return@executeTransaction }
                     liveRow.isInOfflineFolder = false
                     liveRow.isMarkedAsOffline = false
+                    liveRow.bumpOfflineIntentGeneration()
                     cleared = true
                 }
                 if (!cleared) result.keptOfflineFilesCount++
@@ -1321,6 +1325,7 @@ object OfflineFolderController {
                         isStillClearable?.let { clearable -> if (!clearable(realm, committedRow)) return@executeTransaction }
                         committedRow.isInOfflineFolder = false
                         committedRow.isMarkedAsOffline = false
+                        committedRow.bumpOfflineIntentGeneration()
                         cleared = true
                     }
                     if (!cleared) result.keptOfflineFilesCount++
@@ -1359,13 +1364,23 @@ object OfflineFolderController {
                 // on the transaction-fresh row, immediately before the flags clear (issues: round
                 // 7 #9, round 9 #6, round 11 #9).
                 var cleared = false
+                // THE OPERATION'S OWN EXPECTED MUTATION (issue: round 26 #13): the transaction
+                // clears the marker and bumps the durable generation — the post-commit
+                // re-validation normalizes a DETACHED comparison copy back to the PRE-COMMIT
+                // marker/generation (the exact values this same predicate just validated on the
+                // transaction-fresh row), so cleanup never rejects its own mutation.
+                var preCommitMarker = false
+                var preCommitStamp = 0L
                 realm.executeTransaction {
                     if (isAborted()) return@executeTransaction
                     val committedRow = FileController.getFileById(realm, file.id) ?: return@executeTransaction
                     if (committedRow.isOffline) return@executeTransaction
                     isStillClearable?.let { clearable -> if (!clearable(realm, committedRow)) return@executeTransaction }
+                    preCommitMarker = committedRow.isMarkedAsOffline
+                    preCommitStamp = committedRow.offlineIntentStamp
                     committedRow.isInOfflineFolder = false
                     committedRow.isMarkedAsOffline = false
+                    committedRow.bumpOfflineIntentGeneration()
                     cleared = true
                 }
                 if (cleared) {
@@ -1374,9 +1389,20 @@ object OfflineFolderController {
                     // must share one intent protocol. The realm is refreshed first so commits from
                     // other threads are actually visible here, and the global intent monitor holds
                     // through this decision and the deletion — a nested-root addition cannot
-                    // commit inside it.
+                    // commit inside it. The predicate is applied against the NORMALIZED view: the
+                    // marker/generation arms see the pre-commit values the transaction validated;
+                    // every arm the operation did not touch (identity, publication token,
+                    // ancestry) still reads the LIVE row, so an external invalidation in the
+                    // commit→deletion window is still caught.
                     runCatching { realm.refresh() }
-                    val intentRevoked = isAborted() || (isStillClearable?.invoke(realm, liveRow) == false)
+                    val normalized = FileController.getFileById(realm, file.id)?.let { live ->
+                        realm.copyFromRealm(live, 1).apply {
+                            isMarkedAsOffline = preCommitMarker
+                            offlineIntentStamp = preCommitStamp
+                        }
+                    }
+                    val intentRevoked = isAborted() ||
+                        (isStillClearable != null && (normalized == null || isStillClearable(realm, normalized) == false))
                     if (!intentRevoked) {
                         deleteOfflineCopy(context, liveRow, offlineFile, userDrive, result)
                     } else {
@@ -1456,6 +1482,7 @@ object OfflineFolderController {
                         // removed intent (the durable-intent check).
                         if (!hasDurableIntent) return@executeTransaction
                         liveRow.isMarkedAsOffline = true
+                        liveRow.bumpOfflineIntentGeneration()
                         marked = true
                     }
                     if (marked) FileController.getFileById(realm, fileId)?.let { realm.copyFromRealm(it, 0) } else null

@@ -732,15 +732,27 @@ object FileController {
         val pending = ArrayDeque(filesToDelete)
         filesToDelete.clear()
         runCatching {
-            val graphRealm = realm ?: getRealmInstance(userDrive ?: UserDrive(capturedUserId))
-            graphRealm.use { traversalRealm ->
+            // A SUPPLIED REALM IS BORROWED, NEVER CLOSED (the caller's use block owns its
+            // lifecycle); only a self-opened instance is closed here.
+            if (realm != null) {
                 while (pending.isNotEmpty()) {
                     val file = pending.removeFirst()
                     if (!seenIds.add(file.id)) continue
                     ordered.add(file)
-                    val children = getFileById(traversalRealm, file.id)?.children ?: emptyList()
+                    val children = getFileById(realm, file.id)?.children ?: emptyList()
                     childrenIdsById[file.id] = children.map { it.id }
                     children.forEach { pending.add(it) }
+                }
+            } else {
+                getRealmInstance(userDrive ?: UserDrive(capturedUserId)).use { traversalRealm ->
+                    while (pending.isNotEmpty()) {
+                        val file = pending.removeFirst()
+                        if (!seenIds.add(file.id)) continue
+                        ordered.add(file)
+                        val children = getFileById(traversalRealm, file.id)?.children ?: emptyList()
+                        childrenIdsById[file.id] = children.map { it.id }
+                        children.forEach { pending.add(it) }
+                    }
                 }
             }
         }.onFailure(Sentry::captureException)

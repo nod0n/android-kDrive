@@ -457,6 +457,9 @@ object SyncOfflineUtils {
                 // it defers, retaining the copy and the unresolved cursor.
                 synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withFileLock(userDrive, fileAction.fileId) {
+                        // POST-LOCK-WAIT CHECK (issue: round 26 #18): a cancelled caller
+                        // never exercises deletion authority after waiting on the locks.
+                        checkCancelled()
                         runCatching { realm.refresh() }
                         val freshRow = FileController.getFileById(realm, fileAction.fileId)
                             ?: return@withFileLock
@@ -561,6 +564,7 @@ object SyncOfflineUtils {
                     fetchedFile = remoteFile,
                     okHttpClient = resolvingClient,
                     userDrive = userDrive,
+                    checkCancelled = checkCancelled,
                 )
             }
         }
@@ -578,6 +582,10 @@ object SyncOfflineUtils {
         val actionAt = fileAction.lastActionAt
         val handled = synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, localFile.id) {
+                // POST-LOCK-WAIT CHECK (issue: round 26 #18): a cancelled caller never runs
+                // any metadata/preservation/deletion effect after waiting on the locks —
+                // the previous check ran only BEFORE the acquisition.
+                checkCancelled()
                 runCatching { realm.refresh() }
                 val liveRow = FileController.getFileById(realm, localFile.id)
                 // PENDING-RECOVERY EXCLUSION (issue: round 22 #3): unresolved recovery
