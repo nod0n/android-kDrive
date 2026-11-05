@@ -2162,8 +2162,12 @@ class DownloadOfflineFileManager(
             // the publication recovery record: a relocation whose source observation
             // cannot be presented validly fails the record write — before any proof move —
             // and the state is retained.
+            // THE EXPLICIT PRESENCE DISCRIMINATOR (issue: round 32 #5): "A" = the
+            // operation legitimately carried no observation; a present observation is
+            // carried verbatim (its "1|" frame distinguishes it from the marker on read —
+            // a round-31 record's empty field reads as absent, its raw text as present).
             val attemptedObservationText = when (attemptedObservation) {
-                is AttemptedObservationCapture.Absent -> ""
+                is AttemptedObservationCapture.Absent -> "A"
                 is AttemptedObservationCapture.Valid -> attemptedObservation.text
                 AttemptedObservationCapture.Invalid -> return@runCatching false
             }
@@ -2194,20 +2198,33 @@ class DownloadOfflineFileManager(
             )
         }.getOrDefault(false)
 
+        /** THE PARSED OBSERVATION (issue: round 32 #6): an explicit FORMAT with a NULLABLE
+         * publication id. The legacy grammar's second field is the VERSION — never an
+         * attempt identity — and must never be compared against a publication id; only
+         * the current format carries one. */
+        private enum class ObservationFormat { CURRENT, LEGACY }
+
+        private class ParsedObservation(
+            val format: ObservationFormat,
+            val prefix: List<String>,
+            /** The COMPLETE location tail — pipe-containing destinations stay intact. */
+            val location: String,
+            /** The attempt id of the CURRENT format only; a legacy observation has none. */
+            val publicationId: Long?,
+        )
+
         /**
-         * THE OBSERVATION'S FIXED-PREFIX PARSE (issue: round 30 #6, refined round 31 #4):
-         * the location is the ENTIRE tail after the fixed prefix — a destination containing
-         * '|' occupies several components and must never be recovered by position from the
-         * end. EVERY typed prefix field is validated (the attempt id, the version, the
-         * nullable size and all three timestamps) — a frame-and-count match alone admitted
-         * damaged evidence whose generation fields could not be trusted at replay.
-         * Returns the fixed prefix fields and the location tail, or null for an
-         * unparseable observation. The current format carries the attempt id at prefix[1]
-         * (seven fixed fields); a pre-attempt-id legacy observation (six fixed fields) has
-         * no attempt id to validate — the reader's publication-id binding stays the
-         * authority.
+         * THE OBSERVATION'S FIXED-PREFIX PARSE (issues: round 30 #6, round 31 #4, round 32
+         * #6): the location is the ENTIRE tail after the fixed prefix — a destination
+         * containing '|' occupies several components and must never be recovered by
+         * position from the end, in EITHER format. EVERY typed prefix field is validated
+         * (attempt id, version, nullable size, all three timestamps). The CURRENT grammar
+         * (seven fixed fields, attempt id at prefix[1]) is tried first; the LEGACY grammar
+         * (six fixed fields, version at prefix[1]) accepts the remaining valid shapes —
+         * including pipe-containing paths — and carries a NULL publication id, never its
+         * version-as-id. Returns null for an unparseable observation.
          */
-        private fun parseObservationBinding(text: String): Pair<List<String>, String>? {
+        private fun parseObservationBinding(text: String): ParsedObservation? {
             val fields = text.split("|")
             val currentFormat = fields.size >= 8 && fields[0] == "1" &&
                 fields[1].toLongOrNull() != null &&
@@ -2216,23 +2233,47 @@ class DownloadOfflineFileManager(
                 fields[4].toLongOrNull() != null &&
                 fields[5].toLongOrNull() != null &&
                 fields[6].toLongOrNull() != null
-            val legacyFormat = fields.size == 7 && fields[0] == "1" &&
+            if (currentFormat) {
+                return ParsedObservation(
+                    format = ObservationFormat.CURRENT,
+                    prefix = fields.take(7),
+                    location = fields.drop(7).joinToString("|"),
+                    publicationId = fields[1].toLong(),
+                )
+            }
+            val legacyFormat = fields.size >= 7 && fields[0] == "1" &&
                 fields[1].toIntOrNull() != null &&
                 (fields[2].isEmpty() || fields[2].toLongOrNull() != null) &&
                 fields[3].toLongOrNull() != null &&
                 fields[4].toLongOrNull() != null &&
                 fields[5].toLongOrNull() != null
-            return when {
-                currentFormat -> fields.take(7) to fields.drop(7).joinToString("|")
-                legacyFormat -> fields.take(6) to fields.drop(6).joinToString("|")
-                else -> null
+            if (legacyFormat) {
+                return ParsedObservation(
+                    format = ObservationFormat.LEGACY,
+                    prefix = fields.take(6),
+                    location = fields.drop(6).joinToString("|"),
+                    publicationId = null,
+                )
             }
+            return null
         }
 
-        internal fun movePublishedProvenance(
+        /**
+         * THE PREPARED PROOF-MOVE PHASE 1 (issues: round 23 #14, round 32 #4): the
+         * relocation state (scope sidecar, retained proof, captured observation) and the
+         * DESTINATION proof are written and verified BEFORE any byte moves — a proof or
+         * observation failure fails the relocation while the source is still intact. The
+         * observation requirement comes from EXPLICIT OPERATION EVIDENCE
+         * ([requireObservation] — the caller's unresolved-publication flag, never
+         * version == 0); the carried observation must bind to the source record's
+         * publication id and to [expectedObservationLocation].
+         */
+        internal fun prepareProofRelocation(
             context: Context,
             source: IOFile,
             target: IOFile,
+            expectedObservationLocation: String,
+            requireObservation: Boolean,
             sharedWithMe: Boolean = false,
             storageKind: String = "offline",
         ): Boolean {
@@ -2251,14 +2292,11 @@ class DownloadOfflineFileManager(
                 provenance.recordText(target),
                 sharedWithMe = sharedWithMe,
                 storageKind = storageKind,
-                // THE OBSERVATION RIDES THE RELOCATION STATE (issues: round 30 #7, round
-                // 31 #4): captured from the source BEFORE any rebind — an unresolved
-                // source record (version 0) whose observation cannot be presented validly
-                // fails the relocation record write and the state is retained.
                 attemptedObservation = captureAttemptedObservation(
                     context,
                     source,
-                    unresolvedRecord = readPublishedProvenance(context, source)?.version == 0,
+                    expectedObservationLocation = expectedObservationLocation,
+                    requireObservation = requireObservation,
                 ),
             )
             if (!relocationStateWritten) {
@@ -2292,32 +2330,34 @@ class DownloadOfflineFileManager(
                 deletePublishedProvenance(context, source)
                 return false
             }
-            // THE ATTEMPTED OBSERVATION TRAVELS WITH THE RECORD, REWRITTEN AND VERIFIED
-            // (issues: round 28 #13, round 29 #6/#7): an AUTHORIZED RELOCATION re-binds
-            // the observation's location to the NEW destination (an unchanged copy would
-            // be rejected by its own reader) and keeps the attempt's publication id; the
-            // write is ATOMIC and read back — a failure RETAINS the recoverable state and
-            // fails the move (never an ignored writeText beside a successful
-            // publication).
+            return true
+        }
+
+        /**
+         * THE PREPARED PROOF-MOVE PHASE 2 (issues: round 28 #13, round 30 #6, round 32
+         * #4/#6): the observation travels with the moved record — the COMPLETE location
+         * tail is re-bound (fixed-prefix parse, pipes safe, both formats), the write is
+         * atomic and read back, and a CURRENT-format observation's attempt id must equal
+         * the record now sitting at the target (a LEGACY observation carries no id — never
+         * its version). A failure RETAINS the recoverable relocation state (the sweep
+         * replays it onto the already-moved bytes) and fails the move.
+         */
+        internal fun completePreparedProofMove(
+            context: Context,
+            source: IOFile,
+            target: IOFile,
+        ): Boolean {
             val sourceObs = IOFile(provenanceFileFor(context, source).path + ".obs")
             val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
             if (sourceObs.exists()) {
-                // FIXED-PREFIX REBIND (issue: round 30 #6): the parsed TAIL — the whole
-                // destination path, '|' characters included — is replaced with the new
-                // destination; the previous last-component replacement corrupted every
-                // pipe-containing path's binding ("/folder/a|b" became
-                // "/folder/a|/folder/a|b") and its suppression never fired again. The
-                // rebound text is written atomically, read back AND RE-PARSED: the
-                // resulting destination and — for the current format — the attempt id are
-                // validated against the moved record, not merely compared as text.
                 val parsed = runCatching { sourceObs.readText().trim() }.getOrNull()
                     ?.let { parseObservationBinding(it) }
                     ?: return false
-                val (prefix, _) = parsed
-                val reboundText = (prefix + target.absolutePath).joinToString("|")
-                val reboundParsed = parseObservationBinding(reboundText)
-                if (reboundParsed?.second != target.absolutePath ||
-                    (prefix.size == 7 && reboundParsed.first[1].toLongOrNull() != provenance.publicationId)
+                val reboundText = (parsed.prefix + target.absolutePath).joinToString("|")
+                val rebound = parseObservationBinding(reboundText) ?: return false
+                if (rebound.location != target.absolutePath) return false
+                if (rebound.format == ObservationFormat.CURRENT &&
+                    rebound.publicationId != readPublishedProvenance(context, target)?.publicationId
                 ) {
                     return false
                 }
@@ -2327,7 +2367,7 @@ class DownloadOfflineFileManager(
                 // THE READ-BACK IS RE-PARSED, NOT MERELY COMPARED (issue: round 30 #6).
                 val writtenBack = runCatching { targetObs.readText().trim() }.getOrNull()
                 if (writtenBack != reboundText ||
-                    parseObservationBinding(writtenBack ?: "")?.second != target.absolutePath
+                    parseObservationBinding(writtenBack ?: "")?.location != target.absolutePath
                 ) {
                     return false
                 }
@@ -2337,6 +2377,26 @@ class DownloadOfflineFileManager(
             runCatching { proofRelocationRecordFile(context, target).delete() }
             return true
         }
+
+        internal fun movePublishedProvenance(
+            context: Context,
+            source: IOFile,
+            target: IOFile,
+            sharedWithMe: Boolean = false,
+            storageKind: String = "offline",
+            requireObservation: Boolean = false,
+        ): Boolean =
+            prepareProofRelocation(
+                context,
+                source,
+                target,
+                // THE STAGED FLOW'S BINDING (issue: round 32 #5): the staged observation
+                // already names the FINAL destination (prepareStagedProvenance bound it).
+                expectedObservationLocation = target.absolutePath,
+                requireObservation = requireObservation,
+                sharedWithMe = sharedWithMe,
+                storageKind = storageKind,
+            ) && completePreparedProofMove(context, source, target)
 
         /**
          * The EXACT cache publication token captured at staging or edit initiation (issue:
@@ -2441,60 +2501,88 @@ class DownloadOfflineFileManager(
         }
 
         /**
-         * THE CARRIED ATTEMPTED OBSERVATION CAPTURE (issue: round 30 #7, refined round 31
-         * #4): a recovery/proof-move operation captures the staged attempt's observation
-         * BEFORE the replacement. [unresolvedRecord] decides whether an observation MUST
-         * exist — a missing, unreadable or invalid one is [AttemptedObservationCapture.Invalid]
-         * (the record write then fails closed), never a silent absence.
+         * THE CARRIED ATTEMPTED OBSERVATION CAPTURE (issues: round 30 #7, round 31 #4,
+         * round 32 #5): a recovery/proof-move operation captures the observation BEFORE
+         * the replacement. [requireObservation] comes from EXPLICIT OPERATION EVIDENCE
+         * (the caller's unresolved-publication flag — never version == 0, which a
+         * verified-uploaded/version-less proof shares with an unresolved one); an ABSENT
+         * observation of a non-requiring operation is legitimate ([Absent]). A PRESENT
+         * observation — either format, pipes safe — must BIND to its operation: the
+         * current format's attempt id equals the governing record's publication id (never
+         * a legacy version), and its intended location equals [expectedObservationLocation]
+         * (the staged destination, or the relocation's source binding). Anything else is
+         * [AttemptedObservationCapture.Invalid] and fails the record write before any byte
+         * is replaced.
          */
         private fun captureAttemptedObservation(
             context: Context,
             publishedFile: IOFile,
-            unresolvedRecord: Boolean,
+            expectedObservationLocation: String,
+            requireObservation: Boolean,
         ): AttemptedObservationCapture {
-            if (!unresolvedRecord) return AttemptedObservationCapture.Absent
             val text = runCatching { IOFile(provenanceFileFor(context, publishedFile).path + ".obs").readText().trim() }
                 .getOrNull()
-            return when {
-                text.isNullOrEmpty() -> AttemptedObservationCapture.Invalid
-                else -> {
-                    val parsed = parseObservationBinding(text)
-                    if (parsed != null) AttemptedObservationCapture.Valid(text) else AttemptedObservationCapture.Invalid
+            val parsed = text?.takeIf { it.isNotEmpty() }?.let { parseObservationBinding(it) }
+            if (parsed == null) {
+                return if (requireObservation) {
+                    AttemptedObservationCapture.Invalid
+                } else {
+                    AttemptedObservationCapture.Absent
                 }
             }
+            val operationId = readPublishedProvenance(context, publishedFile)?.publicationId
+            val idBound = when (parsed.format) {
+                ObservationFormat.CURRENT -> operationId != null && parsed.publicationId == operationId
+                ObservationFormat.LEGACY -> true
+            }
+            if (!idBound || parsed.location != expectedObservationLocation) {
+                return AttemptedObservationCapture.Invalid
+            }
+            return AttemptedObservationCapture.Valid(text)
         }
 
         /**
-         * THE REPLAYED OBSERVATION BINDING (issue: round 30 #7): the carried observation is
-         * re-established at the target WITH the proof it belongs to — the tail is re-bound
-         * to this destination (fixed-prefix parse, pipes safe), the write is atomic and
-         * read back, and the parsed attempt id must equal the established proof's
-         * publication id. A null carried text (a resolved publication, or a legacy record
-         * predating the observation) establishes nothing and succeeds.
+         * THE REPLAYED OBSERVATION BINDING (issues: round 30 #7, round 32 #5/#6): the
+         * carried observation is re-established at the target WITH the operation's proof —
+         * the COMPLETE location tail is re-bound (fixed-prefix parse, pipes safe, both
+         * formats), the write is atomic and read back, and the CURRENT format's attempt id
+         * must equal the operation's EXPECTED publication id ([expectedPublicationId], from
+         * the persisted expected proof — never a legacy version; a LEGACY observation has
+         * no id and is restored only under that validated operation authority). A null
+         * carried text (the explicit absent discriminator) establishes nothing and
+         * succeeds; a non-null text that fails to parse is on-disk corruption and RETAINS
+         * the operation.
          */
         private fun establishRecoveredObservation(
             context: Context,
             target: IOFile,
             observationText: String?,
-            proof: PublishedProvenance,
+            expectedPublicationId: Long?,
         ): Boolean {
-            // AN ABSENT CARRIED OBSERVATION IS LEGITIMATE ONLY FOR ONE SHAPE (issue: round
-            // 31 #4): a resolved generation's operation carried none — null means absent,
-            // never "the evidence could not be read". A v4/proof-move operation that
-            // created an observation persists it VALID; a non-null text that fails to
-            // parse here is on-disk corruption and RETAINS the operation instead of
-            // authorizing disposal or replay.
             if (observationText == null) return true
             val parsed = parseObservationBinding(observationText) ?: return false
-            val reboundText = (parsed.first + target.absolutePath).joinToString("|")
+            val reboundText = (parsed.prefix + target.absolutePath).joinToString("|")
             val rebound = parseObservationBinding(reboundText) ?: return false
-            if (rebound.second != target.absolutePath) return false
-            if (parsed.first.size == 7 && rebound.first[1].toLongOrNull() != proof.publicationId) return false
+            if (rebound.location != target.absolutePath) return false
+            when (parsed.format) {
+                ObservationFormat.CURRENT -> if (parsed.publicationId != expectedPublicationId || expectedPublicationId == null) {
+                    return false
+                }
+                ObservationFormat.LEGACY -> if (expectedPublicationId == null) return false
+            }
             val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
             if (!atomicWriteText(targetObs, reboundText)) return false
             val writtenBack = runCatching { targetObs.readText().trim() }.getOrNull()
             return writtenBack == reboundText &&
-                parseObservationBinding(writtenBack ?: "")?.second == target.absolutePath
+                parseObservationBinding(writtenBack ?: "")?.location == target.absolutePath
+        }
+
+        /** THE EXPECTED PUBLICATION IDENTITY (issue: round 32 #5): the operation's own
+         * publication id, parsed from its persisted expected proof text (v2-frame body
+         * index 8). */
+        private fun publicationIdOfRecordText(text: String?): Long? {
+            if (text == null) return null
+            return text.removePrefix(PROVENANCE_FRAME).split("|").getOrNull(8)?.trim()?.toLongOrNull()
         }
 
         private fun writeRecoveryRecord(
@@ -2518,8 +2606,12 @@ class DownloadOfflineFileManager(
             // that created an observation but cannot present it validly FAILS the record
             // here — before any byte is replaced — instead of writing an empty field whose
             // replay would later read as "no observation required".
+            // THE EXPLICIT PRESENCE DISCRIMINATOR (issue: round 32 #5): "A" = the
+            // operation legitimately carried no observation; a present observation is
+            // carried verbatim (its "1|" frame distinguishes it from the marker on read —
+            // a round-31 record's empty field reads as absent, its raw text as present).
             val attemptedObservationText = when (attemptedObservation) {
-                is AttemptedObservationCapture.Absent -> ""
+                is AttemptedObservationCapture.Absent -> "A"
                 is AttemptedObservationCapture.Valid -> attemptedObservation.text
                 AttemptedObservationCapture.Invalid -> return@runCatching false
             }
@@ -2629,7 +2721,12 @@ class DownloadOfflineFileManager(
                     backupHash = v4[8].trim().takeIf { it.isNotEmpty() },
                     expectedPublicationHash = v4[9].trim().takeIf { it.isNotEmpty() },
                     expectedPublicationRecordText = v4[10].takeIf { it.isNotEmpty() },
-                    attemptedObservationText = v4[11].takeIf { it.isNotEmpty() },
+                    // THE PRESENCE DISCRIMINATOR ON READ (issue: round 32 #5): an empty
+                    // field (a round-31 writer) or the explicit "A" marker means the
+                    // operation legitimately carried no observation; anything else is the
+                    // carried text (its own "1|" frame is validated at use — malformed
+                    // contents retain the operation, never read as absence).
+                    attemptedObservationText = v4[11].takeIf { it.isNotEmpty() && it != "A" },
                     legacy = false,
                 )
             }
@@ -3070,8 +3167,12 @@ class DownloadOfflineFileManager(
                                                     establishRecoveredObservation(
                                                         context,
                                                         target,
-                                                        parts.getOrNull(3)?.takeIf { it.isNotEmpty() },
-                                                        readPublishedProvenance(context, target) ?: return@runCatching false,
+                                                        // THE PRESENCE DISCRIMINATOR ON READ (issue:
+                                                        // round 32 #5), as in the v4 record.
+                                                        parts.getOrNull(3)?.takeIf { it.isNotEmpty() && it != "A" },
+                                                        // THE OPERATION'S OWN IDENTITY (issue: round 32
+                                                        // #5): the retained proof's publication id.
+                                                        retainedPublicationId,
                                                     )
                                                 }.getOrDefault(false)
                                                 if (proofEstablished && observationEstablished) disposeRecoveryRecord(recordFile)
@@ -3212,23 +3313,30 @@ class DownloadOfflineFileManager(
                 // has superseded the attempt — its observation evidence is spent and is
                 // deliberately not rewritten (the binding reader would reject it anyway).
                 if (record.attemptedObservationText != null) {
-                    val carried = parseObservationBinding(record.attemptedObservationText)
-                    val carriedAttemptId = carried?.first?.getOrNull(1)?.toLongOrNull()
-                    if (carried == null || carriedAttemptId == null) {
-                        // DAMAGED CARRIED EVIDENCE NEVER AUTHORIZES DISPOSAL (issue: round
-                        // 31 #4): supersession is inferred from VALIDATED publication
-                        // identities only — an unparseable carried observation retains the
-                        // operation state.
-                        return false
+                    // DAMAGED CARRIED EVIDENCE NEVER AUTHORIZES DISPOSAL (issues: round 31
+                    // #4, round 32 #5): an unparseable carried observation retains the
+                    // operation state.
+                    parseObservationBinding(record.attemptedObservationText) ?: return false
+                    // THE EXPECTED OPERATION IDENTITY DECIDES SUPERSESSION (issue: round
+                    // 32 #5): the comparison is between the operation's own EXPECTED
+                    // publication id (its persisted expected proof) and the CURRENT target
+                    // proof's id — never a raw carried-observation id alone, whose
+                    // mismatch previously disposed the operation while the target still
+                    // carried the operation's own expected publication.
+                    val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
+                    when {
+                        expectedPublicationId == null -> return false
+                        targetProof.publicationId == expectedPublicationId -> {
+                            // The target IS the operation's own output: the observation
+                            // re-establishes under the same validated identity.
+                            if (!establishRecoveredObservation(context, target, record.attemptedObservationText, expectedPublicationId)) {
+                                return false
+                            }
+                        }
+                        // A NEWER publication (validated identity) superseded the
+                        // operation: its observation evidence is spent and is deliberately
+                        // not rewritten.
                     }
-                    if (carriedAttemptId == targetProof.publicationId &&
-                        !establishRecoveredObservation(context, target, record.attemptedObservationText, targetProof)
-                    ) {
-                        return false
-                    }
-                    // carriedAttemptId != the target proof's publication id: a NEWER
-                    // publication (validated identity) has superseded the attempt — its
-                    // observation evidence is spent and is deliberately not rewritten.
                 }
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
@@ -3264,14 +3372,21 @@ class DownloadOfflineFileManager(
                 if (record.expectedPublicationRecordText != null) {
                     if (!atomicWriteText(provenanceFileFor(context, target), record.expectedPublicationRecordText)) return false
                     val establishedProof = readPublishedProvenance(context, target) ?: return false
-                    // THE OBSERVATION IS ESTABLISHED WITH ITS PROOF (issue: round 30 #7):
-                    // the interrupted publication's replay no longer reconstructs a
-                    // self-certifying destination proof while the attempt's observation is
-                    // stranded at the staged key — both are established (the observation
-                    // re-bound and verified against the proof's publication id) BEFORE the
+                    // THE OBSERVATION IS ESTABLISHED WITH ITS PROOF (issues: round 30
+                    // #7, round 32 #5): the interrupted publication's replay no longer
+                    // reconstructs a self-certifying destination proof while the attempt's
+                    // observation is stranded at the staged key — both are established (the
+                    // observation re-bound and verified against the operation's EXPECTED
+                    // publication id, parsed from its persisted expected proof) BEFORE the
                     // recovery state is disposed; a failed observation write retains the
                     // whole operation state, never half of it.
-                    if (!establishRecoveredObservation(context, target, record.attemptedObservationText, establishedProof)) {
+                    if (!establishRecoveredObservation(
+                            context,
+                            target,
+                            record.attemptedObservationText,
+                            publicationIdOfRecordText(record.expectedPublicationRecordText),
+                        )
+                    ) {
                         return false
                     }
                 }
@@ -4148,7 +4263,9 @@ class DownloadOfflineFileManager(
                     attemptedObservation = captureAttemptedObservation(
                         provenanceContext,
                         staged,
-                        unresolvedRecord = explicitUnresolvedGeneration,
+                        // THE INTENDED DESTINATION BINDING (issue: round 32 #5).
+                        expectedObservationLocation = target.absolutePath,
+                        requireObservation = explicitUnresolvedGeneration,
                     ),
                 ))
             if (!recoveryOk || !recoveryRecorded) {
@@ -4178,6 +4295,11 @@ class DownloadOfflineFileManager(
                         target,
                         sharedWithMe = userDrive.sharedWithMe,
                         storageKind = destinationStorageKind(provenanceContext, file, target, userDrive),
+                        // EXPLICIT OPERATION EVIDENCE (issue: round 32 #4): the observation
+                        // requirement comes from this publication's own unresolved flag —
+                        // never version == 0, which a verified-uploaded/version-less proof
+                        // shares.
+                        requireObservation = explicitUnresolvedGeneration,
                     )
                 ) {
                     val restored = recoveryFile != null && restoreRecoveryCopy(
@@ -4483,7 +4605,9 @@ class DownloadOfflineFileManager(
                                 attemptedObservation = captureAttemptedObservation(
                                     context,
                                     staged,
-                                    unresolvedRecord = !generationResolved,
+                                    // THE INTENDED DESTINATION BINDING (issue: round 32 #5).
+                                    expectedObservationLocation = target.absolutePath,
+                                    requireObservation = !generationResolved,
                                 ),
                             ))
                         if (!recoveryOk || !recoveryRecorded) {
@@ -4506,6 +4630,9 @@ class DownloadOfflineFileManager(
                                         target,
                                         sharedWithMe = userDrive.sharedWithMe,
                                         storageKind = destinationStorageKind(context, file, target, userDrive),
+                                        // EXPLICIT OPERATION EVIDENCE (issue: round 32 #4),
+                                        // as in the coordinated arm.
+                                        requireObservation = !generationResolved,
                                     ) -> {
                                     runCatching { recoveryFile?.delete() }
                                     recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }

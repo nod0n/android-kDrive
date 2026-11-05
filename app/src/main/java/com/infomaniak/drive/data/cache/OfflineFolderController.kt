@@ -739,17 +739,39 @@ object OfflineFolderController {
                         } else {
                             runCatching {
                                 target.parentFile?.mkdirs()
-                                val renamed = oldOfflineFile.renameTo(target)
-                                if (renamed) {
-                                    // The published generation's provenance travels with the
-                                    // bytes (issue: round 16 #12/#13): a migrated copy keeps its
-                                    // sidecar, and no orphan is left at the old path to lend its
-                                    // generation to a later file there. Best effort: a failed
-                                    // sidecar move never fails the byte migration — the copy
-                                    // simply loses provenance and a later walk re-downloads it.
-                                    DownloadOfflineFileManager.movePublishedProvenance(context, oldOfflineFile, target)
+                                // THE RELOCATION IS PREPARED AND ITS PROOF/OBSERVATION
+                                // VALIDATED BEFORE THE BYTES MOVE (issue: round 32 #4): the
+                                // previous shape renamed the bytes FIRST and treated the
+                                // proof move as best-effort — a failed proof/observation left
+                                // bytes at B with the provenance stranded at A and NO
+                                // prepared relocation recovery. The observation requirement
+                                // is evidence-based here: an ABSENT observation of a
+                                // verified-uploaded/version-less record is legitimate, while
+                                // a PRESENT but unbindable one fails the relocation BEFORE
+                                // any byte moves.
+                                if (!DownloadOfflineFileManager.prepareProofRelocation(
+                                        context,
+                                        oldOfflineFile,
+                                        target,
+                                        expectedObservationLocation = oldOfflineFile.absolutePath,
+                                        requireObservation = false,
+                                    )
+                                ) {
+                                    return@runCatching false
                                 }
-                                renamed
+                                val renamed = oldOfflineFile.renameTo(target)
+                                if (!renamed) {
+                                    // The rename touched nothing; the prepared destination
+                                    // state is inert (a record without bytes) and the sweep's
+                                    // missing-target arm disposes the retained relocation
+                                    // state with the source proof intact.
+                                    return@runCatching false
+                                }
+                                // THE PROOF AND OBSERVATION COMPLETE TOGETHER (issue: round
+                                // 32 #4): a failure here RETAINS the durable relocation state
+                                // (the sweep replays it onto the already-moved bytes) — never
+                                // bytes-without-provenance and no prepared recovery.
+                                DownloadOfflineFileManager.completePreparedProofMove(context, oldOfflineFile, target)
                             }.getOrDefault(false)
                         }
                     }
