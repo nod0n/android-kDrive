@@ -1487,9 +1487,18 @@ class DownloadOfflineFileManager(
          * replacements and the unresolved-download retry loop.
          */
         private fun disposeRecoveryRecord(recordFile: IOFile): Boolean {
-            val bodyDisposed = disposeRecoveryRecord(recordFile)
-            val sidecarDisposed = runCatching { IOFile(recordFile.path + ".scope").delete() }.getOrDefault(false)
-            return bodyDisposed && sidecarDisposed
+            // DIRECT BODY DELETION (issue: round 27 #1): an already-absent body counts as
+            // disposed (a caller may have removed it first); an actual deletion FAILURE
+            // propagates — the operation state is retained, never half-disposed. The
+            // previous body line called this very function with the same argument and
+            // recursed to StackOverflowError on every disposal.
+            val bodyDisposed = if (!recordFile.exists()) true else runCatching { recordFile.delete() }.getOrDefault(false)
+            if (!bodyDisposed) return false
+            // THE SIDECAR ONLY AFTER CONFIRMED BODY DISPOSITION (issue: round 27 #1): the
+            // index never outlives its operation and never disappears before the body; an
+            // absent sidecar (a legacy record) is already disposed.
+            val sidecar = IOFile(recordFile.path + ".scope")
+            return !sidecar.exists() || runCatching { sidecar.delete() }.getOrDefault(false)
         }
 
         /**
@@ -1538,9 +1547,19 @@ class DownloadOfflineFileManager(
          * 25 #3): the ambiguity gate for legacy in-place restore output — a readable
          * strict prefix of the immutable backup could equally be a user truncation.
          */
-        private fun filePrefixMatches(prefixFile: IOFile, fullFile: IOFile): Boolean = runCatching {
+        /**
+         * THREE-VALUED PREFIX COMPARISON (issue: round 27 #12): TRUE = a proven strict
+         * prefix; FALSE = PROVEN non-prefix content (a complete, successful comparison
+         * including the reliable length bound); NULL = READ/EOF UNCERTAINTY — the
+         * comparison could not complete (an unreadable backup, a short read, an I/O
+         * failure), which is NEVER permission to treat the target as a genuine edit: a
+         * partial in-place restore's output must retain the complete backup. The previous
+         * Boolean folded read failures into "not a prefix".
+         */
+        private fun filePrefixMatches(prefixFile: IOFile, fullFile: IOFile): Boolean? = runCatching {
             val prefixLength = prefixFile.length()
-            if (prefixLength <= 0L || prefixLength >= fullFile.length()) return@runCatching false
+            if (prefixLength <= 0L) return@runCatching null
+            if (prefixLength >= fullFile.length()) return@runCatching false
             prefixFile.inputStream().use { a ->
                 fullFile.inputStream().use { b ->
                     val bufA = ByteArray(64 * 1024)
@@ -1551,13 +1570,13 @@ class DownloadOfflineFileManager(
                         var readA = 0
                         while (readA < chunk) {
                             val r = a.read(bufA, readA, chunk - readA)
-                            if (r < 0) return@runCatching false
+                            if (r < 0) return@runCatching null
                             readA += r
                         }
                         var readB = 0
                         while (readB < chunk) {
                             val r = b.read(bufB, readB, chunk - readB)
-                            if (r < 0) return@runCatching false
+                            if (r < 0) return@runCatching null
                             readB += r
                         }
                         for (i in 0 until chunk) {
@@ -1568,7 +1587,7 @@ class DownloadOfflineFileManager(
                     true
                 }
             }
-        }.getOrDefault(false)
+        }.getOrNull()
 
         /**
          * Moves the provenance record of [source]'s published bytes onto [target], rewriting
@@ -2382,8 +2401,15 @@ class DownloadOfflineFileManager(
                 // unresolved; only independent operation evidence (the expected-publication
                 // arm above) or a verified resolution outside this arm may resolve them.
                 val targetLength = runCatching { target.length() }.getOrDefault(-1L)
-                val prefixShaped = filePrefixMatches(target, recoveryFile)
-                if (prefixShaped || targetLength == 0L) return false
+                val prefixRead = filePrefixMatches(target, recoveryFile)
+                // (issues: round 25 #3, round 26 #3, round 27 #12): a proven strict prefix
+                // (true) AND a READ/EOF UNCERTAINTY (null — e.g. an unreadable backup)
+                // both retain the ambiguous output and the complete backup unresolved;
+                // only a PROVEN non-prefix comparison (false) may proceed toward edit
+                // registration — the previous Boolean let a backup whose bytes could not
+                // be read register its partial target as an edit before the backup's
+                // deletion.
+                if (prefixRead != false || targetLength == 0L) return false
                 val rowOwnsTarget = runCatching {
                     FileController.getRealmInstance(recordScope).use { realm ->
                         runCatching { realm.refresh() }
