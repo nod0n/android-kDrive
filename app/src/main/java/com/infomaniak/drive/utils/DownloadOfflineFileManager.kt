@@ -2819,8 +2819,17 @@ class DownloadOfflineFileManager(
                 runCatching { realm.refresh() }.onFailure { return@use DestinationOwnership.Failed }
                 val appContext = appContextForOwnership() ?: return@use DestinationOwnership.Failed
                 val nameComponent = target.path.substringAfterLast('/')
+                // THE CAPTURED CANONICAL NAMESPACE BOUNDS THE RELEVANT CANDIDATES (review-38
+                // #9): the shared Realm spans the user's drives (REALM_DB_SHARES_WITH_ME is
+                // per-user), but every row's offline path resolves under its OWN
+                // `${userId}/${driveId}` root (File.getOfflineFile) — a row of another drive
+                // provably cannot inhabit this target's namespace, so it is excluded BEFORE
+                // its ancestry is resolved: its temporarily incomplete chain must not fail
+                // the whole query for an unrelated destination. A same-drive candidate whose
+                // claim cannot be resolved still fails the query closed (review-37 #5).
                 val candidates = realm.where(File::class.java)
                     .equalTo(File::name.name, nameComponent)
+                    .equalTo(File::driveId.name, scope.driveId)
                     .notEqualTo(File::type.name, File.Type.DIRECTORY.value)
                     .findAll()
                     .createSnapshot()
