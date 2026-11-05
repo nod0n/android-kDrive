@@ -27,6 +27,7 @@ import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.ErrorCode
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.FolderFilesProvider
 import com.infomaniak.drive.data.cache.OfflineFolderController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.FileActivityType
@@ -810,6 +811,33 @@ object SyncOfflineUtils {
         realm: Realm,
         actionLastActionAt: Long? = null,
     ): Boolean {
+        // BOUNDED DURABLE ANCESTRY RESOLUTION FOR THE DEFERRED ACTION (issue: round 24
+        // #10): a dirty file moved into an uncached destination previously deferred on the
+        // SAME activity forever — no Sync caller resolved the missing destination chain,
+        // so only an unrelated UI traversal could unblock it. ONE bounded, fair
+        // resolution pass runs OUTSIDE every coordination lock (the monitor-first protocol
+        // forbids acquiring the monitor under this function's file lock), BEFORE the
+        // lock; the in-lock gate below retries the registration against the fresh
+        // complete chain, and still-unresolved ancestry defers WITHOUT registration.
+        if (remoteFile != null && remoteFile.parentId > 0) {
+            val chainIncomplete = runCatching {
+                FileController.getRealmInstance(userDrive).use { probeRealm ->
+                    runCatching { probeRealm.refresh() }
+                    !FileController.destinationChainExists(probeRealm, remoteFile.parentId)
+                }
+            }.getOrDefault(true)
+            if (chainIncomplete) {
+                val resolvingClient = runCatching {
+                    runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+                }.getOrNull() ?: return false
+                FolderFilesProvider.resolveMissingAncestryOutsideLocks(
+                    realm = realm,
+                    fetchedFile = remoteFile,
+                    okHttpClient = resolvingClient,
+                    userDrive = userDrive,
+                )
+            }
+        }
         // Upload-source registration is a mutation owner of these bytes: it holds the shared
         // per-file coordination so a publication or cleanup cannot interleave (issue:
         // round 4 #4). The action predicate applies BEFORE the snapshot side effect (issue:
@@ -962,6 +990,24 @@ object SyncOfflineUtils {
                 // after a cancellation. The existing record keeps owning the snapshot bytes;
                 // registering again would duplicate pending work or reactivate the
                 // cancellation. The action is handled: durable ownership exists either way.
+                // OUTSTANDING ACCEPTANCE RETRIES (issue: round 24 #10): the cursor is
+                // retained until BOTH the registration and the conditional metadata
+                // acceptance have succeeded — a previous pass that registered the snapshot
+                // but deferred the advance (broken ancestry, newer metadata) re-attempts
+                // the conditional acceptance here instead of consuming the action
+                // unadvanced. The no-action sweep path (remoteFile == null) has no action
+                // identity to advance.
+                if (remoteFile != null) {
+                    return advanceUploadMetadataConditionally(
+                        remoteFile = remoteFile,
+                        freshSource = freshSource,
+                        localFile = localFile,
+                        realm = realm,
+                        userDrive = userDrive,
+                        registrationFolder = registrationFolder,
+                        actionLastActionAt = actionLastActionAt,
+                    )
+                }
                 return true
             }
             // Immutable per-revision source (issue: round 7 #4): ordinary offline edits used to
@@ -1061,33 +1107,29 @@ object SyncOfflineUtils {
             }
 
             if (remoteFile != null) {
-                remoteFile.lastModifiedAt = freshSource.lastModified() / 1000
-                remoteFile.size = freshSource.length()
                 // Conditional advance (issues: round 12 #4, round 13 #3, round 14 #1): the
                 // uploaded snapshot's baseline must not roll back a strictly newer generation
                 // OR newer non-Sync metadata committed meanwhile; the action's nullable
                 // timestamp bounds the cursor the same way as the other action commits. Under
                 // this section's lock the acceptance gate and this commit read the same row,
                 // so a rejection here means the row vanished mid-section: the snapshot's
-                // durable ownership exists, the action is consumed, and the rejection is
-                // logged rather than ignored.
-                // THE ANCESTRY AUTHORITY HOLDS THROUGH ACCEPTANCE (issue: round 23 #10):
-                // a chain broken during the registration I/O defers the metadata commit —
-                // the durable snapshot registration exists, and the ACTION IS RETAINED
-                // (issue: round 24 #1): a later pass re-attempts the acceptance with the
-                // resolved ancestry instead of consuming the activity unadvanced.
-                val advanced = if (registrationFolder > 0 && !FileController.destinationChainExists(realm, registrationFolder)) {
-                    SentryLog.i("SyncOffline", "Upload advance deferred for ${localFile.id}: its destination ancestry broke during registration")
-                    false
-                } else FileController.updateExistingFileIfNotSuperseded(
-                    newFile = remoteFile,
+                // durable ownership exists, and the ACTION IS RETAINED (issues: round 24
+                // #1/#10) — a later pass re-attempts the acceptance with the resolved
+                // ancestry instead of consuming the activity unadvanced.
+                val advanced = advanceUploadMetadataConditionally(
+                    remoteFile = remoteFile,
+                    freshSource = freshSource,
+                    localFile = localFile,
                     realm = realm,
                     userDrive = userDrive,
-                    requireActionAtOrAfter = actionLastActionAt,
-                    observed = localFile,
+                    registrationFolder = registrationFolder,
+                    actionLastActionAt = actionLastActionAt,
                 )
                 if (!advanced) {
-                    SentryLog.i("SyncOffline", "Upload advance rejected for ${localFile.id}; snapshot ownership retained")
+                    SentryLog.i(
+                        "SyncOffline",
+                        "Upload advance deferred or rejected for ${localFile.id}; snapshot ownership retained, action pending",
+                    )
                     // A REJECTED OR DEFERRED ADVANCE RETAINS THE ACTION (issue: round 24 #1):
                     // the acceptance is not manufactured — the cursor stays so a later pass
                     // re-attempts the conditional metadata acceptance with the resolved
@@ -1101,6 +1143,37 @@ object SyncOfflineUtils {
             context.syncImmediately(isAutomaticTrigger = false)
         }
         return true
+    }
+
+    /**
+     * The conditional metadata acceptance for the upload action (issues: round 12 #4, round
+     * 13 #3, round 14 #1, round 24 #10): prepares the action payload's POST-COMMIT identity,
+     * validates the destination ancestry, and commits through the conditional acceptance.
+     * False means the advance was DEFERRED (a chain broken during the registration I/O) or
+     * REJECTED (a newer generation or newer non-Sync metadata owns the row) — the action's
+     * cursor is retained either way (issue: round 24 #1), and the dedup arm re-attempts this
+     * acceptance on the next pass (issue: round 24 #10).
+     */
+    private fun advanceUploadMetadataConditionally(
+        remoteFile: File,
+        freshSource: IOFile,
+        localFile: File,
+        realm: Realm,
+        userDrive: UserDrive,
+        registrationFolder: Int,
+        actionLastActionAt: Long?,
+    ): Boolean {
+        remoteFile.lastModifiedAt = freshSource.lastModified() / 1000
+        remoteFile.size = freshSource.length()
+        return if (registrationFolder > 0 && !FileController.destinationChainExists(realm, registrationFolder)) {
+            false
+        } else FileController.updateExistingFileIfNotSuperseded(
+            newFile = remoteFile,
+            realm = realm,
+            userDrive = userDrive,
+            requireActionAtOrAfter = actionLastActionAt,
+            observed = localFile,
+        )
     }
 
     /**

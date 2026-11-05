@@ -424,6 +424,7 @@ object FolderFilesProvider {
         transaction: (files: ArrayList<File>) -> Unit,
         okHttpClient: OkHttpClient? = null,
         checkCancelled: () -> Unit = {},
+        sequenceHadUnresolved: Boolean = false,
     ) {
         val folderProxy = FileController.getFileById(realm, folderId)
         val folderFilesProviderArgs = FolderFilesProviderArgs(
@@ -445,16 +446,28 @@ object FolderFilesProvider {
 
         transaction(folderFilesProviderResult?.folderFiles ?: arrayListOf())
 
-        if (folderFilesProviderResult?.isComplete == false) getCloudStorageFiles(
-            realm = realm,
-            folderId = folderId,
-            userDrive = userDrive,
-            sortType = sortType,
-            isFirstPage = false,
-            transaction = transaction,
-            okHttpClient = currentOkHttpClient,
-            checkCancelled = checkCancelled,
-        )
+        // CROSS-PAGE UNRESOLVED ACCUMULATION (issue: round 24 #17): the flag rides the
+        // whole listing sequence — a successful FINAL page re-marks the folder incomplete
+        // when ANY page's reconciliation left candidates unresolved, so a later page can
+        // never erase earlier deferred work and the redrive stays independent of
+        // pagination completion.
+        val sequenceUnresolved = sequenceHadUnresolved ||
+            (folderFilesProviderResult?.unresolvedReconciliation == true)
+        if (folderFilesProviderResult?.isComplete == false) {
+            getCloudStorageFiles(
+                realm = realm,
+                folderId = folderId,
+                userDrive = userDrive,
+                sortType = sortType,
+                isFirstPage = false,
+                transaction = transaction,
+                okHttpClient = currentOkHttpClient,
+                checkCancelled = checkCancelled,
+                sequenceHadUnresolved = sequenceUnresolved,
+            )
+        } else if (folderFilesProviderResult != null && sequenceUnresolved) {
+            FileController.updateFile(folderId, realm) { folderRow -> folderRow.isComplete = false }
+        }
     }
 
     fun tryLoadActivitiesFromFolder(folder: File, userDrive: UserDrive, activitiesJob: Job): Boolean {
@@ -620,8 +633,9 @@ object FolderFilesProvider {
                 // their move-in candidates deferred forever. ONE pass per listing, same
                 // protocol (fresh pre-observed details, fair per-item outcomes); unresolved
                 // candidates wait for the next listing pass.
+                var unresolvedDeferredCount = 0
                 if (commitOutcomes.deferredIds.isNotEmpty()) {
-                    val unresolvedCount = resolveDeferredCandidatesOnce(
+                    unresolvedDeferredCount = resolveDeferredCandidatesOnce(
                         realm = realm,
                         okHttpClient = okHttpClient,
                         folderId = folderFilesProviderArgs.folderId,
@@ -629,7 +643,7 @@ object FolderFilesProvider {
                         deferredIds = commitOutcomes.deferredIds,
                         checkCancelled = checkCancelled,
                     )
-                    if (unresolvedCount > 0) {
+                    if (unresolvedDeferredCount > 0) {
                         // INCOMPLETE RECONCILIATION OUTLIVES PAGINATION (issue: round 22 #17):
                         // the folder's persisted completeness previously came from pagination
                         // alone — a fully listed folder with unresolved deferred candidates
@@ -647,7 +661,12 @@ object FolderFilesProvider {
                     }
                 }
                 val folderFiles = if (folderWithChildren) ArrayList(apiResponseData) else arrayListOf()
-                FolderFilesProviderResult(folder = localFolder, folderFiles = folderFiles, isComplete = isCompleteFolder)
+                FolderFilesProviderResult(
+                    folder = localFolder,
+                    folderFiles = folderFiles,
+                    isComplete = isCompleteFolder,
+                    unresolvedReconciliation = unresolvedDeferredCount > 0,
+                )
             }
             folderFilesProviderArgs.isFirstPage -> {
                 loadFromLocal(realm, folderProxy, folderWithChildren, folderFilesProviderArgs.order)
@@ -740,6 +759,10 @@ object FolderFilesProvider {
                     folderProxy,
                     userDrive,
                     observedChildren,
+                    // THE EXECUTING JOB'S CALLBACK (issue: round 24 #18): the ancestor
+                    // resolver's additional requests and coordinated commits check the
+                    // ACTIVITIES pass's job — after each HTTP and inside each lock section.
+                    checkCancelled = { activitiesJob.ensureActive() },
                 ) && allActivitiesHandled
             }
         }
@@ -806,6 +829,7 @@ object FolderFilesProvider {
         currentFolder: File,
         userDrive: UserDrive,
         observedChildren: Map<Int, File>,
+        checkCancelled: () -> Unit = {},
     ): Boolean {
         val actionFile = actionFiles[fileId]
 
@@ -832,7 +856,10 @@ object FolderFilesProvider {
                 }
                 // The file has not yet been managed and is not the parent folder.
                 if (returnResponse[fileId] == null && actionFile?.id != currentFolder.id) {
-                    val handled = upsertAction(realm, currentFolder, actionFile, userDrive, observedChildren[fileId])
+                    val handled = upsertAction(
+                        realm, currentFolder, actionFile, userDrive, observedChildren[fileId],
+                        checkCancelled,
+                    )
                     returnResponse[fileId] = this
                     handled
                 } else {
@@ -977,6 +1004,7 @@ object FolderFilesProvider {
         actionFile: File?,
         userDrive: UserDrive,
         observed: File?,
+        checkCancelled: () -> Unit = {},
     ): Boolean {
         if (actionFile == null) {
             // SCOPED RESOLVING FETCH (issue: round 19 #21): a payload-less update/unknown
@@ -1017,6 +1045,7 @@ object FolderFilesProvider {
                         fetchedFile = details,
                         okHttpClient = okHttpClient,
                         userDrive = userDrive,
+                        checkCancelled = checkCancelled,
                     )
                     // COMPLETE ASCENDING LOCK SET ONCE (issue: round 22 #14): the previous
                     // withFileLock(file) pre-held the CHILD lock while the upsert then
@@ -1073,26 +1102,63 @@ object FolderFilesProvider {
     }
 
     /**
-     * ONE bounded, fair pass resolving a fetched row's missing ancestry (issue: round 23
-     * #15): climbs the parent chain to its usable boundary — a cached ancestor, a zero
-     * parent or the budget — fetching each MISSING ancestor with a single details request
-     * OUTSIDE any lock, then committing the fetched ancestors TOP-DOWN through the
-     * coordinated upsert (whose resolved-parent acceptance validates each ancestor's own
-     * complete chain, so an interior failure defers that ancestor and everything below
-     * it). No retry loop: ancestors beyond the budget or with indeterminate fetches wait
-     * for the next activity pass, exactly like the event they unblock.
+     * ONE bounded, fair pass resolving a fetched row's missing ancestry (issues: round 23
+     * #15, round 24 #15/#16/#18): climbs the parent chain to its usable boundary — a zero
+     * parent, the fetch budget, or a CACHED ancestor whose OWN chain is already complete —
+     * fetching each MISSING ancestor with a single details request OUTSIDE any lock, then
+     * committing the fetched ancestors TOP-DOWN through the coordinated validate-preserve-
+     * commit protocol.
+     *
+     * CACHED HOLES DO NOT TERMINATE THE CLIMB (issue: round 24 #15): a cached ancestor
+     * with an incomplete chain of its own no longer stops the walk — the climb continues
+     * THROUGH it, so every pass makes durable progress on holes above cached rows instead
+     * of re-fetching the same boundary forever.
+     *
+     * EXPLICIT ABSENCE/IDENTITY BEFORE EACH REQUEST, VALIDATE-PRESERVE-COMMIT UNDER THE
+     * COMPLETE LOCK SET (issue: round 24 #16): each ancestor's pre-request observation is
+     * captured (null = documented absence) BEFORE its details request; the commit re-reads
+     * the current graph under the monitor + the ancestor's lock set, runs the shared
+     * preservation boundary against that observation, and upserts with the observation as
+     * the tie anchor — a strictly newer response can no longer change an ancestor's
+     * identity over rows another request inserted during the HTTP without reconciling
+     * them.
+     *
+     * SCAFFOLD ACCEPTANCE (issue: round 24 #15): the fetched ancestors commit with
+     * requireResolvedParent = false — with more missing ancestors than the fetch budget,
+     * the topmost fetched ancestor's own parent is still absent, and requiring its
+     * complete chain committed NOTHING on every pass (each pass re-fetched the same first
+     * eight). Committed scaffold rows are durable progress; the event's own commit still
+     * requires the complete usable chain.
+     *
+     * THE EXECUTING CONTEXT IS CHECKED (issue: round 24 #18): the callback rides every
+     * request and every coordinated commit — after each HTTP and inside each lock section.
+     * No retry loop: ancestors beyond the budget or with indeterminate fetches wait for
+     * the next pass, exactly like the event they unblock.
      */
-    private fun resolveMissingAncestryOutsideLocks(
+    internal fun resolveMissingAncestryOutsideLocks(
         realm: Realm,
         fetchedFile: File,
         okHttpClient: OkHttpClient,
         userDrive: UserDrive,
+        checkCancelled: () -> Unit = {},
     ) {
         val fetchedAncestors = ArrayDeque<File>()
         var cursorRow: File = fetchedFile
-        for (_hop in 0 until MISSING_ANCESTRY_RESOLUTION_BUDGET) {
+        var fetchBudget = MISSING_ANCESTRY_RESOLUTION_BUDGET
+        var walkedHops = 0
+        while (walkedHops++ < FileController.ANCESTRY_VALIDATION_DEPTH_BUDGET) {
             val parentId = cursorRow.parentId.takeIf { it > 0 } ?: break
-            if (FileController.getFileById(realm, parentId) != null) break // usable boundary
+            val cached = FileController.getFileById(realm, parentId)
+            if (cached != null) {
+                // A CACHED BOUNDARY ONLY WHEN ITS OWN CHAIN IS COMPLETE (issue: round 24
+                // #15); an interior hole is climbed THROUGH, never mistaken for resolved
+                // ancestry.
+                if (FileController.usableAncestryChain(realm, parentId)) break
+                cursorRow = cached
+                continue
+            }
+            if (fetchBudget-- <= 0) break
+            checkCancelled()
             val parent = runCatching {
                 ApiRepository.getFileDetails(
                     file = File(
@@ -1102,10 +1168,18 @@ object FolderFilesProvider {
                     okHttpClient = okHttpClient,
                 )
             }.getOrNull()?.data?.takeIf { it.id == parentId } ?: break // indeterminate: defer as before
+            checkCancelled()
             fetchedAncestors.addFirst(parent) // top-down commit order
             cursorRow = parent
         }
         for (ancestor in fetchedAncestors) {
+            // EXPLICIT ABSENCE/IDENTITY CAPTURED BEFORE THE REQUEST (issue: round 24 #16):
+            // the observation each ancestor's commit is validated against is the state the
+            // request was issued from — an absent row is a documented absence, an existing
+            // row its depth-one identity.
+            val preRequestObservation = FileController.getFileById(realm, ancestor.id)
+                ?.let { row -> realm.copyFromRealm(row, 1) }
+            checkCancelled()
             val committed = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withLocksFor(
                     userDrive,
@@ -1114,12 +1188,35 @@ object FolderFilesProvider {
                         ancestor.parentId.takeIf { it > 0 }?.let(::add)
                     }.distinct(),
                 ) {
-                    FileController.upsertFetchedFileIfNotOlderInCoordinatedSection(
-                        newFile = ancestor,
+                    // POST-LOCK-WAIT CHECK (issue: round 24 #18).
+                    checkCancelled()
+                    runCatching { realm.refresh() }
+                    // THE SHARED PRESERVATION BOUNDARY AGAINST THE CAPTURED OBSERVATION
+                    // (issue: round 24 #16): the raw upsert bypassed the caller-level
+                    // validate-preserve-commit protocol — a newer response changing an
+                    // ancestor's identity over rows inserted during the HTTP no longer
+                    // skips it.
+                    val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                         realm = realm,
+                        remoteFiles = listOf(ancestor),
                         userDrive = userDrive,
-                        observed = null,
-                    )
+                        observedById = preRequestObservation?.let { mapOf(ancestor.id to it) } ?: emptyMap(),
+                    ).first()
+                    if (committable !== ancestor) {
+                        false
+                    } else {
+                        // SCAFFOLD ACCEPTANCE (issue: round 24 #15): requireResolvedParent
+                        // = false — the scaffold commits over its own (possibly still
+                        // absent) parent so every pass makes durable progress; the event's
+                        // own acceptance still validates the complete usable chain.
+                        FileController.upsertFetchedFileIfNotOlderInCoordinatedSection(
+                            newFile = committable,
+                            realm = realm,
+                            userDrive = userDrive,
+                            observed = preRequestObservation,
+                            requireResolvedParent = false,
+                        )
+                    }
                 }
             }
             if (!committed) break
@@ -1141,6 +1238,13 @@ object FolderFilesProvider {
         val folderFiles: ArrayList<File>,
         val isComplete: Boolean,
         val cursor: String? = null,
+        /**
+         * THIS page's budgeted resolution pass left candidates unresolved (issue: round 24
+         * #17): the page-walk accumulates the flag across the whole listing sequence — a
+         * successful FINAL page must not erase the durable incompleteness an earlier
+         * page's unresolved candidates established.
+         */
+        val unresolvedReconciliation: Boolean = false,
     )
 
     enum class SourceRestrictionType {

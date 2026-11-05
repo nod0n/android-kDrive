@@ -118,6 +118,12 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
         getFilesJob.cancel()
         getFolderActivitiesJob.cancel()
         getFilesJob = Job()
+        // THE EXECUTING JOB IS CAPTURED IMMUTABLY (issue: round 24 #18): the callback
+        // below reads THIS request's job — starting J2 replaces the mutable field and
+        // cancels J1, but J1's in-flight callback previously read the FIELD and checked
+        // active J2, letting J1's late results preserve and commit. The captured value
+        // is cancelled with J1, so its checks fail closed.
+        val executingJob = getFilesJob
 
         // The request's EFFECTIVE scope is built ONCE and carried with the result (issue:
         // round 21 #16): the previous per-call `userDrive ?: UserDrive()` constructed the
@@ -127,8 +133,8 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
         val requestScope = userDrive ?: UserDrive()
 
         return liveData(Dispatchers.IO + getFilesJob) {
-            tailrec suspend fun recursiveDownload(folderId: Int, isFirstPage: Boolean) {
-                getFilesJob.ensureActive()
+            tailrec suspend fun recursiveDownload(folderId: Int, isFirstPage: Boolean, sequenceHadUnresolved: Boolean) {
+                executingJob.ensureActive()
 
                 val folderFilesProviderResult = FolderFilesProvider.getFiles(
                     FolderFilesProvider.FolderFilesProviderArgs(
@@ -138,13 +144,19 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                         sourceRestrictionType = sourceRestrictionType,
                         userDrive = requestScope,
                     ),
-                    // THE EXECUTING JOB'S CALLBACK (issue: round 23 #19): the ordinary
-                    // listing previously omitted the cancellation callback entirely — the
-                    // provider's post-HTTP and post-locks checks ran an EMPTY default. The
-                    // liveData block's job rides getFilesJob, so every save re-checks the
-                    // executing job, including inside the coordinated commit section.
-                    checkCancelled = { getFilesJob.ensureActive() },
+                    // THE EXECUTING JOB'S CALLBACK (issue: round 23 #19, round 24 #18):
+                    // the ordinary listing previously omitted the cancellation callback
+                    // entirely, and the mutable-field read let a replaced job's callback
+                    // check the WRONG job. The CAPTURED job rides every save, including
+                    // inside the coordinated commit section.
+                    checkCancelled = { executingJob.ensureActive() },
                 )
+                // CROSS-PAGE UNRESOLVED ACCUMULATION (issue: round 24 #17): the flag rides
+                // the whole listing sequence — a successful FINAL page must not erase the
+                // durable incompleteness an earlier page's unresolved candidates
+                // established.
+                val sequenceUnresolved = sequenceHadUnresolved ||
+                    (folderFilesProviderResult?.unresolvedReconciliation == true)
 
                 when {
                     folderFilesProviderResult == null -> {
@@ -152,6 +164,11 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                         emit(null)
                     }
                     folderFilesProviderResult.isComplete -> {
+                        if (sequenceUnresolved) {
+                            FileController.updateFile(folderId, userDrive = requestScope) { folderRow ->
+                                folderRow.isComplete = false
+                            }
+                        }
                         emit(folderFilesProviderResult.toFolderFilesResult(isFirstPage, isNewSort, requestScope))
                         val parentFolder = folderFilesProviderResult.folder.id
                         val files = folderFilesProviderResult.folderFiles.count()
@@ -164,12 +181,12 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                             val files = folderFilesProviderResult.folderFiles.count()
                             SentryLog.i(TAG, "getFiles: Emit first page, parentFolder = $parentFolder, files = $files")
                         }
-                        recursiveDownload(folderId, isFirstPage = false)
+                        recursiveDownload(folderId, isFirstPage = false, sequenceHadUnresolved = sequenceUnresolved)
                     }
                 }
             }
             runCatching {
-                recursiveDownload(folderId, isFirstPage = true)
+                recursiveDownload(folderId, isFirstPage = true, sequenceHadUnresolved = false)
             }.cancellable().onFailure { t ->
                 SentryLog.e(TAG, "recursiveDownload failed", t)
             }.getOrNull()

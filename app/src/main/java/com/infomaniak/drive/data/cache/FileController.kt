@@ -74,8 +74,8 @@ object FileController {
     /** Ancestry resolutions per gallery pass (issue: round 19 #27) — bounded, retried next refresh. */
     private const val GALLERY_ANCESTRY_RESOLUTION_BUDGET = 4
 
-    /** Parent hops inspected by one resolved-ancestry validation (issue: round 23 #15) — bounds pathological chains/cycles. */
-    private const val ANCESTRY_VALIDATION_DEPTH_BUDGET = 32
+    /** Parent hops inspected by one resolved-ancestry validation (issue: round 23 #15) — bounds pathological chains/cycles; exhaustion is unresolved (round 24 #15). Shared with the ancestry resolver's climb bound. */
+    internal const val ANCESTRY_VALIDATION_DEPTH_BUDGET = 32
 
     /**
      * Fair rotating start offset for the gallery ancestry work set (issue: round 22 #16): each
@@ -1211,7 +1211,6 @@ object FileController {
         observed: File? = null,
         requireResolvedParent: Boolean = true,
     ): Boolean {
-        val previousParentId = getFileById(realm, newFile.id)?.parentId?.takeIf { it != newFile.parentId }
         var accepted = false
         realm.executeTransaction {
             val live = getFileById(realm, newFile.id)
@@ -1226,6 +1225,12 @@ object FileController {
             if (requireResolvedParent && newFile.parentId > 0 && !usableAncestryChain(realm, newFile.parentId)) {
                 return@executeTransaction
             }
+            // TRANSACTION-FRESH PREVIOUS MEMBERSHIP (issue: round 24 #16): the previous
+            // parent id is read from the SAME transaction-fresh live row the acceptance
+            // validated — the pre-transaction read used state that could be stale after
+            // the coordination wait, so backlink removal could act on a move that never
+            // committed (or miss one that did).
+            val previousParentId = live?.parentId?.takeIf { it != newFile.parentId }
             if (live?.isUsable() == true) newFile.keepOldLocalFilesData(live)
             it.insertOrUpdate(newFile)
             // AUTHORITATIVE MEMBERSHIP (issue: round 21 #18), same coordinated operation:
@@ -1262,14 +1267,20 @@ object FileController {
 
     /**
      * The COMPLETE usable ancestry check for resolved-parent acceptance (issue: round 23
-     * #15): climbs parent ids from [startParentId] to the usable boundary — a zero parent
-     * or the depth budget — and requires EVERY hop to be a cached row. Bounded against
-     * pathological chains; a budget exhaustion with all rows present is a usable chain.
+     * #15): climbs parent ids from [startParentId] to the usable boundary — a zero parent —
+     * and requires EVERY hop to be a cached row. BUDGET EXHAUSTION AND CYCLES ARE
+     * UNRESOLVED, NOT USABLE (issue: round 24 #15): the previous loop returned true after
+     * the depth budget even when another missing ancestor or a cycle remained above; a
+     * chain that does not reach its zero-parent boundary within the budget — or revisits a
+     * row — defers the acceptance instead.
      */
-    private fun usableAncestryChain(realm: Realm, startParentId: Int): Boolean {
+    internal fun usableAncestryChain(realm: Realm, startParentId: Int): Boolean {
         var parentId = startParentId
+        val visited = mutableSetOf<Int>()
         var depth = 0
-        while (parentId > 0 && depth++ < ANCESTRY_VALIDATION_DEPTH_BUDGET) {
+        while (parentId > 0) {
+            if (depth++ >= ANCESTRY_VALIDATION_DEPTH_BUDGET) return false
+            if (!visited.add(parentId)) return false
             parentId = getFileById(realm, parentId)?.parentId ?: return false
         }
         return true
