@@ -3392,16 +3392,49 @@ class DownloadOfflineFileManager(
                                                     disposeRecoveryRecord(recordFile)
                                                 } else false
                                             }
-                                            !currentOwnerHolds(
-                                                context, scope, proofFileId, target,
-                                                sharedWithMe = moveScopeShared,
-                                                storageKind = moveScopeKind,
-                                            ) ->
-                                                // The path's ownership moved since the record was
-                                                // written: the retained proof is never written over
-                                                // another owner's state (issue: round 25 #4).
-                                                false
-                                            else -> runCatching {
+                                            else -> {
+                                                // OWNER RESOLUTION WITH THE RECORDED OLD IDENTITY
+                                                // (review-33 #3): the direct relocation's interrupted
+                                                // post-rename state has the bytes AND the prepared
+                                                // proof at the destination while the live ROW still
+                                                // resolves to the recorded source — the metadata change
+                                                // is exactly what this operation's own exclusion
+                                                // prevents. Requiring the destination owner there
+                                                // deadlocked the operation forever; the recorded old
+                                                // identity authorizes the CONDITIONAL MOVE-COMPLETION.
+                                                val ownerAtTarget = currentOwnerHolds(
+                                                    context, scope, proofFileId, target,
+                                                    sharedWithMe = moveScopeShared,
+                                                    storageKind = moveScopeKind,
+                                                )
+                                                var completionViaSource: IOFile? = null
+                                                val ownerResolved = ownerAtTarget || run {
+                                                    val recordedSource = parsed.recordedSourcePath
+                                                    if (recordedSource == null) {
+                                                        false
+                                                    } else {
+                                                        val sourceFile = IOFile(recordedSource)
+                                                        // FRESH OWNERSHIP CHECKS (review-33 #3): the live
+                                                        // row must STILL exclusively resolve to the recorded
+                                                        // source, and the source path must be VACATED (the
+                                                        // rename happened; nothing else was placed there).
+                                                        val sourceAbsent = !sourceFile.exists()
+                                                        sourceAbsent && currentOwnerHolds(
+                                                            context, scope, proofFileId, sourceFile,
+                                                            sharedWithMe = moveScopeShared,
+                                                            storageKind = moveScopeKind,
+                                                        ).also { holds -> if (holds) completionViaSource = sourceFile }
+                                                    }
+                                                }
+                                                when {
+                                                    !ownerResolved ->
+                                                        // The path's ownership moved since the record was
+                                                        // written: the retained proof is never written over
+                                                        // another owner's state (issue: round 25 #4) — and
+                                                        // neither the destination nor the recorded source
+                                                        // authorizes the completion.
+                                                        false
+                                                    else -> runCatching {
                                                 // THE EXPECTED PUBLICATION IDENTITY (issue: round
                                                 // 26 #4): a target that already carries a
                                                 // self-certifying proof with a DIFFERENT
@@ -3413,8 +3446,11 @@ class DownloadOfflineFileManager(
                                                 // an absent target proof) is the recovery of the
                                                 // operation's own state and may be written.
                                                 val currentProof = readPublishedProvenance(context, target)
+                                                // THE OPERATION'S OWN IDENTITY (review-33 #9): parsed
+                                                // from the retained proof text through the shared
+                                                // decoder's payload.
                                                 val retainedPublicationId =
-                                                    proofFields.getOrNull(8)?.trim()?.toLongOrNull() ?: 0L
+                                                    publicationIdOfRecordText(parsed.proofText) ?: 0L
                                                 if (currentProof != null && currentProof.certifiesBytes(target) &&
                                                     currentProof.publicationId != retainedPublicationId
                                                 ) {
@@ -3449,9 +3485,25 @@ class DownloadOfflineFileManager(
                                                         retainedPublicationId,
                                                     )
                                                 }.getOrDefault(false)
-                                                if (proofEstablished && observationEstablished) disposeRecoveryRecord(recordFile)
+                                                if (proofEstablished && observationEstablished) {
+                                                    // THE RECORDED OLD IDENTITY'S DISPOSAL (review-33
+                                                    // #3): completing through the recorded source also
+                                                    // retires the vacated source's stranded proof and
+                                                    // observation — the source-side disposal the
+                                                    // interrupted process never reached. The live row's
+                                                    // later metadata advance is no longer excluded.
+                                                    completionViaSource?.let { vacatedSource ->
+                                                        runCatching {
+                                                            IOFile(provenanceFileFor(context, vacatedSource).path + ".obs").delete()
+                                                        }
+                                                        deletePublishedProvenance(context, vacatedSource)
+                                                    }
+                                                    disposeRecoveryRecord(recordFile)
+                                                }
                                                 proofEstablished && observationEstablished
                                             }.getOrDefault(false)
+                                                }
+                                            }
                                         }
                                     }
                                 }
