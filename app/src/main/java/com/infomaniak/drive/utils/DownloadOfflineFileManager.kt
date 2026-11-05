@@ -2793,11 +2793,14 @@ class DownloadOfflineFileManager(
                 var claimantId: Int? = null
                 var ambiguous = false
                 for (candidate in candidates) {
-                    // THE CAPTURED REALM FLAVOR RESOLVES THE PATH (review-36 #4): a shared
-                    // owner with a blank stored path was invisible to the ordinary-Realm
-                    // resolution and contributed no claim — the query read as Unclaimed over
-                    // a governed path.
+                    // THE CAPTURED REALM FLAVOR RESOLVES THE PATH (review-36 #4); AN UNRESOLVED
+                    // RELEVANT CANDIDATE FAILS THE QUERY (review-37 #5): a same-name row whose
+                    // physical claim cannot be resolved (temporarily incomplete ancestry) is
+                    // never silently skipped — the query previously read as Unclaimed over
+                    // unresolved ownership. Unclaimed requires every relevant claim to be
+                    // conclusively excluded.
                     val candidatePath = candidate.getOfflineFile(context, realmScope.userId, sharedWithMe = sharedWithMe)?.path
+                        ?: return@use DestinationOwnership.Failed
                     if (candidatePath == target.path) {
                         if (claimantId != null && claimantId != candidate.id) {
                             ambiguous = true
