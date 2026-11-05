@@ -26,6 +26,7 @@ import com.infomaniak.drive.data.models.StoredOfflineCopyState
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.ProofRelocationFlow
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
@@ -765,8 +766,12 @@ object OfflineFolderController {
                                         // THE PUBLISHED-SOURCE RELOCATION CONTRACT (review-33
                                         // #4): the source bytes have not moved yet — a
                                         // preparation failure preserves the source proof and
-                                        // disposes only the destination preparation.
-                                        flow = DownloadOfflineFileManager.ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION,
+                                        // disposes only the destination preparation. THE
+                                        // COMPANION-NESTED TYPE IS IMPORTED (review-33 compile
+                                        // repair): Kotlin resolves companion callables through
+                                        // the class name but not companion-nested TYPES — the
+                                        // same convention as Companion.PublicationOutcome.
+                                        flow = ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION,
                                         // THE RECORDED SOURCE IDENTITY (review-33 #3): the v2
                                         // relocation record carries the old location so the
                                         // sweep's conditional move-completion can validate the
