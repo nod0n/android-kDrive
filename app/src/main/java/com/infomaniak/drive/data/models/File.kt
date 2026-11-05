@@ -402,12 +402,23 @@ open class File(
         if (provenance?.contentHash == null && offlineFile.length() <= 0L && (size ?: 0L) > 0L) {
             return StoredOfflineCopyState.ABSENT_OR_STALE
         }
-        // COMPLETENESS BEFORE EVERY READABLE RETURN (issue: round 23 #8): the known-
-        // truncation gate previously sat after the unknown/mismatching-version and
-        // timestamp early returns — a truncated hashless copy with an unknown version
+        // COMPLETENESS BEFORE EVERY READABLE RETURN (issues: round 23 #8, round 24 #8):
+        // the known-truncation gate previously sat after the unknown/mismatching-version
+        // and timestamp early returns — a truncated hashless copy with an unknown version
         // still returned readable. A KNOWN-truncated copy is ABSENT regardless of which
         // later arm would have spoken; an unknown row size stays conservative-readable.
-        if (size != null && !isIntactFile(offlineFile)) return StoredOfflineCopyState.ABSENT_OR_STALE
+        // COMPLETENESS AGAINST THE COPY'S OWN GENERATION (issue: round 24 #8): a
+        // hash-CERTIFIED copy is complete for the generation it was published under —
+        // the record's content identity was computed over the full published bytes — so
+        // the CURRENT remote row's size is never a universal prerequisite for its
+        // readability: valid certified R1 bytes stay available as unverified retained
+        // content after metadata accepts a larger R2. The remote-size comparison still
+        // gates every UNCERTIFIED copy (the only size evidence available for it), and it
+        // still gates CURRENTNESS below.
+        val copyCertifiedForOwnGeneration = provenance?.contentHash != null && provenance.contentHash == currentHash
+        if (!copyCertifiedForOwnGeneration && size != null && !isIntactFile(offlineFile)) {
+            return StoredOfflineCopyState.ABSENT_OR_STALE
+        }
         // OWN-GENERATION coherence (issue: round 18 #14): the copy's usability is judged
         // against the generation it was published under — never against current remote
         // metadata alone, which a backward-dated newer revision changes without the bytes
