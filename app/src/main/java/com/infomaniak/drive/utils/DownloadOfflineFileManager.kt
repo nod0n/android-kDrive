@@ -1826,12 +1826,39 @@ class DownloadOfflineFileManager(
          * temporary file in the same directory and RENAMED into place — an interrupted
          * write can no longer leave a torn (undecodable) record at the operational path.
          */
+        /**
+         * THE CRASH-CONSISTENT RECORD WRITE (review-37 #9): the journal and proof protocol's
+         * records must be durably committed BEFORE dependent destructive effects (byte
+         * replacement, source-proof deletion, metadata commits) — atomic visibility alone
+         * lets a crash persist those effects without the recovery evidence needed to
+         * reconcile them. The temporary file's DATA is synchronized (FileDescriptor.sync(),
+         * the standard java.io API), the rename publishes atomically, and the DIRECTORY
+         * ENTRY is synchronized (android.system.Os.open with O_RDONLY + Os.fsync — the
+         * platform-supported directory-durability primitive) before the write reports
+         * success. Any failure reports false, so callers retain their authority.
+         */
         private fun atomicWriteText(target: IOFile, text: String): Boolean = runCatching {
             val temp = IOFile(target.parentFile, "${target.name}.${UUID.randomUUID()}.tmp")
-            temp.writeText(text)
+            java.io.FileOutputStream(temp).use { stream ->
+                stream.write(text.toByteArray())
+                stream.flush()
+                stream.fd.sync()
+            }
             if (!temp.renameTo(target)) {
                 runCatching { temp.delete() }
                 return@runCatching false
+            }
+            // THE DIRECTORY ENTRY IS DURABLE (review-37 #9): the rename's persistence is
+            // established by synchronizing the containing directory.
+            val directoryFd = android.system.Os.open(
+                target.parentFile?.absolutePath ?: return@runCatching false,
+                android.system.OsConstants.O_RDONLY,
+                0,
+            )
+            try {
+                android.system.Os.fsync(directoryFd)
+            } finally {
+                android.system.Os.close(directoryFd)
             }
             true
         }.getOrDefault(false)
