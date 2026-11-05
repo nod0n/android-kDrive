@@ -248,8 +248,11 @@ internal suspend fun downloadFile(
     // inside the lifetime that retains and interrupts the transfer — a cancellation while
     // the copy is blocked in a read reaches the transfer, and the response closes on
     // every path (the previous header-only await left the call unowned during the body
-    // read).
-    DownloadOfflineFileManager.withDownloadResponse(
+    // read). The ACTUAL outcome is returned explicitly: the previous shape returned
+    // non-locally from inside a use lambda, and the lifetime call as a bare tail
+    // expression is not accepted as this function's return path — the result is
+    // forwarded exactly, never defaulted, and every deferred/failed outcome survives.
+    return DownloadOfflineFileManager.withDownloadResponse(
         fileUrl = downloadUrl,
         okHttpClient = okHttpClient,
         downloadInterceptor = downloadProgressInterceptor,
