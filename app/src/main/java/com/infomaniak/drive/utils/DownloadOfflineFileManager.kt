@@ -1640,7 +1640,23 @@ class DownloadOfflineFileManager(
                     absolutePath = target.absolutePath,
                 )
                 recordFile.writeText(provenance.recordText(target))
-                readPublishedProvenance(context, target) != null
+                if (readPublishedProvenance(context, target) == null) return@runCatching false
+                // RETIRE THE PREVIOUS PUBLICATION'S OBSERVATION (review-33 #8): the new
+                // verified-uploaded proof carries a NEW publication id, and the id-binding
+                // capture correctly rejects an observation belonging to a DIFFERENT
+                // publication — a stale observation of the REPLACED generation would
+                // otherwise block every later legitimate move of the reconciled file (a
+                // normal upload lifecycle, not a damaged-file scenario). A failed
+                // retirement fails this write (the caller defers and keeps the snapshot
+                // owned for the retry), so success never leaves the new proof bound to a
+                // dead attempt's evidence.
+                val previousObservation = IOFile(provenanceFileFor(context, target).path + ".obs")
+                if (previousObservation.exists() &&
+                    !runCatching { previousObservation.delete() }.getOrDefault(false)
+                ) {
+                    return@runCatching false
+                }
+                true
             }.getOrDefault(false)
         }
 
