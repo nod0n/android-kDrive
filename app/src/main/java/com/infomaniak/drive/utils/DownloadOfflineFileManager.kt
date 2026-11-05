@@ -4281,7 +4281,14 @@ class DownloadOfflineFileManager(
                 row.updatedAt == attemptedUpdatedAt &&
                 row.size == attemptedSize &&
                 (row.version?.number ?: 0) == attemptedVersion
-        }.getOrDefault(false)
+        }
+            // CANCELLATION IS NEVER A SUPPRESSION MISS (issue: round 30 #8): a cancelled
+            // caller (the SAF bridge job, a stopped worker, a cancelled dialog) must not
+            // read as "no covering publication" — the caller would then start a NEW
+            // blocking transfer the cancellation cannot reach. The exception is rethrown
+            // to the caller's own cancellation boundary.
+            .onFailure { if (it is CancellationException) throw it }
+            .getOrDefault(false)
 
         /**
          * The post-download details re-fetch (OUTSIDE every lock) that the worker's and the
@@ -4329,7 +4336,14 @@ class DownloadOfflineFileManager(
                         else -> GenerationEstablishment.FAILED
                     }
                 } ?: GenerationEstablishment.FAILED
-        }.getOrDefault(GenerationEstablishment.FAILED)
+        }
+            // CANCELLATION IS NEVER AN ESTABLISHMENT FAILURE (issue: round 30 #8): a
+            // cancelled caller must not read as "the generation could not be established"
+            // — the caller would treat its staged bytes as unresolved work (or discard
+            // them) instead of stopping. The exception is rethrown to the caller's own
+            // cancellation boundary.
+            .onFailure { if (it is CancellationException) throw it }
+            .getOrDefault(GenerationEstablishment.FAILED)
 
         internal suspend fun publishDownloadedCopy(
             context: Context,

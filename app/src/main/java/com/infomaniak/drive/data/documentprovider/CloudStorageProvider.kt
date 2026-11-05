@@ -964,6 +964,11 @@ class CloudStorageProvider : DocumentsProvider() {
                     return ParcelFileDescriptor.open(cacheFile, accessMode)
                 }
             }
+                // CANCELLATION IS NEVER A SUPPRESSION MISS (issue: round 30 #8): the
+                // bridge job's cancellation rethrown by the helper must not be consumed
+                // into "no covering publication" here — the operation stops instead of
+                // starting a fresh download the signal cannot reach.
+                .onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }
 
             // Download data file — THE CANCELLABLE REQUEST (issue: round 29 #10): the
             // previous blocking execute() ran to completion regardless of the signal; the

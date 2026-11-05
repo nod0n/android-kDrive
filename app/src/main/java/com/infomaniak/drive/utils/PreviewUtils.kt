@@ -234,7 +234,12 @@ internal suspend fun downloadFile(
                 userDrive = userDrive,
                 okHttpClient = okHttpClient,
             )
-        }.getOrDefault(false)
+        }
+            // CANCELLATION IS NEVER A SUPPRESSION MISS (issue: round 30 #8): a cancelled
+            // preview must not fall through into a fresh blocking download the
+            // cancellation cannot reach.
+            .onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
+            .getOrDefault(false)
         if (suppressed) return PublicationOutcome.SKIPPED_READABLE_DEFERRED
     }
 
