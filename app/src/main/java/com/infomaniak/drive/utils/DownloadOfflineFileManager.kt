@@ -593,6 +593,10 @@ class DownloadOfflineFileManager(
         val published = runCatching {
             publishStagedOfflineFile(context, file, offlineFile, staged)
         }.onFailure { exception ->
+            // CANCELLATION IS NEVER A FAILED PROMOTION (issue: round 31 #6): the
+            // enclosing catch must not consume the cancellation now rethrown by the
+            // publication's inner boundaries into an ordinary outcome.
+            if (exception is CancellationException) throw exception
             SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
         }.getOrDefault(PublicationOutcome.FAILED)
         // Cache promotion is a transfer path too: its superseded/conflict outcomes must reach
@@ -4187,6 +4191,10 @@ class DownloadOfflineFileManager(
                     },
                 )
             }.onFailure { exception ->
+                // CANCELLATION IS NEVER A FAILED PROMOTION (issue: round 31 #6): the UI
+                // promotion's enclosing catch must not consume the cancellation rethrown
+                // by the publication's boundaries.
+                if (exception is CancellationException) throw exception
                 SentryLog.e(TAG, "Cache promotion failed for ${offlineFile.path}", exception)
             }.getOrDefault(PublicationOutcome.FAILED)
 
@@ -4569,6 +4577,11 @@ class DownloadOfflineFileManager(
                 try {
                     val stagedComplete = runCatching { writeStaged(staged) }
                         .onFailure { exception ->
+                            // CANCELLATION IS NEVER A FAILED STAGING (issue: round 31 #6):
+                            // the plain-cache staging wrapper must not consume the
+                            // cancellation into stagedComplete=false; the enclosing finally
+                            // still cleans the staged bytes while the exception propagates.
+                            if (exception is CancellationException) throw exception
                             SentryLog.e(TAG, "Staged cache transfer failed for ${target.path}", exception)
                         }.isSuccess
                     if (!stagedComplete) {
@@ -4648,6 +4661,13 @@ class DownloadOfflineFileManager(
                             )
                         }
                     }.onFailure { exception ->
+                        // CANCELLATION IS NEVER A FAILED PUBLICATION (issue: round 31 #6):
+                        // the coordinated arm's enclosing catch must not consume the
+                        // cancellation rethrown by writeStaged, the client acquisition or
+                        // the generation establishment — the preview would otherwise
+                        // follow its ordinary error path instead of terminating as
+                        // cancelled. The finally still cleans the staged state.
+                        if (exception is CancellationException) throw exception
                         SentryLog.e(TAG, "Staged offline publication failed for ${target.path}", exception)
                     }.getOrDefault(PublicationOutcome.FAILED)
                 } finally {
