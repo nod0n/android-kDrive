@@ -165,6 +165,13 @@ class DownloadOfflineFileManager(
      */
     private var verificationBasis: File? = null
 
+    /** THE VERIFIED OLD-SOURCE HASH (issue: round 27 #3): the basis-location copy's
+     * content hash at the moment the verification comparison CONVERGED — the
+     * retirement revalidates the old path's bytes against exactly this value under
+     * its own locks, so an intervening edit in the release/reacquire gap is
+     * preserved, never deleted. Null when no basis copy was verified. */
+    private var verifiedBasisSourceHash: String? = null
+
     suspend fun execute(
         context: Context,
         file: File,
@@ -179,6 +186,7 @@ class DownloadOfflineFileManager(
         lastTransferGenerationUnresolved = false
         verificationMetadataDeferred = false
         verificationBasis = null
+        verifiedBasisSourceHash = null
 
         // CAPTURED CACHE PUBLICATION TOKEN (issue: round 22 #21): the pre-download cache
         // cleanup validates the cache's CURRENT self-certification, but a later writer can
@@ -739,6 +747,33 @@ class DownloadOfflineFileManager(
                 downloadWorker.workerTag(),
                 "Download of ${file.id} deferred: an explicitly unresolved publication already covers this generation and no new evidence exists",
             )
+            // THE DEFERRED VERIFICATION ADVANCE STILL PROGRESSES (issue: round 27 #4):
+            // suppression must not strand a converged verification whose CONDITIONAL
+            // METADATA ADVANCE was rejected on a tied-rename tie — the same generation the
+            // unresolved record captured is re-fetched here, and the conditional
+            // acceptance (against the LIVE row's own captured observation) runs WITHOUT
+            // any byte transfer, so the row can advance to the accepted rename and the
+            // publication's own retirement/revalidation path owns the old-location bytes.
+            runCatching {
+                val freshForAdvance = ApiRepository.getFileDetails(
+                    file = File(id = file.id, driveId = userDrive.driveId),
+                    okHttpClient = okHttpClient,
+                ).data?.takeIf { it.id == file.id } ?: return@runCatching
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                        FileController.getRealmInstance(userDrive).use { realm ->
+                            runCatching { realm.refresh() }
+                            val live = FileController.getFileById(realm, file.id) ?: return@withFileLock
+                            FileController.updateExistingFileIfNotOlder(
+                                newFile = freshForAdvance,
+                                realm = realm,
+                                userDrive = userDrive,
+                                observed = live,
+                            )
+                        }
+                    }
+                }
+            }
             return@withContext ListenableWorker.Result.failure()
         }
 
@@ -847,7 +882,14 @@ class DownloadOfflineFileManager(
                                     newFile = file,
                                     realm = realm,
                                     userDrive = userDrive,
-                                    observed = file,
+                                    // THE CAPTURED HISTORICAL OBSERVATION (issue: round
+                                    // 27 #4): the advancement was issued from the retained
+                                    // A basis — the previous observed = file (the fetched B
+                                    // identity) could never match a live A row with tied
+                                    // updatedAt, so a legitimate rename's advancement was
+                                    // rejected on every attempt (and the no-spin gate then
+                                    // kept the row at A indefinitely).
+                                    observed = verificationBasis ?: file,
                                 )
                                 // THE OLD PHYSICAL SOURCE IS RETIRED WITH THE ACCEPTED
                                 // IDENTITY (issue: round 25 #9): a converged verification
@@ -862,8 +904,26 @@ class DownloadOfflineFileManager(
                                 if (advanceAccepted && basisPath != null && basisPath != offlineFile.path) {
                                     val basisCopy = IOFile(basisPath)
                                     if (basisCopy.exists()) {
-                                        deletePublishedProvenance(context, basisCopy)
-                                        runCatching { basisCopy.delete() }
+                                        // THE SOURCE REVISION IS REVALIDATED UNDER THE
+                                        // RETIREMENT LOCKS (issue: round 27 #3): the
+                                        // publication released its coordination before this
+                                        // section — an editor could have written a NEWER
+                                        // revision to the old path in the gap. The bytes are
+                                        // retired ONLY when their hash still equals the hash
+                                        // the publication's comparison verified; a DIFFERENT
+                                        // or UNREADABLE revision is PRESERVED (never deleted —
+                                        // the intervening revision is not this operation's to
+                                        // discard).
+                                        val currentBasisHash = UploadFile.sha256OrNull(basisCopy)
+                                        if (currentBasisHash == null || currentBasisHash != verifiedBasisSourceHash) {
+                                            SentryLog.i(
+                                                TAG,
+                                                "Retained old-path revision for ${file.id}: an intervening revision was preserved",
+                                            )
+                                        } else {
+                                            deletePublishedProvenance(context, basisCopy)
+                                            runCatching { basisCopy.delete() }
+                                        }
                                     }
                                 }
                             }
@@ -2811,6 +2871,11 @@ class DownloadOfflineFileManager(
                                 else -> null
                             } ?: return@run true
                             if (stagedHash == null || comparisonHash != stagedHash) return@run true
+                            // THE VERIFIED OLD-SOURCE HASH (issue: round 27 #3): the
+                            // retirement revalidates the old path against exactly this
+                            // comparison-time hash; an intervening edit in the
+                            // release/reacquire gap is preserved, never deleted.
+                            verifiedBasisSourceHash = if (basisLocationCopy != null) comparisonHash else null
                             // THE NEW LOCATION NEVER RECEIVES A BARE OVERWRITE (issue: round
                             // 25 #9, same authority as the transfer): existing bytes at the
                             // target must equal the staged copy.
@@ -2932,6 +2997,31 @@ class DownloadOfflineFileManager(
                 // resolution; the durable intent is retained (no marker clear).
                 runCatching { staged.delete() }
                 return PublicationOutcome.SKIPPED_CONFLICT
+            } else if (verificationBasis != null) {
+                // THE OLD PHYSICAL SOURCE IS COMPARED INDEPENDENTLY OF DESTINATION
+                // EXISTENCE (issue: round 27 #2): the previous verification comparison
+                // existed only inside the target-exists block — with the renamed
+                // destination B absent locally, the publication skipped the comparison
+                // entirely, published the staged generation at B and let the metadata
+                // advance retire the CAPTURED BASIS's copy at A, deleting an uncompared
+                // historical/local revision. An ABSENT destination in verification mode
+                // still requires the basis comparison: differing OR unreadable old bytes
+                // are RETAINED (the durable intent stays) and no retirement is
+                // authorized.
+                val basisCopy = appContextForCheck?.let { ctx ->
+                    casBasis.getOfflineFile(ctx, userDrive.userId)
+                }?.takeIf { it.exists() && it.path != target.path }
+                val stagedHash = UploadFile.sha256OrNull(staged)
+                val basisHash = basisCopy?.let { UploadFile.sha256OrNull(it) }
+                if (basisCopy != null && (stagedHash == null || basisHash == null || basisHash != stagedHash)) {
+                    runCatching { staged.delete() }
+                    return PublicationOutcome.SKIPPED_PROTECTED
+                }
+                // A CONVERGED BASIS COMPARISON: the verified old-source hash rides to
+                // the retirement's revalidation (issue: round 27 #3).
+                verifiedBasisSourceHash = if (basisCopy != null) basisHash else null
+            } else {
+                verifiedBasisSourceHash = null
             }
 
             staged.setLastModified(file.getLastModifiedInMilliSecond())
