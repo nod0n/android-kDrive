@@ -84,7 +84,14 @@ class DownloadProgressViewModel : ViewModel() {
                 StoredOfflineCopyState.FOREIGN_CONFLICT -> Unit
                 StoredOfflineCopyState.ABSENT_OR_STALE -> Unit
             }
-        } else if (!file.isObsoleteOrNotIntact(outputFile)) {
+        } else if (!file.isObsoleteOrNotIntact(outputFile) &&
+            // THE CACHE FAST PATH REQUIRES THE SAME PROVENANCE OUTCOME AS THE
+            // PUBLICATION (issue: round 25 #21): a previous PUBLISHED_UNRESOLVED
+            // publication wrote a version-0 record — the bytes look intact, but the next
+            // dialog invocation must not turn that unresolved state into 100% without
+            // new evidence; the full generation-provenance classification decides.
+            DownloadOfflineFileManager.cacheBytesProvenCurrent(context, outputFile, file, userDrive)
+        ) {
             downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
             return@launch
         }
@@ -101,11 +108,28 @@ class DownloadProgressViewModel : ViewModel() {
                 UploadFile.sha256OrNull(outputFile) != null &&
                 (file.size == null || outputFile.length() == file.size)
             if ((file.isOffline || file.isInOfflineFolder) && retainedUsable &&
-                // THE SCOPED CLASSIFICATION IS NOT BYPASSED (issue: round 24 #6): a
-                // positively foreign provenance on this path is a conflict — preservation
-                // alone never completes the dialog over another identity's bytes.
-                file.storedOfflineCopyState(context, outputFile, userDrive) !=
-                StoredOfflineCopyState.FOREIGN_CONFLICT &&
+                // PRESERVATION IS NOT USABLE COMPLETION (issue: round 25 #8): KEEP_LOCAL
+                // also represents UNPROVEN_HISTORICAL — a same-size historical file whose
+                // timestamp fails its own baseline classifies ABSENT_OR_STALE, yet this
+                // arm previously reported 100. Completion requires the SHARED usable
+                // classification (proven current) or a POSITIVELY VERIFIED protected
+                // revision (exact durable upload ownership over the current bytes); a
+                // recovery exclusion or a preservation decision alone retains the intent
+                // and the transfer defers through the coordinated publication.
+                (file.storedOfflineCopyState(context, outputFile, userDrive) ==
+                    StoredOfflineCopyState.PROVEN_CURRENT ||
+                    (UploadFile.sha256OrNull(outputFile)?.let { currentHash ->
+                        UploadFile.hasDurableOriginalRevisionOwnership(
+                            fileName = file.name,
+                            remoteFolder = file.parentId,
+                            driveId = userDrive.driveId,
+                            userId = userDrive.userId,
+                            fileModifiedAt = Date(outputFile.lastModified()),
+                            fileSize = outputFile.length(),
+                            contentHash = currentHash,
+                            originalFileId = file.id,
+                        )
+                    } == true)) &&
                 OfflineFolderController.decisionForReplacingOwnedCopy(file, outputFile, userDrive) ==
                 OfflineFolderController.OwnedCopyReplacementDecision.KEEP_LOCAL
             ) {

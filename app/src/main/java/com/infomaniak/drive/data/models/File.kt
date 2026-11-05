@@ -150,6 +150,14 @@ open class File(
     var isComplete: Boolean = false,
     var isFromUploads: Boolean = false,
     var isMarkedAsOffline: Boolean = false,
+    /**
+     * THE DURABLE INTENT STAMP (issue: round 25 #10): bumped by every pending-marker
+     * transition in [com.infomaniak.drive.data.cache.FileController.markFileAsOffline] — an
+     * unmark/repin sequence can never reproduce a captured observation's stamp, so the
+     * destructive absence predicates detect marker ABA without a Boolean flag's
+     * blindness. Persisted (schema File DB 16, default 0 = pre-stamp rows).
+     */
+    var offlineIntentStamp: Long = 0,
     var isOffline: Boolean = false,
 
     /**
@@ -533,12 +541,25 @@ open class File(
      */
     fun deleteCaches(context: Context, userId: Int = AccountUtils.currentUserId): Boolean {
         if (isOffline || isInOfflineFolder) {
-            val offlineFile = getOfflineFile(context, userId) ?: return true
+            val offlineFile = getOfflineFile(context, userId) ?: run {
+                // THE RECOVERY CHECK DOES NOT NEED THE TARGET (issue: round 25 #7): an
+                // unresolvable path with an unresolved recovery governing this IDENTITY
+                // retains the owning row — the previous order returned true for a null
+                // path and let the row (the retained bytes' required metadata) be deleted.
+                return !DownloadOfflineFileManager.hasUnresolvedRecovery(
+                    context,
+                    UserDrive(userId, driveId),
+                    id,
+                    null,
+                )
+            }
             // Never drop the bytes backing a pending upload when the cache row goes away
             // (issue #1902); the upload still reads from this file.
-            // DELETION-BOUNDARY RECOVERY EXCLUSION (issue: round 23 #3): bytes governed
-            // by an unresolved durable recovery are recovery-managed state — deleting
-            // them destroys the recovery's subject. The re-read fails closed.
+            // DELETION-BOUNDARY RECOVERY EXCLUSION (issues: round 23 #3, round 25 #7):
+            // bytes governed by an unresolved durable recovery are recovery-managed
+            // state — deleting them destroys the recovery's subject. The check runs by
+            // identity AND path and fails closed; a MISSING target with a governing
+            // recovery retains the row too.
             if (offlineFile.exists() && (UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) ||
                     DownloadOfflineFileManager.hasUnresolvedRecovery(
                         context,
@@ -555,15 +576,28 @@ open class File(
                 // #12): every byte-deletion path clears matching provenance — an orphaned
                 // record must never lend its generation to bytes later published here.
                 DownloadOfflineFileManager.deletePublishedProvenance(context, offlineFile)
-                offlineFile.delete()
+                // A FAILED DELETION IS NOT A DISPOSAL (issue: round 25 #7): the caller
+                // retains the row when the bytes could not actually be removed.
+                if (!offlineFile.delete()) return false
             }
             return true
         } else {
-            getCacheFile(context).apply {
-                if (exists()) {
-                    DownloadOfflineFileManager.deletePublishedProvenance(context, this)
-                    delete()
+            val cacheFile = getCacheFile(context)
+            if (cacheFile.exists()) {
+                // THE PLAIN-CACHE BRANCH CARRIES THE SAME EXCLUSION (issue: round 25 #7):
+                // plain-cache publications write durable recovery records for their
+                // rollback backups — an unresolved one keeps this cache out of deletion.
+                if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                        context,
+                        UserDrive(userId, driveId),
+                        id,
+                        cacheFile.absolutePath,
+                    )
+                ) {
+                    return false
                 }
+                DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
+                if (!cacheFile.delete()) return false
             }
             return true
         }

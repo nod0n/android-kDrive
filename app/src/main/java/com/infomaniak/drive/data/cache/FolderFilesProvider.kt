@@ -229,6 +229,11 @@ object FolderFilesProvider {
             // the executing context again INSIDE saveRemoteFiles, after the complete
             // coordination set is held, immediately before the boundary/transaction.
             checkCancelled = checkCancelled,
+            // THE SEQUENCE'S UNRESOLVED STATE RIDES THE FINAL-PAGE TRANSACTION (issue:
+            // round 25 #17): earlier pages' deferred candidates make this page's durable
+            // completeness false in the SAME transaction that commits it — never a
+            // post-hoc downgrade a crash can outrun.
+            sequenceHadUnresolved = accumulatedDeferredIds.isNotEmpty(),
         )
 
         when {
@@ -442,6 +447,7 @@ object FolderFilesProvider {
             folderFilesProviderArgs = folderFilesProviderArgs,
             okHttpClient = currentOkHttpClient,
             checkCancelled = checkCancelled,
+            sequenceHadUnresolved = sequenceHadUnresolved,
         )
 
         transaction(folderFilesProviderResult?.folderFiles ?: arrayListOf())
@@ -466,6 +472,12 @@ object FolderFilesProvider {
                 sequenceHadUnresolved = sequenceUnresolved,
             )
         } else if (folderFilesProviderResult != null && sequenceUnresolved) {
+            // POST-SEQUENCE DOWNGRADE (issue: round 22 #17) — retained alongside the
+            // in-transaction flag (issue: round 25 #17): the transaction already wrote
+            // the unresolved completeness for carried state and this page's own
+            // substitutions; this write covers an edge the transaction could not see
+            // (this page resolved clean but the resolver's post-save pass left
+            // candidates unresolved). Idempotent over the same value.
             FileController.updateFile(folderId, realm) { folderRow -> folderRow.isComplete = false }
         }
     }
@@ -545,6 +557,7 @@ object FolderFilesProvider {
         folderFilesProviderArgs: FolderFilesProviderArgs,
         okHttpClient: OkHttpClient,
         checkCancelled: () -> Unit = {},
+        sequenceHadUnresolved: Boolean = false,
     ): FolderFilesProviderResult? = with(Dispatchers.IO) {
         val userDrive = folderFilesProviderArgs.userDrive
 
@@ -589,6 +602,7 @@ object FolderFilesProvider {
             okHttpClient = okHttpClient,
             observedById = observedById,
             checkCancelled = checkCancelled,
+            sequenceHadUnresolved = sequenceHadUnresolved,
         )
     }
 
@@ -600,6 +614,7 @@ object FolderFilesProvider {
         okHttpClient: OkHttpClient = DefaultHttpClientProvider.okHttpClient,
         observedById: Map<Int, File> = emptyMap(),
         checkCancelled: () -> Unit = {},
+        sequenceHadUnresolved: Boolean = false,
     ): FolderFilesProviderResult? {
         val userDrive = folderFilesProviderArgs.userDrive
         val apiResponseData = apiResponse.data
@@ -626,7 +641,12 @@ object FolderFilesProvider {
                     observedById = observedById,
                     // POST-LOCKS CHECK (issue: round 23 #19): the ordinary/SAF route's
                     // executing-context callback reaches the save's coordinated section.
-                    checkCancelled = checkCancelled
+                    checkCancelled = checkCancelled,
+                    // THE SEQUENCE'S UNRESOLVED STATE RIDES THE FINAL-PAGE TRANSACTION
+                    // (issue: round 25 #17): earlier pages' unresolved reconciliation
+                    // makes this page's durable completeness false in the SAME
+                    // transaction that commits it.
+                    sequenceHadUnresolved = sequenceHadUnresolved,
                 )
                 // ORDINARY/SAF LISTING RESOLUTION (issue: round 21 #17): the shared route's
                 // budgeted resolver previously never ran for the ordinary and SAF paths —
@@ -1025,6 +1045,10 @@ object FolderFilesProvider {
                     okHttpClient = okHttpClient,
                 )
             }.getOrNull()
+            // THE EXECUTING CONTEXT AFTER THE RESPONSE (issue: round 25 #18): a cancelled
+            // caller stops BEFORE any coordinated effect, with only the stateless probe
+            // discarded — no row, cursor or byte effect has run.
+            checkCancelled()
             val details = probe?.data?.takeIf { it.id == fileId }
             return when {
                 details != null -> {
@@ -1063,6 +1087,10 @@ object FolderFilesProvider {
                     }.distinct()
                     synchronized(OfflineFileCoordination.rootIntentMonitor) {
                         OfflineFileCoordination.withLocksFor(userDrive, coordinatedIds) {
+                            // POST-LOCK-WAIT CHECK IN THE CHILD'S OWN SECTION (issue: round
+                            // 25 #18): a cancelled caller never runs the boundary or the
+                            // coordinated upsert after waiting on the lock set.
+                            checkCancelled()
                             val committable = OfflineFolderController.reconcileOwnedCopiesBeforeCommit(
                                 realm = realm,
                                 remoteFiles = listOf(details),
@@ -1142,12 +1170,16 @@ object FolderFilesProvider {
         userDrive: UserDrive,
         checkCancelled: () -> Unit = {},
     ) {
-        val fetchedAncestors = ArrayDeque<File>()
+        val fetchedAncestors = ArrayDeque<Pair<File, File?>>() // ancestor to its PRE-REQUEST observation
+        val climbedIds = mutableSetOf<Int>() // CYCLE CHECK (issue: round 25 #15)
         var cursorRow: File = fetchedFile
         var fetchBudget = MISSING_ANCESTRY_RESOLUTION_BUDGET
         var walkedHops = 0
         while (walkedHops++ < FileController.ANCESTRY_VALIDATION_DEPTH_BUDGET) {
             val parentId = cursorRow.parentId.takeIf { it > 0 } ?: break
+            // CYCLE CHECK (issue: round 25 #15): a repeated id is a corrupted cycle —
+            // the climb defers instead of circling to the walk bound.
+            if (!climbedIds.add(parentId)) break
             val cached = FileController.getFileById(realm, parentId)
             if (cached != null) {
                 // A CACHED BOUNDARY ONLY WHEN ITS OWN CHAIN IS COMPLETE (issue: round 24
@@ -1159,6 +1191,15 @@ object FolderFilesProvider {
             }
             if (fetchBudget-- <= 0) break
             checkCancelled()
+            // EXPLICIT ABSENCE/IDENTITY CAPTURED IMMEDIATELY BEFORE THE REQUEST AND
+            // CARRIED WITH THE RESPONSE (issue: round 25 #14): the observation each
+            // ancestor's commit is validated against is the state its OWN request was
+            // issued from — an absent row is a documented absence, an existing row its
+            // depth-one identity. The previous capture ran in the commit loop, AFTER
+            // every ancestor HTTP had completed, so a row another request inserted
+            // during the climb was mistaken for the state the request was issued from.
+            val preRequestObservation = FileController.getFileById(realm, parentId)
+                ?.let { row -> realm.copyFromRealm(row, 1) }
             val parent = runCatching {
                 ApiRepository.getFileDetails(
                     file = File(
@@ -1169,16 +1210,10 @@ object FolderFilesProvider {
                 )
             }.getOrNull()?.data?.takeIf { it.id == parentId } ?: break // indeterminate: defer as before
             checkCancelled()
-            fetchedAncestors.addFirst(parent) // top-down commit order
+            fetchedAncestors.addFirst(parent to preRequestObservation) // top-down commit order
             cursorRow = parent
         }
-        for (ancestor in fetchedAncestors) {
-            // EXPLICIT ABSENCE/IDENTITY CAPTURED BEFORE THE REQUEST (issue: round 24 #16):
-            // the observation each ancestor's commit is validated against is the state the
-            // request was issued from — an absent row is a documented absence, an existing
-            // row its depth-one identity.
-            val preRequestObservation = FileController.getFileById(realm, ancestor.id)
-                ?.let { row -> realm.copyFromRealm(row, 1) }
+        for ((ancestor, preRequestObservation) in fetchedAncestors) {
             checkCancelled()
             val committed = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withLocksFor(

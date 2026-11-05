@@ -74,8 +74,17 @@ object FileController {
     /** Ancestry resolutions per gallery pass (issue: round 19 #27) — bounded, retried next refresh. */
     private const val GALLERY_ANCESTRY_RESOLUTION_BUDGET = 4
 
-    /** Parent hops inspected by one resolved-ancestry validation (issue: round 23 #15) — bounds pathological chains/cycles; exhaustion is unresolved (round 24 #15). Shared with the ancestry resolver's climb bound. */
-    internal const val ANCESTRY_VALIDATION_DEPTH_BUDGET = 32
+    /**
+     * Parent hops inspected by one resolved-ancestry validation (issue: round 23 #15) and by
+     * the ancestry resolver's cached climb (issue: round 25 #15) — bounds pathological
+     * chains/cycles; exhaustion is unresolved (round 24 #15). 512, not 32: a COMPLETE CACHED
+     * ancestry is validated ITERATIVELY for its full depth (a 32-hop bound previously
+     * declared deep cached chains unresolved forever), while the NETWORK fetch budget stays
+     * separately bounded ([FolderFilesProvider.MISSING_ANCESTRY_RESOLUTION_BUDGET]) — cached
+     * hops cost no request, so the walk bound protects only against cycles (visited-set
+     * detected) and runaway graphs, not against request volume.
+     */
+    internal const val ANCESTRY_VALIDATION_DEPTH_BUDGET = 512
 
     /**
      * Fair rotating start offset for the gallery ancestry work set (issue: round 22 #16): each
@@ -392,6 +401,11 @@ object FileController {
         val block: (Realm) -> Unit? = { realm ->
             realm.executeTransaction {
                 markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin = false)
+                // THE DURABLE INTENT STAMP (issue: round 25 #10): EVERY marker transition
+                // bumps a per-row generation, so an unmark/repin sequence (ABA) never
+                // reproduces the request-time observation's stamp — the destructive
+                // absence predicates compare it against the captured row's.
+                getFileById(realm, fileId)?.let { file -> file.offlineIntentStamp = System.currentTimeMillis() }
             }
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
@@ -698,7 +712,7 @@ object FileController {
         }
     }
 
-    tailrec fun deleteFileAndChildrenRec(
+    fun deleteFileAndChildrenRec(
         filesToDelete: MutableList<File>,
         realm: Realm? = null,
         userDrive: UserDrive? = null,
@@ -706,19 +720,43 @@ object FileController {
     ) {
         if (filesToDelete.isEmpty()) return
 
-        val file = filesToDelete.removeAt(0)
-        val children = getFileByUidOrId(file.id, userDrive)?.children ?: emptyList()
-
-        filesToDelete.addAll(children)
-        // DEFERRED REMOVAL OUTCOME (issue: round 24 #4), as in removeFile: when the byte
-        // deletion retained the bytes (pending upload, unresolved recovery), the owning
-        // row is retained too — its metadata is what reconciles the retained bytes later.
-        val bytesDisposed = file.deleteCaches(context)
-        if (bytesDisposed) {
-            updateFile(file.id, realm, userDrive) { localFile -> localFile.deleteFromRealm() }
+        // TWO-PHASE REMOVAL (issue: round 25 #7): the previous single pass deleted a
+        // PARENT row before discovering that a descendant had to be retained — the
+        // retained descendant then lost the required ownership metadata and ancestry
+        // above it. Phase one flattens the graph breadth-first; phase two processes
+        // DEEPEST-FIRST so every parent's decision sees its descendants' actual outcomes.
+        val ordered = mutableListOf<File>()
+        val seenIds = mutableSetOf<Int>()
+        val childrenIdsById = mutableMapOf<Int, List<Int>>()
+        val capturedUserId = userDrive?.userId ?: AccountUtils.currentUserId
+        val pending = ArrayDeque(filesToDelete)
+        filesToDelete.clear()
+        while (pending.isNotEmpty()) {
+            val file = pending.removeFirst()
+            if (!seenIds.add(file.id)) continue
+            ordered.add(file)
+            val children = getFileByUidOrId(file.id, userDrive)?.children ?: emptyList()
+            childrenIdsById[file.id] = children.map { it.id }
+            children.forEach { pending.add(it) }
         }
-
-        deleteFileAndChildrenRec(filesToDelete, realm, userDrive, context)
+        val retainedIds = mutableSetOf<Int>()
+        for (file in ordered.reversed()) {
+            // DEFERRED REMOVAL OUTCOME (issue: round 24 #4), as in removeFile: when the
+            // byte deletion RETAINED the bytes (pending upload, unresolved recovery), the
+            // owning row is retained too. THE CAPTURED SCOPE rides the recursive
+            // deletion (issue: round 25 #7) — never the default active account.
+            val bytesDisposed = file.deleteCaches(context, capturedUserId)
+            // A REQUIRED ANCESTOR (issue: round 25 #7): a parent whose subtree retained
+            // anything keeps its row and metadata — deleting the row over a retained
+            // descendant strands the descendant's ownership.
+            val subtreeRetains = !bytesDisposed ||
+                (childrenIdsById[file.id]?.any { it in retainedIds } == true)
+            if (subtreeRetains) {
+                retainedIds.add(file.id)
+            } else {
+                updateFile(file.id, realm, userDrive) { localFile -> localFile.deleteFromRealm() }
+            }
+        }
     }
 
     fun deleteFile(
@@ -2204,6 +2242,7 @@ object FileController {
         userDrive: UserDrive,
         observedById: Map<Int, File> = emptyMap(),
         checkCancelled: () -> Unit = {},
+        sequenceHadUnresolved: Boolean = false,
     ): ListingCommitOutcomes {
         val remoteFiles = apiResponse.data ?: return ListingCommitOutcomes(emptySet(), emptySet())
 
@@ -2338,7 +2377,19 @@ object FileController {
                     // Add children
                     folderProxy.children.addAll(acceptedChildren)
                     // Update folder properties
-                    folderProxy.isComplete = isCompleteFolder
+                    // SEQUENCE-UNRESOLVED COMPLETENESS IN THE SAME TRANSACTION (issue:
+                    // round 25 #17): the durable completeness must never be written
+                    // true over unresolved work — the previous final page committed
+                    // isComplete = true and only a LATER separate write downgraded it
+                    // after the resolution pass, so a crash in between left the folder
+                    // durably complete with unresolved candidates. This transaction
+                    // folds in the sequence's carried unresolved state AND this page's
+                    // own boundary substitutions (a deferred OR superseded entry —
+                    // judged precisely after the transaction — conservatively keeps the
+                    // folder incomplete; a later fully resolving pass re-persists the
+                    // pagination completeness through saveRemoteFiles).
+                    folderProxy.isComplete = isCompleteFolder && !sequenceHadUnresolved &&
+                        substitutedOrDroppedIds.isEmpty()
                     folderProxy.responseAt = apiResponse.responseAt
                     folderProxy.cursor = apiResponse.cursor
                     folderProxy.versionCode = BuildConfig.VERSION_CODE

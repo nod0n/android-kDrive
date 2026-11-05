@@ -470,6 +470,21 @@ class FileMigration : RealmMigration {
 
             oldVersionTemp++
         }
+
+        // Migrated to version 16 (issue: round 25 #10):
+        // - Added `File.offlineIntentStamp` — the DURABLE INTENT STAMP bumped by every
+        //   pending-marker transition, so an unmark/repin (ABA) sequence never reproduces a
+        //   captured observation's stamp in the destructive absence predicates. GUARDED
+        //   addField with a zero DEFAULT: existing rows keep the pre-stamp semantics (a
+        //   zero stamp only ever matches another zero), no backfill needed.
+        if (oldVersionTemp == 15L) {
+            schema[File::class.java.simpleName]?.apply {
+                if (!hasField(File::offlineIntentStamp.name)) {
+                    addField(File::offlineIntentStamp.name, Long::class.java, FieldAttribute.DEFAULT_VALUE(0L))
+                }
+            }
+            oldVersionTemp++
+        }
     }
 
     override fun equals(other: Any?): Boolean {
@@ -497,7 +512,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 15L // Must be bumped when the schema changes
+        const val DB_VERSION = 16L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }

@@ -1296,6 +1296,22 @@ object OfflineFolderController {
                     return@withFileLock
                 }
 
+                // DURABLE RECOVERY EXCLUSION AT THE COVERAGE BOUNDARY (issue: round 25 #7):
+                // an unresolved recovery governing this row or its path — including the
+                // MISSING-target clearing arm below and the classified-clean byte deletion
+                // after the flags clear — keeps the intent and the bytes out of this
+                // cleanup; the sweep owns their resolution. The check runs before both.
+                if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                        context,
+                        userDrive,
+                        liveRow.id,
+                        offlineFile.absolutePath,
+                    )
+                ) {
+                    result.keptOfflineFilesCount++
+                    return@withFileLock
+                }
+
                 if (!offlineFile.exists()) {
                     var cleared = false
                     realm.executeTransaction {

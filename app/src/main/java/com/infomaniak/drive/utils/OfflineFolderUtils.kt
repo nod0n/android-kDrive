@@ -151,20 +151,19 @@ object OfflineFolderUtils {
             // a new publication, a restoration, or a re-pin since the request changes the
             // current token, and the old absence authority no longer clears the candidate.
             val subtreeRecordTokensById = run {
-                val tokens = HashMap<Int, OfflineFolderUtils.AbsentChildPublicationToken>()
+                // NULLABLE VALUES (issue: round 25 #11): a ZERO token is an explicit
+                // NO-RECORD capture; NULL is a capture-time READ FAILURE — the destructive
+                // predicates treat null as never-matching (defer), so absence and failure
+                // are distinguished on both sides.
+                val tokens = HashMap<Int, OfflineFolderUtils.AbsentChildPublicationToken?>()
                 subtreeObservedById.values.forEach { observed ->
                     if (!observed.isFolder()) {
                         // The provenance registry is keyed by the SCOPED java.io.File (issue:
                         // round 24 #1): the model row is resolved to its own offline path under
                         // the walk's captured scope before the record is read — never the
-                        // active account.
-                        val record = observed.getOfflineFile(context, userDrive.userId)
-                            ?.let { DownloadOfflineFileManager.readPublishedProvenance(context, it) }
-                        tokens[observed.id] = OfflineFolderUtils.AbsentChildPublicationToken(
-                            version = record?.version ?: 0,
-                            contentHash = record?.contentHash,
-                            publicationId = record?.publicationId ?: 0L,
-                        )
+                        // active account. The capture and every validation build their tokens
+                        // through the same helper.
+                        tokens[observed.id] = publicationTokenOf(context, observed, userDrive.userId)
                     }
                 }
                 tokens
@@ -264,7 +263,7 @@ object OfflineFolderUtils {
         folderQueue: ArrayDeque<Int>,
         visitedFolderIds: MutableSet<Int>,
         subtreeObservedById: Map<Int, File>,
-        subtreeRecordTokensById: Map<Int, AbsentChildPublicationToken>,
+        subtreeRecordTokensById: Map<Int, AbsentChildPublicationToken?>,
     ): FolderWalkOutcome {
         val allPages = mutableListOf<File>()
         var lastResponse: CursorApiResponse<List<File>>? = null
@@ -730,22 +729,24 @@ object OfflineFolderUtils {
         traversalStartedGeneration: Long,
         boundaryObservation: File?,
         subtreeObservedById: Map<Int, File>,
-        subtreeRecordTokensById: Map<Int, AbsentChildPublicationToken>,
+        subtreeRecordTokensById: Map<Int, AbsentChildPublicationToken?>,
         predicateContext: Context,
         predicateUserDrive: UserDrive,
     ): (Realm, File) -> Boolean = { currentRealm, candidate ->
         val liveBoundary = FileController.getFileById(currentRealm, boundaryFolderId)
-        // RESOLVED-LOCATION AUTHORITY (issue: round 22 #11): the boundary's request-time
-        // ancestor chain — reconstructed from the pre-request subtree map's parent links —
-        // must be a prefix of its LIVE chain. An ancestor above the listed parent moving
-        // changes the boundary's resolved offline path WITHOUT changing its parentId (the
-        // listed-parent check alone cannot see it); the old response is not the authority
-        // for the relocated location. A live chain that comes up short (a missing ancestor
-        // row) also defers.
+        // RESOLVED-LOCATION AUTHORITY (issues: round 22 #11, round 25 #10): the boundary's
+        // request-time ancestor chain — reconstructed from the pre-request subtree map's
+        // parent links — must be a prefix of its LIVE chain, compared as (id, NAME) pairs:
+        // an ancestor RENAME preserves every id while changing the resolved offline path,
+        // which the id-only comparison could not see. An ancestor above the listed parent
+        // moving changes the boundary's resolved offline path WITHOUT changing its parentId
+        // (the listed-parent check alone cannot see it); the old response is not the
+        // authority for the relocated or renamed location. A live chain that comes up short
+        // (a missing ancestor row) also defers.
         val requestAncestry = buildList {
             var current: Int? = subtreeObservedById[boundaryFolderId]?.parentId
             while (current != null && current > 0) {
-                add(current)
+                add(current to subtreeObservedById[current]?.name)
                 current = subtreeObservedById[current]?.parentId
             }
         }
@@ -753,12 +754,15 @@ object OfflineFolderUtils {
             var current: Int? = liveBoundary.parentId
             val visited = mutableSetOf<Int>()
             while (current != null && current > 0 && visited.add(current)) {
-                add(current)
-                current = FileController.getFileById(currentRealm, current)?.parentId
+                val row = FileController.getFileById(currentRealm, current)
+                add(current to row?.name)
+                current = row?.parentId
             }
         }
         val boundaryLocationHolds = liveAncestry.size >= requestAncestry.size &&
-            requestAncestry.withIndex().all { (index, ancestorId) -> liveAncestry[index] == ancestorId }
+            requestAncestry.withIndex().all { (index, requestAncestor) ->
+                liveAncestry[index] == requestAncestor
+            }
         val boundaryHolds = liveBoundary != null &&
             liveBoundary.parentId == boundaryListedParentId &&
             boundaryLocationHolds &&
@@ -804,31 +808,28 @@ object OfflineFolderUtils {
             }
             chain
         }
-        // PUBLICATION/RESTORATION AND INTENT TOKENS (issues: round 23 #11, round 24 #11):
-        // the current record's COMPLETE publication token — version, content hash and the
-        // fresh per-publication identity — must equal the request-time token: a new
-        // publication, a restoration, or a re-publication of the SAME bytes since the
-        // request changes it (the (version, hash) pair alone could not distinguish a
-        // same-generation re-publication) — and the intent flag must be unchanged (a
-        // re-pin after the request is newer work's business).
+        // PUBLICATION/RESTORATION AND INTENT TOKENS (issues: round 23 #11, round 24 #11,
+        // round 25 #10/#11): the current record's COMPLETE publication token — version,
+        // content hash and the fresh per-publication identity — must EQUAL the request-time
+        // token through the SHARED builder (an explicit no-record capture is the zero token
+        // on BOTH sides; a read failure on either side is null and never matches). A new
+        // publication, a restoration with its FRESH identity, or a re-publication of the
+        // SAME bytes since the request changes the token — and the durable intent stamp
+        // (bumped by every marker transition) plus the marker flag must be unchanged: a
+        // re-pin after the request is newer work's business.
         val currentRecordToken = runCatching {
-            candidate.getOfflineFile(predicateContext, predicateUserDrive.userId)
-                ?.let { DownloadOfflineFileManager.readPublishedProvenance(predicateContext, it) }
-                ?.let { record ->
-                    AbsentChildPublicationToken(
-                        version = record.version,
-                        contentHash = record.contentHash,
-                        publicationId = record.publicationId,
-                    )
-                }
+            publicationTokenOf(predicateContext, candidate, predicateUserDrive.userId)
         }.getOrNull()
         val requestRecordToken = subtreeRecordTokensById[candidate.id]
-        val recordTokenHolds = requestRecordToken == null || currentRecordToken == requestRecordToken
+        val recordTokenHolds = requestRecordToken != null &&
+            currentRecordToken != null &&
+            currentRecordToken == requestRecordToken
         val candidateTokenHolds = requestObservation != null &&
             requestObservation.parentId == candidate.parentId &&
             FileController.isSameObservation(candidate, requestObservation) &&
             requestChainToBoundary == liveChainToBoundary &&
             requestObservation.isMarkedAsOffline == candidate.isMarkedAsOffline &&
+            requestObservation.offlineIntentStamp == candidate.offlineIntentStamp &&
             recordTokenHolds
         var reachesBoundary = candidate.id == boundaryFolderId
         var currentId: Int? = FileController.getFileById(currentRealm, candidate.id)?.parentId
@@ -865,7 +866,7 @@ object OfflineFolderUtils {
         requestGeneration: Long,
         observedById: Map<Int, File>,
         subtreeObservedById: Map<Int, File>,
-        subtreeRecordTokensById: Map<Int, AbsentChildPublicationToken>,
+        subtreeRecordTokensById: Map<Int, AbsentChildPublicationToken?>,
     ) {
         val result = OfflineFolderController.RemovalResult()
         // REQUEST-TIME freshness horizon (issues: round 11 #8, round 12 #9, round 18 #25):
@@ -882,11 +883,13 @@ object OfflineFolderUtils {
         // LIVE chain. An ancestor relocating changes the resolved offline path of every
         // row beneath it without changing their parentIds; the old absence response is
         // not the authority for the relocated location, and the whole cleanup defers.
+        // (id, NAME) PAIRS (issue: round 25 #10): an ancestor RENAME preserves every id
+        // while changing the resolved path — the id-only comparison could not see it.
         val requestFolderChain = buildList {
             var current: Int? = subtreeObservedById[folderId]?.parentId
             val seen = mutableSetOf<Int>()
             while (current != null && current > 0 && seen.add(current)) {
-                add(current)
+                add(current to subtreeObservedById[current]?.name)
                 current = subtreeObservedById[current]?.parentId
             }
         }
@@ -894,12 +897,13 @@ object OfflineFolderUtils {
             var current: Int? = FileController.getFileById(realm, folderId)?.parentId
             val seen = mutableSetOf<Int>()
             while (current != null && current > 0 && seen.add(current)) {
-                add(current)
-                current = FileController.getFileById(realm, current)?.parentId
+                val row = FileController.getFileById(realm, current)
+                add(current to row?.name)
+                current = row?.parentId
             }
         }
         val folderLocationHolds = liveFolderChain.size >= requestFolderChain.size &&
-            requestFolderChain.withIndex().all { (index, ancestorId) -> liveFolderChain[index] == ancestorId }
+            requestFolderChain.withIndex().all { (index, requestAncestor) -> liveFolderChain[index] == requestAncestor }
         if (!folderLocationHolds) {
             SentryLog.i(TAG, "Folder $folderId reconciliation deferred: its request-time location no longer holds")
             return
@@ -969,24 +973,53 @@ object OfflineFolderUtils {
                             observedById[candidate.id]?.let { observed ->
                                 FileController.isSameObservation(candidate, observed)
                             } == true &&
+                            // THE REQUEST-TIME MARKER AND DURABLE INTENT STAMP (issue:
+                            // round 25 #10): isSameObservation excludes the marker — a
+                            // verification marker SET after the listing request was cleared
+                            // by the older absence response; the durable intent stamp is
+                            // bumped by every marker transition, so an unmark/repin (ABA)
+                            // no longer passes either.
+                            observedById[candidate.id]?.isMarkedAsOffline == candidate.isMarkedAsOffline &&
+                            observedById[candidate.id]?.offlineIntentStamp == candidate.offlineIntentStamp &&
                             // THE PUBLICATION/RESTORATION TOKEN ON THE DIRECT LEAF TOO
-                            // (issue: round 24 #11): the leaf cleanup previously compared
-                            // only the row observation — a publication or restoration of
-                            // the SAME bytes after the request (coarse row fields
-                            // unchanged) was cleared by the old absence response. The
-                            // current record's complete publication token must equal the
-                            // request-time token, inside this final coordinated decision.
+                            // (issues: round 24 #11, round 25 #11): the current record's
+                            // complete publication token must equal the request-time token
+                            // through the SHARED builder (explicit absence = the zero token
+                            // on both sides; a read failure on either side defers), inside
+                            // this final coordinated decision.
                             (runCatching {
-                                candidate.getOfflineFile(context, userDrive.userId)
-                                    ?.let { DownloadOfflineFileManager.readPublishedProvenance(context, it) }
-                                    ?.let { record ->
-                                        AbsentChildPublicationToken(
-                                            version = record.version,
-                                            contentHash = record.contentHash,
-                                            publicationId = record.publicationId,
-                                        )
+                                publicationTokenOf(context, candidate, userDrive.userId)
+                            }.getOrNull()?.let { current ->
+                                current == subtreeRecordTokensById[candidate.id]
+                            } == true) &&
+                            // THE FOLDER'S REQUEST-TIME LOCATION INSIDE THE DECISION (issue:
+                            // round 25 #10): the (id, name) ancestor chain — reconstructed
+                            // from the pre-request subtree map, which captures the ancestry
+                            // above the walk root — must still be a prefix of the live chain
+                            // HERE, not only in the outer pre-check.
+                            run {
+                                val requestChain = buildList {
+                                    var current: Int? = subtreeObservedById[folderId]?.parentId
+                                    val seenChained = mutableSetOf<Int>()
+                                    while (current != null && current > 0 && seenChained.add(current)) {
+                                        add(current to subtreeObservedById[current]?.name)
+                                        current = subtreeObservedById[current]?.parentId
                                     }
-                            }.getOrNull() == subtreeRecordTokensById[candidate.id])
+                                }
+                                val liveChain = buildList {
+                                    var current: Int? = FileController.getFileById(currentRealm, folderId)?.parentId
+                                    val seenChained = mutableSetOf<Int>()
+                                    while (current != null && current > 0 && seenChained.add(current)) {
+                                        val row = FileController.getFileById(currentRealm, current)
+                                        add(current to row?.name)
+                                        current = row?.parentId
+                                    }
+                                }
+                                liveChain.size >= requestChain.size &&
+                                    requestChain.withIndex().all { (index, requestAncestor) ->
+                                        liveChain[index] == requestAncestor
+                                    }
+                            }
                     },
                 )
             }
@@ -1011,7 +1044,7 @@ object OfflineFolderUtils {
         traversalStartedGeneration: Long,
         boundaryObservation: File?,
         subtreeObservedById: Map<Int, File>,
-        subtreeRecordTokensById: Map<Int, AbsentChildPublicationToken>,
+        subtreeRecordTokensById: Map<Int, AbsentChildPublicationToken?>,
     ) {
         val visited = mutableSetOf(rootFolderId)
         // folderId to the parent the traversal reached it from — the only parent relationship
@@ -1212,6 +1245,24 @@ object OfflineFolderUtils {
     }
 
     private val TAG = OfflineFolderUtils::class.java.simpleName
+
+    /**
+     * The COMPLETE publication token of [row] at its offline path, with an EXPLICIT
+     * absent-record representation (issue: round 25 #11): NO record is the zero token —
+     * the SAME representation the request-time capture uses, so a covered file with
+     * missing bytes and no sidecar compares EQUAL at capture and validation instead of
+     * never clearing. A record that EXISTS but cannot be read is NULL — never equal to the
+     * absent token: absence and read failure are distinguished, and a read failure defers
+     * the destructive decision.
+     */
+    private fun publicationTokenOf(context: Context, row: File, userId: Int): AbsentChildPublicationToken? {
+        val offlineFile = row.getOfflineFile(context, userId) ?: return AbsentChildPublicationToken(0, null, 0)
+        if (!DownloadOfflineFileManager.provenanceRecordFileExists(context, offlineFile)) {
+            return AbsentChildPublicationToken(0, null, 0)
+        }
+        val record = DownloadOfflineFileManager.readPublishedProvenance(context, offlineFile) ?: return null
+        return AbsentChildPublicationToken(record.version, record.contentHash, record.publicationId)
+    }
 
     /**
      * The request-time publication/restoration token of an absent-child candidate (issue:
