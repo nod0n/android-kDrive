@@ -1006,21 +1006,28 @@ class MainViewModel(
                                 // is resolved and persisted SYNCHRONOUSLY, under this
                                 // section's locks, before the source metadata is removed.
                                 runCatching {
-                                    FileController.getFileById(sharedRealm, file.id)?.let { pathRoot ->
-                                        val pathStack = ArrayDeque<File>().apply { add(pathRoot) }
-                                        val pathSeen = mutableSetOf<Int>()
-                                        while (pathStack.isNotEmpty()) {
-                                            val node = pathStack.removeFirst()
-                                            if (!pathSeen.add(node.id)) continue
-                                            node.children.forEach { pathStack.add(it) }
-                                            if (node.isFolder() || !(node.isOffline || node.isInOfflineFolder)) continue
-                                            val nodeScope = UserDrive(
-                                                userId = sharedScope.userId,
-                                                driveId = node.driveId.takeIf { it > 0 } ?: sharedScope.driveId,
-                                                sharedWithMe = true,
-                                            )
-                                            val resolvedPath = FileController.generateAndSavePath(node.id, nodeScope)
-                                            FileController.persistResolvedPath(node.id, nodeScope, resolvedPath)
+                                    // THE CAPTURED SCOPE'S OWN REALM INSTANCE (round-24 build
+                                    // correction): the merge's sharedRealm session closed with
+                                    // its use block — the walk opens a FRESH instance on the
+                                    // SAME captured sharedScope (never a global/current-account
+                                    // fallback) and closes it deterministically.
+                                    FileController.getRealmInstance(sharedScope).use { pathRealm ->
+                                        FileController.getFileById(pathRealm, file.id)?.let { pathRoot ->
+                                            val pathStack = ArrayDeque<File>().apply { add(pathRoot) }
+                                            val pathSeen = mutableSetOf<Int>()
+                                            while (pathStack.isNotEmpty()) {
+                                                val node = pathStack.removeFirst()
+                                                if (!pathSeen.add(node.id)) continue
+                                                node.children.forEach { pathStack.add(it) }
+                                                if (node.isFolder() || !(node.isOffline || node.isInOfflineFolder)) continue
+                                                val nodeScope = UserDrive(
+                                                    userId = sharedScope.userId,
+                                                    driveId = node.driveId.takeIf { it > 0 } ?: sharedScope.driveId,
+                                                    sharedWithMe = true,
+                                                )
+                                                val resolvedPath = FileController.generateAndSavePath(node.id, nodeScope)
+                                                FileController.persistResolvedPath(node.id, nodeScope, resolvedPath)
+                                            }
                                         }
                                     }
                                 }.onFailure(Sentry::captureException)

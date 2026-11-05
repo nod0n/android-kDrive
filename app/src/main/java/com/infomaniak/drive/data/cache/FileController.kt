@@ -168,7 +168,13 @@ object FileController {
         return savePath(userDrive, fileId, generatedPath)
     }
 
-    private fun savePath(userDrive: UserDrive, fileId: Int, generatedPath: String) {
+    private fun savePath(userDrive: UserDrive, fileId: Int, generatedPath: String): Boolean {
+        // THE TRANSACTION RESULT IS THE EXPLICIT TRUTHFUL RETURN (round-24 build
+        // correction): the flag is captured outside the whole coordination chain and
+        // returned directly — a missing row (the transaction's early exit) or a stale
+        // derivation (the candidate no longer matches the fresh ancestry) leaves it
+        // FALSE; a deferred or failed persistence is never reported true.
+        var persisted = false
         getRealmInstance(userDrive).use { realm ->
             // Ancestry coordination + TRANSACTION-FRESH derivation (issue: round 12 #7): the
             // previous check derived the path from a pre-lock, un-refreshed Realm view, so a
@@ -178,7 +184,6 @@ object FileController {
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withFileLock(userDrive, fileId) {
                     runCatching { realm.refresh() }
-                    var persisted = false
                     realm.executeTransaction {
                         val liveRow = getFileById(realm, fileId) ?: return@executeTransaction
                         // Persist only when the CURRENT transaction-fresh ancestry still
@@ -188,10 +193,10 @@ object FileController {
                             persisted = true
                         }
                     }
-                    persisted
                 }
             }
         }
+        return persisted
     }
 
     private tailrec fun generatePath(file: File, userDrive: UserDrive, recPath: StringBuilder = StringBuilder()): String {

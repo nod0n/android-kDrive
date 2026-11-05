@@ -77,6 +77,25 @@ import java.util.UUID
  */
 enum class CachePromotionOutcome { FULFILLED, DEFERRED, FAILED }
 
+/**
+ * TYPED generation establishment for a completed download (issues: round 22 #23,
+ * round 23 #22, round 24 #19/#20): the download route carries no revision token, so
+ * the only available establishment is a post-download details comparison — and a
+ * LATER details response is not response-bound identity (nothing here establishes a
+ * server guarantee excluding cached/stale or ABA observations). The three answers
+ * travel TYPED to every publication path: [ESTABLISHED] may issue a known-generation
+ * proof; [COARSE_UNRESOLVED] (both sides version-less coarse equality, or an
+ * unrestablishable route such as a public share) publishes with an explicitly
+ * UNRESOLVED version-0 proof and an unresolved outcome — never a known-generation
+ * claim from metadata equality; [FAILED] means the bytes' generation is UNKNOWABLE —
+ * the caller discards the bytes and preserves the intent.
+ *
+ * TOP LEVEL, NOT COMPANION-NESTED (round-24 build correction): external callers
+ * (SAF, workers) qualify it through the file's package — a companion-nested type is
+ * not reachable as `DownloadOfflineFileManager.GenerationEstablishment`.
+ */
+enum class GenerationEstablishment { ESTABLISHED, COARSE_UNRESOLVED, FAILED }
+
 class DownloadOfflineFileManager(
     private val userDrive: UserDrive,
     private val filesCount: Int,
@@ -1948,9 +1967,17 @@ class DownloadOfflineFileManager(
                 // the explicit-lock loop cannot overflow the stack the way nested monitors did.
                 OfflineFileCoordination.withLocksFor(userDrive, listOfNotNull(file.id, preLockOwner?.id)) {
                     publishLockedCore(
-                        userDrive, isInheritedDownload, file, target, staged, onPublishedLocked, lockedOwnerId,
-                        verificationBasis, explicitUnresolvedGeneration,
-                    ) { coroutineContext.ensureActive() }
+                        userDrive = userDrive,
+                        isInheritedDownload = isInheritedDownload,
+                        file = file,
+                        target = target,
+                        staged = staged,
+                        onPublishedLocked = onPublishedLocked,
+                        lockedOwnerId = lockedOwnerId,
+                        verificationBasis = verificationBasis,
+                        explicitUnresolvedGeneration = explicitUnresolvedGeneration,
+                        checkCancelled = { coroutineContext.ensureActive() },
+                    )
                 }
             }
         }
@@ -2080,11 +2107,22 @@ class DownloadOfflineFileManager(
                 hasUnresolvedRecovery(appContextForRecovery, userDrive, file.id, target.absolutePath)
             if (target.exists()) {
                 val appContext = Realm.getApplicationContext()
-                val liveOwner = appContext?.let { ctx ->
+                // THE OWNER ROW'S STABLE SNAPSHOT (round-24 build correction): the
+                // DestinationOwner DTO carries only the ownership/baseline fields — the
+                // exact-identity ownership query below needs the ACTUAL observed row's
+                // name and parentId, read here from the SAME realm the ownership was
+                // resolved in, detached so it survives the session, and never invented
+                // or weakened. One val resolution (DTO + detached row snapshot) — no
+                // captured mutable state.
+                val ownerResolution: Pair<OfflineFolderController.DestinationOwner, File?>? = appContext?.let { ctx ->
                     FileController.getRealmInstance(userDrive).use { realm ->
-                        OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)
+                        OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)?.let { owner ->
+                            owner to (FileController.getFileById(realm, owner.id)?.let { realm.copyFromRealm(it, 1) })
+                        }
                     }
                 }
+                val liveOwner = ownerResolution?.first
+                val liveOwnerRow: File? = ownerResolution?.second
 
                 // REGISTRY OWNER CONFLICT (issue: round 20 #11): the destination's
                 // provenance record POSITIVELY names a different owner — the bytes
@@ -2210,13 +2248,13 @@ class DownloadOfflineFileManager(
                     // stays a conflict — the intent is RETAINED (the marker stays), the
                     // dialog never reports 100 and the bulk counts the work unresolved.
                     val ownedByThisFile = liveOwner != null && liveOwner.id == file.id && liveOwner.id == lockedOwnerId
-                    val protectedContentUsable = ownedByThisFile &&
+                    val protectedContentUsable = ownedByThisFile && liveOwnerRow != null &&
                         run {
                             val currentProtectedHash = UploadFile.sha256OrNull(target)
                             currentProtectedHash != null &&
                                 UploadFile.hasDurableOriginalRevisionOwnership(
-                                    fileName = liveOwner.name,
-                                    remoteFolder = liveOwner.parentId,
+                                    fileName = liveOwnerRow.name,
+                                    remoteFolder = liveOwnerRow.parentId,
                                     driveId = userDrive.driveId,
                                     userId = userDrive.userId,
                                     fileModifiedAt = java.util.Date(target.lastModified()),
@@ -2703,21 +2741,6 @@ class DownloadOfflineFileManager(
          * partial bytes — or delete existing bytes — at the destination. The destination is
          * never touched before the staged copy is complete.
          */
-        /**
-         * TYPED generation establishment for a completed download (issues: round 22 #23,
-         * round 23 #22, round 24 #19/#20): the download route carries no revision token, so
-         * the only available establishment is a post-download details comparison — and a
-         * LATER details response is not response-bound identity (nothing here establishes a
-         * server guarantee excluding cached/stale or ABA observations). The three answers
-         * travel TYPED to every publication path: [ESTABLISHED] may issue a known-generation
-         * proof; [COARSE_UNRESOLVED] (both sides version-less coarse equality, or an
-         * unrestablishable route such as a public share) publishes with an explicitly
-         * UNRESOLVED version-0 proof and an unresolved outcome — never a known-generation
-         * claim from metadata equality; [FAILED] means the bytes' generation is UNKNOWABLE —
-         * the caller discards the bytes and preserves the intent.
-         */
-        internal enum class GenerationEstablishment { ESTABLISHED, COARSE_UNRESOLVED, FAILED }
-
         /**
          * The post-download details re-fetch (OUTSIDE every lock) that the worker's and the
          * direct callers' generation binding runs before any publication (issues: round 22

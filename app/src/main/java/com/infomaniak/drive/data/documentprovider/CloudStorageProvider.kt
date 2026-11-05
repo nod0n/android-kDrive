@@ -60,6 +60,7 @@ import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.PublicationOutcome
+import com.infomaniak.drive.utils.GenerationEstablishment
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.NotificationUtils.buildGeneralNotification
 import com.infomaniak.drive.utils.OfflineFileCoordination
@@ -945,13 +946,12 @@ class CloudStorageProvider : DocumentsProvider() {
                                 okHttpClient = okHttpClient,
                             )
                         }
-                    } else DownloadOfflineFileManager.GenerationEstablishment.FAILED
-                    if (establishment != DownloadOfflineFileManager.GenerationEstablishment.FAILED) {
+                    } else GenerationEstablishment.FAILED
+                    if (establishment != GenerationEstablishment.FAILED) {
                         val outcome = runBlocking {
                             DownloadOfflineFileManager.publishStagedCacheCopy(
                                 context, file, cacheFile, userDrive, staged,
-                                generationResolved = establishment ==
-                                    DownloadOfflineFileManager.GenerationEstablishment.ESTABLISHED,
+                                generationResolved = establishment == GenerationEstablishment.ESTABLISHED,
                             )
                         }
                         if (outcome == PublicationOutcome.PUBLISHED ||
