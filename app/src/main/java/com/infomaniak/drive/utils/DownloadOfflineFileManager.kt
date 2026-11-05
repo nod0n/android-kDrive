@@ -2564,7 +2564,17 @@ class DownloadOfflineFileManager(
             // #4): an abort must restore the destination's exact previous evidence, never
             // leave the operation's prepared record nor destroy what was there.
             val previousDestinationRecordText = if (flow == ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION) {
-                runCatching { provenanceFileFor(context, target).readText().trim() }.getOrNull()?.takeIf { it.isNotEmpty() } ?: ""
+                val priorFile = provenanceFileFor(context, target)
+                when {
+                    // ABSENT: the destination carried no record.
+                    !priorFile.exists() -> ""
+                    // PRESENT: the prior evidence must be captured RELIABLY (review-35 #5) —
+                    // an unreadable or empty record FAILS preparation; a failed read folded
+                    // into "none existed" would later authorize deleting a damaged prior
+                    // publication's evidence.
+                    else -> runCatching { priorFile.readText().trim() }.getOrNull()
+                        ?.takeIf { it.isNotEmpty() } ?: return false
+                }
             } else ""
             // THE RELOCATION STATE EXISTS BEFORE THE DESTINATION WRITE IS ATTEMPTED
             // (issue: round 23 #14): every failure path below leaves a durable record of
@@ -2627,6 +2637,10 @@ class DownloadOfflineFileManager(
                     // failed restore RETAINS the state for the sweep's retry.
                     ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION -> {
                         val stateParsed = parseProofMoveRecord(proofRelocationRecordFile(context, target))
+                        // AN UNDECODABLE JOURNAL IS RETAINED (review-35 #5): a parse failure
+                        // never substitutes "no previous destination proof" — the destination
+                        // is left untouched and the state stays for the sweep.
+                        if (stateParsed == null) return false
                         if (!resolveAbortedDestinationRecord(
                                 context,
                                 target,
@@ -2651,6 +2665,10 @@ class DownloadOfflineFileManager(
                     }
                     ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION -> {
                         val stateParsed = parseProofMoveRecord(proofRelocationRecordFile(context, target))
+                        // AN UNDECODABLE JOURNAL IS RETAINED (review-35 #5): a parse failure
+                        // never substitutes "no previous destination proof" — the destination
+                        // is left untouched and the state stays for the sweep.
+                        if (stateParsed == null) return false
                         if (!resolveAbortedDestinationRecord(
                                 context,
                                 target,
@@ -2680,16 +2698,34 @@ class DownloadOfflineFileManager(
             operationPublicationId: Long?,
             previousDestinationRecordText: String?,
         ): Boolean {
-            val destinationRecord = readPublishedProvenance(context, target)
-            val recordIsOurs = destinationRecord != null &&
-                destinationRecord.publicationId == operationPublicationId
-            if (!recordIsOurs) return true
+            val destinationFile = provenanceFileFor(context, target)
+            // TRI-STATE DESTINATION EVIDENCE (review-35 #5): ABSENT (nothing of ours to
+            // revert), UNREADABLE (uncertain — the journal is RETAINED, never treated as
+            // "not ours -> success"), READABLE (operation-owned -> restore-or-delete, or
+            // positively superseding -> left intact).
+            if (!destinationFile.exists()) return true
+            val currentText = runCatching { destinationFile.readText().trim() }.getOrNull()
+            if (currentText.isNullOrEmpty()) return false
+            // THE PRIOR-DESTINATION PAYLOAD IS PREVALIDATED (review-35 #7): a restore
+            // writes only a record that fully parses FOR THIS TARGET, and the readback
+            // must equal it exactly.
+            if (!previousDestinationRecordText.isNullOrEmpty()) {
+                val priorValid = runCatching {
+                    parseProvenanceText(previousDestinationRecordText, expectedPath = target.absolutePath)
+                }.getOrNull()?.let { it.absolutePath == target.absolutePath } == true
+                if (!priorValid) return false
+            }
+            val destinationRecord = runCatching {
+                parseProvenanceText(currentText, expectedPath = target.absolutePath)
+            }.getOrNull()?.takeIf { it.absolutePath == target.absolutePath }
+            if (destinationRecord == null) return false
+            if (destinationRecord.publicationId != operationPublicationId) return true
             val recordFile = verifiedProvenanceFileFor(context, target) ?: return false
             return if (previousDestinationRecordText.isNullOrEmpty()) {
                 runCatching { recordFile.delete() }.getOrDefault(false)
             } else {
                 runCatching { atomicWriteText(recordFile, previousDestinationRecordText) }.getOrDefault(false) &&
-                    readPublishedProvenance(context, target) != null
+                    runCatching { recordFile.readText().trim() }.getOrNull() == previousDestinationRecordText
             }
         }
 
@@ -3864,11 +3900,33 @@ class DownloadOfflineFileManager(
                                                         // observation establish FIRST (idempotent on retry),
                                                         // the bytes return second, the destination's aborted
                                                         // evidence is removed third.
+                                                        // THE SOURCE-BOUND PAYLOAD IS FULLY CROSS-CHECKED
+                                                        // BEFORE ANY MUTATION (review-35 #7): grammar and
+                                                        // embedded location bind it to the recorded source,
+                                                        // the owner fields bind it to THIS operation, and
+                                                        // its content hash must equal the target-bound
+                                                        // proof's (the very generation being restored). A
+                                                        // damaged payload retains the journal — bytes never
+                                                        // move under foreign or incorrect evidence.
+                                                        val sourceProofParsed = runCatching {
+                                                            parseProvenanceText(sourceProofText, expectedPath = recordedSource)
+                                                        }.getOrNull()?.takeIf { it.absolutePath == recordedSource }
+                                                        if (sourceProofParsed == null ||
+                                                            sourceProofParsed.userId != parsed.proofUserId ||
+                                                            sourceProofParsed.driveId != parsed.proofDriveId ||
+                                                            sourceProofParsed.fileId != parsed.proofFileId ||
+                                                            sourceProofParsed.contentHash == null ||
+                                                            sourceProofParsed.contentHash != parsed.proofContentHash
+                                                        ) {
+                                                            return@runCatching false
+                                                        }
+                                                        // THE READBACK VERIFIES THE EXPECTED COMPLETE RECORD
+                                                        // (review-35 #7), not merely "some provenance".
                                                         val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
                                                         val sourceProofEstablished = sourceRecordFile != null && runCatching {
                                                             atomicWriteText(sourceRecordFile, sourceProofText)
                                                         }.getOrDefault(false) &&
-                                                            readPublishedProvenance(context, sourceFile) != null
+                                                            runCatching { sourceRecordFile.readText().trim() }.getOrNull() == sourceProofText
                                                         if (!sourceProofEstablished) return@runCatching false
                                                         if (!observationEvidenceComplete(
                                                                 context,
