@@ -152,14 +152,37 @@ object FileController {
     }
 
     /**
-     * THE INCOMING IDENTITY'S POST-COMMIT DESTINATION (issue: round 30 #3): the offline
-     * location the INCOMING metadata identity would resolve to AFTER its commit — its own
-     * stored path when carried, otherwise [incoming.parentId]'s CURRENT chain plus its
-     * name — derived through the same generation logic the live rows use ([generatePath]
-     * on the managed parent row), and assembled exactly like [File.getOfflineFile].
+     * THE INCOMING IDENTITY'S POST-MERGE REMOTE PATH (issue: round 30 #3, refined round
+     * 31 #3): the path the INCOMING identity will carry AFTER the conditional merge — its
+     * own stored path when carried, otherwise derived from AUTHORITATIVE ancestry (the
+     * parent's current chain plus its name, via the same generation logic the live rows
+     * use). A blank-path DIRECT CHILD OF ROOT_ID derives from the EMPTY directory prefix:
+     * the root row itself has no parent, so generating through it yields an empty path —
+     * the previous derivation rejected every valid blank-path root child forever.
      * Strictly READ-ONLY: no path persistence, no writes, no directories created. Returns
-     * null when the destination cannot be derived (a missing parent row, an incomplete
-     * chain) — the caller defers, never guessing.
+     * null when the path cannot be derived — the caller defers, never guessing.
+     */
+    internal fun deriveIncomingRemotePath(
+        realm: Realm,
+        incoming: File,
+        userDrive: UserDrive,
+    ): String? {
+        incoming.path.takeIf { it.isNotEmpty() }?.let { return it }
+        if (incoming.parentId <= 0) return null
+        if (incoming.parentId == ROOT_ID) return "/${incoming.name}"
+        val parentRow = realm.where(File::class.java)
+            .equalTo(File::id.name, incoming.parentId)
+            .findFirst() ?: return null
+        val parentPath = generatePath(parentRow, userDrive)
+        if (parentPath.isBlank()) return null
+        return "$parentPath/${incoming.name}"
+    }
+
+    /**
+     * THE INCOMING IDENTITY'S POST-COMMIT DESTINATION (issue: round 30 #3): the offline
+     * location the INCOMING metadata identity would resolve to AFTER its commit, assembled
+     * exactly like [File.getOfflineFile] from [deriveIncomingRemotePath]. Returns null
+     * when the destination cannot be derived — the caller defers, never guessing.
      */
     internal fun deriveIncomingOfflinePath(
         realm: Realm,
@@ -167,16 +190,7 @@ object FileController {
         userDrive: UserDrive,
         context: Context,
     ): IOFile? {
-        val remotePath = incoming.path.ifBlank {
-            if (incoming.parentId <= 0) return null
-            val parentRow = realm.where(File::class.java)
-                .equalTo(File::id.name, incoming.parentId)
-                .findFirst() ?: return null
-            val parentPath = generatePath(parentRow, userDrive)
-            if (parentPath.isBlank()) return null
-            "$parentPath/${incoming.name}"
-        }
-        if (remotePath.isBlank()) return null
+        val remotePath = deriveIncomingRemotePath(realm, incoming, userDrive) ?: return null
         val rootFolder = IOFile(File.getOfflineFolder(context), "${userDrive.userId}/${userDrive.driveId}")
         val child = if (incoming.isFolder()) remotePath else remotePath.substringBeforeLast("/")
         val folder = IOFile(rootFolder, child)

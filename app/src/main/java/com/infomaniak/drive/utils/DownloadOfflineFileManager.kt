@@ -863,6 +863,22 @@ class DownloadOfflineFileManager(
                             // not labelled "absent" merely because it equals the previously
                             // selected target: this validation runs BEFORE the old-source
                             // step below.
+                            // THE EXACT POST-MERGE CANDIDATE (issues: round 30 #3, round
+                            // 31 #3): the conditional merge PRESERVES the old row's stored
+                            // path when the incoming path is blank — validating a
+                            // chain-derived destination and then committing a row that
+                            // keeps the OLD stored path would let the validated
+                            // destination and the committed row disagree. The incoming
+                            // candidate is constructed under this coordination with the
+                            // path derived from AUTHORITATIVE ancestry (ROOT_ID children
+                            // from the empty directory prefix), and the conditional commit
+                            // below persists exactly that path.
+                            val incomingRemotePath = FileController.deriveIncomingRemotePath(
+                                realm = realm,
+                                incoming = freshForAdvance,
+                                userDrive = userDrive,
+                            ) ?: return@withFileLock
+                            freshForAdvance.path = incomingRemotePath
                             val incomingDestination = FileController.deriveIncomingOfflinePath(
                                 realm = realm,
                                 incoming = freshForAdvance,

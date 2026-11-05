@@ -69,13 +69,22 @@ class DownloadProgressViewModel : ViewModel() {
                     return@launch
                 }
                 StoredOfflineCopyState.READABLE_UNVERIFIED -> {
+                    // THE EARLY DEFERRED-READABLE PATH (issue: round 31 #9): a READABLE
+                    // retained copy whose generation is UNVERIFIED (the version-0
+                    // unresolved publication among others) is never routed through
+                    // verified-download completion — reopening the dialog must not turn
+                    // the previous PUBLISHED_UNRESOLVED into 100 without new evidence.
+                    // Verification is scheduled (as before) and the flow FALLS THROUGH:
+                    // the shared flow's exact positively-owned-edit arm and the
+                    // suppression gate decide between a truthful completion for a
+                    // POSITIVELY OWNED local edit (exact durable ownership), a re-drive
+                    // justified by new evidence, and a deferred (null) outcome — the
+                    // retained content stays accessible at the destination throughout.
                     OfflineFolderController.scheduleOfflineVerification(
                         fileId = file.id,
                         userDrive = userDrive,
                         observedGeneration = outputFile.lastModified() / 1_000L,
                     )
-                    downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
-                    return@launch
                 }
                 // POSITIVELY FOREIGN provenance (issue: round 19 #12): ownership precedes
                 // completion — the dialog never reports 100 over another identity's bytes.
