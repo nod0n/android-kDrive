@@ -665,6 +665,10 @@ class DownloadOfflineFileManager(
         onPublishedLocked = { completePublishedFileLocked(context, file, target) },
         verificationBasis = verificationBasis,
         explicitUnresolvedGeneration = explicitUnresolvedGeneration,
+        // THE COMPARISON-TIME BASIS HASH (issue: round 27 #3) rides this transfer's own
+        // instance state — the companion core cannot hold it, so the wrapper binds the
+        // callback; the retirement below reads exactly the hash its publication verified.
+        onVerifiedBasisHash = { verifiedBasisSourceHash = it },
     )
 
     /**
@@ -2723,6 +2727,7 @@ class DownloadOfflineFileManager(
             onPublishedLocked: (() -> Unit)? = null,
             verificationBasis: File? = null,
             explicitUnresolvedGeneration: Boolean = false,
+            onVerifiedBasisHash: ((String?) -> Unit)? = null,
         ): PublicationOutcome = withContext(Dispatchers.IO) {
             // ROOT-INTENT coordination for publication (issue: round 12 #8): an ancestry-
             // dependent publication must serialize with ancestry-changing writers (folder
@@ -2763,6 +2768,7 @@ class DownloadOfflineFileManager(
                         verificationBasis = verificationBasis,
                         explicitUnresolvedGeneration = explicitUnresolvedGeneration,
                         checkCancelled = { coroutineContext.ensureActive() },
+                        onVerifiedBasisHash = onVerifiedBasisHash,
                     )
                 }
             }
@@ -2787,6 +2793,7 @@ class DownloadOfflineFileManager(
             checkCancelled: () -> Unit,
             verificationBasis: File? = null,
             explicitUnresolvedGeneration: Boolean = false,
+            onVerifiedBasisHash: ((String?) -> Unit)? = null,
         ): PublicationOutcome {
             checkCancelled()
             // HISTORICAL VERIFICATION BASIS (issue: round 24 #7): a verification transfer's
@@ -2983,8 +2990,10 @@ class DownloadOfflineFileManager(
                             // THE VERIFIED OLD-SOURCE HASH (issue: round 27 #3): the
                             // retirement revalidates the old path against exactly this
                             // comparison-time hash; an intervening edit in the
-                            // release/reacquire gap is preserved, never deleted.
-                            verifiedBasisSourceHash = if (basisLocationCopy != null) comparisonHash else null
+                            // release/reacquire gap is preserved, never deleted. The hash
+                            // is threaded to the CALLER (this coordinated core runs in the
+                            // companion and holds no transfer-instance state).
+                            onVerifiedBasisHash?.invoke(if (basisLocationCopy != null) comparisonHash else null)
                             // THE NEW LOCATION NEVER RECEIVES A BARE OVERWRITE (issue: round
                             // 25 #9, same authority as the transfer): existing bytes at the
                             // target must equal the staged copy.
@@ -3127,10 +3136,11 @@ class DownloadOfflineFileManager(
                     return PublicationOutcome.SKIPPED_PROTECTED
                 }
                 // A CONVERGED BASIS COMPARISON: the verified old-source hash rides to
-                // the retirement's revalidation (issue: round 27 #3).
-                verifiedBasisSourceHash = if (basisCopy != null) basisHash else null
+                // the retirement's revalidation (issue: round 27 #3), threaded to the
+                // caller (this core holds no transfer-instance state).
+                onVerifiedBasisHash?.invoke(if (basisCopy != null) basisHash else null)
             } else {
-                verifiedBasisSourceHash = null
+                onVerifiedBasisHash?.invoke(null)
             }
 
             staged.setLastModified(file.getLastModifiedInMilliSecond())
@@ -3519,11 +3529,11 @@ class DownloadOfflineFileManager(
                             when {
                                 staged.renameTo(target) &&
                                     movePublishedProvenance(
-                                        context,
+                                        provenanceContext,
                                         staged,
                                         target,
                                         sharedWithMe = userDrive.sharedWithMe,
-                                        storageKind = destinationStorageKind(context, file, target, userDrive),
+                                        storageKind = destinationStorageKind(provenanceContext, file, target, userDrive),
                                     ) -> {
                                     runCatching { recoveryFile?.delete() }
                                     recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
