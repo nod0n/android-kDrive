@@ -3636,6 +3636,44 @@ class DownloadOfflineFileManager(
             return ids.filter { it > 0 }.toSet()
         }
 
+        /** THE EXACT RELOCATION RECEIPT (review-36 #2): the file's OWN proofmove journal
+         * whose bytes already sit at the recorded destination (hash-certified by the
+         * journal's own proof) — a relocation this very flow completed and whose only
+         * pending step is the conditional metadata commit. Distinct from every OTHER
+         * recovery, which still excludes. */
+        internal class RelocationReceipt(
+            val targetPath: String,
+            val sourcePath: String?,
+            val publicationId: Long?,
+        )
+
+        internal fun ownCompletedRelocationReceipt(
+            context: Context,
+            userDrive: UserDrive,
+            fileId: Int,
+        ): RelocationReceipt? {
+            val records = runCatching {
+                stagingDirectory(context)
+                    .listFiles { f -> f.name.startsWith("proofmove_") && f.name.endsWith(".recovery") }
+            }.getOrNull() ?: return null
+            for (recordFile in records) {
+                val parsed = parseProofMoveRecord(recordFile) ?: continue
+                if (parsed.observationFieldDamaged || !parsed.identitiesValid) continue
+                if (parsed.proofFileId != fileId) continue
+                if (parsed.proofUserId != userDrive.userId || parsed.proofDriveId != userDrive.driveId) continue
+                val target = IOFile(parsed.targetPath)
+                val targetHash = if (target.exists()) UploadFile.sha256OrNull(target) else null
+                if (targetHash != null && targetHash == parsed.proofContentHash) {
+                    return RelocationReceipt(
+                        targetPath = target.absolutePath,
+                        sourcePath = parsed.recordedSourcePath,
+                        publicationId = publicationIdOfRecordText(parsed.proofText),
+                    )
+                }
+            }
+            return null
+        }
+
         /**
          * Whether an UNRESOLVED durable recovery still governs [fileId] or the bytes at
          * [targetPath] (issue: round 23 #3): re-read INSIDE the final mutation locks — the

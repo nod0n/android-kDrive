@@ -1342,6 +1342,19 @@ object SyncOfflineUtils {
                 observed = file,
             )
             if (!committed) return DownloadActionOutcome(handled = false)
+            // THE RETAINED JOURNAL FOLLOWS THE ACTUAL COMMIT (review-36 #2): the second
+            // preservation boundary recognized this flow's own completed relocation; the
+            // journal disposes only after the committed row verifiably resolves to the
+            // published destination — an uncommitted or superseded commit retains it for
+            // the sweep's coherent completion or owner-checked rollback.
+            DownloadOfflineFileManager.ownCompletedRelocationReceipt(context, userDrive, remoteFile.id)?.let { receipt ->
+                DownloadOfflineFileManager.disposeRelocationJournalAfterCommit(
+                    context,
+                    userDrive,
+                    remoteFile.id,
+                    receipt.targetPath,
+                )
+            }
             // Preserve the download origin: a refresh of a file covered by an offline folder is
             // an inherited download, so its completion can never manufacture an explicit pin
             // after an unmark (issue #1902). The enqueue's Operation is returned UNAWAITED

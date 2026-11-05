@@ -904,7 +904,19 @@ object OfflineFolderController {
                         resolvedOldOffline?.absolutePath,
                     )
                 ) {
-                    return@withFileLock oldRow
+                    // THE OWN-COMPLETED RELOCATION IS RECOGNIZED (review-36 #2): a journal
+                    // this very flow's relocation created — bytes hash-certified at its
+                    // recorded destination — does not block the conditional metadata commit
+                    // (blocking it rolled the relocation back and re-created the same
+                    // journal forever); EVERY other recovery still excludes.
+                    if (DownloadOfflineFileManager.ownCompletedRelocationReceipt(
+                            context,
+                            userDrive,
+                            oldRow.id,
+                        ) == null
+                    ) {
+                        return@withFileLock oldRow
+                    }
                 }
                 val oldOffline = resolvedOldOffline?.takeIf { it.exists() }
                 if (oldOffline == null) {
