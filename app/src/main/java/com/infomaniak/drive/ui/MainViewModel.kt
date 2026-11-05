@@ -1514,6 +1514,7 @@ class MainViewModel(
                         // The pending download marker is part of the removed intent (issue:
                         // round 5 #15): a stale marker cannot resurrect the pin.
                         liveRow.isMarkedAsOffline = false
+                        liveRow.bumpOfflineIntentGeneration()
                         if (!isFolder && !liveRow.isInOfflineFolder &&
                             !OfflineFolderController.isFileCoveredByAnyRoot(fileId, userDrive, realm)
                         ) {

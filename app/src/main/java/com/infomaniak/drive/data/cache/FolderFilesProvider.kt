@@ -69,6 +69,7 @@ object FolderFilesProvider {
     fun getFiles(
         folderFilesProviderArgs: FolderFilesProviderArgs,
         checkCancelled: () -> Unit = {},
+        sequenceHadUnresolved: Boolean = false,
     ): FolderFilesProviderResult? {
         val realm = folderFilesProviderArgs.realm ?: FileController.getRealmInstance(folderFilesProviderArgs.userDrive)
         try {
@@ -81,7 +82,12 @@ object FolderFilesProvider {
             )
             val files = when {
                 needToLoadFromRemote && sourceRestrictionType != SourceRestrictionType.ONLY_FROM_LOCAL -> {
-                    loadFromRemote(realm, folderProxy, folderFilesProviderArgs, checkCancelled)
+                    // THE SEQUENCE'S UNRESOLVED STATE REACHES THE FINAL TRANSACTION
+                    // (issue: round 26 #19): the ordinary listing's accumulated flag rides
+                    // getFiles → loadFromRemote → handleRemoteFiles → saveRemoteFiles, so
+                    // the final page's SAME transaction commits the durable incompleteness —
+                    // never a post-hoc downgrade an interruption can outrun.
+                    loadFromRemote(realm, folderProxy, folderFilesProviderArgs, checkCancelled, sequenceHadUnresolved)
                 }
                 folderFilesProviderArgs.isFirstPage -> {
                     loadFromLocal(realm, folderProxy, folderFilesProviderArgs.withChildren, folderFilesProviderArgs.order)
@@ -500,6 +506,7 @@ object FolderFilesProvider {
         folderProxy: File?,
         folderFilesProviderArgs: FolderFilesProviderArgs,
         checkCancelled: () -> Unit = {},
+        sequenceHadUnresolved: Boolean = false,
     ): FolderFilesProviderResult? = with(Dispatchers.IO) {
 
         SentryLog.i(TAG, "loadFromRemote")
@@ -548,7 +555,16 @@ object FolderFilesProvider {
 
         ensureActive()
 
-        handleRemoteFiles(realm, apiResponse, folderFilesProviderArgs, folderProxy, okHttpClient, observedById, checkCancelled)
+        handleRemoteFiles(
+            realm,
+            apiResponse,
+            folderFilesProviderArgs,
+            folderProxy,
+            okHttpClient = okHttpClient,
+            observedById = observedById,
+            checkCancelled = checkCancelled,
+            sequenceHadUnresolved = sequenceHadUnresolved,
+        )
     }
 
     private fun loadCloudStorageFromRemote(
@@ -1171,14 +1187,18 @@ object FolderFilesProvider {
         checkCancelled: () -> Unit = {},
     ) {
         val fetchedAncestors = ArrayDeque<Pair<File, File?>>() // ancestor to its PRE-REQUEST observation
-        val climbedIds = mutableSetOf<Int>() // CYCLE CHECK (issue: round 25 #15)
+        val climbedIds = mutableSetOf<Int>() // CYCLE CHECK (issues: round 25 #15, round 26 #17)
         var cursorRow: File = fetchedFile
         var fetchBudget = MISSING_ANCESTRY_RESOLUTION_BUDGET
-        var walkedHops = 0
-        while (walkedHops++ < FileController.ANCESTRY_VALIDATION_DEPTH_BUDGET) {
+        // FINITE CACHED ITERATION, NO FIXED DEPTH CAP (issue: round 26 #17): the climb
+        // terminates structurally — at the root, at a cycle (the visited set), or at the
+        // separate network budget — never at an arbitrary hop count. A hole above any fixed
+        // budget was previously unreachable forever, because every invocation restarted
+        // from the same descendant and burned its bound on cached hops.
+        while (true) {
             val parentId = cursorRow.parentId.takeIf { it > 0 } ?: break
-            // CYCLE CHECK (issue: round 25 #15): a repeated id is a corrupted cycle —
-            // the climb defers instead of circling to the walk bound.
+            // CYCLE CHECK: a repeated id is a corrupted cycle — the climb defers instead
+            // of circling.
             if (!climbedIds.add(parentId)) break
             val cached = FileController.getFileById(realm, parentId)
             if (cached != null) {

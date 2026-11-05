@@ -157,7 +157,17 @@ open class File(
      * destructive absence predicates detect marker ABA without a Boolean flag's
      * blindness. Persisted (schema File DB 16, default 0 = pre-stamp rows).
      */
-    var offlineIntentStamp: Long = 0,
+    var offlineIntentStamp: Long = 0
+
+    /**
+     * THE MONOTONIC INTENT GENERATION (issue: round 26 #12): strictly per-row increasing
+     * (previous + 1), inside the caller's transaction — equal stamps for rapid transitions
+     * and clock-skew resurrection of an older value are both impossible, so an old absence
+     * authority can never reproduce a captured generation. Every intent writer bumps.
+     */
+    fun bumpOfflineIntentGeneration() {
+        offlineIntentStamp = offlineIntentStamp + 1L
+    },
     var isOffline: Boolean = false,
 
     /**
@@ -555,19 +565,24 @@ open class File(
             }
             // Never drop the bytes backing a pending upload when the cache row goes away
             // (issue #1902); the upload still reads from this file.
-            // DELETION-BOUNDARY RECOVERY EXCLUSION (issues: round 23 #3, round 25 #7):
-            // bytes governed by an unresolved durable recovery are recovery-managed
+            // DELETION-BOUNDARY RECOVERY EXCLUSION (issues: round 23 #3, round 25 #7, round
+            // 26 #9): bytes governed by an unresolved durable recovery are recovery-managed
             // state — deleting them destroys the recovery's subject. The check runs by
-            // identity AND path and fails closed; a MISSING target with a governing
-            // recovery retains the row too.
-            if (offlineFile.exists() && (UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()) ||
-                    DownloadOfflineFileManager.hasUnresolvedRecovery(
-                        context,
-                        UserDrive(userId, driveId),
-                        id,
-                        offlineFile.absolutePath,
-                    )
-                    )
+            // identity AND path BEFORE any existence test: a RESOLVED but MISSING target
+            // with a governing recovery retains the row too (the backup's restoration needs
+            // its live owner — the previous exists-gated check let the row be deleted over
+            // a pending backup, stranding it).
+            if (offlineFile.exists() &&
+                UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())
+            ) {
+                return false
+            }
+            if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                    context,
+                    UserDrive(userId, driveId),
+                    id,
+                    offlineFile.absolutePath,
+                )
             ) {
                 return false
             }
@@ -583,19 +598,20 @@ open class File(
             return true
         } else {
             val cacheFile = getCacheFile(context)
+            // THE PLAIN-CACHE BRANCH CARRIES THE SAME EXCLUSION BEFORE ANY EXISTS TEST
+            // (issues: round 25 #7, round 26 #9): an unresolved recovery governs the
+            // identity whether or not the cache bytes are currently present — a missing
+            // target with a pending backup retains the row.
+            if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                    context,
+                    UserDrive(userId, driveId),
+                    id,
+                    cacheFile.absolutePath,
+                )
+            ) {
+                return false
+            }
             if (cacheFile.exists()) {
-                // THE PLAIN-CACHE BRANCH CARRIES THE SAME EXCLUSION (issue: round 25 #7):
-                // plain-cache publications write durable recovery records for their
-                // rollback backups — an unresolved one keeps this cache out of deletion.
-                if (DownloadOfflineFileManager.hasUnresolvedRecovery(
-                        context,
-                        UserDrive(userId, driveId),
-                        id,
-                        cacheFile.absolutePath,
-                    )
-                ) {
-                    return false
-                }
                 DownloadOfflineFileManager.deletePublishedProvenance(context, cacheFile)
                 if (!cacheFile.delete()) return false
             }

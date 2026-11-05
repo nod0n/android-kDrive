@@ -150,6 +150,10 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
                     // check the WRONG job. The CAPTURED job rides every save, including
                     // inside the coordinated commit section.
                     checkCancelled = { executingJob.ensureActive() },
+                    // THE ACCUMULATED SEQUENCE STATE RIDES THE SAVE (issue: round 26 #19):
+                    // the final page's transaction itself carries the earlier pages'
+                    // unresolved work durably.
+                    sequenceHadUnresolved = sequenceHadUnresolved,
                 )
                 // CROSS-PAGE UNRESOLVED ACCUMULATION (issue: round 24 #17): the flag rides
                 // the whole listing sequence — a successful FINAL page must not erase the

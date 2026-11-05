@@ -163,7 +163,10 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                                 realm.executeTransaction {
                                     val root = FileController.getFileById(realm, folderId)
                                     if (root != null && root.isValid) {
-                                        if (root.isMarkedAsOffline) root.isMarkedAsOffline = false
+                                        if (root.isMarkedAsOffline) root.apply {
+                                            isMarkedAsOffline = false
+                                            bumpOfflineIntentGeneration()
+                                        }
                                     }
                                     // ACTUAL MODEL IDENTITY (round-19 build fix): lastSyncedAt
                                     // lives on the DURABLE OfflineRoot record, not on the File

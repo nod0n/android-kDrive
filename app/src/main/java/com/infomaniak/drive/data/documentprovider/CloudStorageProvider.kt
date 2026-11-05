@@ -525,11 +525,16 @@ class CloudStorageProvider : DocumentsProvider() {
 
         val context = context ?: throw IllegalStateException("Delete document failed: missing Android Context")
 
-        FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
+        // THE DOCUMENT'S COMPLETE CAPTURED SCOPE (issue: round 26 #10): the opened realm's
+        // scope rides the whole deletion — the previous call omitted it, so the recursive
+        // traversal captured the ACTIVE account and enumerated the WRONG graph for a
+        // document of another captured account/shared scope.
+        val documentUserDrive = createUserDrive(documentId)
+        FileController.getRealmInstance(documentUserDrive).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
                 // Delete
-                val apiResponse = FileController.deleteFile(file, realm, context = context)
+                val apiResponse = FileController.deleteFile(file, realm, documentUserDrive, context)
 
                 if (apiResponse.isSuccess()) {
 

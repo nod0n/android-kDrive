@@ -468,7 +468,10 @@ class FileInfoActionsView @JvmOverloads constructor(
                                                     realm.executeTransaction {
                                                         val live = FileController.getFileById(realm, fileId)
                                                         stands = live?.isOffline == true
-                                                        if (stands) live?.isMarkedAsOffline = true
+                                                        if (stands) {
+                                                            live?.isMarkedAsOffline = true
+                                                            live?.bumpOfflineIntentGeneration()
+                                                        }
                                                     }
                                                     stands
                                                 }

@@ -75,18 +75,6 @@ object FileController {
     private const val GALLERY_ANCESTRY_RESOLUTION_BUDGET = 4
 
     /**
-     * Parent hops inspected by one resolved-ancestry validation (issue: round 23 #15) and by
-     * the ancestry resolver's cached climb (issue: round 25 #15) — bounds pathological
-     * chains/cycles; exhaustion is unresolved (round 24 #15). 512, not 32: a COMPLETE CACHED
-     * ancestry is validated ITERATIVELY for its full depth (a 32-hop bound previously
-     * declared deep cached chains unresolved forever), while the NETWORK fetch budget stays
-     * separately bounded ([FolderFilesProvider.MISSING_ANCESTRY_RESOLUTION_BUDGET]) — cached
-     * hops cost no request, so the walk bound protects only against cycles (visited-set
-     * detected) and runaway graphs, not against request volume.
-     */
-    internal const val ANCESTRY_VALIDATION_DEPTH_BUDGET = 512
-
-    /**
      * Fair rotating start offset for the gallery ancestry work set (issue: round 22 #16): each
      * pass starts its bounded budget at the next rotation position, so a persistently failing
      * ancestor request cannot consume the budget ahead of independent candidates forever.
@@ -349,6 +337,12 @@ object FileController {
             .equalTo(File::id.name, fileId)
             .findFirst()?.let { file ->
                 file.isMarkedAsOffline = isMarkedAsOffline
+                // THE MONOTONIC INTENT GENERATION (issue: round 26 #12): strictly per-row
+                // increasing (previous + 1), inside the same transaction — equal stamps for
+                // rapid transitions and clock-skew resurrection of an older value are both
+                // impossible, so an old absence authority can never reproduce a captured
+                // generation.
+                file.offlineIntentStamp = file.offlineIntentStamp + 1L
                 // Durable explicit-pin intent (issue: round 5 #15): the user's request must not
                 // depend on the shared pending marker, which an overlapping inherited walk can
                 // clear. Inherited completion neither consumes nor suppresses this flag, and
@@ -401,11 +395,10 @@ object FileController {
         val block: (Realm) -> Unit? = { realm ->
             realm.executeTransaction {
                 markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline, setExplicitPin = false)
-                // THE DURABLE INTENT STAMP (issue: round 25 #10): EVERY marker transition
-                // bumps a per-row generation, so an unmark/repin sequence (ABA) never
-                // reproduces the request-time observation's stamp — the destructive
-                // absence predicates compare it against the captured row's.
-                getFileById(realm, fileId)?.let { file -> file.offlineIntentStamp = System.currentTimeMillis() }
+                // THE MONOTONIC INTENT GENERATION (issues: round 25 #10, round 26 #12): the
+                // bump lives INSIDE the query (previous + 1, same transaction) — every
+                // query-based writer inherits it; the previous millisecond write permitted
+                // equal stamps and clock-skew resurrection.
             }
         }
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
@@ -725,36 +718,61 @@ object FileController {
         // retained descendant then lost the required ownership metadata and ancestry
         // above it. Phase one flattens the graph breadth-first; phase two processes
         // DEEPEST-FIRST so every parent's decision sees its descendants' actual outcomes.
+        // THE SUPPLIED REALM IS THE GRAPH (issue: round 26 #10): children are enumerated
+        // TRANSACTION-FRESH from the CALLER'S realm instance — the previous
+        // getFileByUidOrId(file.id, userDrive) opened its own instance on the CAPTURED
+        // (or default/current) scope, so a document belonging to another captured
+        // account/shared scope was traversed against the WRONG graph and its metadata
+        // removed without ever discovering retained descendants. When no realm is
+        // supplied the captured-scope instance is used, as before.
         val ordered = mutableListOf<File>()
         val seenIds = mutableSetOf<Int>()
         val childrenIdsById = mutableMapOf<Int, List<Int>>()
         val capturedUserId = userDrive?.userId ?: AccountUtils.currentUserId
         val pending = ArrayDeque(filesToDelete)
         filesToDelete.clear()
-        while (pending.isNotEmpty()) {
-            val file = pending.removeFirst()
-            if (!seenIds.add(file.id)) continue
-            ordered.add(file)
-            val children = getFileByUidOrId(file.id, userDrive)?.children ?: emptyList()
-            childrenIdsById[file.id] = children.map { it.id }
-            children.forEach { pending.add(it) }
-        }
+        runCatching {
+            val graphRealm = realm ?: getRealmInstance(userDrive ?: UserDrive(capturedUserId))
+            graphRealm.use { traversalRealm ->
+                while (pending.isNotEmpty()) {
+                    val file = pending.removeFirst()
+                    if (!seenIds.add(file.id)) continue
+                    ordered.add(file)
+                    val children = getFileById(traversalRealm, file.id)?.children ?: emptyList()
+                    childrenIdsById[file.id] = children.map { it.id }
+                    children.forEach { pending.add(it) }
+                }
+            }
+        }.onFailure(Sentry::captureException)
         val retainedIds = mutableSetOf<Int>()
-        for (file in ordered.reversed()) {
-            // DEFERRED REMOVAL OUTCOME (issue: round 24 #4), as in removeFile: when the
-            // byte deletion RETAINED the bytes (pending upload, unresolved recovery), the
-            // owning row is retained too. THE CAPTURED SCOPE rides the recursive
-            // deletion (issue: round 25 #7) — never the default active account.
-            val bytesDisposed = file.deleteCaches(context, capturedUserId)
-            // A REQUIRED ANCESTOR (issue: round 25 #7): a parent whose subtree retained
-            // anything keeps its row and metadata — deleting the row over a retained
-            // descendant strands the descendant's ownership.
-            val subtreeRetains = !bytesDisposed ||
-                (childrenIdsById[file.id]?.any { it in retainedIds } == true)
-            if (subtreeRetains) {
-                retainedIds.add(file.id)
-            } else {
-                updateFile(file.id, realm, userDrive) { localFile -> localFile.deleteFromRealm() }
+        // COORDINATED FINAL CLASSIFICATION AND DELETION (issue: round 26 #10): the
+        // deepest-first byte/row decisions run under the intent monitor and ONE ascending
+        // lock set over every affected identity — the previous unlocked phase two could
+        // interleave with a concurrent publication or move between an outcome's
+        // classification and its row deletion.
+        val deletionScope = userDrive ?: UserDrive(capturedUserId)
+        val affectedIds = ordered.map { it.id }.distinct().sorted()
+        if (affectedIds.isEmpty()) return
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withLocksFor(deletionScope, affectedIds) {
+                for (file in ordered.reversed()) {
+                    // DEFERRED REMOVAL OUTCOME (issue: round 24 #4), as in removeFile: when
+                    // the byte deletion RETAINED the bytes (pending upload, unresolved
+                    // recovery), the owning row is retained too. THE CAPTURED SCOPE rides
+                    // the recursive deletion (issue: round 25 #7) — never the default
+                    // active account.
+                    val bytesDisposed = file.deleteCaches(context, capturedUserId)
+                    // A REQUIRED ANCESTOR (issue: round 25 #7): a parent whose subtree
+                    // retained anything keeps its row and metadata — deleting the row over
+                    // a retained descendant strands the descendant's ownership.
+                    val subtreeRetains = !bytesDisposed ||
+                        (childrenIdsById[file.id]?.any { it in retainedIds } == true)
+                    if (subtreeRetains) {
+                        retainedIds.add(file.id)
+                    } else {
+                        updateFile(file.id, realm, userDrive) { localFile -> localFile.deleteFromRealm() }
+                    }
+                }
             }
         }
     }
@@ -798,6 +816,7 @@ object FileController {
                                 // (issue: round 5 #15): a stale marker would otherwise resurrect
                                 // the pin through the sync's intent check after the next download.
                                 file.isMarkedAsOffline = false
+                                file.bumpOfflineIntentGeneration()
                             }
                         }
                     }
@@ -1047,7 +1066,10 @@ object FileController {
                     file.isOffline = isOffline
                     // A removed intent cannot be reauthorized by its stale pending marker
                     // (issue: round 15 #12): unpinning clears both.
-                    if (!isOffline) file.isMarkedAsOffline = false
+                    if (!isOffline) {
+                        file.isMarkedAsOffline = false
+                        file.bumpOfflineIntentGeneration()
+                    }
                 }
             }
         }
@@ -1334,9 +1356,13 @@ object FileController {
     internal fun usableAncestryChain(realm: Realm, startParentId: Int): Boolean {
         var parentId = startParentId
         val visited = mutableSetOf<Int>()
-        var depth = 0
         while (parentId > 0) {
-            if (depth++ >= ANCESTRY_VALIDATION_DEPTH_BUDGET) return false
+            // A REPEATED ID IS A CYCLE (issues: round 23 #15, round 26 #17) — the walk
+            // defers. Every other termination is structural: a cached chain is FINITE (it
+            // ends at the root or at a missing row), so valid chains of ANY supported depth
+            // converge — the previous fixed hop budgets (32, then 512) permanently rejected
+            // deeper complete chains and left holes above the budget unreachable forever,
+            // because every invocation restarted from the same descendant.
             if (!visited.add(parentId)) return false
             parentId = getFileById(realm, parentId)?.parentId ?: return false
         }
@@ -2780,6 +2806,11 @@ object FileController {
         if (oldFile.updatedAt > updatedAt) updatedAt = oldFile.updatedAt
         versionCode = oldFile.versionCode
         isMarkedAsOffline = oldFile.isMarkedAsOffline
+        // THE INTENT GENERATION IS PRESERVED (issue: round 26 #12): a metadata merge never
+        // resets the durable generation — an incoming object's default zero must not
+        // replace a newer stamp (the previous omission let keepOldLocalFilesData resurrect
+        // an older captured observation's match).
+        offlineIntentStamp = oldFile.offlineIntentStamp
     }
 
     private fun RealmQuery<File>.getSortQueryByOrder(order: SortType): RealmQuery<File> {
