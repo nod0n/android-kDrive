@@ -75,13 +75,17 @@ import io.sentry.SentryLevel
 import io.sentry.protocol.Message
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import splitties.init.appCtx
 import java.io.IOException
 import java.net.URLEncoder
@@ -1022,7 +1026,6 @@ class CloudStorageProvider : DocumentsProvider() {
                 // copy could then publish mixed bytes under the previously validated
                 // generation, which the post-write invalidation could not retract.
                 val stagedOk = runBlocking(operationJob) {
-                    val bridgeJob = coroutineContext[kotlinx.coroutines.Job]
                     val response = DownloadOfflineFileManager.downloadFileResponseAsync(
                         fileUrl = ApiRoutes.downloadFile(file),
                         okHttpClient = okHttpClient,
@@ -1030,13 +1033,22 @@ class CloudStorageProvider : DocumentsProvider() {
                             SentryLog.i(TAG, "open currentProgress: $progress")
                         })
                     )
-                    // OWNERSHIP THROUGH CONSUMPTION (issue: round 30 #9): the await's
-                    // cancellation handler is spent once the response arrived — the
-                    // operation job's cancelling completion CLOSES the response (which
-                    // interrupts a blocked body read) until consumption finishes, and the
-                    // use below closes it on every exit (double close is safe).
-                    val bodyOwnership = bridgeJob?.invokeOnCompletion(onCancelling = true) { cause ->
-                        if (cause != null) runCatching { response.close() }
+                    // OWNERSHIP THROUGH CONSUMPTION, STABLE API (issue: round 30 #9): the
+                    // await's cancellation handler is spent once the response arrived — a
+                    // cancellation DURING the body consumption must still reach the
+                    // transfer. A watcher sibling on an EXPLICIT dispatcher observes this
+                    // operation's cancellation — structured children are cancelled at
+                    // CANCELLATION TIME, not at completion (a completion-time handler
+                    // could never run while the read blocks, and the internal onCancelling
+                    // completion hook is deliberately not used) — and CLOSES the response,
+                    // interrupting the blocked read; the use below closes it on every exit
+                    // (double close is safe).
+                    val bodyOwnership = launch(Dispatchers.IO, CoroutineStart.UNDISPATCHED) {
+                        try {
+                            awaitCancellation()
+                        } finally {
+                            withContext(NonCancellable) { runCatching { response.close() } }
+                        }
                     }
                     try {
                         response.use { ownedResponse ->
@@ -1051,7 +1063,7 @@ class CloudStorageProvider : DocumentsProvider() {
                             }.isSuccess
                         }
                     } finally {
-                        bodyOwnership.dispose()
+                        bodyOwnership.cancel()
                     }
                 }
                 // TYPED GENERATION-BOUND RESPONSE BINDING (issues: round 23 #22, round
