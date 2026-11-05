@@ -554,6 +554,23 @@ object FileController {
                                     folderId = fileId,
                                     realm = realm,
                                 )
+                        // EXPLICITLY KEPT CHILDREN ARE RETAINED DESCENDANTS (review-38 #8):
+                        // the recursion skips a keepFiles child entirely, but its retention
+                        // still belongs in the aggregate when the child's LIVE parentId chain
+                        // still requires this row — deleting the parent would strand the kept
+                        // child's required ancestor and backlink (the My Shares replacement
+                        // keeps a child whose folder the refreshed list no longer carries,
+                        // while the child survives with parentId pointing at the deleted
+                        // row). Revalidated HERE, inside the coordination, before BOTH
+                        // parent-deletion branches; the caller's membership replacement
+                        // consumes the same aggregate. A kept child moved elsewhere is
+                        // classified accurately: its live row no longer requires this row as
+                        // its ancestor, so it contributes no retention here.
+                        val keptChildStillRequiresThisRow = file.isFolder() && keepFiles.isNotEmpty() &&
+                                file.children.createSnapshot().any { keepFiles.contains(it.id) && it.parentId == fileId }
+                        if (keptChildStillRequiresThisRow) {
+                            allRemoved = false
+                        }
                         if (!keepFileCaches.contains(fileId)) {
                             // Inherited copies are preserved before any deletion (issue: round 3 #6):
                             // a pending upload keeps its bytes, a dirty copy is snapshotted first.
