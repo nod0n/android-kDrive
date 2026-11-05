@@ -852,24 +852,43 @@ object SyncOfflineUtils {
         val offlineDir = context.getString(R.string.EXPOSED_OFFLINE_DIR)
         val oldPath = IOFile(context.filesDir, "$offlineDir/${userDrive.userId}/${userDrive.driveId}/${file.id}")
         if (!oldPath.exists()) return
-        // THE FRESH BOUNDARY GUARD (review-35 #14): the migration's rename writes DIRECTLY
-        // over the recovery-managed target — a captured enumeration predates this exact
-        // boundary. Under the file lock, a fresh exclusion check (the file's identity plus
-        // BOTH the migrated source and destination paths) defers the migration; the sweep
-        // owns the unresolved state.
-        OfflineFileCoordination.withFileLock(userDrive, file.id) {
-            val recoveryGoverned = DownloadOfflineFileManager.hasUnresolvedRecovery(
-                context,
-                userDrive,
-                file.id,
-                oldPath.absolutePath,
-            ) || DownloadOfflineFileManager.hasUnresolvedRecovery(
-                context,
-                userDrive,
-                file.id,
-                ioFile.absolutePath,
-            )
-            if (!recoveryGoverned) oldPath.renameTo(ioFile)
+        // THE COMPLETE MIGRATION BOUNDARY (review-35 #14, completed review-36 #11): intent
+        // monitor → file lock → FRESH Realm identity and destination resolution →
+        // destination classification — the rename never targets a stale path or an
+        // existing destination copy, and a governed migration defers.
+        synchronized(OfflineFileCoordination.rootIntentMonitor) {
+            OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    runCatching { realm.refresh() }.onFailure { return@use }
+                    // F'S IDENTITY IS REVALIDATED (review-36 #11): the caller's destination was
+                    // derived from a DETACHED row — F may have moved between observation and
+                    // this boundary, and another retained row may now own the old location.
+                    val freshRow = FileController.getFileById(realm, file.id) ?: return@use
+                    val freshDestination = freshRow.getOfflineFile(
+                        context,
+                        userDrive.userId,
+                        sharedWithMe = userDrive.sharedWithMe,
+                    ) ?: return@use
+                    if (freshDestination.absolutePath != ioFile.absolutePath) return@use
+                    val recoveryGoverned = DownloadOfflineFileManager.hasUnresolvedRecovery(
+                        context,
+                        userDrive,
+                        file.id,
+                        oldPath.absolutePath,
+                    ) || DownloadOfflineFileManager.hasUnresolvedRecovery(
+                        context,
+                        userDrive,
+                        file.id,
+                        freshDestination.absolutePath,
+                    )
+                    if (recoveryGoverned) return@use
+                    // EXISTING-DESTINATION CLASSIFICATION (review-36 #11): a destination that
+                    // already holds content belongs to the CURRENT resolution — the stale
+                    // ID-named old copy never replaces it; the migration defers instead.
+                    if (freshDestination.exists()) return@use
+                    oldPath.renameTo(freshDestination)
+                }
+            }
         }
     }
 
