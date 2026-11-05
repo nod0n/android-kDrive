@@ -3560,6 +3560,17 @@ class DownloadOfflineFileManager(
             staged: IOFile,
             generationResolved: Boolean = true,
         ): PublicationOutcome = try {
+            // THE MONITOR PRECEDES THE FILE LOCK (issue: round 28 #11): this writer
+            // creates and disposes scope-indexed operation records (sidecar BEFORE body),
+            // so its (sidecar, body) publication pair must be atomic relative to the
+            // sweep's orphan classification — which holds the intent monitor. The
+            // previous file-lock-only section could interleave with the monitor-held
+            // sweep: the index of an operation being created was deleted before its body
+            // existed, and a later crash left recovery without its captured
+            // flavor/kind. Consistent monitor→lock ordering with every other coordinated
+            // section; no lock-order inversion is introduced (the monitor is acquired
+            // FIRST, as the protocol requires).
+            synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, file.id) {
                 // Cancellation re-check AFTER the blocking lock (issue: round 18 #23):
                 // lock acquisition does not respond to coroutine cancellation — a
@@ -3712,6 +3723,7 @@ class DownloadOfflineFileManager(
                     SentryLog.e(TAG, "Staged cache publication failed for ${target.path}", exception)
                 }.getOrDefault(PublicationOutcome.FAILED)
             }
+            } // THE MONITOR-HELD WRITER BOUNDARY (issue: round 28 #11)
         } finally {
             // Staging cleanup on EVERY path, cancellation included (issue: round 18 #23),
             // INCLUDING the staged provenance record (issue: round 19 #11): a prepared
