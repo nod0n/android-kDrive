@@ -2121,6 +2121,7 @@ class DownloadOfflineFileManager(
             proofText: String,
             sharedWithMe: Boolean = false,
             storageKind: String = "offline",
+            attemptedObservationText: String? = null,
         ): Boolean = runCatching {
             val recordFile = proofRelocationRecordFile(context, target)
             // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
@@ -2139,7 +2140,14 @@ class DownloadOfflineFileManager(
                 storageKind = storageKind,
             )
             if (!sidecarWritten) return@runCatching false
-            atomicWriteText(recordFile, listOf("1", target.absolutePath, proofText).joinToString("\n"))
+            // FOURTH LINE: THE CARRIED OBSERVATION (issue: round 30 #7) — the relocation
+            // state retains the attempt's observation beside the proof, so the replay
+            // re-establishes BOTH at the destination before disposal (a legacy three-line
+            // record carries none; the replay treats it as absent).
+            atomicWriteText(
+                recordFile,
+                listOf("1", target.absolutePath, proofText, attemptedObservationText ?: "").joinToString("\n"),
+            )
         }.getOrDefault(false)
 
         /**
@@ -2184,6 +2192,10 @@ class DownloadOfflineFileManager(
                 provenance.recordText(target),
                 sharedWithMe = sharedWithMe,
                 storageKind = storageKind,
+                // THE OBSERVATION RIDES THE RELOCATION STATE (issue: round 30 #7):
+                // captured from the source BEFORE any rebind, so a crash between the
+                // relocation record and the observation move is recoverable with BOTH.
+                attemptedObservationText = readAttemptedObservationText(context, source),
             )
             if (!relocationStateWritten) {
                 // Without recoverable state the source proof is NOT destroyed: the old
@@ -2347,6 +2359,43 @@ class DownloadOfflineFileManager(
          * validate against the exact backed-up generation. A backup without a computable
          * hash is never kept (it could not be verified against anything).
          */
+        /**
+         * THE CARRIED ATTEMPTED OBSERVATION (issue: round 30 #7): a recovery operation
+         * persists the staged attempt's observation text BEFORE the replacement, so an
+         * interrupted publication can re-establish the proof AND its retry evidence
+         * together. Null when the attempt published no observation (a resolved generation).
+         */
+        private fun readAttemptedObservationText(context: Context, publishedFile: IOFile): String? =
+            runCatching { IOFile(provenanceFileFor(context, publishedFile).path + ".obs").readText().trim() }
+                .getOrNull()?.takeIf { it.isNotEmpty() && parseObservationBinding(it) != null }
+
+        /**
+         * THE REPLAYED OBSERVATION BINDING (issue: round 30 #7): the carried observation is
+         * re-established at the target WITH the proof it belongs to — the tail is re-bound
+         * to this destination (fixed-prefix parse, pipes safe), the write is atomic and
+         * read back, and the parsed attempt id must equal the established proof's
+         * publication id. A null carried text (a resolved publication, or a legacy record
+         * predating the observation) establishes nothing and succeeds.
+         */
+        private fun establishRecoveredObservation(
+            context: Context,
+            target: IOFile,
+            observationText: String?,
+            proof: PublishedProvenance,
+        ): Boolean {
+            if (observationText == null) return true
+            val parsed = parseObservationBinding(observationText) ?: return false
+            val reboundText = (parsed.first + target.absolutePath).joinToString("|")
+            val rebound = parseObservationBinding(reboundText) ?: return false
+            if (rebound.second != target.absolutePath) return false
+            if (parsed.first.size == 7 && rebound.first[1].toLongOrNull() != proof.publicationId) return false
+            val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!atomicWriteText(targetObs, reboundText)) return false
+            val writtenBack = runCatching { targetObs.readText().trim() }.getOrNull()
+            return writtenBack == reboundText &&
+                parseObservationBinding(writtenBack ?: "")?.second == target.absolutePath
+        }
+
         private fun writeRecoveryRecord(
             context: Context,
             recoveryFile: IOFile,
@@ -2358,13 +2407,14 @@ class DownloadOfflineFileManager(
             backupHash: String,
             expectedPublicationHash: String?,
             expectedPublicationRecordText: String?,
+            attemptedObservationText: String?,
         ): Boolean = runCatching {
-            // RECORD v3 (issue: round 23 #2): the operation's EXPECTED TARGET PUBLICATION
-            // (the staged generation's content hash and the proof the target will carry)
-            // rides the record — the reconciliation can then distinguish INTERRUPTED
-            // PUBLICATION OUTPUT (the target already holds the expected bytes: complete
-            // the publication with its captured proof) from a PROVEN INTERVENING EDIT,
-            // and never auto-uploads arbitrary changed targets.
+            // RECORD v4 (issue: round 30 #7): the operation's ATTEMPTED OBSERVATION rides
+            // the record beside the expected proof — an interrupted publication can then
+            // re-establish the destination proof AND the durable retry evidence together,
+            // and the disposal happens only once BOTH are established (the previous v3
+            // replay reconstructed a self-certifying proof while the observation was still
+            // stranded at the staged key, leaving suppression without its evidence).
             val recordFile = recoveryRecordFile(context, recoveryFile)
             // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
             // scope index exists before the record itself, and names the destination's
@@ -2387,7 +2437,7 @@ class DownloadOfflineFileManager(
             atomicWriteText(
                 recordFile,
                 listOf(
-                    "3",
+                    "4",
                     target.absolutePath,
                     recoveryFile.absolutePath,
                     oldTargetMtimeMillis.toString(),
@@ -2398,6 +2448,7 @@ class DownloadOfflineFileManager(
                     backupHash,
                     expectedPublicationHash ?: "",
                     expectedPublicationRecordText ?: "",
+                    attemptedObservationText ?: "",
                 ).joinToString("\n")
             )
         }.getOrDefault(false)
@@ -2414,6 +2465,9 @@ class DownloadOfflineFileManager(
             val backupHash: String?,
             val expectedPublicationHash: String?,
             val expectedPublicationRecordText: String?,
+            /** THE CARRIED ATTEMPTED OBSERVATION (issue: round 30 #7) — v4 records only;
+             * v1–v3 records carried no observation (their attempts predate it). */
+            val attemptedObservationText: String? = null,
             val legacy: Boolean,
             /** The owner scope was recovered from validated durable state (issue: round 24
              * #3) — a record whose scope could not be established is never locked, queried
@@ -2453,6 +2507,24 @@ class DownloadOfflineFileManager(
          */
         private fun readRecoveryRecord(recordFile: IOFile): RecoveryRecord? = runCatching {
             val text = recordFile.readText()
+            val v4 = text.split("\n", limit = 12)
+            if (v4.size == 12 && v4[0].trim() == "4") {
+                return@runCatching RecoveryRecord(
+                    recordFile = recordFile,
+                    targetPath = v4[1],
+                    recoveryPath = v4[2],
+                    oldTargetMtimeMillis = v4[3].trim().toLongOrNull() ?: return null,
+                    oldRecordText = v4[4].takeIf { it.isNotEmpty() },
+                    fileId = v4[5].trim().toIntOrNull() ?: return null,
+                    userId = v4[6].trim().toIntOrNull() ?: return null,
+                    driveId = v4[7].trim().toIntOrNull() ?: return null,
+                    backupHash = v4[8].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationHash = v4[9].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationRecordText = v4[10].takeIf { it.isNotEmpty() },
+                    attemptedObservationText = v4[11].takeIf { it.isNotEmpty() },
+                    legacy = false,
+                )
+            }
             val v3 = text.split("\n", limit = 11)
             if (v3.size == 11 && v3[0].trim() == "3") {
                 return@runCatching RecoveryRecord(
@@ -2682,8 +2754,8 @@ class DownloadOfflineFileManager(
                 // never written over the restored bytes.
                 if (recordFile.name.startsWith("proofmove_")) {
                     val proofMoveResolved = runCatching {
-                        val parts = recordFile.readText().split("\n", limit = 3)
-                        if (parts.size != 3 || parts[0].trim() != "1") return@runCatching false
+                        val parts = recordFile.readText().split("\n", limit = 4)
+                        if ((parts.size != 3 && parts.size != 4) || parts[0].trim() != "1") return@runCatching false
                         val target = IOFile(parts[1])
                         val proofText = parts[2]
                         // FRAMING-AWARE FIELD PARSING (issue: round 25 #12): the owner and
@@ -2821,12 +2893,30 @@ class DownloadOfflineFileManager(
                                                     return@runCatching disposeRecoveryRecord(recordFile)
                                                 }
                                                 val recordTarget = verifiedProvenanceFileFor(context, target)
-                                                val written = recordTarget != null && runCatching {
+                                                val proofEstablished = recordTarget != null && runCatching {
                                                     atomicWriteText(recordTarget, proofText)
                                                 }.getOrDefault(false) &&
                                                     readPublishedProvenance(context, target) != null
-                                                if (written) disposeRecoveryRecord(recordFile)
-                                                written
+                                                // THE OBSERVATION JOINS THE PROOFMOVE REPLAY
+                                                // (issue: round 30 #7): the retained proof is
+                                                // written only together with its attempt's
+                                                // observation — re-bound to THIS destination and
+                                                // verified against the established proof's
+                                                // publication id — and the relocation state is
+                                                // disposed only when BOTH are established. A
+                                                // legacy three-line record carries none (a
+                                                // pre-observation attempt); its evidence contract
+                                                // is unchanged.
+                                                val observationEstablished = proofEstablished && runCatching {
+                                                    establishRecoveredObservation(
+                                                        context,
+                                                        target,
+                                                        parts.getOrNull(3)?.takeIf { it.isNotEmpty() },
+                                                        readPublishedProvenance(context, target) ?: return@runCatching false,
+                                                    )
+                                                }.getOrDefault(false)
+                                                if (proofEstablished && observationEstablished) disposeRecoveryRecord(recordFile)
+                                                proofEstablished && observationEstablished
                                             }.getOrDefault(false)
                                         }
                                     }
@@ -2954,6 +3044,23 @@ class DownloadOfflineFileManager(
                     UserDrive(userId = record.userId, driveId = record.driveId),
                 )
             ) {
+                // THE OBSERVATION JOINS THE SELF-CERTIFYING DISPOSAL (issue: round 30 #7):
+                // the crash window this arm closed the proof of — rename and destination
+                // record written, observation not yet moved — previously disposed the
+                // operation with the retry evidence stranded at the staged key. A carried
+                // observation is established WITH the proof it belongs to (same publication
+                // id) before disposal; a proof carrying a DIFFERENT (newer) publication id
+                // has superseded the attempt — its observation evidence is spent and is
+                // deliberately not rewritten (the binding reader would reject it anyway).
+                if (record.attemptedObservationText != null) {
+                    val carriedAttemptId = parseObservationBinding(record.attemptedObservationText)
+                        ?.first?.getOrNull(1)?.toLongOrNull()
+                    if (carriedAttemptId != null && carriedAttemptId == targetProof.publicationId &&
+                        !establishRecoveredObservation(context, target, record.attemptedObservationText, targetProof)
+                    ) {
+                        return false
+                    }
+                }
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
                 return true
@@ -2987,7 +3094,17 @@ class DownloadOfflineFileManager(
                 if (currentRecord != null && currentRecord.contentHash != record.expectedPublicationHash) return false
                 if (record.expectedPublicationRecordText != null) {
                     if (!atomicWriteText(provenanceFileFor(context, target), record.expectedPublicationRecordText)) return false
-                    if (readPublishedProvenance(context, target) == null) return false
+                    val establishedProof = readPublishedProvenance(context, target) ?: return false
+                    // THE OBSERVATION IS ESTABLISHED WITH ITS PROOF (issue: round 30 #7):
+                    // the interrupted publication's replay no longer reconstructs a
+                    // self-certifying destination proof while the attempt's observation is
+                    // stranded at the staged key — both are established (the observation
+                    // re-bound and verified against the proof's publication id) BEFORE the
+                    // recovery state is disposed; a failed observation write retains the
+                    // whole operation state, never half of it.
+                    if (!establishRecoveredObservation(context, target, record.attemptedObservationText, establishedProof)) {
+                        return false
+                    }
                 }
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
@@ -3855,6 +3972,10 @@ class DownloadOfflineFileManager(
                     backupHash,
                     expectedPublicationHash,
                     expectedPublicationRecordText,
+                    // THE OBSERVATION RIDES THE RECOVERY (issue: round 30 #7): captured
+                    // from the staged attempt BEFORE the replacement, so an interrupted
+                    // publication can re-establish proof and evidence together.
+                    attemptedObservationText = readAttemptedObservationText(provenanceContext, staged),
                 ))
             if (!recoveryOk || !recoveryRecorded) {
                 runCatching { recoveryFile?.delete() }
@@ -4179,6 +4300,8 @@ class DownloadOfflineFileManager(
                                 backupHash,
                                 expectedPublicationHash,
                                 expectedPublicationRecordText,
+                                // THE OBSERVATION RIDES THE RECOVERY (issue: round 30 #7).
+                                attemptedObservationText = readAttemptedObservationText(context, staged),
                             ))
                         if (!recoveryOk || !recoveryRecorded) {
                             runCatching { recoveryFile?.delete() }
