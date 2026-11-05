@@ -695,7 +695,7 @@ class MainViewModel(
                                                                                 application,
                                                                                 oldCopy,
                                                                                 newCopy,
-                                                                                sharedWithMe = sharedScope.sharedWithMe,
+                                                                                userDrive = sharedScope,
                                                                             )
                                                                         }.getOrDefault(false)
                                                                         if (prepared) {
@@ -1160,7 +1160,7 @@ class MainViewModel(
                                                                             application,
                                                                             sourceBytes,
                                                                             destinationBytes,
-                                                                            sharedWithMe = sharedScope.sharedWithMe,
+                                                                            userDrive = sharedScope,
                                                                         )
                                                                     }.getOrDefault(false)
                                                                     if (!relocationPrepared) return@runCatching false

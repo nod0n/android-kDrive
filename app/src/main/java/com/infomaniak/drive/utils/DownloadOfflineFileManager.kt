@@ -2752,7 +2752,9 @@ class DownloadOfflineFileManager(
         ): DestinationOwnership = runCatching {
             val realmScope = UserDrive(userId = scope.userId, driveId = scope.driveId, sharedWithMe = sharedWithMe)
             FileController.getRealmInstance(realmScope).use { realm ->
-                runCatching { realm.refresh() }
+                // REFRESH FAILURE IS A FAILED QUERY (review-36 #4): a stale Realm view never
+                // reads as "unclaimed" — the caller defers.
+                runCatching { realm.refresh() }.onFailure { return@use DestinationOwnership.Failed }
                 val appContext = appContextForOwnership() ?: return@use DestinationOwnership.Failed
                 val nameComponent = target.path.substringAfterLast('/')
                 val candidates = realm.where(File::class.java)
@@ -2763,7 +2765,11 @@ class DownloadOfflineFileManager(
                 var claimantId: Int? = null
                 var ambiguous = false
                 for (candidate in candidates) {
-                    val candidatePath = candidate.getOfflineFile(context, realmScope.userId)?.path ?: continue
+                    // THE CAPTURED REALM FLAVOR RESOLVES THE PATH (review-36 #4): a shared
+                    // owner with a blank stored path was invisible to the ordinary-Realm
+                    // resolution and contributed no claim — the query read as Unclaimed over
+                    // a governed path.
+                    val candidatePath = candidate.getOfflineFile(context, realmScope.userId, sharedWithMe = sharedWithMe)?.path
                     if (candidatePath == target.path) {
                         if (claimantId != null && claimantId != candidate.id) {
                             ambiguous = true
@@ -2942,18 +2948,29 @@ class DownloadOfflineFileManager(
             context: Context,
             source: IOFile,
             target: IOFile,
-            sharedWithMe: Boolean,
-        ): Boolean = prepareProofRelocation(
-            context,
-            source,
-            target,
-            expectedObservationLocation = source.absolutePath,
-            requireObservation = false,
-            sharedWithMe = sharedWithMe,
-            storageKind = "offline",
-            flow = ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION,
-            recordedSourcePath = source.absolutePath,
-        )
+            userDrive: UserDrive,
+        ): Boolean {
+            // THE COMMON DESTINATION BOUNDARY (review-36 #3): EVERY published-source caller —
+            // the shared subtree merge and the cross-Realm transfer alike — validates the
+            // destination's recovery state and typed ownership BEFORE any proof or byte
+            // effect, under the complete captured coordination. The moved source graph's own
+            // checks never covered another row's recovery governing an ABSENT destination.
+            val sourceFileId = readPublishedProvenance(context, source)?.fileId ?: 0
+            if (!destinationReadyForRelocation(context, userDrive, sourceFileId, target)) {
+                return false
+            }
+            return prepareProofRelocation(
+                context,
+                source,
+                target,
+                expectedObservationLocation = source.absolutePath,
+                requireObservation = false,
+                sharedWithMe = userDrive.sharedWithMe,
+                storageKind = "offline",
+                flow = ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION,
+                recordedSourcePath = source.absolutePath,
+            )
+        }
 
         /**
          * DISPOSES THE CALLER'S OWN DESTINATION PREPARATION (review-33 #6, review-34 #4):
