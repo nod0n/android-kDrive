@@ -780,9 +780,12 @@ object FileController {
             )
             // THE COMMITTED DESTINATION IS REPORTED (review-35 #4): the caller disposes the
             // retained relocation journal only after its own metadata commit verifies the
-            // committed row resolves to this exact destination.
+            // committed row resolves to this exact destination. THE LOCAL LABELED RETURN
+            // FORWARDS THE ACTUAL RESULT (review-35 compile repair): the lambda is held in
+            // a variable and passed to let/use, so a bare non-local return is prohibited —
+            // the labeled return is the value forward, with no failure swallowed.
             if (relocated) onRelocatedTo?.invoke(newOffline)
-            return relocated
+            return@renameBlock relocated
         }
         return customRealm?.let(block) ?: getRealmInstance(scope).use(block)
     }
