@@ -3301,7 +3301,7 @@ class DownloadOfflineFileManager(
          * version establishes absence — a legacy-ambiguous observation converges only when
          * INDEPENDENT durable evidence proves the operation legitimately carried none: the
          * bytes are an exact uploaded revision owned by the record's own row. */
-        private fun legacyAmbiguityResolvedByUploadAuthority(
+        private fun legacyAmbiguityResolvedByCompletedUpload(
             context: Context,
             bytesFile: IOFile,
             fileId: Int,
@@ -3309,9 +3309,19 @@ class DownloadOfflineFileManager(
         ): Boolean = runCatching {
             val bytesHash = UploadFile.sha256OrNull(bytesFile) ?: return@runCatching false
             FileController.getRealmInstance(userDrive).use { realm ->
-                runCatching { realm.refresh() }
-                val row = FileController.getFileById(realm, fileId) ?: return@runCatching false
-                UploadFile.hasDurableOriginalRevisionOwnership(
+                // REFRESH FAILURE FAILS CLOSED (review-38 #5): a stale Realm view never
+                // grants completion authority.
+                runCatching { realm.refresh() }.onFailure { return@use false }
+                val row = FileController.getFileById(realm, fileId) ?: return@use false
+                // THE COMPLETED-UPLOAD AUTHORITY (review-38 #3): the retracted pending-
+                // ownership query matched `uploadAt == null` records — RETAINED-UNSENT
+                // snapshots whose ownership is local snapshot ownership, never an upload
+                // completion. Only an ACTIVE COMPLETED record (uploadAt set by uploadFinished
+                // alone; a cancelled record is never completion) bound to the record's own
+                // row identity and PROVING the target bytes' hash is independent durable
+                // evidence that this exact content was genuinely uploaded. A purged row
+                // leaves the ambiguity unresolved (retain); no predicate substitutes.
+                UploadFile.hasCompletedOriginalRevisionOwnership(
                     fileName = row.name,
                     remoteFolder = row.parentId,
                     driveId = userDrive.driveId,
@@ -3341,7 +3351,7 @@ class DownloadOfflineFileManager(
             carriedText != null -> establishRecoveredObservation(context, target, carriedText, expectedPublicationId)
             ambiguous -> targetObservationEvidenceComplete(context, target, expectedPublicationId) ||
                 (fileId != null && userDrive != null &&
-                    legacyAmbiguityResolvedByUploadAuthority(context, target, fileId, userDrive))
+                    legacyAmbiguityResolvedByCompletedUpload(context, target, fileId, userDrive))
             else -> true
         }
 
@@ -4512,7 +4522,11 @@ class DownloadOfflineFileManager(
                 val targetHash = if (target.exists()) UploadFile.sha256OrNull(target) else null
                 val missingBackupProof = if (target.exists()) readPublishedProvenance(context, target) else null
                 val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
-                val operationScope = UserDrive(userId = record.userId, driveId = record.driveId)
+                // THE CAPTURED FLAVOR CARRIES INTO EVERY AUTHORITY CHECK (review-38 #5):
+                // the scope the operation actually ran under — including its shared-Realm
+                // flavor — decides which Realm resolves the owner row; the ordinary flavor
+                // resolves a shared owner's earlier identity or nothing at all.
+                val operationScope = UserDrive(userId = record.userId, driveId = record.driveId, sharedWithMe = capturedShared)
                 val missingBackupComplete = targetHash != null && missingBackupProof != null &&
                     missingBackupProof.certifiesBytes(target) &&
                     missingBackupProof.identifies(
@@ -4549,7 +4563,7 @@ class DownloadOfflineFileManager(
             if (targetProof != null && targetProof.certifiesBytes(target) &&
                 targetProof.identifies(
                     File(id = record.fileId, driveId = record.driveId),
-                    UserDrive(userId = record.userId, driveId = record.driveId),
+                    UserDrive(userId = record.userId, driveId = record.driveId, sharedWithMe = capturedShared),
                 )
             ) {
                 // THE OBSERVATION JOINS THE SELF-CERTIFYING DISPOSAL (issue: round 30 #7):
@@ -4595,11 +4609,11 @@ class DownloadOfflineFileManager(
                             expectedPublicationId == null -> return false
                             targetProof.publicationId != expectedPublicationId -> Unit
                             else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId) &&
-                                !legacyAmbiguityResolvedByUploadAuthority(
+                                !legacyAmbiguityResolvedByCompletedUpload(
                                     context,
                                     target,
                                     record.fileId,
-                                    UserDrive(userId = record.userId, driveId = record.driveId),
+                                    UserDrive(userId = record.userId, driveId = record.driveId, sharedWithMe = capturedShared),
                                 )
                             ) {
                                 return false

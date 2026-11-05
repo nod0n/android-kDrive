@@ -799,6 +799,47 @@ open class UploadFile(
         }
 
         /**
+         * READ-ONLY COMPLETED-UPLOAD ownership check for the ORIGINAL revision (review-38 #3):
+         * [hasDurableOriginalRevisionOwnership]'s `uploadAt == null` requirement matches
+         * PENDING/retained-unsent snapshots — local snapshot ownership, never an upload
+         * completion. This query requires an ACTIVE COMPLETED record: [uploadAt] is set by
+         * [uploadFinished] alone (the transfer's actual completion) and a cancelled record
+         * (deletedAt != null) is never completion. The caller's successful content hash is
+         * REQUIRED and the candidate must PROVE those bytes — the exact owner, bytes and
+         * revision (identity fields plus the stable original id when known) are bound
+         * together, so a completed transfer of different content grants nothing. When the
+         * row is later discarded the evidence is gone and the caller must retain — no
+         * predicate substitutes for the missing durable completion.
+         */
+        fun hasCompletedOriginalRevisionOwnership(
+            fileName: String,
+            remoteFolder: Int,
+            driveId: Int,
+            userId: Int,
+            fileModifiedAt: Date,
+            fileSize: Long,
+            contentHash: String,
+            originalFileId: Int? = null,
+            customRealm: Realm? = null,
+        ): Boolean {
+            val block: (Realm) -> Boolean = { realm ->
+                val candidates = realm.uploadTable
+                    .equalTo(UploadFile::fileName.name, fileName)
+                    .equalTo(UploadFile::remoteFolder.name, remoteFolder)
+                    .equalTo(UploadFile::driveId.name, driveId)
+                    .equalTo(UploadFile::userId.name, userId)
+                    .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
+                    .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
+                    .isNotNull(UploadFile::uploadAt.name)
+                    .isNull(UploadFile::deletedAt.name)
+                    .apply { if (originalFileId != null && originalFileId > 0) equalTo(UploadFile::originalFileId.name, originalFileId) }
+                    .findAll()
+                candidates.any { recordProvesContent(it, contentHash) }
+            }
+            return customRealm?.let(block) ?: getRealmInstance().use(block)
+        }
+
+        /**
          * Whether an upload record already exists for this exact content revision (identified by
          * file name, target folder, drive, user and modification date). Distinct from
          * [hasPendingUpload]: the uri of an offline folder snapshot changes per revision, so the
