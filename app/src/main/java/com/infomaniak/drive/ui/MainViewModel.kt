@@ -532,14 +532,18 @@ class MainViewModel(
                                     // location BEFORE the identity commit. An incomplete
                                     // reconciliation defers the whole merge (the source realm
                                     // keeps its row; the sync retries).
+                                    // COMPLETED RELOCATIONS RETAIN THEIR JOURNALS UNTIL THE
+                                    // METADATA COMMIT (review-34 #3): each child completion
+                                    // succeeds while the rows still resolve the old paths —
+                                    // the state is disposed only after the merge transaction
+                                    // commits, so a failed or interrupted merge leaves every
+                                    // child's owner-checked rollback authority intact. The list
+                                    // is declared in the ENCLOSING flow scope: the completions
+                                    // populate it inside the mergeAllowed reconciliation, and
+                                    // the disposal runs after mergeOk (which that block does not
+                                    // enclose — the merge transaction runs outside it).
+                                    val completedRelocationTargets = mutableListOf<IOFile>()
                                     if (mergeAllowed) {
-                                        // COMPLETED RELOCATIONS RETAIN THEIR JOURNALS UNTIL THE
-                                        // METADATA COMMIT (review-34 #3): each child completion
-                                        // succeeds while the rows still resolve the old paths —
-                                        // the state is disposed only after the merge transaction
-                                        // commits, so a failed or interrupted merge leaves every
-                                        // child's owner-checked rollback authority intact.
-                                        val completedRelocationTargets = mutableListOf<IOFile>()
                                         sharedRealm.where(File::class.java)
                                             .equalTo(File::id.name, file.id)
                                             .findFirst()?.let { preRoot ->

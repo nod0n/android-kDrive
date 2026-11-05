@@ -1653,6 +1653,7 @@ class DownloadOfflineFileManager(
                 }
                 true
             }.getOrDefault(false)
+        }
 
         /** THE WRITER'S OBSERVATION RETIREMENT (review-33 #8, idempotent review-34 #7): a
          * freshly written proof is a NEW publication — every pre-existing observation
@@ -1687,7 +1688,6 @@ class DownloadOfflineFileManager(
                 else -> true
             }
         }.getOrDefault(false)
-        }
 
         internal fun readPublishedProvenance(context: Context, publishedFile: IOFile): PublishedProvenance? = runCatching {
             parseProvenanceText(
@@ -2422,6 +2422,12 @@ class DownloadOfflineFileManager(
                         // a FOUR-line record with an empty field is ambiguous (review-34 #8).
                         observationAmbiguous = parts.size == 4 && observationField?.isEmpty() == true,
                         recordedSourcePath = null,
+                        // LEGACY RECORDS CARRY NEITHER NEW AUTHORITY (review-34 #3/#4): a
+                        // v1 record has no source-bound proof and no recorded preexisting
+                        // destination proof — both genuinely absent, which the replay and
+                        // the abort resolver treat as "retain, never roll back or restore".
+                        recordedSourceProofText = null,
+                        previousDestinationRecordText = null,
                         proofLocationValid = locationValid,
                         embeddedProofLocation = embeddedLocation,
                     )
