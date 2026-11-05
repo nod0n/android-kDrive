@@ -751,28 +751,64 @@ class DownloadOfflineFileManager(
                 downloadWorker.workerTag(),
                 "Download of ${file.id} deferred: an explicitly unresolved publication already covers this generation and no new evidence exists",
             )
-            // THE DEFERRED VERIFICATION ADVANCE STILL PROGRESSES (issue: round 27 #4):
-            // suppression must not strand a converged verification whose CONDITIONAL
-            // METADATA ADVANCE was rejected on a tied-rename tie — the same generation the
-            // unresolved record captured is re-fetched here, and the conditional
-            // acceptance (against the LIVE row's own captured observation) runs WITHOUT
-            // any byte transfer, so the row can advance to the accepted rename and the
-            // publication's own retirement/revalidation path owns the old-location bytes.
-            runCatching {
-                val freshForAdvance = ApiRepository.getFileDetails(
-                    file = File(id = file.id, driveId = userDrive.driveId),
-                    okHttpClient = okHttpClient,
-                ).data?.takeIf { it.id == file.id } ?: return@runCatching
+            // THE DEFERRED VERIFICATION ADVANCE STILL PROGRESSES (issues: round 27 #4,
+            // round 28 #4/#5): suppression must not strand a converged verification whose
+            // CONDITIONAL METADATA ADVANCE was rejected on a tied-rename tie. The
+            // resumption is BOUND to the outstanding durable operation: a DETACHED
+            // pre-request observation of the live row is captured BEFORE the details
+            // request (the previous shape read the managed row AFTER the response and
+            // passed it as its own observation — a tied identity commit during the HTTP
+            // validated the row against itself and accepted stale B); the coordinated
+            // section re-derives the destination proof binding (the version-0 unresolved
+            // publication must still certify the target for this identity at the fetched
+            // generation), validates the live row against the detached observation, and
+            // runs the conditional acceptance through the normal boundary. Cancellation
+            // is checked after the response and inside the acquired section, and is
+            // REthrown (never consumed by runCatching).
+            run {
+                val preRequestObservation = FileController.getRealmInstance(userDrive).use { obsRealm ->
+                    runCatching { obsRealm.refresh() }
+                    FileController.getFileById(obsRealm, file.id)?.let { obsRealm.copyFromRealm(it, 1) }
+                } ?: return@withContext ListenableWorker.Result.failure()
+                val freshForAdvance = runCatching {
+                    ApiRepository.getFileDetails(
+                        file = File(id = file.id, driveId = userDrive.driveId),
+                        okHttpClient = okHttpClient,
+                    ).data?.takeIf { it.id == file.id }
+                }.getOrElse { if (it is kotlin.coroutines.cancellation.CancellationException) throw it else null }
+                // THE EXECUTING CONTEXT AFTER THE RESPONSE (issue: round 28 #5).
+                ensureActive()
+                if (freshForAdvance == null) return@withContext ListenableWorker.Result.failure()
                 synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withFileLock(userDrive, file.id) {
+                        // POST-LOCK-WAIT CHECK (issue: round 28 #5).
+                        ensureActive()
                         FileController.getRealmInstance(userDrive).use { realm ->
                             runCatching { realm.refresh() }
                             val live = FileController.getFileById(realm, file.id) ?: return@withFileLock
+                            // THE OBSERVATION MUST STILL MATCH (issue: round 28 #4): a tied
+                            // identity commit during the request is newer work's business.
+                            if (!FileController.isSameObservation(live, preRequestObservation)) {
+                                return@withFileLock
+                            }
+                            // THE DURABLE OPERATION BINDING (issue: round 28 #4): the
+                            // target must STILL carry the outstanding version-0 unresolved
+                            // publication for this identity, certifying its bytes, at the
+                            // fetched generation — otherwise this resumption has no
+                            // operation to advance.
+                            val bindingProof = readPublishedProvenance(context, offlineFile)
+                            val bindingHolds = bindingProof != null &&
+                                bindingProof.version == 0 &&
+                                bindingProof.identifies(live, userDrive) &&
+                                bindingProof.certifiesBytes(offlineFile) &&
+                                bindingProof.revisedAt == freshForAdvance.revisedAt &&
+                                bindingProof.lastModifiedAt == freshForAdvance.lastModifiedAt
+                            if (!bindingHolds) return@withFileLock
                             FileController.updateExistingFileIfNotOlder(
                                 newFile = freshForAdvance,
                                 realm = realm,
                                 userDrive = userDrive,
-                                observed = live,
+                                observed = preRequestObservation,
                             )
                         }
                     }
@@ -882,49 +918,92 @@ class DownloadOfflineFileManager(
                     synchronized(OfflineFileCoordination.rootIntentMonitor) {
                         OfflineFileCoordination.withFileLock(userDrive, file.id) {
                             FileController.getRealmInstance(userDrive).use { realm ->
-                                advanceAccepted = FileController.updateExistingFileIfNotOlder(
-                                    newFile = file,
-                                    realm = realm,
-                                    userDrive = userDrive,
-                                    // THE CAPTURED HISTORICAL OBSERVATION (issue: round
-                                    // 27 #4): the advancement was issued from the retained
-                                    // A basis — the previous observed = file (the fetched B
-                                    // identity) could never match a live A row with tied
-                                    // updatedAt, so a legitimate rename's advancement was
-                                    // rejected on every attempt (and the no-spin gate then
-                                    // kept the row at A indefinitely).
-                                    observed = verificationBasis ?: file,
-                                )
-                                // THE OLD PHYSICAL SOURCE IS RETIRED WITH THE ACCEPTED
-                                // IDENTITY (issue: round 25 #9): a converged verification
-                                // across an accepted rename published at the NEW location;
-                                // once the metadata advance accepts it, the retained copy
-                                // (and its proof) at the CAPTURED BASIS's old location is
-                                // residue — disposed here under the same locks. A REJECTED
-                                // advance keeps the row at the old location: its copy and
-                                // proof are still the row's and are never touched.
+                                runCatching { realm.refresh() }
+                                val liveRow = FileController.getFileById(realm, file.id)
+                                // THE OLD SOURCE IS CLASSIFIED AND PRESERVED BEFORE ANY
+                                // IDENTITY ADVANCE (issues: round 27 #3, round 28 #2/#3):
+                                // the row still OWNS A at this moment — an intervening or
+                                // unreadable revision is durably registered under the
+                                // CURRENT (pre-advance) identity and the advancement is
+                                // SKIPPED (the row keeps its old location, so the retained
+                                // revision's ownership stays discoverable); hash equality
+                                // alone is CONTENT EVIDENCE, never deletion authority — the
+                                // retirement additionally requires fresh URI-consumer,
+                                // recovery, exclusive-ownership and non-foreign authority.
                                 val basisPath = verificationBasis
                                     ?.getOfflineFile(context, userDrive.userId)?.path
-                                if (advanceAccepted && basisPath != null && basisPath != offlineFile.path) {
+                                var retirementAuthorized = true
+                                if (basisPath != null && basisPath != offlineFile.path) {
                                     val basisCopy = IOFile(basisPath)
                                     if (basisCopy.exists()) {
-                                        // THE SOURCE REVISION IS REVALIDATED UNDER THE
-                                        // RETIREMENT LOCKS (issue: round 27 #3): the
-                                        // publication released its coordination before this
-                                        // section — an editor could have written a NEWER
-                                        // revision to the old path in the gap. The bytes are
-                                        // retired ONLY when their hash still equals the hash
-                                        // the publication's comparison verified; a DIFFERENT
-                                        // or UNREADABLE revision is PRESERVED (never deleted —
-                                        // the intervening revision is not this operation's to
-                                        // discard).
                                         val currentBasisHash = UploadFile.sha256OrNull(basisCopy)
-                                        if (currentBasisHash == null || currentBasisHash != verifiedBasisSourceHash) {
-                                            SentryLog.i(
-                                                TAG,
-                                                "Retained old-path revision for ${file.id}: an intervening revision was preserved",
-                                            )
-                                        } else {
+                                        val basisUri = android.net.Uri.fromFile(basisCopy).toString()
+                                        val preAdvanceRow = liveRow?.let { realm.copyFromRealm(it, 1) }
+                                        when {
+                                            // AN INTERVENING OR UNREADABLE REVISION AT A
+                                            // (issue: round 28 #2): register it durably under
+                                            // the row's CURRENT identity; the advancement is
+                                            // skipped so the owning metadata stays with the
+                                            // retained bytes.
+                                            currentBasisHash == null || currentBasisHash != verifiedBasisSourceHash -> {
+                                                if (preAdvanceRow != null) {
+                                                    runCatching {
+                                                        OfflineFolderController.registerDirtySnapshot(
+                                                            context = context,
+                                                            file = preAdvanceRow,
+                                                            offlineFile = basisCopy,
+                                                            userDrive = userDrive,
+                                                            allowPendingRecoveryResolution = true,
+                                                        )
+                                                    }
+                                                }
+                                                retirementAuthorized = false
+                                                SentryLog.i(
+                                                    TAG,
+                                                    "Preserved intervening revision at the old path of ${file.id}; advancement deferred",
+                                                )
+                                            }
+                                            // A LIVE URI CONSUMER OWNS THE OLD BYTES (issue:
+                                            // round 28 #3): retiring A would break the upload's
+                                            // stored source; the copy at B does not repair it.
+                                            UploadFile.hasPendingUpload(uri = basisUri) ||
+                                                UploadFile.hasRetainedUnsentUpload(uri = basisUri) -> retirementAuthorized = false
+                                            // AN UNRESOLVED RECOVERY GOVERNS THE OLD PATH (issue:
+                                            // round 28 #3): the sweep owns its resolution.
+                                            hasUnresolvedRecovery(context, userDrive, file.id, basisPath) -> retirementAuthorized = false
+                                            // THE ROW NO LONGER EXCLUSIVELY OWNS THE OLD PATH,
+                                            // OR A FOREIGN RECORD NAMES IT (issue: round 28 #3):
+                                            // re-owned or foreign-attributed bytes are never
+                                            // this operation's to discard.
+                                            preAdvanceRow == null ||
+                                                OfflineFolderController.exclusivePathOwner(
+                                                    realm, context, userDrive, basisPath,
+                                                ) != preAdvanceRow.id ||
+                                                readPublishedProvenance(context, basisCopy)
+                                                    ?.positivelyForeignTo(preAdvanceRow, userDrive) == true -> retirementAuthorized = false
+                                        }
+                                    }
+                                }
+                                if (retirementAuthorized) {
+                                    advanceAccepted = FileController.updateExistingFileIfNotOlder(
+                                        newFile = file,
+                                        realm = realm,
+                                        userDrive = userDrive,
+                                        // THE CAPTURED HISTORICAL OBSERVATION (issue: round
+                                        // 27 #4): the advancement was issued from the retained
+                                        // A basis — the previous observed = file (the fetched B
+                                        // identity) could never match a live A row with tied
+                                        // updatedAt, so a legitimate rename's advancement was
+                                        // rejected on every attempt (and the no-spin gate then
+                                        // kept the row at A indefinitely).
+                                        observed = verificationBasis ?: file,
+                                    )
+                                    // THE OLD PHYSICAL SOURCE IS RETIRED WITH THE ACCEPTED
+                                    // IDENTITY (issue: round 25 #9): only the exact verified
+                                    // revision, under full current authority, is retired.
+                                    if (advanceAccepted && basisPath != null && basisPath != offlineFile.path) {
+                                        val basisCopy = IOFile(basisPath)
+                                        if (basisCopy.exists()) {
                                             deletePublishedProvenance(context, basisCopy)
                                             runCatching { basisCopy.delete() }
                                         }
@@ -3133,7 +3212,14 @@ class DownloadOfflineFileManager(
                 val basisHash = basisCopy?.let { UploadFile.sha256OrNull(it) }
                 if (basisCopy != null && (stagedHash == null || basisHash == null || basisHash != stagedHash)) {
                     runCatching { staged.delete() }
-                    return PublicationOutcome.SKIPPED_PROTECTED
+                    // A DEFERRED OUTCOME, NEVER A PROTECTED SUCCESS (issue: round 28 #1):
+                    // the comparison could not converge (differing or unreadable old
+                    // bytes) — the work is UNRESOLVED: the single-file worker retries and
+                    // the batch/root keeps its incompleteness. The previous
+                    // SKIPPED_PROTECTED is reserved for a positively verified usable copy
+                    // FULFILLING the request; a failed comparison fulfills nothing (B is
+                    // absent, the pending marker stays).
+                    return PublicationOutcome.SKIPPED_CONFLICT
                 }
                 // A CONVERGED BASIS COMPARISON: the verified old-source hash rides to
                 // the retirement's revalidation (issue: round 27 #3), threaded to the
