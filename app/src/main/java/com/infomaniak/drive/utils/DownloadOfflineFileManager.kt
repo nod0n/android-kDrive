@@ -923,10 +923,19 @@ class DownloadOfflineFileManager(
          * captured account, drive and exact published location — never by a suffix reserved
          * inside directories holding user content.
          */
-        private fun provenanceFileFor(context: Context, publishedFile: IOFile): IOFile {
+        /**
+         * Collision-resistant registry key (issue: round 24 #5): the SHA-256 of the
+         * absolute path. The proofmove relocation records previously used the path's
+         * 32-bit `hashCode`, letting unrelated paths share one record.
+         */
+        private fun provenanceKeyHex(publishedFile: IOFile): String {
             val digest = java.security.MessageDigest.getInstance("SHA-256")
                 .digest(publishedFile.absolutePath.toByteArray())
-            val hex = digest.joinToString("") { "%02x".format(it) }
+            return digest.joinToString("") { "%02x".format(it) }
+        }
+
+        private fun provenanceFileFor(context: Context, publishedFile: IOFile): IOFile {
+            val hex = provenanceKeyHex(publishedFile)
             return IOFile(IOFile(provenanceRoot(context), hex.substring(0, 2)), "$hex.gen")
         }
 
@@ -1128,7 +1137,7 @@ class DownloadOfflineFileManager(
          * without recoverable relocation state.
          */
         private fun proofRelocationRecordFile(context: Context, target: IOFile): IOFile =
-            IOFile(stagingDirectory(context), "proofmove_${target.absolutePath.hashCode()}.recovery")
+            IOFile(stagingDirectory(context), "proofmove_${provenanceKeyHex(target)}.recovery")
 
         private fun writeProofRelocationRecord(context: Context, target: IOFile, proofText: String): Boolean = runCatching {
             proofRelocationRecordFile(context, target).writeText(
@@ -1318,7 +1327,30 @@ class DownloadOfflineFileManager(
             val expectedPublicationHash: String?,
             val expectedPublicationRecordText: String?,
             val legacy: Boolean,
+            /** The owner scope was recovered from validated durable state (issue: round 24
+             * #3) — a record whose scope could not be established is never locked, queried
+             * against a fabricated account, or mutated; it is retained as unresolved. */
+            val scopeResolved: Boolean = true,
         )
+
+        /**
+         * The (userId, driveId) embedded in a canonical offline path
+         * `<offlineRoot>/<userId>/<driveId>/…` (issue: round 24 #3): the durable owner/path
+         * index that exists independently of record-payload parsing. Legacy v1 recovery
+         * records carry no owner identity, but their TARGET PATH does. Null when the path
+         * is not a canonical offline path under any account.
+         */
+        private fun legacyScopeFromPath(targetPath: String): Pair<Int, Int>? = runCatching {
+            val context = Realm.getApplicationContext() ?: return@runCatching null
+            val rootPath = File.getOfflineFolder(context).canonicalPath
+            val canonical = IOFile(targetPath).canonicalPath
+            if (!canonical.startsWith(rootPath + IOFile.separator)) return@runCatching null
+            val segments = canonical.removePrefix(rootPath + IOFile.separator).split(IOFile.separator)
+            val userId = segments.getOrNull(0)?.trim()?.toIntOrNull() ?: return@runCatching null
+            val driveId = segments.getOrNull(1)?.trim()?.toIntOrNull() ?: return@runCatching null
+            if (userId <= 0 || driveId <= 0) return@runCatching null
+            userId to driveId
+        }.getOrNull()
 
         /**
          * Versioned recovery-record parsing (issue: round 23 #3): v3 (11 fields, the
@@ -1326,8 +1358,10 @@ class DownloadOfflineFileManager(
          * legacy five-field v1. A v1 record carried no owner identity and no backup hash:
          * the identity is derived from the backup file's own name (newStagedFile embeds
          * id_driveId) and the immutable backup hash is computed from the backup itself at
-         * reconciliation. A legacy record whose identity cannot be derived stays
-         * unparseable (unresolved, never deleted, never auto-registered).
+         * reconciliation. THE OWNER SCOPE is recovered from the record's VALIDATED CANONICAL
+         * TARGET PATH (issue: round 24 #3) — never a fabricated account 0: a v1 record
+         * whose path does not establish a scope consistent with the staged name stays
+         * unparseable (unresolved, never deleted, never locked, never auto-registered).
          */
         private fun readRecoveryRecord(recordFile: IOFile): RecoveryRecord? = runCatching {
             val text = recordFile.readText()
@@ -1371,6 +1405,13 @@ class DownloadOfflineFileManager(
                 val nameParts = recoveryName.split("_")
                 val derivedFileId = nameParts.getOrNull(0)?.trim()?.toIntOrNull() ?: return null
                 val derivedDriveId = nameParts.getOrNull(1)?.trim()?.toIntOrNull() ?: return null
+                // SCOPE FROM THE VALIDATED CANONICAL LOCATION (issue: round 24 #3): the
+                // path's embedded account is cross-checked against the staged name's drive
+                // id — a contradiction (or an unparseable path) leaves the record WITHOUT
+                // an owner scope: it stays retained and unresolved, never reconciled under
+                // account 0 and never mutated.
+                val pathScope = legacyScopeFromPath(v1[1])
+                val scopeResolved = pathScope != null && pathScope.second == derivedDriveId
                 return@runCatching RecoveryRecord(
                     recordFile = recordFile,
                     targetPath = v1[1],
@@ -1378,12 +1419,13 @@ class DownloadOfflineFileManager(
                     oldTargetMtimeMillis = v1[3].trim().toLongOrNull() ?: return null,
                     oldRecordText = v1[4].takeIf { it.isNotEmpty() },
                     fileId = derivedFileId,
-                    userId = 0,
-                    driveId = derivedDriveId,
+                    userId = pathScope?.first ?: 0,
+                    driveId = pathScope?.second ?: derivedDriveId,
                     backupHash = null,
                     expectedPublicationHash = null,
                     expectedPublicationRecordText = null,
                     legacy = true,
+                    scopeResolved = scopeResolved,
                 )
             }
             null
@@ -1400,21 +1442,28 @@ class DownloadOfflineFileManager(
          * I/O failure): the caller must treat null as "exclude conservatively" — an
          * enumeration failure never means "no pending recovery".
          */
-        internal fun pendingRecoveryFileIds(context: Context, userDrive: UserDrive): Set<Int>? = runCatching {
-            stagingDirectory(context)
-                .listFiles { f -> f.name.endsWith(".recovery") }
-                ?.mapNotNull { recordFile ->
-                    val record = readRecoveryRecord(recordFile) ?: return@mapNotNull null
-                    when {
-                        !record.legacy && record.userId == userDrive.userId &&
-                            record.driveId == userDrive.driveId -> record.fileId
-                        record.legacy && record.driveId == userDrive.driveId -> record.fileId
-                        else -> null
-                    }
+        internal fun pendingRecoveryFileIds(context: Context, userDrive: UserDrive): Set<Int>? {
+            val files = runCatching {
+                stagingDirectory(context)
+                    .listFiles { f -> f.name.endsWith(".recovery") && !f.name.startsWith("proofmove_") }
+            }.getOrNull()
+            // ENUMERATION FAILURE IS UNRESOLVED, NEVER ABSENCE (issue: round 24 #3): the
+            // previous mapNotNull chain also made a null listing and every UNREADABLE
+            // record disappear — both now fail the whole per-scope enumeration closed
+            // (the caller defers the pass; the sweep owns the unresolved state).
+            if (files == null) return null
+            val ids = mutableSetOf<Int>()
+            for (recordFile in files) {
+                val record = readRecoveryRecord(recordFile) ?: return null
+                when {
+                    !record.legacy && record.userId == userDrive.userId &&
+                        record.driveId == userDrive.driveId -> ids.add(record.fileId)
+                    record.legacy && record.driveId == userDrive.driveId -> ids.add(record.fileId)
+                    else -> Unit
                 }
-                ?.filter { it > 0 }
-                ?.toSet()
-        }.getOrNull()
+            }
+            return ids.filter { it > 0 }.toSet()
+        }
 
         /**
          * Whether an UNRESOLVED durable recovery still governs [fileId] or the bytes at
@@ -1430,21 +1479,39 @@ class DownloadOfflineFileManager(
             userDrive: UserDrive,
             fileId: Int,
             targetPath: String?,
-        ): Boolean = runCatching {
-            stagingDirectory(context)
-                .listFiles { f -> f.name.endsWith(".recovery") }
-                ?.any { recordFile ->
-                    val record = readRecoveryRecord(recordFile)
-                    record != null && (
-                        (!record.legacy && record.fileId == fileId &&
-                            record.userId == userDrive.userId && record.driveId == userDrive.driveId) ||
-                            (record.legacy && record.fileId == fileId &&
-                                record.driveId == userDrive.driveId) ||
-                            (targetPath != null &&
-                                IOFile(record.targetPath).absolutePath == targetPath)
-                        )
-                } == true
-        }.getOrDefault(true)
+        ): Boolean {
+            val files = runCatching {
+                stagingDirectory(context).listFiles { f -> f.name.endsWith(".recovery") }
+            }.getOrNull()
+            // ENUMERATION FAILURE IS UNRESOLVED, NEVER ABSENCE (issue: round 24 #3): the
+            // previous `?.any{} == true` turned a null listing into a fail-OPEN answer
+            // (getOrDefault(true) only guarded thrown exceptions, not null).
+            if (files == null) return true
+            for (recordFile in files) {
+                if (recordFile.name.startsWith("proofmove_")) {
+                    // PENDING RELOCATION STATE GOVERNS ITS TARGET PATH (issue: round 24
+                    // #5): an unresolved proofmove record means the destination's proof is
+                    // mid-relocation — and an unreadable one may govern any path, so it
+                    // fails closed.
+                    val parts = runCatching { recordFile.readText().split("\n", limit = 3) }.getOrNull()
+                    if (parts == null || parts.size < 3) return true
+                    if (targetPath != null && IOFile(parts[1]).absolutePath == targetPath) return true
+                    continue
+                }
+                val record = readRecoveryRecord(recordFile)
+                // DECODING FAILURE IS UNRESOLVED, NEVER ABSENCE (issue: round 24 #3): an
+                // unreadable record may govern any identity or path — the previous
+                // mapNotNull/any chain silently classified it as "no recovery".
+                if (record == null) return true
+                val identityMatches = record.fileId == fileId &&
+                    record.driveId == userDrive.driveId &&
+                    (record.legacy || record.userId == userDrive.userId)
+                if (identityMatches || (targetPath != null && IOFile(record.targetPath).absolutePath == targetPath)) {
+                    return true
+                }
+            }
+            return false
+        }
 
         /**
          * Reconciles interrupted publications left by crashes or failed restores (issues:
@@ -1476,25 +1543,59 @@ class DownloadOfflineFileManager(
             }.getOrDefault(emptyList())
             var allResolved = true
             for (recordFile in records) {
-                // PROOF-RELOCATION RECOVERY (issue: round 23 #14): a proofmove record
-                // holds the original proof and its exact destination — the destination
-                // proof write is re-attempted and VERIFIED before the state is disposed;
-                // a failure keeps the state (and reports the sweep unresolved).
+                // PROOF-RELOCATION RECOVERY (issues: round 23 #14, round 24 #5): a proofmove
+                // record holds the original proof and its exact destination. The retained
+                // proof's OWN identity (owner scope + expected content hash, parsed from the
+                // proof text) coordinates the re-attempt under the OWNER's locks, and the
+                // target must still hold THE PROOF'S OWN BYTES before the proof may be
+                // (re-)written onto them — a failed publication whose rollback already
+                // restored the previous generation is SUPERSEDED: its proof is disposed,
+                // never written over the restored bytes.
                 if (recordFile.name.startsWith("proofmove_")) {
                     val proofMoveResolved = runCatching {
                         val parts = recordFile.readText().split("\n", limit = 3)
-                        if (parts.size == 3 && parts[0].trim() == "1") {
-                            val target = IOFile(parts[1])
-                            val recordTarget = verifiedProvenanceFileFor(context, target)
-                            val written = recordTarget != null && runCatching {
-                                recordTarget.writeText(parts[2])
-                                true
-                            }.getOrDefault(false)
-                            if (written && readPublishedProvenance(context, target) != null) {
-                                runCatching { recordFile.delete() }
-                                true
-                            } else false
-                        } else false
+                        if (parts.size != 3 || parts[0].trim() != "1") return@runCatching false
+                        val target = IOFile(parts[1])
+                        val proofText = parts[2]
+                        val proofFields = proofText.split("|")
+                        val proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull()
+                        val proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull()
+                        val proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull()
+                        val proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() }
+                        when {
+                            proofUserId == null || proofDriveId == null || proofFileId == null ||
+                                proofContentHash == null ->
+                                // An unattributable or unverifiable retained proof is never
+                                // written onto unknown bytes: the state stays for a later
+                                // sweep (issue: round 24 #5).
+                                false
+                            !target.exists() ->
+                                // The destination bytes are gone — the relocation has no
+                                // subject (a rollback or a later writer removed them). The
+                                // retained proof text cannot recreate bytes: the superseded
+                                // relocation state is disposed unverified.
+                                runCatching { recordFile.delete() }.getOrDefault(false)
+                            else -> {
+                                val scope = UserDrive(userId = proofUserId, driveId = proofDriveId)
+                                val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                                    OfflineFileCoordination.withFileLock(scope, proofFileId) {
+                                        val targetMatchesProof =
+                                            UploadFile.sha256OrNull(target) == proofContentHash
+                                        val written = targetMatchesProof && runCatching {
+                                            val recordTarget = verifiedProvenanceFileFor(context, target)
+                                            recordTarget != null && runCatching {
+                                                recordTarget.writeText(proofText)
+                                                true
+                                            }.getOrDefault(false) &&
+                                                readPublishedProvenance(context, target) != null
+                                        }.getOrDefault(false)
+                                        written
+                                    }
+                                }
+                                if (resolved) runCatching { recordFile.delete() }
+                                resolved
+                            }
+                        }
                     }.getOrDefault(false)
                     if (!proofMoveResolved) allResolved = false
                     continue
@@ -1504,6 +1605,14 @@ class DownloadOfflineFileManager(
                     // An unparseable (or legacy-format) record is never deleted: it may
                     // still guard a needed backup, and dropping it could lose the only
                     // copy of a generation.
+                    allResolved = false
+                    continue
+                }
+                // NO OWNER SCOPE, NO MUTATION (issue: round 24 #3): a legacy record whose
+                // scope could not be recovered from its validated canonical path is never
+                // locked against a fabricated account 0 and never reconciled — the record
+                // and its backup stay retained, unresolved durable state.
+                if (!record.scopeResolved) {
                     allResolved = false
                     continue
                 }
@@ -1584,23 +1693,15 @@ class DownloadOfflineFileManager(
                 return true
             }
             if (target.exists() && currentTargetHash != null) {
-                // INTERRUPTED RESTORE OUTPUT (issue: round 23 #2): readable bytes that are
-                // a strict PREFIX of the immutable backup are a partially copied restore —
-                // completing the VERIFIED restore over them is the resolution (they are
-                // the backup's own content, never an edit to preserve).
-                if (target.length() < recoveryFile.length() &&
-                    filePrefixMatches(target, recoveryFile, target.length())
-                ) {
-                    return restoreRecoveryCopy(
-                        context = context,
-                        recoveryFile = recoveryFile,
-                        target = target,
-                        recordFile = record.recordFile,
-                        oldRecordText = record.oldRecordText,
-                        oldTargetMtimeMillis = record.oldTargetMtimeMillis,
-                        expectedBackupHash = backupHash,
-                    )
-                }
+                // RESTORATION AUTHORITY IS NEVER PREFIX SIMILARITY (issue: round 24 #2):
+                // the previous strict-prefix arm auto-restored a shorter target whose
+                // bytes matched the backup's prefix — but a legitimate truncating edit
+                // (including to zero bytes, before upload registration) satisfies the
+                // same predicate, and prefix equality cannot establish which operation
+                // produced the bytes. Restores are STAGED AND ATOMIC (the verified stage
+                // replaces the target in one rename), so interrupted-restore output can
+                // no longer exist at the target: a changed readable target routes through
+                // the PROVEN EDIT arm below or stays unresolved — it is never overwritten.
                 // PROVEN INTERVENING EDIT ONLY (issue: round 23 #2): the bytes differ from
                 // BOTH the backup and the expected publication. They are a genuine newer
                 // revision only when the target is NEWER than the backed-up generation AND
@@ -1659,50 +1760,17 @@ class DownloadOfflineFileManager(
         private fun appContextForOwnership(): android.content.Context? = Realm.getApplicationContext()
 
         /**
-         * Whether [prefixFile]'s bytes are exactly [prefixFile]'s first [prefixLength] of
-         * [fullFile] (issue: round 23 #2): interrupted restore output is a strict prefix of
-         * the immutable backup — distinguishable from a genuine edit without trusting mtimes.
-         */
-        private fun filePrefixMatches(prefixFile: IOFile, fullFile: IOFile, prefixLength: Long): Boolean = runCatching {
-            if (prefixFile.length() != prefixLength || fullFile.length() < prefixLength) return@runCatching false
-            prefixFile.inputStream().use { a ->
-                fullFile.inputStream().use { b ->
-                    val bufA = ByteArray(64 * 1024)
-                    val bufB = ByteArray(64 * 1024)
-                    var remaining = prefixLength
-                    while (remaining > 0) {
-                        val chunk = minOf(remaining, bufA.size.toLong()).toInt()
-                        var readA = 0
-                        while (readA < chunk) {
-                            val r = a.read(bufA, readA, chunk - readA)
-                            if (r < 0) return@runCatching false
-                            readA += r
-                        }
-                        var readB = 0
-                        while (readB < chunk) {
-                            val r = b.read(bufB, readB, chunk - readB)
-                            if (r < 0) return@runCatching false
-                            readB += r
-                        }
-                        for (i in 0 until chunk) {
-                            if (bufA[i] != bufB[i]) return@runCatching false
-                        }
-                        remaining -= chunk
-                    }
-                    true
-                }
-            }
-        }.getOrDefault(false)
-
-        /**
          * RESTORES the retained old bytes with their retained proof and verifies the result
-         * before disposing the recovery state (issue: round 21 #9): copyTo does not restore
-         * the original mtime, an ignored restoration previously deleted the only recovery
-         * copy even when it had failed, and an unverified restore could leave partial bytes
-         * under the old proof. On any failure the recovery backup and its durable record
-         * are RETAINED for the reconciliation sweep; on success — bytes verified against
-         * the backup's own content hash, mtime restored, proof written back and read —
-         * they are disposed.
+         * before disposing the recovery state (issues: round 21 #9, round 24 #2): the BACKUP
+         * is validated against its immutable recorded hash BEFORE anything is mutated — a
+         * damaged backup never reaches the target — and the restore is STAGED: the backup is
+         * copied to a verified stage, timestamped, and published by an ATOMIC RENAME, so a
+         * failed restore leaves the existing target bytes and proof untouched (the previous
+         * in-place copyTo destroyed the existing target before the verification could fail).
+         * On any failure the recovery backup and its durable record are RETAINED for the
+         * reconciliation sweep; on success — the published bytes re-hashed against the
+         * backup's own content hash, mtime restored, proof written back and read — they are
+         * disposed.
          */
         private fun restoreRecoveryCopy(
             context: Context,
@@ -1713,25 +1781,40 @@ class DownloadOfflineFileManager(
             oldTargetMtimeMillis: Long,
             expectedBackupHash: String? = null,
         ): Boolean = runCatching {
-            recoveryFile.copyTo(target, overwrite = true)
-            val targetHash = UploadFile.sha256OrNull(target)
+            // BACKUP INTEGRITY BEFORE ANY TARGET MUTATION (issue: round 24 #2): the backup
+            // must still hash to the record's immutable hash (a corrupted backup never
+            // "restores" successfully — and never overwrites the target first).
             val backupHashNow = UploadFile.sha256OrNull(recoveryFile)
-            // IMMUTABLE VERIFICATION (issue: round 23 #2): the restored bytes verify
-            // against the RECORD's immutable backup hash — and the backup itself must
-            // still hash to it (a corrupted backup never "restores" successfully).
-            val restoredOk = target.exists() && target.length() == recoveryFile.length() &&
-                targetHash != null && backupHashNow != null &&
-                (expectedBackupHash == null || backupHashNow == expectedBackupHash) &&
-                targetHash == backupHashNow &&
-                target.setLastModified(oldTargetMtimeMillis)
-            if (!restoredOk) return@runCatching false
-            if (oldRecordText != null) {
-                provenanceFileFor(context, target).writeText(oldRecordText)
-                if (readPublishedProvenance(context, target) == null) return@runCatching false
+            if (backupHashNow == null || (expectedBackupHash != null && backupHashNow != expectedBackupHash)) {
+                return@runCatching false
             }
-            runCatching { recoveryFile.delete() }
-            runCatching { recordFile.delete() }
-            true
+            val stage = IOFile(stagingDirectory(context), "restore_${UUID.randomUUID()}.part")
+            try {
+                val stagedOk = runCatching {
+                    recoveryFile.copyTo(stage, overwrite = true)
+                    stage.exists() && stage.length() == recoveryFile.length() &&
+                        UploadFile.sha256OrNull(stage) == backupHashNow
+                }.getOrDefault(false)
+                if (!stagedOk) return@runCatching false
+                if (!stage.setLastModified(oldTargetMtimeMillis)) return@runCatching false
+                // ATOMIC PUBLICATION of the verified stage: the rename replaces the target
+                // in one step; a failed rename leaves the target exactly as it was.
+                if (!stage.renameTo(target)) return@runCatching false
+                // VERIFIED RESULT: the published bytes are re-hashed against the immutable
+                // backup hash before any state is disposed.
+                if (UploadFile.sha256OrNull(target) != backupHashNow) return@runCatching false
+                if (oldRecordText != null) {
+                    provenanceFileFor(context, target).writeText(oldRecordText)
+                    if (readPublishedProvenance(context, target) == null) return@runCatching false
+                }
+                runCatching { recoveryFile.delete() }
+                runCatching { recordFile.delete() }
+                true
+            } finally {
+                // The unpublished stage never lingers (issue: round 24 #21 discipline).
+                runCatching { if (stage.exists()) stage.delete() }
+                runCatching { deletePublishedProvenance(context, stage) }
+            }
         }.getOrDefault(false)
 
         /**
@@ -2130,6 +2213,14 @@ class DownloadOfflineFileManager(
                         oldRecordText = oldRecordText,
                         oldTargetMtimeMillis = oldTargetMtime,
                     )
+                    if (restored) {
+                        // THE ROLLBACK SUPERSEDES THE FAILED PUBLICATION'S PROOF (issue:
+                        // round 24 #5): a verified restore put the previous generation and
+                        // its proof back — the relocation record for the failed proof is
+                        // disposed here, so the next sweep can never write it over the
+                        // restored bytes.
+                        runCatching { proofRelocationRecordFile(provenanceContext, target).delete() }
+                    }
                     if (!restored) {
                         if (recoveryFile == null) {
                             // Nothing recoverable existed before (fresh publication): fail closed.
@@ -2137,7 +2228,9 @@ class DownloadOfflineFileManager(
                         }
                         // A FAILED restore RETAINS the recovery copy and its durable record
                         // (issue: round 21 #9): the sweep reconciles them; deleting them
-                        // here could lose the only copy of the old generation.
+                        // here could lose the only copy of the old generation. The pending
+                        // relocation record stays too: the sweep validates it against the
+                        // target's actual bytes before any write (issue: round 24 #5).
                     }
                     return PublicationOutcome.FAILED
                 }
@@ -2422,6 +2515,13 @@ class DownloadOfflineFileManager(
                                         oldRecordText = oldRecordText,
                                         oldTargetMtimeMillis = oldTargetMtime,
                                     )
+                                    if (restored) {
+                                        // THE ROLLBACK SUPERSEDES THE FAILED PUBLICATION'S
+                                        // PROOF (issue: round 24 #5), as in the coordinated
+                                        // publication: the verified restore owns the target's
+                                        // proof again — the relocation record is disposed.
+                                        runCatching { proofRelocationRecordFile(context, target).delete() }
+                                    }
                                     if (!restored && recoveryFile == null) {
                                         runCatching { target.delete() }
                                     }
