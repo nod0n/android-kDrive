@@ -3851,23 +3851,6 @@ class DownloadOfflineFileManager(
                                 // written onto unknown bytes: the state stays for a later
                                 // sweep (issue: round 24 #5).
                                 false
-                            !target.exists() ->
-                                // THE DESTINATION IS RESTORED, NOT JUST ABANDONED (review-34
-                                // #4): the operation's own prepared record is reverted to the
-                                // exact preexisting destination proof (or removed when none
-                                // existed); a later publication's record is left intact. A
-                                // failed revert retains the state for a verified retry.
-                                if (!resolveAbortedDestinationRecord(
-                                        context,
-                                        target,
-                                        publicationIdOfRecordText(parsed.proofText),
-                                        parsed.previousDestinationRecordText,
-                                    )
-                                ) {
-                                    false
-                                } else {
-                                    disposeRecoveryRecord(recordFile)
-                                }
                             else -> {
                                 val scope = UserDrive(userId = proofUserId, driveId = proofDriveId)
                                 // THE CAPTURED REALM FLAVOR (issue: round 26 #5): the sidecar
@@ -3912,8 +3895,52 @@ class DownloadOfflineFileManager(
                                             moveScopeKind = moveAuthority.scope.storageKind
                                         }
                                     }
-                                        val targetHash = UploadFile.sha256OrNull(target)
+                                        // THE FRESH ABSENCE IS PART OF THE LOCKED DECISION (review-36
+                                        // #6): a target the sweep found absent may have been created
+                                        // (or its bytes renamed) while the locks were acquired.
+                                        val targetHash = if (target.exists()) UploadFile.sha256OrNull(target) else null
                                         when {
+                                            // THE MISSING-TARGET ARM INSIDE THE VALIDATED CAPTURED-SCOPE
+                                            // COORDINATION (review-36 #6): the arm previously ran BEFORE
+                                            // the monitor and file locks and could restore, delete or
+                                            // dispose concurrently with a publisher still preparing this
+                                            // very operation. Absence is RECHECKED after acquiring the
+                                            // locks; the operation identity comes from the journal's own
+                                            // decoded payload; coordination is held through the proof
+                                            // restoration and the journal disposal.
+                                            !target.exists() -> {
+                                                // THE PHASE AUTHORITY (review-36 #5): the recorded
+                                                // source's bytes still hash-certifying the journal's own
+                                                // validated source-bound proof proves the pre-byte
+                                                // phase — a damaged destination record is this
+                                                // operation's known partial write and is repaired from
+                                                // the captured prior evidence.
+                                                val phaseProven = parsed.recordedSourcePath != null &&
+                                                    parsed.recordedSourceProofText != null && runCatching {
+                                                    val sourceFile = IOFile(parsed.recordedSourcePath)
+                                                    val sourceHash = if (sourceFile.exists()) UploadFile.sha256OrNull(sourceFile) else null
+                                                    val sourceProof = runCatching {
+                                                        parseProvenanceText(
+                                                            parsed.recordedSourceProofText,
+                                                            expectedPath = parsed.recordedSourcePath,
+                                                        )
+                                                    }.getOrNull()?.takeIf { it.absolutePath == parsed.recordedSourcePath }
+                                                    sourceHash != null && sourceProof != null &&
+                                                        sourceHash == sourceProof.contentHash
+                                                }.getOrDefault(false)
+                                                if (!resolveAbortedDestinationRecord(
+                                                        context,
+                                                        target,
+                                                        publicationIdOfRecordText(parsed.proofText),
+                                                        parsed.previousDestinationRecordText,
+                                                        phaseProvenOperationOwned = phaseProven,
+                                                    )
+                                                ) {
+                                                    false
+                                                } else {
+                                                    disposeRecoveryRecord(recordFile)
+                                                }
+                                            }
                                             // A FAILED TARGET HASH IS UNRESOLVED (issue: round 26
                                             // #4): the retained proof is never rewritten onto
                                             // bytes whose identity could not be read, and the
