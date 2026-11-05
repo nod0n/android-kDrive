@@ -739,6 +739,21 @@ object OfflineFolderController {
                             false
                         } else {
                             runCatching {
+                                // THE DESTINATION'S OWN AUTHORITY IS VALIDATED BEFORE
+                                // PREPARATION (review-35 #6): an ABSENT destination can still
+                                // be governed — another row's recovery may own this path (its
+                                // bytes retained in a backup) and another live row may claim
+                                // it. Preparing over it would destroy that authority; both
+                                // operations are retained while B remains governed.
+                                if (!DownloadOfflineFileManager.destinationReadyForRelocation(
+                                        context,
+                                        userDrive,
+                                        newIdentity.id,
+                                        target,
+                                    )
+                                ) {
+                                    return@runCatching false
+                                }
                                 target.parentFile?.mkdirs()
                                 // THE RELOCATION IS PREPARED AND ITS PROOF/OBSERVATION
                                 // VALIDATED BEFORE THE BYTES MOVE (issue: round 32 #4): the

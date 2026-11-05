@@ -2729,26 +2729,96 @@ class DownloadOfflineFileManager(
             }
         }
 
-        /** DESTINATION EXCLUSIVITY FOR THE ROLLBACK (review-34 #3): the vacated
-         * destination path must not be claimed by ANOTHER row before the operation reverts
-         * its bytes and evidence away from it — the fallback no longer relies on the
-         * source-side ownership check alone. */
-        private fun destinationPathUnclaimed(
+        /** THE TYPED DESTINATION OWNERSHIP (review-35 #8): exclusivePathOwner returns null
+         * for BOTH "no row claims the path" and "multiple rows claim it" — the rollback and
+         * the destination pre-check must distinguish them, and a failed query must defer
+         * rather than read as "unclaimed". */
+        private sealed class DestinationOwnership {
+            object Unclaimed : DestinationOwnership()
+            class Exclusive(val ownerFileId: Int) : DestinationOwnership()
+            object Ambiguous : DestinationOwnership()
+            object Failed : DestinationOwnership()
+        }
+
+        private fun destinationOwnership(
+            context: Context,
+            scope: UserDrive,
+            target: IOFile,
+            sharedWithMe: Boolean,
+        ): DestinationOwnership = runCatching {
+            val realmScope = UserDrive(userId = scope.userId, driveId = scope.driveId, sharedWithMe = sharedWithMe)
+            FileController.getRealmInstance(realmScope).use { realm ->
+                runCatching { realm.refresh() }
+                val appContext = appContextForOwnership() ?: return@use DestinationOwnership.Failed
+                val nameComponent = target.path.substringAfterLast('/')
+                val candidates = realm.where(File::class.java)
+                    .equalTo(File::name.name, nameComponent)
+                    .notEqualTo(File::type.name, File.Type.DIRECTORY.value)
+                    .findAll()
+                    .createSnapshot()
+                var claimantId: Int? = null
+                var ambiguous = false
+                for (candidate in candidates) {
+                    val candidatePath = candidate.getOfflineFile(context, realmScope.userId)?.path ?: continue
+                    if (candidatePath == target.path) {
+                        if (claimantId != null && claimantId != candidate.id) {
+                            ambiguous = true
+                            break
+                        }
+                        claimantId = candidate.id
+                    }
+                }
+                when {
+                    ambiguous -> DestinationOwnership.Ambiguous
+                    claimantId == null -> DestinationOwnership.Unclaimed
+                    else -> DestinationOwnership.Exclusive(claimantId)
+                }
+            }
+        }.getOrDefault(DestinationOwnership.Failed)
+
+        /** THE TYPED DESTINATION OWNERSHIP GATE (review-35 #8): a revert or a destination
+         * publication may proceed only when the path is proven UNCLAIMED or EXCLUSIVELY
+         * claimed by [fileId]'s row. AMBIGUOUS (multiple claimants, previously conflated
+         * with "none" by the null return) and FAILED queries DEFER. */
+        private fun destinationOwnershipPermits(
             context: Context,
             scope: UserDrive,
             fileId: Int,
             target: IOFile,
             sharedWithMe: Boolean,
             storageKind: String,
-        ): Boolean = runCatching {
-            val realmScope = UserDrive(userId = scope.userId, driveId = scope.driveId, sharedWithMe = sharedWithMe)
-            FileController.getRealmInstance(realmScope).use { realm ->
-                runCatching { realm.refresh() }
-                storageKind != "offline" || appContextForOwnership()?.let { ctx ->
-                    OfflineFolderController.exclusivePathOwner(realm, ctx, realmScope, target.path)
-                }.let { it == null || it == fileId }
+        ): Boolean {
+            // ID-KEYED DESTINATIONS ARE STRUCTURALLY EXCLUSIVE (issue: round 28 #9), as in
+            // currentOwnerHolds; the name-derived query applies to offline paths only.
+            if (storageKind != "offline") return true
+            return when (val ownership = destinationOwnership(context, scope, target, sharedWithMe)) {
+                is DestinationOwnership.Unclaimed -> true
+                is DestinationOwnership.Exclusive -> ownership.ownerFileId == fileId
+                is DestinationOwnership.Ambiguous, is DestinationOwnership.Failed -> false
             }
-        }.getOrDefault(false)
+        }
+
+        /** THE DESTINATION'S PRE-PREPARATION AUTHORITY (review-35 #6): an ABSENT
+         * destination can still be governed — another row's recovery may own this path (its
+         * bytes retained in a backup) and another live row may claim it. Returns true only
+         * when the destination is free of unresolved recovery AND its typed ownership
+         * permits the publication; otherwise both operations are retained. */
+        internal fun destinationReadyForRelocation(
+            context: Context,
+            userDrive: UserDrive,
+            fileId: Int,
+            target: IOFile,
+        ): Boolean {
+            if (hasUnresolvedRecovery(context, userDrive, fileId, target.absolutePath)) return false
+            return destinationOwnershipPermits(
+                context,
+                userDrive,
+                fileId,
+                target,
+                sharedWithMe = userDrive.sharedWithMe,
+                storageKind = "offline",
+            )
+        }
 
         /**
          * THE PREPARED PROOF-MOVE PHASE 2 (issues: round 28 #13, round 30 #6, round 32
@@ -3888,7 +3958,7 @@ class DownloadOfflineFileManager(
                                                             sharedWithMe = moveScopeShared,
                                                             storageKind = moveScopeKind,
                                                         )
-                                                        val destinationUnclaimed = destinationPathUnclaimed(
+                                                        val destinationUnclaimed = destinationOwnershipPermits(
                                                             context, scope, proofFileId, target,
                                                             sharedWithMe = moveScopeShared,
                                                             storageKind = moveScopeKind,
