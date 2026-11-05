@@ -4438,7 +4438,11 @@ class DownloadOfflineFileManager(
             // coordinated core; missing or mismatched provenance fails and the caller
             // enqueues a fresh download.
             val staged = newStagedFile(context, authoritativeFile)
-            try {
+            // THE TRY EXPRESSION IS THE RETURNED VALUE (review-32 compile repair): the
+            // outer staging finally spans creation through publication while the try
+            // block's last expression (the actual typed outcome) is forwarded explicitly
+            // — a bare try statement cannot satisfy a block body's return requirement.
+            return try {
             // THE CAPTURED PROMOTION TOKEN (issue: round 23 #20): captured ATOMICALLY WITH
             // STAGING — inside the same monitor+lock section that copies the cache — so a
             // writer that replaces the cache after the section (certifying different bytes
