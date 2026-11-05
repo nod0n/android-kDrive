@@ -712,7 +712,13 @@ object FileController {
                             val appContext = Realm.getApplicationContext()
                             val commitScope = userDrive ?: UserDrive()
                             preservedReceipt?.let { receipt ->
-                                if (appContext != null && DownloadOfflineFileManager.relocationReceiptMatchesJournal(appContext, receipt)) {
+                                // THE DISPOSAL BINDS THE RECEIPT TO THE COMMITTING FILE (review-38
+                                // #7): the receipt must name THIS file's operation — a discovered
+                                // or stale receipt for another identity never disposes here; the
+                                // current-journal match and the disposal helper's destination
+                                // ownership check bind the exact destination and scope.
+                                if (appContext != null && receipt.fileId == file.id &&
+                                    DownloadOfflineFileManager.relocationReceiptMatchesJournal(appContext, receipt)) {
                                     DownloadOfflineFileManager.disposeRelocationJournalAfterCommit(
                                         appContext,
                                         commitScope,
@@ -824,19 +830,18 @@ object FileController {
                 userDrive = scope,
                 newOfflineTarget = newOffline,
                 realm = realm,
+                onRelocationReceipt = onRelocationReceipt,
             )
-            // THE EXACT RECEIPT IS RETURNED (review-35 #4, review-37 #2): decoded FROM the
-            // retained journal at this relocation's own destination; the caller disposes it
-            // after its own metadata commit verifies the committed row resolves to this
-            // destination and the CURRENT journal still matches the receipt. THE LOCAL
-            // LABELED RETURN FORWARDS THE ACTUAL RESULT (review-35 compile repair): the
-            // lambda is held in a variable and passed to let/use, so a bare non-local return
-            // is prohibited — the labeled return is the value forward, no failure swallowed.
-            if (relocated) {
-                DownloadOfflineFileManager.readRelocationReceipt(context, newOffline)?.let { receipt ->
-                    onRelocationReceipt?.invoke(receipt)
-                }
-            }
+            // THE RECEIPT IS THE RELOCATION'S OWN RETURN (review-38 #7): the callback is
+            // forwarded into reconcileMovedInheritedCopy, and ONLY its completed relocation
+            // branch invokes it — with the receipt decoded from the journal that relocation
+            // itself created at its own destination. A snapshot or upload-disposal outcome
+            // produces NO receipt, and a journal that predates this operation (another
+            // identity's interrupted recovery at the new name's path) is never read as this
+            // operation's receipt. THE LOCAL LABELED RETURN FORWARDS THE ACTUAL RESULT
+            // (review-35 compile repair): the lambda is held in a variable and passed to
+            // let/use, so a bare non-local return is prohibited — the labeled return is the
+            // value forward, no failure swallowed.
             return@renameBlock relocated
         }
         return customRealm?.let(block) ?: getRealmInstance(scope).use(block)

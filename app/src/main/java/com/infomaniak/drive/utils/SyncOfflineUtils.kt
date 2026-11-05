@@ -1391,7 +1391,11 @@ object SyncOfflineUtils {
             // doctrine), and the committed row verifiably resolves to the published
             // destination.
             relocationReceipt?.let { receipt ->
-                if (DownloadOfflineFileManager.relocationReceiptMatchesJournal(context, receipt)) {
+                // THE DISPOSAL BINDS THE RECEIPT TO THE COMMITTING FILE (review-38 #7): the
+                // receipt must name THIS file's operation; the current-journal match and the
+                // disposal helper's destination ownership check bind the exact destination.
+                if (receipt.fileId == remoteFile.id &&
+                    DownloadOfflineFileManager.relocationReceiptMatchesJournal(context, receipt)) {
                     DownloadOfflineFileManager.disposeRelocationJournalAfterCommit(
                         context,
                         userDrive,
