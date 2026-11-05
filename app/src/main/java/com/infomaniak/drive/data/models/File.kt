@@ -898,7 +898,7 @@ open class File(
                 // UNRESOLVED generation (issue: round 20 #14): bytes were published but no
                 // generation proof exists — the same usable-destination validation as a
                 // supersession decides whether the copy may serve.
-                PublicationOutcome.SKIPPED_SUPERSEDED, PublicationOutcome.PUBLISHED_UNRESOLVED -> {
+                PublicationOutcome.SKIPPED_SUPERSEDED -> {
                     // Usable only when the CURRENT row still owns the named destination AND
                     // that destination holds usable content (issue: round 12 #11): metadata
                     // ownership alone reports completion over a missing or obsolete retained
@@ -971,6 +971,31 @@ open class File(
                         throw java.io.IOException("Superseded preview left no usable destination for $name")
                     }
                     onProgress(PROGRESS_COMPLETE)
+                }
+                // READABLE-UNVERIFIED, NEVER A COMPLETED DOWNLOAD (issues: round 29 #9 and
+                // masked flow B): an unresolved publication's copy is INTENTIONALLY
+                // unverified (a version-0 record) — the proven-current helper can never
+                // validate it, and existence alone was precisely the false-100 defect (a
+                // first public-share download emitted completion for its unresolved cache).
+                // The copy is served READABLE only when its captured publication identity
+                // still holds, freshly re-derived at THIS caller: the record names THIS
+                // row's scope, its immutable content hash certifies the CURRENT bytes, and
+                // it is not positively foreign. Distinct from verified completion: NO
+                // PROGRESS_COMPLETE is emitted for any unresolved outcome, and evidence
+                // (a metadata advance, a lost or non-certifying record) re-justifies a
+                // real transfer on a later pass. A copy whose identity cannot be
+                // established is truthfully unusable — an error, never a silent success.
+                PublicationOutcome.PUBLISHED_UNRESOLVED, PublicationOutcome.SKIPPED_READABLE_DEFERRED -> {
+                    val readable = cacheFile.exists() &&
+                        DownloadOfflineFileManager.readPublishedProvenance(context, cacheFile)
+                            ?.takeIf { proof ->
+                                proof.identifies(this, userDrive) &&
+                                    proof.certifiesBytes(cacheFile) &&
+                                    !proof.positivelyForeignTo(this, userDrive)
+                            } != null
+                    if (!readable) {
+                        throw java.io.IOException("Unresolved publication left no readable destination for $name")
+                    }
                 }
                 PublicationOutcome.SKIPPED_CONFLICT ->
                     // The destination holds protected content owned by another row (issue:

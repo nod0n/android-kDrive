@@ -225,9 +225,13 @@ class DownloadProgressViewModel : ViewModel() {
             when (outcome) {
                 // An unresolved generation is never a completed download (issue: round 20
                 // #14): the bytes were published, but no generation proof exists — the
-                // dialog reports no 100 over them.
+                // dialog reports no 100 over them. The deferred-readable suppression
+                // outcome (issue: round 29 masked flow B) defers the same way: no transfer
+                // ran, the durable unresolved state stands, and readable retained content
+                // is never promoted to a completed download.
                 PublicationOutcome.SKIPPED_INVALIDATED, PublicationOutcome.FAILED,
                 PublicationOutcome.SKIPPED_CONFLICT, PublicationOutcome.PUBLISHED_UNRESOLVED,
+                PublicationOutcome.SKIPPED_READABLE_DEFERRED,
                 -> null
                 PublicationOutcome.SKIPPED_SUPERSEDED -> {
                     // Supersession is completion only when the CURRENT row still owns the

@@ -441,6 +441,10 @@ class FileInfoActionsView @JvmOverloads constructor(
                             // published but no generation proof exists — never a pin
                             // confirmation over unproven content.
                             PublicationOutcome.PUBLISHED_UNRESOLVED,
+                            // THE DEFERRED-READABLE SUPPRESSION OUTCOME (issue: round 29
+                            // masked flow B): no transfer ran; the durable unresolved state
+                            // stands — never a pin confirmation from it either.
+                            PublicationOutcome.SKIPPED_READABLE_DEFERRED,
                             PublicationOutcome.FAILED,
                             -> {
                                 // Every non-published outcome re-reads the CURRENT scoped

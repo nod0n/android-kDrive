@@ -635,6 +635,10 @@ class DownloadOfflineFileManager(
                 // round 8 #9): this transfer's skip clears no marker and runs no completion.
                 CachePromotionOutcome.DEFERRED
             }
+            // THE DEFERRED-READABLE SUPPRESSION OUTCOME (issues: round 29 masked flow B):
+            // the pre-transfer suppression decided no transfer adds anything — the durable
+            // unresolved state stands, no marker clear, no completion.
+            PublicationOutcome.SKIPPED_READABLE_DEFERRED -> CachePromotionOutcome.DEFERRED
             // UNRESOLVED generation (issue: round 20 #14): the bytes are published but the
             // generation is unproven — the promotion is NOT fulfilled (the marker stays,
             // the root's incompleteness is retained via the unresolved-outcome set).
@@ -988,6 +992,16 @@ class DownloadOfflineFileManager(
                                             // unregistered. UNREADABLE bytes are UNCERTAIN,
                                             // never a proven edit.
                                             currentBasisHash != null -> {
+                                                // THE REGISTERED EDIT NEVER ADVANCES (issue: round 29
+                                                // audit of #1, preserving round-28 #2): a proven edit is
+                                                // registered under the row's CURRENT (pre-advance)
+                                                // identity and the advancement is SKIPPED — the owning
+                                                // metadata must stay with the retained bytes, so the
+                                                // registration's discovery trail survives. (The rewrite
+                                                // initially let a SUCCESSFUL registration advance and
+                                                // retire, discarding the location the snapshot was
+                                                // registered under.) Foreign, clean and uncertain bytes
+                                                // defer unregistered; UNREADABLE is the branch below.
                                                 val classifiedEdit = currentBasisHash != verifiedBasisSourceHash &&
                                                     OfflineFolderController.protectionStateOf(
                                                         preAdvanceRow ?: liveRow ?: return@withFileLock,
@@ -995,18 +1009,16 @@ class DownloadOfflineFileManager(
                                                         userDrive,
                                                     ) == OfflineFolderController.CopyProtection.DIRTY
                                                 if (classifiedEdit && preAdvanceRow != null) {
-                                                    val registered = runCatching {
+                                                    runCatching {
                                                         OfflineFolderController.registerDirtySnapshot(
                                                             context = context,
                                                             file = preAdvanceRow,
                                                             offlineFile = basisCopy,
                                                             userDrive = userDrive,
                                                         )
-                                                    }.getOrDefault(false)
-                                                    if (!registered) retirementAuthorized = false
-                                                } else {
-                                                    retirementAuthorized = false
+                                                    }
                                                 }
+                                                retirementAuthorized = false
                                                 SentryLog.i(
                                                     TAG,
                                                     "Old-path revision for ${file.id} classified; advancement deferred",
@@ -1082,6 +1094,11 @@ class DownloadOfflineFileManager(
                         // (issue: round 8 #9): this transfer's skip must not clear its marker
                         // out from under the newer transfer.
                     }
+                    // THE DEFERRED-READABLE SUPPRESSION OUTCOME (issues: round 29 masked
+                    // flow B): no transfer ran — the durable unresolved state stands; the
+                    // single-file worker retries on its durable re-drive and the batch/root
+                    // keep their incompleteness (UNRESOLVED_PUBLICATION_OUTCOMES).
+                    PublicationOutcome.SKIPPED_READABLE_DEFERRED -> Unit
                 }
                 ListenableWorker.Result.success()
             } else {
@@ -1232,6 +1249,16 @@ class DownloadOfflineFileManager(
              * completion, never a 100, never a marker clear, never a root completion.
              * Typed so every public caller distinguishes it from PUBLISHED. */
             PUBLISHED_UNRESOLVED,
+
+            /** THE DEFERRED-READABLE SUPPRESSION OUTCOME (issue: round 29 masked flow B): the
+             * pre-transfer suppression answered that the destination ALREADY holds this
+             * identity's explicitly unresolved publication covering the current generation —
+             * no transfer ran. The retained copy is READABLE-UNVERIFIED access, distinct from
+             * verified completion: never a 100, never a throw-as-failure when the copy is
+             * servable; the caller validates readability against the captured publication
+             * identity and decides. Like every unresolved outcome, the durable unresolved
+             * state is retained and evidence re-justifies a real transfer. */
+            SKIPPED_READABLE_DEFERRED,
         }
 
         /** Outcomes that must retain Bulk/root incompleteness (issues: round 17 #7, round 20 #14). */
@@ -1241,6 +1268,9 @@ class DownloadOfflineFileManager(
                 PublicationOutcome.SKIPPED_CONFLICT,
                 PublicationOutcome.SKIPPED_INVALIDATED,
                 PublicationOutcome.PUBLISHED_UNRESOLVED,
+                // The suppression outcome defers the transfer entirely (masked flow B): the
+                // durable unresolved state stands and no completion is claimed.
+                PublicationOutcome.SKIPPED_READABLE_DEFERRED,
             )
 
         /** Suffix of the old SIBLING sidecar experiment — never written or deleted again (round 17 #1). */
@@ -3089,47 +3119,61 @@ class DownloadOfflineFileManager(
             explicitUnresolvedGeneration: Boolean = false,
             onVerifiedBasisHash: ((String?) -> Unit)? = null,
         ): PublicationOutcome = withContext(Dispatchers.IO) {
-            // ROOT-INTENT coordination for publication (issue: round 12 #8): an ancestry-
-            // dependent publication must serialize with ancestry-changing writers (folder
-            // moves take the monitor before their locks) — a monitored UI folder move could
-            // otherwise change ancestry after this publication validates its destination,
-            // because it locks the ancestor rather than this publishing leaf. The monitor is
-            // acquired BEFORE the ordered file locks and retained through the destination
-            // ownership read, the final supersession decision and the filesystem rename
-            // inside publishLockedCore. Order: intent monitor → ascending file locks →
-            // Realm/FS mutation.
-            synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                // Destination ownership (issue: round 6 #3): the row owning the existing bytes at
-                // [target] is resolved BEFORE locking, then this publication holds BOTH the
-                // incoming file's and the owner's coordination locks in a stable ascending-id
-                // order, so the owner's mutators (cleanup, reconciliation, its own publications)
-                // are serialized with it and no lock ordering can deadlock.
-                val appContext = Realm.getApplicationContext()
-                val preLockOwner = appContext?.let { ctx ->
-                    FileController.getRealmInstance(userDrive).use { realm ->
-                        OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)
+            try {
+                // ROOT-INTENT coordination for publication (issue: round 12 #8): an ancestry-
+                // dependent publication must serialize with ancestry-changing writers (folder
+                // moves take the monitor before their locks) — a monitored UI folder move could
+                // otherwise change ancestry after this publication validates its destination,
+                // because it locks the ancestor rather than this publishing leaf. The monitor is
+                // acquired BEFORE the ordered file locks and retained through the destination
+                // ownership read, the final supersession decision and the filesystem rename
+                // inside publishLockedCore. Order: intent monitor → ascending file locks →
+                // Realm/FS mutation.
+                synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    // Destination ownership (issue: round 6 #3): the row owning the existing bytes at
+                    // [target] is resolved BEFORE locking, then this publication holds BOTH the
+                    // incoming file's and the owner's coordination locks in a stable ascending-id
+                    // order, so the owner's mutators (cleanup, reconciliation, its own publications)
+                    // are serialized with it and no lock ordering can deadlock.
+                    val appContext = Realm.getApplicationContext()
+                    val preLockOwner = appContext?.let { ctx ->
+                        FileController.getRealmInstance(userDrive).use { realm ->
+                            OfflineFolderController.destinationOwnerRow(realm, ctx, userDrive, file, target)
+                        }
+                    }
+                    val lockedOwnerId: Int? = preLockOwner?.id
+
+                    // Both locks (incoming + established owner) in ONE ascending-id acquisition,
+                    // constant stack (issues: round 11 #1, round 11 #12): the same ordered protocol as
+                    // every graph commit and cleanup acquisition, so no lock cycle is possible, and
+                    // the explicit-lock loop cannot overflow the stack the way nested monitors did.
+                    OfflineFileCoordination.withLocksFor(userDrive, listOfNotNull(file.id, preLockOwner?.id)) {
+                        publishLockedCore(
+                            userDrive = userDrive,
+                            isInheritedDownload = isInheritedDownload,
+                            file = file,
+                            target = target,
+                            staged = staged,
+                            onPublishedLocked = onPublishedLocked,
+                            lockedOwnerId = lockedOwnerId,
+                            verificationBasis = verificationBasis,
+                            explicitUnresolvedGeneration = explicitUnresolvedGeneration,
+                            checkCancelled = { coroutineContext.ensureActive() },
+                            onVerifiedBasisHash = onVerifiedBasisHash,
+                        )
                     }
                 }
-                val lockedOwnerId: Int? = preLockOwner?.id
-
-                // Both locks (incoming + established owner) in ONE ascending-id acquisition,
-                // constant stack (issues: round 11 #1, round 11 #12): the same ordered protocol as
-                // every graph commit and cleanup acquisition, so no lock cycle is possible, and
-                // the explicit-lock loop cannot overflow the stack the way nested monitors did.
-                OfflineFileCoordination.withLocksFor(userDrive, listOfNotNull(file.id, preLockOwner?.id)) {
-                    publishLockedCore(
-                        userDrive = userDrive,
-                        isInheritedDownload = isInheritedDownload,
-                        file = file,
-                        target = target,
-                        staged = staged,
-                        onPublishedLocked = onPublishedLocked,
-                        lockedOwnerId = lockedOwnerId,
-                        verificationBasis = verificationBasis,
-                        explicitUnresolvedGeneration = explicitUnresolvedGeneration,
-                        checkCancelled = { coroutineContext.ensureActive() },
-                        onVerifiedBasisHash = onVerifiedBasisHash,
-                    )
+            } finally {
+                // THE STAGED OBSERVATION JOINS THE STAGING CLEANUP (issues: round 29 #7, audit A3):
+                // the coordinated core's explicit failure returns delete the staged BYTES, but a
+                // prepared record (and its durable attempted observation) also lingered on every
+                // path that never published — prepare failure, rename failure, or a cancellation
+                // throw between preparation and the rename (the plain-cache protocol already cleans
+                // both in its finally; the direct callers deleted bytes only). After a SUCCESSFUL
+                // publication both files already moved to the target key, so this is a no-op there.
+                runCatching { if (staged.exists()) staged.delete() }
+                Realm.getApplicationContext()?.let { ctx ->
+                    runCatching { deletePublishedProvenance(ctx, staged) }
                 }
             }
         }
