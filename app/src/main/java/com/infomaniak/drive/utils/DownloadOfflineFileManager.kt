@@ -3933,6 +3933,31 @@ class DownloadOfflineFileManager(
                                 // persisted capture could describe a superseded graph.
                                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                                     OfflineFileCoordination.withFileLock(scope, proofFileId) {
+                                    // THE JOURNAL IS REREAD INSIDE THE COORDINATION (review-37 #8):
+                                    // the filename is deterministic per destination — after waiting
+                                    // for the locks, operation I may have completed and operation J
+                                    // may have left a PENDING journal at the same destination (same
+                                    // scope/file/path, so the sidecar checks would pass). Mutating
+                                    // or disposing from the stale decode could destroy J's current
+                                    // journal. The CURRENT body must still represent EXACTLY the
+                                    // decoded operation — every parsed field compared — otherwise
+                                    // the replay defers and a later sweep re-reads fresh.
+                                    val reread = parseProofMoveRecord(recordFile)
+                                    if (reread == null ||
+                                        reread.version != parsed.version ||
+                                        reread.targetPath != parsed.targetPath ||
+                                        reread.proofText != parsed.proofText ||
+                                        reread.observationText != parsed.observationText ||
+                                        reread.observationFieldDamaged != parsed.observationFieldDamaged ||
+                                        reread.observationAmbiguous != parsed.observationAmbiguous ||
+                                        reread.recordedSourcePath != parsed.recordedSourcePath ||
+                                        reread.recordedSourceProofText != parsed.recordedSourceProofText ||
+                                        reread.previousDestinationRecordText != parsed.previousDestinationRecordText ||
+                                        reread.proofLocationValid != parsed.proofLocationValid ||
+                                        reread.embeddedProofLocation != parsed.embeddedProofLocation
+                                    ) {
+                                        return@withFileLock false
+                                    }
                                     // THE TRI-STATE SIDECAR AUTHORITY (issues: round 28
                                     // #10, round 29 #5): an invalid CURRENT index defers
                                     // the replay (no substituted realm/kind); an ABSENT
