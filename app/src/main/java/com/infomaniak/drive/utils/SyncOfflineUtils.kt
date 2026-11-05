@@ -291,7 +291,16 @@ object SyncOfflineUtils {
             lastFilesActions?.forEach { fileAction ->
                 coroutineScope.ensureActive()
                 fileActionsIds.add(fileAction.fileId)
-                handleFileAction(context, fileAction, localFilesMap, userDrive, realm, pendingAdvances, pendingRecoveryIds)
+                handleFileAction(
+                    context,
+                    fileAction,
+                    localFilesMap,
+                    userDrive,
+                    realm,
+                    pendingAdvances,
+                    pendingRecoveryIds,
+                    checkCancelled = { coroutineScope.ensureActive() },
+                )
             }
 
             // Check if any of the files that don't have fileActions require synchronization.
@@ -374,6 +383,7 @@ object SyncOfflineUtils {
         realm: Realm,
         pendingAdvances: MutableList<PendingCursorAdvance>,
         pendingRecoveryIds: Set<Int>,
+        checkCancelled: () -> Unit = {},
     ) {
         val localFile = localFilesMap[fileAction.fileId]
         val ioFile = localFile?.getOfflineFile(context, userDrive.userId) ?: return
@@ -414,6 +424,9 @@ object SyncOfflineUtils {
                             okHttpClient = okHttpClient,
                         )
                     }.getOrNull()
+                    // THE EXECUTING CONTEXT AFTER THE RESPONSE (issue: round 25 #16): a
+                    // cancelled caller stops before any deletion authority is exercised.
+                    checkCancelled()
                     when {
                         probe == null -> return
                         probe.data != null -> {
@@ -502,7 +515,7 @@ object SyncOfflineUtils {
                     }
                 }
             }
-            else -> updateFile(context, localFile, fileAction, userDrive, realm, pendingAdvances, pendingRecoveryIds)
+            else -> updateFile(context, localFile, fileAction, userDrive, realm, pendingAdvances, pendingRecoveryIds, checkCancelled)
         }
     }
 
@@ -514,6 +527,7 @@ object SyncOfflineUtils {
         realm: Realm,
         pendingAdvances: MutableList<PendingCursorAdvance>,
         pendingRecoveryIds: Set<Int>,
+        checkCancelled: () -> Unit = {},
     ): Boolean {
         val remoteFile = fileAction.file
         if (remoteFile == null) {
@@ -523,6 +537,36 @@ object SyncOfflineUtils {
             return false
         }
         var downloadOutcome = DownloadActionOutcome(handled = false)
+        // BOUNDED DURABLE ANCESTRY RESOLUTION OUTSIDE THE OUTERMOST COORDINATION (issues:
+        // round 24 #10, round 25 #16): a dirty file moved into an uncached destination
+        // previously deferred on the SAME activity forever, and the round-24 repair ran
+        // its details requests INSIDE this section's monitor and file lock — the HTTPs
+        // must not ride held coordination locks. ONE bounded, fair pass runs here, BEFORE
+        // the synchronized body (it serves the upload arm's registration and the rename
+        // arm's chain validation alike); the in-lock gates re-validate the fresh chain
+        // and defer WITHOUT effects while ancestry is still unresolved.
+        if (remoteFile.parentId > 0) {
+            val chainIncomplete = runCatching {
+                FileController.getRealmInstance(userDrive).use { probeRealm ->
+                    runCatching { probeRealm.refresh() }
+                    !FileController.destinationChainExists(probeRealm, remoteFile.parentId)
+                }
+            }.getOrDefault(true)
+            if (chainIncomplete) {
+                val resolvingClient = runCatching {
+                    runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+                }.getOrNull() ?: return false
+                FolderFilesProvider.resolveMissingAncestryOutsideLocks(
+                    realm = realm,
+                    fetchedFile = remoteFile,
+                    okHttpClient = resolvingClient,
+                    userDrive = userDrive,
+                )
+            }
+        }
+        // THE EXECUTING CONTEXT AFTER THE PRE-LOCK RESOLUTION (issue: round 25 #16): a
+        // cancelled caller stops before entering the coordinated section.
+        checkCancelled()
         // ONE coordinated operation per action (issue: round 14 #1): the ROOT-INTENT monitor
         // precedes the file lock (the move branch re-parents), the Realm REFRESHES under
         // them, and the CURRENT row, byte baseline and action ordering select the branch
@@ -811,33 +855,12 @@ object SyncOfflineUtils {
         realm: Realm,
         actionLastActionAt: Long? = null,
     ): Boolean {
-        // BOUNDED DURABLE ANCESTRY RESOLUTION FOR THE DEFERRED ACTION (issue: round 24
-        // #10): a dirty file moved into an uncached destination previously deferred on the
-        // SAME activity forever — no Sync caller resolved the missing destination chain,
-        // so only an unrelated UI traversal could unblock it. ONE bounded, fair
-        // resolution pass runs OUTSIDE every coordination lock (the monitor-first protocol
-        // forbids acquiring the monitor under this function's file lock), BEFORE the
-        // lock; the in-lock gate below retries the registration against the fresh
-        // complete chain, and still-unresolved ancestry defers WITHOUT registration.
-        if (remoteFile != null && remoteFile.parentId > 0) {
-            val chainIncomplete = runCatching {
-                FileController.getRealmInstance(userDrive).use { probeRealm ->
-                    runCatching { probeRealm.refresh() }
-                    !FileController.destinationChainExists(probeRealm, remoteFile.parentId)
-                }
-            }.getOrDefault(true)
-            if (chainIncomplete) {
-                val resolvingClient = runCatching {
-                    runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
-                }.getOrNull() ?: return false
-                FolderFilesProvider.resolveMissingAncestryOutsideLocks(
-                    realm = realm,
-                    fetchedFile = remoteFile,
-                    okHttpClient = resolvingClient,
-                    userDrive = userDrive,
-                )
-            }
-        }
+        // ANCESTRY RESOLUTION IS THE CALLER'S PRE-LOCK DUTY (issue: round 25 #16): the
+        // bounded resolving pass runs OUTSIDE THE OUTERMOST monitor/file-lock section
+        // (in [updateFile], before its coordinated body) — the previous placement here
+        // issued its details requests while the CALLER held the monitor and this file's
+        // lock, inverting the monitor-first protocol. The in-lock gate below only
+        // VALIDATES the fresh chain and defers WITHOUT registration while unresolved.
         // Upload-source registration is a mutation owner of these bytes: it holds the shared
         // per-file coordination so a publication or cleanup cannot interleave (issue:
         // round 4 #4). The action predicate applies BEFORE the snapshot side effect (issue:
