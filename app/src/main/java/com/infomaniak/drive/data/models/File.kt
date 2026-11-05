@@ -157,17 +157,7 @@ open class File(
      * destructive absence predicates detect marker ABA without a Boolean flag's
      * blindness. Persisted (schema File DB 16, default 0 = pre-stamp rows).
      */
-    var offlineIntentStamp: Long = 0
-
-    /**
-     * THE MONOTONIC INTENT GENERATION (issue: round 26 #12): strictly per-row increasing
-     * (previous + 1), inside the caller's transaction — equal stamps for rapid transitions
-     * and clock-skew resurrection of an older value are both impossible, so an old absence
-     * authority can never reproduce a captured generation. Every intent writer bumps.
-     */
-    fun bumpOfflineIntentGeneration() {
-        offlineIntentStamp = offlineIntentStamp + 1L
-    },
+    var offlineIntentStamp: Long = 0,
     var isOffline: Boolean = false,
 
     /**
@@ -182,6 +172,16 @@ open class File(
     var lastActionAt: Long = 0,
 
     ) : RealmObject(), Parcelable {
+
+    /**
+     * THE MONOTONIC INTENT GENERATION (issue: round 26 #12): strictly per-row increasing
+     * (previous + 1), inside the caller's transaction — equal stamps for rapid transitions
+     * and clock-skew resurrection of an older value are both impossible, so an old absence
+     * authority can never reproduce a captured generation. Every intent writer bumps.
+     */
+    fun bumpOfflineIntentGeneration() {
+        offlineIntentStamp = offlineIntentStamp + 1L
+    }
 
     /**
      * The baseline the bytes at this row's offline path were published under, for edit
