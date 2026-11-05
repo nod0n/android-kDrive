@@ -2820,6 +2820,47 @@ class DownloadOfflineFileManager(
                 parseObservationBinding(writtenBack ?: "")?.location == target.absolutePath
         }
 
+        /** THE VALIDATED TARGET OBSERVATION EVIDENCE (review-34 #8): for an AMBIGUOUS
+         * legacy absence, disposal is authorized only when the attempt's evidence already
+         * EXISTS at the target — the observation is readable there, names the target, and
+         * (current format) binds to the operation's expected publication id. Otherwise the
+         * operation is retained as typed unresolved recovery: legacy emptiness alone is
+         * never authority to discard required recovery evidence. */
+        private fun targetObservationEvidenceComplete(
+            context: Context,
+            target: IOFile,
+            expectedPublicationId: Long?,
+        ): Boolean = runCatching {
+            val obsFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!obsFile.exists()) return@runCatching false
+            val parsed = parseObservationBinding(obsFile.readText().trim()) ?: return@runCatching false
+            if (parsed.location != target.absolutePath) return@runCatching false
+            when (parsed.format) {
+                // ONLY the current format's id binding validates the evidence as THIS
+                // operation's; a legacy observation proves nothing about the identity.
+                ObservationFormat.CURRENT -> expectedPublicationId != null &&
+                    parsed.publicationId == expectedPublicationId
+                ObservationFormat.LEGACY -> false
+            }
+        }.getOrDefault(false)
+
+        /** THE AMBIGUITY-AWARE OBSERVATION RESOLUTION (review-34 #8): a carried text
+         * establishes as always; an AMBIGUOUS legacy absence establishes nothing and
+         * succeeds only when the evidence already exists at the target (validated repair);
+         * an explicit absence (the "A" marker / a pre-observation format) succeeds without
+         * establishment. */
+        private fun observationEvidenceComplete(
+            context: Context,
+            target: IOFile,
+            carriedText: String?,
+            ambiguous: Boolean,
+            expectedPublicationId: Long?,
+        ): Boolean = when {
+            carriedText != null -> establishRecoveredObservation(context, target, carriedText, expectedPublicationId)
+            ambiguous -> targetObservationEvidenceComplete(context, target, expectedPublicationId)
+            else -> true
+        }
+
         /** THE EXPECTED PUBLICATION IDENTITY (issue: round 32 #5): the operation's own
          * publication id, parsed from its persisted expected proof text (v2-frame body
          * index 8). */
@@ -2913,9 +2954,15 @@ class DownloadOfflineFileManager(
             val backupHash: String?,
             val expectedPublicationHash: String?,
             val expectedPublicationRecordText: String?,
-            /** THE CARRIED ATTEMPTED OBSERVATION (issue: round 30 #7) — v4 records only;
+            /** THE CARRIED ATTEMPTED OBSERVATION (issue: round 30 #7) — v4/v5 records only;
              * v1–v3 records carried no observation (their attempts predate it). */
             val attemptedObservationText: String? = null,
+            /** AMBIGUOUS LEGACY ABSENCE (review-34 #8): a v4 record whose observation
+             * field is EMPTY — the round-31 writer legitimately emitted empty-for-absent,
+             * but a lost/truncated required observation parses identically. Absence
+             * cannot be established from the record alone; disposal then requires the
+             * validated target-evidence check instead of skipping establishment. */
+            val attemptedObservationAmbiguous: Boolean = false,
             val legacy: Boolean,
             /** The owner scope was recovered from validated durable state (issue: round 24
              * #3) — a record whose scope could not be established is never locked, queried
@@ -3000,6 +3047,10 @@ class DownloadOfflineFileManager(
                     // carried text (its own "1|" frame is validated at use — malformed
                     // contents retain the operation, never read as absence).
                     attemptedObservationText = v4[11].takeIf { it.isNotEmpty() && it != "A" },
+                    // AMBIGUOUS LEGACY EMPTY (review-34 #8): an empty v4 field is the
+                    // round-31 writer's absent OR a lost/truncated required observation —
+                    // the ambiguity rides the record.
+                    attemptedObservationAmbiguous = v4[11].isEmpty(),
                     legacy = false,
                 )
             }
@@ -3552,21 +3603,17 @@ class DownloadOfflineFileManager(
                                                 // observation — re-bound to THIS destination and
                                                 // verified against the established proof's
                                                 // publication id — and the relocation state is
-                                                // disposed only when BOTH are established. A
-                                                // legacy three-line record carries none (a
-                                                // pre-observation attempt); its evidence contract
-                                                // is unchanged.
+                                                // disposed only when BOTH are established.
+                                                // AMBIGUITY-AWARE (review-34 #8): a three-line
+                                                // legacy record's absence is legitimate; a
+                                                // four-line record with an empty field requires
+                                                // the evidence at the target.
                                                 val observationEstablished = proofEstablished && runCatching {
-                                                    establishRecoveredObservation(
+                                                    observationEvidenceComplete(
                                                         context,
                                                         target,
-                                                        // THE DECODER'S PRESENCE SEMANTICS (review-33
-                                                        // #7): the carried text, or null for the
-                                                        // explicit/legacy absence — a v2 record's
-                                                        // empty field never reaches this arm.
                                                         parsed.observationText,
-                                                        // THE OPERATION'S OWN IDENTITY (issue: round 32
-                                                        // #5): the retained proof's publication id.
+                                                        parsed.observationAmbiguous,
                                                         retainedPublicationId,
                                                     )
                                                 }.getOrDefault(false)
@@ -3723,31 +3770,46 @@ class DownloadOfflineFileManager(
                 // id) before disposal; a proof carrying a DIFFERENT (newer) publication id
                 // has superseded the attempt — its observation evidence is spent and is
                 // deliberately not rewritten (the binding reader would reject it anyway).
-                if (record.attemptedObservationText != null) {
+                // THE EXPECTED OPERATION IDENTITY DECIDES SUPERSESSION (issue: round 32
+                // #5): the comparison is between the operation's own EXPECTED publication
+                // id (its persisted expected proof) and the CURRENT target proof's id —
+                // never a raw carried-observation id alone.
+                val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
+                when {
                     // DAMAGED CARRIED EVIDENCE NEVER AUTHORIZES DISPOSAL (issues: round 31
                     // #4, round 32 #5): an unparseable carried observation retains the
                     // operation state.
-                    parseObservationBinding(record.attemptedObservationText) ?: return false
-                    // THE EXPECTED OPERATION IDENTITY DECIDES SUPERSESSION (issue: round
-                    // 32 #5): the comparison is between the operation's own EXPECTED
-                    // publication id (its persisted expected proof) and the CURRENT target
-                    // proof's id — never a raw carried-observation id alone, whose
-                    // mismatch previously disposed the operation while the target still
-                    // carried the operation's own expected publication.
-                    val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
-                    when {
-                        expectedPublicationId == null -> return false
-                        targetProof.publicationId == expectedPublicationId -> {
-                            // The target IS the operation's own output: the observation
-                            // re-establishes under the same validated identity.
-                            if (!establishRecoveredObservation(context, target, record.attemptedObservationText, expectedPublicationId)) {
+                    record.attemptedObservationText != null -> {
+                        parseObservationBinding(record.attemptedObservationText) ?: return false
+                        when {
+                            expectedPublicationId == null -> return false
+                            targetProof.publicationId == expectedPublicationId -> {
+                                // The target IS the operation's own output: the observation
+                                // re-establishes under the same validated identity.
+                                if (!establishRecoveredObservation(context, target, record.attemptedObservationText, expectedPublicationId)) {
+                                    return false
+                                }
+                            }
+                            // A NEWER publication (validated identity) superseded the
+                            // operation: its observation evidence is spent and is
+                            // deliberately not rewritten.
+                        }
+                    }
+                    // AMBIGUOUS LEGACY EMPTY (review-34 #8): emptiness alone is never
+                    // authority to discard the operation — a SUPERSEDED target spends the
+                    // evidence either way, but the operation's own output must show the
+                    // evidence at the target (validated repair) before disposal.
+                    record.attemptedObservationAmbiguous -> {
+                        when {
+                            expectedPublicationId == null -> return false
+                            targetProof.publicationId != expectedPublicationId -> Unit
+                            else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId)) {
                                 return false
                             }
                         }
-                        // A NEWER publication (validated identity) superseded the
-                        // operation: its observation evidence is spent and is deliberately
-                        // not rewritten.
                     }
+                    // An explicit absence (the "A" marker / a pre-observation format) is
+                    // legitimate: nothing to establish.
                 }
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
@@ -3791,10 +3853,14 @@ class DownloadOfflineFileManager(
                     // publication id, parsed from its persisted expected proof) BEFORE the
                     // recovery state is disposed; a failed observation write retains the
                     // whole operation state, never half of it.
-                    if (!establishRecoveredObservation(
+                    // THE AMBIGUITY-AWARE RESOLUTION (review-34 #8), as in every recovery
+                    // disposal: a carried text establishes; an ambiguous legacy absence
+                    // requires the evidence at the target; an explicit absence succeeds.
+                    if (!observationEvidenceComplete(
                             context,
                             target,
                             record.attemptedObservationText,
+                            record.attemptedObservationAmbiguous,
                             publicationIdOfRecordText(record.expectedPublicationRecordText),
                         )
                     ) {
