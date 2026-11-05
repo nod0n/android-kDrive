@@ -1664,14 +1664,16 @@ class DownloadOfflineFileManager(
             !observationFile.exists() || runCatching { observationFile.delete() }.getOrDefault(false)
         }.getOrDefault(false)
 
-        /** THE REPAIR-TIME STALE OBSERVATION RESOLUTION (review-34 #7): an observation
-         * bound to a REPLACED publication (CURRENT format, id different from the current
-         * proof's) is retired idempotently here — on repair retries the early-success
-         * shortcut no longer bypasses a previously failed retirement. Returns true when
-         * no stale observation remains (or none ever existed); a legacy or damaged
-         * observation is ambiguous evidence that never blocks a legitimate move and is
-         * left alone (review-34 #8); a failed deletion returns false so the caller
-         * defers. */
+        /** THE REPAIR-TIME STALE OBSERVATION RESOLUTION (review-34 #7, review-35 #11): an
+         * observation bound to a REPLACED publication (CURRENT format, id different from
+         * the current proof's) is retired idempotently here — on repair retries the
+         * early-success shortcut no longer bypasses a previously failed retirement.
+         * A PRESENT but unreadable or damaged observation is NEVER resolved (review-35
+         * #11): parsing failure is not resolution — the caller defers with the upload
+         * ownership retained, exactly as relocation rejects the same state. Returns true
+         * when no stale observation remains (or none ever existed); a legacy observation
+         * is ambiguous evidence that never blocks a legitimate move and is left alone
+         * (review-34 #8); a failed deletion returns false so the caller defers. */
         internal fun staleObservationResolved(
             context: Context,
             target: IOFile,
@@ -1682,7 +1684,9 @@ class DownloadOfflineFileManager(
             val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
                 ?.let { parseObservationBinding(it) }
             when {
-                parsed == null -> true
+                // DAMAGED PRESENCE IS NOT RESOLUTION (review-35 #11): the caller defers
+                // and the surviving evidence is never silently accepted as absence.
+                parsed == null -> false
                 parsed.format == ObservationFormat.CURRENT && parsed.publicationId == currentPublicationId -> true
                 parsed.format == ObservationFormat.CURRENT -> runCatching { observationFile.delete() }.getOrDefault(false)
                 else -> true
@@ -3217,6 +3221,19 @@ class DownloadOfflineFileManager(
             return text.removePrefix(PROVENANCE_FRAME).split("|").getOrNull(8)?.trim()?.toLongOrNull()
         }
 
+        /** THE EXPECTED RECORD'S GENERATION RESOLUTION (review-35 #13): the VERSION field of
+         * the operation's expected/target proof is independent durable evidence of whether
+         * the attempt's observation was REQUIRED — version 0 (or unparseable) is the
+         * unresolved marker whose observation evidence matters; a positive version marks a
+         * RESOLVED generation whose observation was legitimately optional. Legacy emptiness
+         * alone never authorizes anything: the version authority, read from the durable
+         * record, does. */
+        private fun recordTextIndicatesUnresolvedGeneration(recordText: String?): Boolean {
+            if (recordText == null) return true
+            val version = recordText.removePrefix(PROVENANCE_FRAME).split("|").getOrNull(0)?.trim()?.toIntOrNull()
+            return version == null || version == 0
+        }
+
         private fun writeRecoveryRecord(
             context: Context,
             recoveryFile: IOFile,
@@ -3936,16 +3953,19 @@ class DownloadOfflineFileManager(
                                                 // verified against the established proof's
                                                 // publication id — and the relocation state is
                                                 // disposed only when BOTH are established.
-                                                // AMBIGUITY-AWARE (review-34 #8): a three-line
-                                                // legacy record's absence is legitimate; a
-                                                // four-line record with an empty field requires
-                                                // the evidence at the target.
+                                                // AMBIGUITY-AWARE (review-34 #8, converged review-35
+                                                // #13): a three-line legacy record's absence is
+                                                // legitimate; a four-line record with an empty field
+                                                // requires the evidence at the target ONLY for an
+                                                // UNRESOLVED generation (version-0 proof) — a
+                                                // resolved generation's observation was optional.
                                                 val observationEstablished = proofEstablished && runCatching {
                                                     observationEvidenceComplete(
                                                         context,
                                                         target,
                                                         parsed.observationText,
-                                                        parsed.observationAmbiguous,
+                                                        parsed.observationAmbiguous &&
+                                                            recordTextIndicatesUnresolvedGeneration(parsed.proofText),
                                                         retainedPublicationId,
                                                     )
                                                 }.getOrDefault(false)
@@ -4028,7 +4048,8 @@ class DownloadOfflineFileManager(
                                                                 context,
                                                                 sourceFile,
                                                                 parsed.observationText,
-                                                                parsed.observationAmbiguous,
+                                                                parsed.observationAmbiguous &&
+                                                                    recordTextIndicatesUnresolvedGeneration(parsed.proofText),
                                                                 publicationIdOfRecordText(sourceProofText),
                                                             )
                                                         ) {
@@ -4161,10 +4182,35 @@ class DownloadOfflineFileManager(
                 }
             }
             if (!recoveryFile.exists()) {
-                // The backup is gone: a completed publication (or completed restore)
-                // leaves the target with its own readable proof; anything else is
-                // unresolved durable state.
-                if (readPublishedProvenance(context, target) == null) return false
+                // AN ABSENT BACKUP IS NOT COMPLETION EVIDENCE (review-35 #12): the same
+                // owner/publication/content/observation predicate as the self-certifying
+                // arm applies before any disposal — the target must hold bytes CERTIFIED by
+                // a proof naming the recorded owner, at the operation's expected
+                // publication (or a validated newer supersession), with the ambiguity-aware
+                // observation state complete. Anything less retains the operation for
+                // repair; a readable proof that does not certify the current bytes is
+                // never authority.
+                val targetHash = if (target.exists()) UploadFile.sha256OrNull(target) else null
+                val missingBackupProof = if (target.exists()) readPublishedProvenance(context, target) else null
+                val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
+                val operationScope = UserDrive(userId = record.userId, driveId = record.driveId)
+                val missingBackupComplete = targetHash != null && missingBackupProof != null &&
+                    missingBackupProof.certifiesBytes(target) &&
+                    missingBackupProof.identifies(
+                        File(id = record.fileId, driveId = record.driveId),
+                        operationScope,
+                    ) && when {
+                        expectedPublicationId == null -> false
+                        // THE VERSION AUTHORITY (review-35 #13): a RESOLVED generation
+                        // (positive version in the expected record) had a legitimately
+                        // optional observation — the ambiguous legacy emptiness converges;
+                        // an UNRESOLVED marker requires the validated target evidence.
+                        !recordTextIndicatesUnresolvedGeneration(record.expectedPublicationRecordText) -> true
+                        missingBackupProof.publicationId != expectedPublicationId -> true
+                        else -> targetObservationEvidenceComplete(context, target, expectedPublicationId)
+                    }
+                if (!missingBackupComplete) return false
+                runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
                 return true
             }
@@ -4211,13 +4257,16 @@ class DownloadOfflineFileManager(
                             // deliberately not rewritten.
                         }
                     }
-                    // AMBIGUOUS LEGACY EMPTY (review-34 #8): emptiness alone is never
-                    // authority to discard the operation — a SUPERSEDED target spends the
-                    // evidence either way, but the operation's own output must show the
-                    // evidence at the target (validated repair) before disposal.
+                    // AMBIGUOUS LEGACY EMPTY (review-34 #8, converged review-35 #13):
+                    // emptiness alone is never authority — but a RESOLVED generation
+                    // (positive version in the expected record) had a legitimately optional
+                    // observation and converges; an UNRESOLVED marker requires the
+                    // validated target evidence; a SUPERSEDED target spends the evidence
+                    // either way.
                     record.attemptedObservationAmbiguous -> {
                         when {
                             expectedPublicationId == null -> return false
+                            !recordTextIndicatesUnresolvedGeneration(record.expectedPublicationRecordText) -> Unit
                             targetProof.publicationId != expectedPublicationId -> Unit
                             else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId)) {
                                 return false
@@ -4269,14 +4318,18 @@ class DownloadOfflineFileManager(
                     // publication id, parsed from its persisted expected proof) BEFORE the
                     // recovery state is disposed; a failed observation write retains the
                     // whole operation state, never half of it.
-                    // THE AMBIGUITY-AWARE RESOLUTION (review-34 #8), as in every recovery
-                    // disposal: a carried text establishes; an ambiguous legacy absence
-                    // requires the evidence at the target; an explicit absence succeeds.
+                    // THE AMBIGUITY-AWARE RESOLUTION (review-34 #8, converged review-35 #13),
+                    // as in every recovery disposal: a carried text establishes; an ambiguous
+                    // legacy absence requires the evidence at the target ONLY for an
+                    // UNRESOLVED generation (version-0 expected proof) — a resolved
+                    // generation's observation was legitimately optional; an explicit
+                    // absence succeeds.
                     if (!observationEvidenceComplete(
                             context,
                             target,
                             record.attemptedObservationText,
-                            record.attemptedObservationAmbiguous,
+                            record.attemptedObservationAmbiguous &&
+                                recordTextIndicatesUnresolvedGeneration(record.expectedPublicationRecordText),
                             publicationIdOfRecordText(record.expectedPublicationRecordText),
                         )
                     ) {
