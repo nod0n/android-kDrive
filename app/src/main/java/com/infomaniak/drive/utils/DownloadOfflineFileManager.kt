@@ -4111,6 +4111,30 @@ class DownloadOfflineFileManager(
                                                         ) {
                                                             return@runCatching false
                                                         }
+                                                        // THE COMPLETE GENERATION AND PUBLICATION TUPLE
+                                                        // (review-36 #7): the source-bound and target-bound
+                                                        // payloads must be the SAME immutable generation and
+                                                        // publication after normalizing ONLY the location
+                                                        // (which differs by design) — version, all three
+                                                        // timestamps, owner fields, content hash and
+                                                        // publication id all equal. A damaged journal
+                                                        // retaining the right path, owner and byte hash with
+                                                        // a different generation or publication tuple is
+                                                        // rejected before either proof is written or any
+                                                        // byte moves; the exact readback alone never
+                                                        // authorized the payload's consistency.
+                                                        val targetProofParsed = runCatching {
+                                                            parseProvenanceText(parsed.proofText, expectedPath = parsed.targetPath)
+                                                        }.getOrNull()?.takeIf { it.absolutePath == parsed.targetPath }
+                                                        if (targetProofParsed == null ||
+                                                            sourceProofParsed.version != targetProofParsed.version ||
+                                                            sourceProofParsed.lastModifiedAt != targetProofParsed.lastModifiedAt ||
+                                                            sourceProofParsed.revisedAt != targetProofParsed.revisedAt ||
+                                                            sourceProofParsed.updatedAt != targetProofParsed.updatedAt ||
+                                                            sourceProofParsed.publicationId != targetProofParsed.publicationId
+                                                        ) {
+                                                            return@runCatching false
+                                                        }
                                                         // THE READBACK VERIFIES THE EXPECTED COMPLETE RECORD
                                                         // (review-35 #7), not merely "some provenance".
                                                         val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
