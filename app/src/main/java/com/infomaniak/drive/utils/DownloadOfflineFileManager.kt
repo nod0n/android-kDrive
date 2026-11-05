@@ -2165,6 +2165,7 @@ class DownloadOfflineFileManager(
             sharedWithMe: Boolean = false,
             storageKind: String = "offline",
             attemptedObservation: AttemptedObservationCapture = AttemptedObservationCapture.Absent,
+            recordedSourcePath: String = "",
         ): Boolean = runCatching {
             // DAMAGED EVIDENCE IS NEVER PERSISTED AS ABSENCE (issue: round 31 #4), as in
             // the publication recovery record: a relocation whose source observation
@@ -2198,11 +2199,18 @@ class DownloadOfflineFileManager(
             if (!sidecarWritten) return@runCatching false
             // FOURTH LINE: THE CARRIED OBSERVATION (issue: round 30 #7) — the relocation
             // state retains the attempt's observation beside the proof, so the replay
-            // re-establishes BOTH at the destination before disposal (a legacy three-line
-            // record carries none; the replay treats it as absent).
+            // re-establishes BOTH at the destination before disposal. FIFTH LINE: THE
+            // RECORDED SOURCE (review-33 #3) — the relocation's old identity, empty for a
+            // staged publication that has no source authority.
+            // RECORD v2 (review-33 #7): the current operation format is VERSIONED — a v2
+            // record REQUIRES its complete field set (the observation field must be the
+            // explicit "A" marker or a carried observation, never empty). A truncated or
+            // empty-fielded v2 record is DAMAGED CURRENT EVIDENCE on read — retained and
+            // fail-closed — never decoded as legitimate absence; only the legacy "1"
+            // records keep the conservative empty-means-absent semantics.
             atomicWriteText(
                 recordFile,
-                listOf("1", target.absolutePath, proofText, attemptedObservationText).joinToString("\n"),
+                listOf("2", target.absolutePath, proofText, attemptedObservationText, recordedSourcePath).joinToString("\n"),
             )
         }.getOrDefault(false)
 
@@ -2266,6 +2274,87 @@ class DownloadOfflineFileManager(
             return null
         }
 
+        /** THE PARSED PROOFMOVE RECORD — the ONE validated decoder's output (review-33 #9):
+         * replay, exclusion and enumeration share this single structural parse. */
+        private class ParsedProofMoveRecord(
+            val version: Int,
+            val targetPath: String,
+            val proofText: String,
+            val proofUserId: Int?,
+            val proofDriveId: Int?,
+            val proofFileId: Int?,
+            val proofContentHash: String?,
+            /** The carried observation text, or null for an explicit/legacy absence. */
+            val observationText: String?,
+            /** DAMAGED CURRENT EVIDENCE (review-33 #7): a v2 record whose observation
+             * field is empty — truncation, never legitimate absence. */
+            val observationFieldDamaged: Boolean,
+            /** The recorded source identity of a v2 relocation record (null = none). */
+            val recordedSourcePath: String?,
+        ) {
+            val identitiesValid: Boolean
+                get() = proofUserId != null && proofDriveId != null && proofFileId != null &&
+                    proofContentHash != null
+        }
+
+        /**
+         * THE ONE VALIDATED PROOFMOVE DECODER (review-33 #9): every consumer — the sweep's
+         * replay, [hasUnresolvedRecovery] and [pendingRecoveryFileIds] — parses the record
+         * through THIS function, so no reader can accept a shape another rejects. The
+         * LEGACY "1" record (three or four lines) keeps its documented semantics: a
+         * missing/empty fourth line is a pre-observation attempt's absence. The CURRENT
+         * "2" record (exactly five lines) requires every field: an empty observation
+         * field is damaged evidence ([observationFieldDamaged]), a fifth line containing
+         * a further newline is a broken record, and any other header, line count or
+         * unreadable file returns null (the caller retains and fails closed by scope).
+         */
+        private fun parseProofMoveRecord(recordFile: IOFile): ParsedProofMoveRecord? = runCatching {
+            val parts = recordFile.readText().split("\n", limit = 5)
+            fun fields(proofText: String): List<String> = proofText.removePrefix(PROVENANCE_FRAME).split("|")
+            when (parts.getOrNull(0)?.trim()) {
+                "1" -> {
+                    if (parts.size != 3 && parts.size != 4) return@runCatching null
+                    val proofFields = fields(parts[2])
+                    ParsedProofMoveRecord(
+                        version = 1,
+                        targetPath = parts[1],
+                        proofText = parts[2],
+                        proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
+                        proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
+                        proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
+                        proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
+                        observationText = parts.getOrNull(3)?.takeIf { it.isNotEmpty() && it != "A" },
+                        observationFieldDamaged = false,
+                        recordedSourcePath = null,
+                    )
+                }
+                "2" -> {
+                    if (parts.size != 5) return@runCatching null
+                    val sourceField = parts[4]
+                    if (sourceField.contains('\n')) return@runCatching null
+                    val proofFields = fields(parts[2])
+                    val observationField = parts[3]
+                    ParsedProofMoveRecord(
+                        version = 2,
+                        targetPath = parts[1],
+                        proofText = parts[2],
+                        proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
+                        proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
+                        proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
+                        proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
+                        observationText = when {
+                            observationField == "A" -> null
+                            observationField.isNotEmpty() -> observationField
+                            else -> null
+                        },
+                        observationFieldDamaged = observationField.isEmpty(),
+                        recordedSourcePath = sourceField.takeIf { it.isNotEmpty() },
+                    )
+                }
+                else -> null
+            }
+        }.getOrNull()
+
         /**
          * THE PREPARED PROOF-MOVE PHASE 1 (issues: round 23 #14, round 32 #4): the
          * relocation state (scope sidecar, retained proof, captured observation) and the
@@ -2284,6 +2373,7 @@ class DownloadOfflineFileManager(
             requireObservation: Boolean,
             sharedWithMe: Boolean = false,
             storageKind: String = "offline",
+            recordedSourcePath: String = "",
         ): Boolean {
             val provenance = readPublishedProvenance(context, source)
             if (provenance == null) {
@@ -2293,7 +2383,9 @@ class DownloadOfflineFileManager(
             // THE RELOCATION STATE EXISTS BEFORE THE DESTINATION WRITE IS ATTEMPTED
             // (issue: round 23 #14): every failure path below leaves a durable record of
             // the original proof and its exact destination; only a VERIFIED destination
-            // proof disposes it.
+            // proof disposes it. The recorded SOURCE identity rides the v2 record
+            // (review-33 #3) — the sweep's conditional move-completion validates the
+            // recorded old identity when the live row has not advanced yet.
             val relocationStateWritten = writeProofRelocationRecord(
                 context,
                 target,
@@ -2306,6 +2398,7 @@ class DownloadOfflineFileManager(
                     expectedObservationLocation = expectedObservationLocation,
                     requireObservation = requireObservation,
                 ),
+                recordedSourcePath = recordedSourcePath,
             )
             if (!relocationStateWritten) {
                 // Without recoverable state the source proof is NOT destroyed: the old
@@ -2528,15 +2621,26 @@ class DownloadOfflineFileManager(
             expectedObservationLocation: String,
             requireObservation: Boolean,
         ): AttemptedObservationCapture {
-            val text = runCatching { IOFile(provenanceFileFor(context, publishedFile).path + ".obs").readText().trim() }
-                .getOrNull()
-            val parsed = text?.takeIf { it.isNotEmpty() }?.let { parseObservationBinding(it) }
-            if (parsed == null) {
+            // TRUE ABSENCE IS POSITIVE NONEXISTENCE (review-33 #7): the observation file's
+            // absence is decided BEFORE any read — a RESOLVED operation's missing
+            // observation is legitimate ([Absent] when optional), while a REQUIRED one
+            // without its evidence fails closed ([Invalid]).
+            val observationFile = IOFile(provenanceFileFor(context, publishedFile).path + ".obs")
+            if (!observationFile.exists()) {
                 return if (requireObservation) {
                     AttemptedObservationCapture.Invalid
                 } else {
                     AttemptedObservationCapture.Absent
                 }
+            }
+            // PRESENT BUT UNREADABLE/EMPTY/UNPARSEABLE IS DAMAGED PRESENCE (review-33 #7):
+            // damaged evidence is [Invalid] EVEN WHEN THE OBSERVATION IS OPTIONAL — the
+            // previous collapse let preparation accept a present damaged observation as
+            // absence and discover the damage only after the bytes had moved.
+            val text = runCatching { observationFile.readText().trim() }.getOrNull()
+            val parsed = text?.takeIf { it.isNotEmpty() }?.let { parseObservationBinding(it) }
+            if (text == null || parsed == null) {
+                return AttemptedObservationCapture.Invalid
             }
             val operationId = readPublishedProvenance(context, publishedFile)?.publicationId
             val idBound = when (parsed.format) {
@@ -2618,6 +2722,11 @@ class DownloadOfflineFileManager(
             // operation legitimately carried no observation; a present observation is
             // carried verbatim (its "1|" frame distinguishes it from the marker on read —
             // a round-31 record's empty field reads as absent, its raw text as present).
+            // RECORD v5 (review-33 #7, versioning the round-30 v4 format): the CURRENT
+            // operation record requires the explicit presence discriminator — the
+            // observation field must be "A" or a carried observation, never empty. The
+            // previous v4 header stays readable as the LEGACY format (its round-31
+            // writer legitimately emitted an empty field: conservative absent).
             val attemptedObservationText = when (attemptedObservation) {
                 is AttemptedObservationCapture.Absent -> "A"
                 is AttemptedObservationCapture.Valid -> attemptedObservation.text
@@ -2645,7 +2754,7 @@ class DownloadOfflineFileManager(
             atomicWriteText(
                 recordFile,
                 listOf(
-                    "4",
+                    "5",
                     target.absolutePath,
                     recoveryFile.absolutePath,
                     oldTargetMtimeMillis.toString(),
@@ -2715,6 +2824,31 @@ class DownloadOfflineFileManager(
          */
         private fun readRecoveryRecord(recordFile: IOFile): RecoveryRecord? = runCatching {
             val text = recordFile.readText()
+            val v5 = text.split("\n", limit = 12)
+            if (v5.size == 12 && v5[0].trim() == "5") {
+                // RECORD v5 ON READ (review-33 #7): the CURRENT format requires the
+                // explicit presence discriminator — an EMPTY observation field is
+                // truncation of a current record, never legitimate absence: the record
+                // is UNDECODABLE (retained unresolved, excluded fail-closed by its scope
+                // sidecar, never self-certifyingly disposed). "A" and a carried text
+                // decode exactly as the legacy v4 branch does.
+                if (v5[11].isEmpty()) return@runCatching null
+                return@runCatching RecoveryRecord(
+                    recordFile = recordFile,
+                    targetPath = v5[1],
+                    recoveryPath = v5[2],
+                    oldTargetMtimeMillis = v5[3].trim().toLongOrNull() ?: return null,
+                    oldRecordText = v5[4].takeIf { it.isNotEmpty() },
+                    fileId = v5[5].trim().toIntOrNull() ?: return null,
+                    userId = v5[6].trim().toIntOrNull() ?: return null,
+                    driveId = v5[7].trim().toIntOrNull() ?: return null,
+                    backupHash = v5[8].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationHash = v5[9].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationRecordText = v5[10].takeIf { it.isNotEmpty() },
+                    attemptedObservationText = v5[11].takeIf { it != "A" },
+                    legacy = false,
+                )
+            }
             val v4 = text.split("\n", limit = 12)
             if (v4.size == 12 && v4[0].trim() == "4") {
                 return@runCatching RecoveryRecord(
@@ -2831,18 +2965,21 @@ class DownloadOfflineFileManager(
                 // 32 #3): the previous filter excluded proof-move records entirely, so a
                 // captured per-file exclusion set missed a relocation's owner while its
                 // state was unresolved — Sync's activity effects ran over governed bytes.
-                // A valid proof is matched by its captured identity; a malformed payload
-                // falls back to the scope sidecar, and an unsidecarred record fails the
-                // pass closed.
+                // Enumeration parses through THE ONE VALIDATED DECODER (review-33 #9): a
+                // structurally damaged (or truncated current) record falls back to the
+                // scope sidecar, and an unsidecarred record fails the pass closed.
                 if (recordFile.name.startsWith("proofmove_")) {
-                    val parts = runCatching { recordFile.readText().split("\n", limit = 4) }.getOrNull()
-                    val proofFields = parts?.getOrNull(2)?.removePrefix(PROVENANCE_FRAME)?.split("|")
-                    val proofUserId = proofFields?.getOrNull(4)?.trim()?.toIntOrNull()
-                    val proofDriveId = proofFields?.getOrNull(5)?.trim()?.toIntOrNull()
-                    val proofFileId = proofFields?.getOrNull(6)?.trim()?.toIntOrNull()
-                    if (proofUserId != null && proofDriveId != null && proofFileId != null) {
-                        if (proofUserId == userDrive.userId && proofDriveId == userDrive.driveId) {
-                            ids.add(proofFileId)
+                    val parsed = parseProofMoveRecord(recordFile)
+                    if (parsed == null || parsed.observationFieldDamaged) {
+                        val scope = readScopeSidecar(recordFile) ?: return null
+                        if (scope.driveId == userDrive.driveId && scope.userId == userDrive.userId) {
+                            ids.add(scope.fileId)
+                        }
+                        continue
+                    }
+                    if (parsed.identitiesValid) {
+                        if (parsed.proofUserId == userDrive.userId && parsed.proofDriveId == userDrive.driveId) {
+                            ids.add(parsed.proofFileId ?: return null)
                         }
                     } else {
                         val scope = readScopeSidecar(recordFile) ?: return null
@@ -2911,10 +3048,12 @@ class DownloadOfflineFileManager(
                     // mid-relocation. A DAMAGED BODY IS INDEPENDENTLY SCOPED (issue: round
                     // 26 #6): the scope index decides exactly like an ordinary corrupt
                     // record — identities/paths demonstrably outside it progress; inside
-                    // it (or without a sidecar) fails closed. The previous blanket
-                    // fail-closed blocked unrelated files and accounts forever.
-                    val parts = runCatching { recordFile.readText().split("\n", limit = 4) }.getOrNull()
-                    if (parts == null || parts.size < 3 || parts[0].trim() != "1") {
+                    // it (or without a sidecar) fails closed. Enumeration parses through
+                    // THE ONE VALIDATED DECODER (review-33 #9); a truncated CURRENT record
+                    // (review-33 #7) is damaged evidence — it never decodes as absence and
+                    // is scoped by its sidecar alone.
+                    val parsed = parseProofMoveRecord(recordFile)
+                    if (parsed == null || parsed.observationFieldDamaged) {
                         val scope = readScopeSidecar(recordFile) ?: return true
                         val scopeIdentity = scope.fileId == fileId &&
                             scope.driveId == userDrive.driveId && scope.userId == userDrive.userId
@@ -2922,7 +3061,16 @@ class DownloadOfflineFileManager(
                         if (scopeIdentity || scopePath) return true
                         continue
                     }
-                    if (targetPath != null && IOFile(parts[1]).absolutePath == targetPath) return true
+                    if (targetPath != null && IOFile(parsed.targetPath).absolutePath == targetPath) return true
+                    // THE RECORDED SOURCE GOVERNS TOO (review-33 #3): a v2 relocation
+                    // record moved the bytes FROM its recorded source — that vacated
+                    // location stays under the operation's exclusion until the sweep
+                    // resolves the state, so no other writer can occupy it meanwhile.
+                    if (targetPath != null && parsed.recordedSourcePath != null &&
+                        IOFile(parsed.recordedSourcePath).absolutePath == targetPath
+                    ) {
+                        return true
+                    }
                     // THE CAPTURED IDENTITY MATCHES TOO (issues: round 31 #2, round 32 #3):
                     // a valid proofmove record carries its owner's full captured
                     // account/drive/file identity in the proof text — the previous
@@ -2934,11 +3082,7 @@ class DownloadOfflineFileManager(
                     // — the scope sidecar decides, and without one it fails closed — the
                     // previous null-identity fall-through returned false and let activity
                     // effects run despite the unresolved operation.
-                    val proofFields = parts[2].removePrefix(PROVENANCE_FRAME).split("|")
-                    val proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull()
-                    val proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull()
-                    val proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull()
-                    if (proofUserId == null || proofDriveId == null || proofFileId == null) {
+                    if (!parsed.identitiesValid) {
                         val scope = readScopeSidecar(recordFile) ?: return true
                         val scopeIdentity = scope.fileId == fileId &&
                             scope.driveId == userDrive.driveId && scope.userId == userDrive.userId
@@ -2946,7 +3090,9 @@ class DownloadOfflineFileManager(
                         if (scopeIdentity || scopePath) return true
                         continue
                     }
-                    if (proofUserId == userDrive.userId && proofDriveId == userDrive.driveId && proofFileId == fileId) {
+                    if (parsed.proofUserId == userDrive.userId && parsed.proofDriveId == userDrive.driveId &&
+                        parsed.proofFileId == fileId
+                    ) {
                         return true
                     }
                     continue
@@ -3018,19 +3164,20 @@ class DownloadOfflineFileManager(
                 // never written over the restored bytes.
                 if (recordFile.name.startsWith("proofmove_")) {
                     val proofMoveResolved = runCatching {
-                        val parts = recordFile.readText().split("\n", limit = 4)
-                        if ((parts.size != 3 && parts.size != 4) || parts[0].trim() != "1") return@runCatching false
-                        val target = IOFile(parts[1])
-                        val proofText = parts[2]
-                        // FRAMING-AWARE FIELD PARSING (issue: round 25 #12): the owner and
-                        // content-hash fields sit at the same BODY indices in both the framed
-                        // and the legacy format once the "v2|" marker is stripped — the
-                        // location is the re-joined tail in both and is never parsed here.
-                        val proofFields = proofText.removePrefix(PROVENANCE_FRAME).split("|")
-                        val proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull()
-                        val proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull()
-                        val proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull()
-                        val proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() }
+                        // THE ONE VALIDATED DECODER (review-33 #9): the replay parses the
+                        // record through the shared structural parser — a shape another
+                        // reader rejects is never completed here.
+                        val parsed = parseProofMoveRecord(recordFile) ?: return@runCatching false
+                        // DAMAGED CURRENT EVIDENCE IS NEVER ABSENCE (review-33 #7): a v2
+                        // record with an empty observation field is truncation — the
+                        // replay retains it instead of completing without evidence.
+                        if (parsed.observationFieldDamaged) return@runCatching false
+                        val target = IOFile(parsed.targetPath)
+                        val proofText = parsed.proofText
+                        val proofUserId = parsed.proofUserId
+                        val proofDriveId = parsed.proofDriveId
+                        val proofFileId = parsed.proofFileId
+                        val proofContentHash = parsed.proofContentHash
                         when {
                             proofUserId == null || proofDriveId == null || proofFileId == null ||
                                 proofContentHash == null ->
@@ -3175,9 +3322,11 @@ class DownloadOfflineFileManager(
                                                     establishRecoveredObservation(
                                                         context,
                                                         target,
-                                                        // THE PRESENCE DISCRIMINATOR ON READ (issue:
-                                                        // round 32 #5), as in the v4 record.
-                                                        parts.getOrNull(3)?.takeIf { it.isNotEmpty() && it != "A" },
+                                                        // THE DECODER'S PRESENCE SEMANTICS (review-33
+                                                        // #7): the carried text, or null for the
+                                                        // explicit/legacy absence — a v2 record's
+                                                        // empty field never reaches this arm.
+                                                        parsed.observationText,
                                                         // THE OPERATION'S OWN IDENTITY (issue: round 32
                                                         // #5): the retained proof's publication id.
                                                         retainedPublicationId,

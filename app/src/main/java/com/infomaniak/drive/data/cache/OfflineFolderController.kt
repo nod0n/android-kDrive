@@ -755,6 +755,12 @@ object OfflineFolderController {
                                         target,
                                         expectedObservationLocation = oldOfflineFile.absolutePath,
                                         requireObservation = false,
+                                        // THE RECORDED SOURCE IDENTITY (review-33 #3): the v2
+                                        // relocation record carries the old location so the
+                                        // sweep's conditional move-completion can validate the
+                                        // recorded old identity when the live row has not
+                                        // advanced to the destination yet.
+                                        recordedSourcePath = oldOfflineFile.absolutePath,
                                     )
                                 ) {
                                     return@runCatching false
