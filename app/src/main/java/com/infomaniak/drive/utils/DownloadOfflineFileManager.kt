@@ -2615,9 +2615,12 @@ class DownloadOfflineFileManager(
             val recordFile = verifiedProvenanceFileFor(context, target) ?: run {
                 return false
             }
+            // THE PREPARED PROOF IS PUBLISHED ATOMICALLY (review-36 #5): a failed write
+            // leaves the captured prior record intact instead of a partial proof — the
+            // operation's own pre-byte failure is then repairable from the journal's
+            // captured authority instead of retaining recovery forever.
             val written = runCatching {
-                recordFile.writeText(provenance.recordText(target))
-                true
+                atomicWriteText(recordFile, provenance.recordText(target))
             }.getOrDefault(false)
             if (!written) {
                 // A partial write must never lend a truncated generation (issue: round 22
@@ -2650,6 +2653,10 @@ class DownloadOfflineFileManager(
                                 target,
                                 provenance.publicationId,
                                 stateParsed?.previousDestinationRecordText,
+                                // THE PHASE IS KNOWN BY CONSTRUCTION (review-36 #5): this IS
+                                // the operation's own failed pre-byte write — a damaged record
+                                // here is repaired from the journal's captured authority.
+                                phaseProvenOperationOwned = true,
                             )
                         ) {
                             return false
@@ -2678,6 +2685,10 @@ class DownloadOfflineFileManager(
                                 target,
                                 provenance.publicationId,
                                 stateParsed?.previousDestinationRecordText,
+                                // THE PHASE IS KNOWN BY CONSTRUCTION (review-36 #5): this IS
+                                // the operation's own failed pre-byte write — a damaged record
+                                // here is repaired from the journal's captured authority.
+                                phaseProvenOperationOwned = true,
                             )
                         ) {
                             return false
@@ -2701,6 +2712,7 @@ class DownloadOfflineFileManager(
             target: IOFile,
             operationPublicationId: Long?,
             previousDestinationRecordText: String?,
+            phaseProvenOperationOwned: Boolean = false,
         ): Boolean {
             val destinationFile = provenanceFileFor(context, target)
             // TRI-STATE DESTINATION EVIDENCE (review-35 #5): ABSENT (nothing of ours to
@@ -2709,7 +2721,21 @@ class DownloadOfflineFileManager(
             // positively superseding -> left intact).
             if (!destinationFile.exists()) return true
             val currentText = runCatching { destinationFile.readText().trim() }.getOrNull()
-            if (currentText.isNullOrEmpty()) return false
+            if (currentText.isNullOrEmpty()) {
+                // THE PHASE-PROVEN REPAIR (review-36 #5): unreadable evidence normally
+                // retains (uncertainty protected) — but when the phase authority proves the
+                // damage is THIS operation's own pre-byte preparation write (the source
+                // bytes still certified at the recorded source), the captured prior
+                // evidence is conditionally restored instead of retaining recovery forever.
+                if (!phaseProvenOperationOwned) return false
+                val repairFile = verifiedProvenanceFileFor(context, target) ?: return false
+                return if (previousDestinationRecordText.isNullOrEmpty()) {
+                    runCatching { repairFile.delete() }.getOrDefault(false)
+                } else {
+                    runCatching { atomicWriteText(repairFile, previousDestinationRecordText) }.getOrDefault(false) &&
+                        runCatching { repairFile.readText().trim() }.getOrNull() == previousDestinationRecordText
+                }
+            }
             // THE PRIOR-DESTINATION PAYLOAD IS PREVALIDATED (review-35 #7): a restore
             // writes only a record that fully parses FOR THIS TARGET, and the readback
             // must equal it exactly.
