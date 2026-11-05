@@ -665,9 +665,9 @@ object FileController {
                     // would roll the row back. The stale operation defers; the authoritative
                     // current identity stays and a later listing/details pass reconciles.
                     if (renameRequestStillCurrent(file.id, observedName, observedParentId, userDrive, realm)) {
-                        var relocatedTo: IOFile? = null
-                        val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm) { relocatedTarget ->
-                            relocatedTo = relocatedTarget
+                        var preservedReceipt: DownloadOfflineFileManager.RelocationReceipt? = null
+                        val preserved = preserveRenameBeforeMetadataChange(file, newName, userDrive, realm) { receipt ->
+                            preservedReceipt = receipt
                         }
                         if (preserved) {
                             // The SAME immutable observation is rechecked INSIDE the
@@ -678,20 +678,21 @@ object FileController {
                                     localFile.name = newName
                                 }
                             }
-                            // THE JOURNAL OUTLIVES THE COMMIT (review-35 #4): the relocation
-                            // journal is disposed only after the committed row verifiably
-                            // resolves to the published destination — a process stop before
-                            // this commit leaves the journal for the sweep's coherent
-                            // completion or owner-checked rollback.
+                            // THE JOURNAL OUTLIVES THE COMMIT (review-35 #4, review-37 #2): the
+                            // relocation journal is disposed only when the CURRENT journal still
+                            // represents exactly the receipt this relocation returned, AND the
+                            // committed row verifiably resolves to the published destination —
+                            // a process stop before this commit leaves the journal for the
+                            // sweep's coherent completion or owner-checked rollback.
                             val appContext = Realm.getApplicationContext()
                             val commitScope = userDrive ?: UserDrive()
-                            relocatedTo?.let { relocatedTarget ->
-                                if (appContext != null) {
+                            preservedReceipt?.let { receipt ->
+                                if (appContext != null && DownloadOfflineFileManager.relocationReceiptMatchesJournal(appContext, receipt)) {
                                     DownloadOfflineFileManager.disposeRelocationJournalAfterCommit(
                                         appContext,
                                         commitScope,
                                         file.id,
-                                        relocatedTarget.absolutePath,
+                                        receipt.targetPath,
                                     )
                                 }
                             }
@@ -745,7 +746,7 @@ object FileController {
         newName: String,
         userDrive: UserDrive?,
         customRealm: Realm?,
-        onRelocatedTo: ((IOFile) -> Unit)? = null,
+        onRelocationReceipt: ((DownloadOfflineFileManager.RelocationReceipt) -> Unit)? = null,
     ): Boolean {
         val context = Realm.getApplicationContext() ?: return false
         val scope = userDrive ?: UserDrive()
@@ -799,13 +800,18 @@ object FileController {
                 newOfflineTarget = newOffline,
                 realm = realm,
             )
-            // THE COMMITTED DESTINATION IS REPORTED (review-35 #4): the caller disposes the
-            // retained relocation journal only after its own metadata commit verifies the
-            // committed row resolves to this exact destination. THE LOCAL LABELED RETURN
-            // FORWARDS THE ACTUAL RESULT (review-35 compile repair): the lambda is held in
-            // a variable and passed to let/use, so a bare non-local return is prohibited —
-            // the labeled return is the value forward, with no failure swallowed.
-            if (relocated) onRelocatedTo?.invoke(newOffline)
+            // THE EXACT RECEIPT IS RETURNED (review-35 #4, review-37 #2): decoded FROM the
+            // retained journal at this relocation's own destination; the caller disposes it
+            // after its own metadata commit verifies the committed row resolves to this
+            // destination and the CURRENT journal still matches the receipt. THE LOCAL
+            // LABELED RETURN FORWARDS THE ACTUAL RESULT (review-35 compile repair): the
+            // lambda is held in a variable and passed to let/use, so a bare non-local return
+            // is prohibited — the labeled return is the value forward, no failure swallowed.
+            if (relocated) {
+                DownloadOfflineFileManager.readRelocationReceipt(context, newOffline)?.let { receipt ->
+                    onRelocationReceipt?.invoke(receipt)
+                }
+            }
             return@renameBlock relocated
         }
         return customRealm?.let(block) ?: getRealmInstance(scope).use(block)

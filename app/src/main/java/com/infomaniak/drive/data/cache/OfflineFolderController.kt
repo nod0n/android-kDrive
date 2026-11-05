@@ -610,6 +610,7 @@ object OfflineFolderController {
         userDrive: UserDrive,
         newOfflineTarget: IOFile? = null,
         realm: Realm? = null,
+        onRelocationReceipt: ((DownloadOfflineFileManager.RelocationReceipt) -> Unit)? = null,
     ): Boolean {
         // SOURCE-OWNERSHIP GATE before any snapshot or deletion (issue: round 16 #3): when the
         // caller supplies its Realm, the old path must be EXCLUSIVELY claimed by this file's
@@ -816,12 +817,23 @@ object OfflineFolderController {
                                 // changing caller disposes after ITS commit verifies the
                                 // committed row resolves to the published destination; every
                                 // other caller converges through the sweep.
-                                DownloadOfflineFileManager.completePreparedProofMove(
+                                val completed = DownloadOfflineFileManager.completePreparedProofMove(
                                     context,
                                     oldOfflineFile,
                                     target,
                                     disposeOnSuccess = false,
                                 )
+                                if (completed) {
+                                    // THE EXACT RECEIPT IS RETURNED BY THE SUCCESSFUL
+                                    // RELOCATION (review-37 #2): decoded FROM the retained
+                                    // journal at this relocation's own destination — the caller
+                                    // carries it through its next preservation boundary and its
+                                    // conditional metadata commit.
+                                    DownloadOfflineFileManager.readRelocationReceipt(context, target)?.let { receipt ->
+                                        onRelocationReceipt?.invoke(receipt)
+                                    }
+                                }
+                                completed
                             }.getOrDefault(false)
                         }
                     }
@@ -852,6 +864,7 @@ object OfflineFolderController {
             FileController.isStaleReplacement(live, incoming, observed)
         },
         observedById: Map<Int, File> = emptyMap(),
+        relocationReceipt: DownloadOfflineFileManager.RelocationReceipt? = null,
     ): List<File> {
         val context = Realm.getApplicationContext() ?: return remoteFiles
         if (remoteFiles.isEmpty()) return remoteFiles
@@ -904,17 +917,18 @@ object OfflineFolderController {
                         resolvedOldOffline?.absolutePath,
                     )
                 ) {
-                    // THE OWN-COMPLETED RELOCATION IS RECOGNIZED (review-36 #2): a journal
-                    // this very flow's relocation created — bytes hash-certified at its
-                    // recorded destination — does not block the conditional metadata commit
-                    // (blocking it rolled the relocation back and re-created the same
-                    // journal forever); EVERY other recovery still excludes.
-                    if (DownloadOfflineFileManager.ownCompletedRelocationReceipt(
-                            context,
-                            userDrive,
-                            oldRow.id,
-                        ) == null
-                    ) {
+                    // THE EXACT RECEIPT EXEMPTS ONLY ITS OWN JOURNAL (review-36 #2,
+                    // corrected review-37 #2): the exemption is bound to the operation the
+                    // caller's own relocation returned — the CURRENT journal at the receipt's
+                    // destination must still match every identity field (recorded source,
+                    // destination, scope flavor, account/drive/file identity, publication).
+                    // A generic file/hash search previously exempted unrelated recovery and
+                    // permitted the wrong destination's commit; every OTHER record still
+                    // excludes.
+                    val exemptOwnRelocation = relocationReceipt != null &&
+                        relocationReceipt.fileId == oldRow.id &&
+                        DownloadOfflineFileManager.relocationReceiptMatchesJournal(context, relocationReceipt)
+                    if (!exemptOwnRelocation) {
                         return@withFileLock oldRow
                     }
                 }

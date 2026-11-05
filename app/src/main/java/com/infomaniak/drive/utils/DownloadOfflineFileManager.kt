@@ -3710,33 +3710,58 @@ class DownloadOfflineFileManager(
             val targetPath: String,
             val sourcePath: String?,
             val publicationId: Long?,
+            val fileId: Int,
+            val userId: Int,
+            val driveId: Int,
+            val sharedWithMe: Boolean,
         )
 
-        internal fun ownCompletedRelocationReceipt(
-            context: Context,
-            userDrive: UserDrive,
-            fileId: Int,
-        ): RelocationReceipt? {
-            val records = runCatching {
-                stagingDirectory(context)
-                    .listFiles { f -> f.name.startsWith("proofmove_") && f.name.endsWith(".recovery") }
-            }.getOrNull() ?: return null
-            for (recordFile in records) {
-                val parsed = parseProofMoveRecord(recordFile) ?: continue
-                if (parsed.observationFieldDamaged || !parsed.identitiesValid) continue
-                if (parsed.proofFileId != fileId) continue
-                if (parsed.proofUserId != userDrive.userId || parsed.proofDriveId != userDrive.driveId) continue
-                val target = IOFile(parsed.targetPath)
-                val targetHash = if (target.exists()) UploadFile.sha256OrNull(target) else null
-                if (targetHash != null && targetHash == parsed.proofContentHash) {
-                    return RelocationReceipt(
-                        targetPath = target.absolutePath,
-                        sourcePath = parsed.recordedSourcePath,
-                        publicationId = publicationIdOfRecordText(parsed.proofText),
-                    )
-                }
+        /**
+         * THE EXACT RELOCATION RECEIPT (review-36 #2, review-37 #2): decoded FROM the
+         * retained journal at the relocation's OWN destination — the operation's exact
+         * recorded source, destination, scope flavor, account/drive/file identity and
+         * publication — NEVER a generic search by file id or bytes hash. Null when no
+         * journal exists at the destination, it is damaged, or its scope sidecar fails the
+         * body cross-check.
+         */
+        internal fun readRelocationReceipt(context: Context, target: IOFile): RelocationReceipt? {
+            val recordFile = proofRelocationRecordFile(context, target)
+            val parsed = parseProofMoveRecord(recordFile) ?: return null
+            if (parsed.observationFieldDamaged || !parsed.identitiesValid) return null
+            val sharedWithMe = when (val authority = readScopeAuthority(
+                recordFile,
+                expectedFileId = parsed.proofFileId,
+                expectedTargetPath = target.absolutePath,
+            )) {
+                is ScopedAuthority.Resolved -> authority.scope.sharedWithMe
+                else -> return null
             }
-            return null
+            return RelocationReceipt(
+                targetPath = target.absolutePath,
+                sourcePath = parsed.recordedSourcePath,
+                publicationId = publicationIdOfRecordText(parsed.proofText),
+                fileId = parsed.proofFileId,
+                userId = parsed.proofUserId,
+                driveId = parsed.proofDriveId,
+                sharedWithMe = sharedWithMe,
+            )
+        }
+
+        /**
+         * THE EXACT JOURNAL VALIDATION (review-37 #2): a receipt exempts ONLY the journal
+         * that STILL represents this exact operation — the CURRENT on-disk body and its
+         * valid sidecar must match every identity field (recorded source, destination, scope
+         * flavor, account/drive/file identity, publication). A stale or changed journal
+         * never exempts.
+         */
+        internal fun relocationReceiptMatchesJournal(context: Context, receipt: RelocationReceipt): Boolean {
+            val current = readRelocationReceipt(context, IOFile(receipt.targetPath)) ?: return false
+            return current.sourcePath == receipt.sourcePath &&
+                current.publicationId == receipt.publicationId &&
+                current.fileId == receipt.fileId &&
+                current.userId == receipt.userId &&
+                current.driveId == receipt.driveId &&
+                current.sharedWithMe == receipt.sharedWithMe
         }
 
         /**

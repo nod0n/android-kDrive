@@ -1283,6 +1283,10 @@ object SyncOfflineUtils {
         val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId)
             ?: return DownloadActionOutcome(handled = false)
         val pathChanged = freshOffline.path != remoteOfflineFile.path
+        // THE OPERATION-SPECIFIC RECEIPT (review-37 #2): returned by THIS flow's successful
+        // relocation and passed explicitly to the second preservation boundary and the
+        // conditional commit — never a generic journal search.
+        var relocationReceipt: DownloadOfflineFileManager.RelocationReceipt? = null
 
         if (pathChanged) {
             // A pending download marker leaves this refresh to the queued worker, which runs
@@ -1302,7 +1306,7 @@ object SyncOfflineUtils {
             if (freshOffline.exists() && run {
                 // Historical provenance anchored BEFORE the relocation (issue: round 17 #3).
                 OfflineFolderController.anchorHistoricalBaseline(context, realm, liveRow, freshOffline, userDrive)
-                !OfflineFolderController.reconcileMovedInheritedCopy(
+                val relocated = !OfflineFolderController.reconcileMovedInheritedCopy(
                     context = context,
                     oldOfflineFile = freshOffline,
                     oldIdentityName = file.name,
@@ -1313,7 +1317,12 @@ object SyncOfflineUtils {
                     newIdentity = remoteFile,
                     userDrive = userDrive,
                     realm = realm,
+                    // THE EXACT RECEIPT IS CARRIED (review-37 #2): the successful relocation
+                    // returns its own operation's receipt, passed explicitly to the next
+                    // preservation boundary and the conditional metadata commit.
+                    onRelocationReceipt = { receipt -> relocationReceipt = receipt },
                 )
+                relocated
                 }
             ) {
                 // Preservation incomplete: keep the old bytes and metadata; a later sync
@@ -1346,6 +1355,7 @@ object SyncOfflineUtils {
                 isStale = { live, incoming, _ ->
                     FileController.isStaleForAuthoritativeAction(live, incoming, actionLastActionAt, observed = file)
                 },
+                relocationReceipt = relocationReceipt,
             ).first()
             if (commitFile !== remoteFile) return DownloadActionOutcome(handled = false)
             // Conditional commit (issues: round 11 #4/#5, round 12 #5, round 14 #1): a newer
@@ -1361,18 +1371,20 @@ object SyncOfflineUtils {
                 observed = file,
             )
             if (!committed) return DownloadActionOutcome(handled = false)
-            // THE RETAINED JOURNAL FOLLOWS THE ACTUAL COMMIT (review-36 #2): the second
-            // preservation boundary recognized this flow's own completed relocation; the
-            // journal disposes only after the committed row verifiably resolves to the
-            // published destination — an uncommitted or superseded commit retains it for
-            // the sweep's coherent completion or owner-checked rollback.
-            DownloadOfflineFileManager.ownCompletedRelocationReceipt(context, userDrive, remoteFile.id)?.let { receipt ->
-                DownloadOfflineFileManager.disposeRelocationJournalAfterCommit(
-                    context,
-                    userDrive,
-                    remoteFile.id,
-                    receipt.targetPath,
-                )
+            // THE SAME VALIDATED OPERATION DISPOSES AFTER THE MATCHING COMMIT (review-37 #2):
+            // the journal is disposed only when the CURRENT on-disk journal still represents
+            // exactly the receipt this flow's relocation returned (review-37 #8's stale-body
+            // doctrine), and the committed row verifiably resolves to the published
+            // destination.
+            relocationReceipt?.let { receipt ->
+                if (DownloadOfflineFileManager.relocationReceiptMatchesJournal(context, receipt)) {
+                    DownloadOfflineFileManager.disposeRelocationJournalAfterCommit(
+                        context,
+                        userDrive,
+                        remoteFile.id,
+                        receipt.targetPath,
+                    )
+                }
             }
             // Preserve the download origin: a refresh of a file covered by an offline folder is
             // an inherited download, so its completion can never manufacture an explicit pin
