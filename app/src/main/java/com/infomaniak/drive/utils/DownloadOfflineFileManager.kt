@@ -1353,48 +1353,119 @@ class DownloadOfflineFileManager(
             true
         }.getOrDefault(false)
 
-        private class RecoveredScope(val userId: Int, val driveId: Int, val fileId: Int, val targetPath: String)
+        private class RecoveredScope(
+            val userId: Int,
+            val driveId: Int,
+            val fileId: Int,
+            val targetPath: String,
+            /** The destination's Realm flavor (issue: round 26 #5): shared-Realm rows never
+             * resolve in the ordinary per-drive realm. Legacy sidecars predate the field. */
+            val sharedWithMe: Boolean = false,
+            /** The destination's storage kind (issue: round 26 #5): ordinary-cache recovery
+             * targets are validated against the row's cache file, never the offline path. */
+            val storageKind: String = "offline",
+        )
 
         /**
-         * INDEPENDENTLY DURABLE SCOPED INDEX (issue: round 25 #6): a single-line scope
-         * sidecar written ATOMICALLY before each operation record — an undecodable record
-         * still names its owner scope and target path, so identities DEMONSTRABLY outside
-         * that scope keep progressing instead of failing closed forever, and the sidecar is
-         * the repair key for a corrupt record's disposition.
+         * INDEPENDENTLY DURABLE SCOPED INDEX (issues: round 25 #6, round 26 #5): a single-line
+         * scope sidecar written ATOMICALLY before each operation record — an undecodable
+         * record still names its owner scope, its destination's realm flavor and storage
+         * kind, and its target path, so identities DEMONSTRABLY outside that scope keep
+         * progressing instead of failing closed forever, and the sidecar is the repair key
+         * for a corrupt record's disposition. Format v2:
+         * `userId|driveId|fileId|shared(0|1)|kind|targetPath` (the path re-joined — it may
+         * contain `|`); the pre-review-26 format was `userId|driveId|fileId|targetPath`.
          */
-        private fun writeScopeSidecar(recordFile: IOFile, userId: Int, driveId: Int, fileId: Int, targetPath: String): Boolean =
-            atomicWriteText(IOFile(recordFile.path + ".scope"), "$userId|$driveId|$fileId|$targetPath")
+        private fun writeScopeSidecar(
+            recordFile: IOFile,
+            userId: Int,
+            driveId: Int,
+            fileId: Int,
+            targetPath: String,
+            sharedWithMe: Boolean = false,
+            storageKind: String = "offline",
+        ): Boolean = atomicWriteText(
+            IOFile(recordFile.path + ".scope"),
+            "$userId|$driveId|$fileId|${if (sharedWithMe) 1 else 0}|$storageKind|$targetPath",
+        )
 
         /** The parsed scope sidecar of [recordFile], or null when absent/undecodable. */
         private fun readScopeSidecar(recordFile: IOFile): RecoveredScope? = runCatching {
             val parts = IOFile(recordFile.path + ".scope").readText().trim().split("|")
             require(parts.size >= 4)
-            RecoveredScope(
-                userId = parts[0].trim().toInt(),
-                driveId = parts[1].trim().toInt(),
-                fileId = parts[2].trim().toInt(),
-                targetPath = parts.drop(3).joinToString("|"),
-            )
+            if (parts.size >= 6) {
+                RecoveredScope(
+                    userId = parts[0].trim().toInt(),
+                    driveId = parts[1].trim().toInt(),
+                    fileId = parts[2].trim().toInt(),
+                    sharedWithMe = parts[3].trim() == "1",
+                    storageKind = parts[4].trim().ifEmpty { "offline" },
+                    targetPath = parts.drop(5).joinToString("|"),
+                )
+            } else {
+                // LEGACY 4-FIELD SIDECAR: the pre-review-26 format named only an ordinary
+                // (non-shared, offline-path) scope — the defaults keep it decodable.
+                RecoveredScope(
+                    userId = parts[0].trim().toInt(),
+                    driveId = parts[1].trim().toInt(),
+                    fileId = parts[2].trim().toInt(),
+                    targetPath = parts.drop(3).joinToString("|"),
+                )
+            }
         }.getOrNull()
 
         /**
-         * CURRENT CANONICAL OWNERSHIP AUTHORITY (issue: round 25 #4): the record's owner
-         * row must still EXIST, still resolve to the record's exact target path, and still
-         * hold the path EXCLUSIVELY — locking the identity named by an old record never
-         * establishes that the owner still controls the target. Read fresh under the
-         * caller's coordination, for every restore and proof rewrite.
+         * THE DURABLE DISPOSAL (issue: round 26 #8): the scope index belongs to the
+         * operation's lifecycle — a successful body disposition removes its sidecar too,
+         * so uniquely named indexes do not accumulate permanently across ordinary
+         * replacements and the unresolved-download retry loop.
          */
-        private fun currentOwnerHolds(context: Context, recordScope: UserDrive, recordFileId: Int, target: IOFile): Boolean =
-            runCatching {
-                FileController.getRealmInstance(recordScope).use { realm ->
-                    runCatching { realm.refresh() }
-                    val row = FileController.getFileById(realm, recordFileId) ?: return@runCatching false
-                    row.getOfflineFile(context, recordScope.userId)?.absolutePath == target.absolutePath &&
-                        appContextForOwnership()?.let { ctx ->
-                            OfflineFolderController.exclusivePathOwner(realm, ctx, recordScope, target.path)
-                        } == row.id
+        private fun disposeRecoveryRecord(recordFile: IOFile): Boolean {
+            val bodyDisposed = disposeRecoveryRecord(recordFile)
+            val sidecarDisposed = runCatching { IOFile(recordFile.path + ".scope").delete() }.getOrDefault(false)
+            return bodyDisposed && sidecarDisposed
+        }
+
+        /**
+         * CURRENT CANONICAL OWNERSHIP AUTHORITY (issues: round 25 #4, round 26 #5): the
+         * record's owner row must still EXIST in the record's ACTUAL Realm flavor, still
+         * resolve to the record's exact target path AT ITS CAPTURED STORAGE KIND, and still
+         * hold the path EXCLUSIVELY — locking the identity named by an old record never
+         * establishes that the owner still controls the target. A shared-Realm destination
+         * is looked up in the shared realm (the ordinary per-drive realm never held the
+         * row); an ordinary-cache destination is validated against the row's id-keyed cache
+         * file (structurally exclusive — the name-based path-conflict query does not apply
+         * to cache paths). Read fresh under the caller's coordination, for every restore
+         * and proof rewrite.
+         */
+        private fun currentOwnerHolds(
+            context: Context,
+            recordScope: UserDrive,
+            recordFileId: Int,
+            target: IOFile,
+            sharedWithMe: Boolean = false,
+            storageKind: String = "offline",
+        ): Boolean = runCatching {
+            val realmScope = UserDrive(
+                userId = recordScope.userId,
+                driveId = recordScope.driveId,
+                sharedWithMe = sharedWithMe,
+            )
+            FileController.getRealmInstance(realmScope).use { realm ->
+                runCatching { realm.refresh() }
+                val row = FileController.getFileById(realm, recordFileId) ?: return@runCatching false
+                val ownedPath = when (storageKind) {
+                    "cache" -> row.getCacheFile(context, realmScope).absolutePath
+                    else -> row.getOfflineFile(context, recordScope.userId)?.absolutePath
                 }
-            }.getOrDefault(false)
+                val pathOwned = ownedPath == target.absolutePath
+                val exclusivelyOwned = storageKind == "cache" ||
+                    appContextForOwnership()?.let { ctx ->
+                        OfflineFolderController.exclusivePathOwner(realm, ctx, realmScope, target.path)
+                    } == row.id
+                pathOwned && exclusivelyOwned
+            }
+        }.getOrDefault(false)
 
         /**
          * Whether [prefixFile]'s COMPLETE bytes equal the head of [fullFile] (issue: round
@@ -1451,11 +1522,18 @@ class DownloadOfflineFileManager(
         private fun proofRelocationRecordFile(context: Context, target: IOFile): IOFile =
             IOFile(stagingDirectory(context), "proofmove_${provenanceKeyHex(target)}.recovery")
 
-        private fun writeProofRelocationRecord(context: Context, target: IOFile, proofText: String): Boolean = runCatching {
+        private fun writeProofRelocationRecord(
+            context: Context,
+            target: IOFile,
+            proofText: String,
+            sharedWithMe: Boolean = false,
+        ): Boolean = runCatching {
             val recordFile = proofRelocationRecordFile(context, target)
-            // ATOMIC WRITE + SCOPE SIDECAR FIRST (issue: round 25 #6): the scope index
-            // exists before the record, so an interrupted or later-corrupted record is
-            // still scoped (identities demonstrably outside it progress).
+            // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
+            // scope index exists before the record, so an interrupted or later-corrupted
+            // record is still scoped (identities demonstrably outside it progress), and it
+            // names the destination's actual Realm flavor (the proofmove target is always
+            // an offline-path publication).
             val proofFields = proofText.removePrefix(PROVENANCE_FRAME).split("|")
             val sidecarWritten = writeScopeSidecar(
                 recordFile,
@@ -1463,12 +1541,19 @@ class DownloadOfflineFileManager(
                 driveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull() ?: 0,
                 fileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull() ?: 0,
                 targetPath = target.absolutePath,
+                sharedWithMe = sharedWithMe,
+                storageKind = "offline",
             )
             if (!sidecarWritten) return@runCatching false
             atomicWriteText(recordFile, listOf("1", target.absolutePath, proofText).joinToString("\n"))
         }.getOrDefault(false)
 
-        internal fun movePublishedProvenance(context: Context, source: IOFile, target: IOFile): Boolean {
+        internal fun movePublishedProvenance(
+            context: Context,
+            source: IOFile,
+            target: IOFile,
+            sharedWithMe: Boolean = false,
+        ): Boolean {
             val provenance = readPublishedProvenance(context, source)
             if (provenance == null) {
                 deletePublishedProvenance(context, target)
@@ -1478,7 +1563,8 @@ class DownloadOfflineFileManager(
             // (issue: round 23 #14): every failure path below leaves a durable record of
             // the original proof and its exact destination; only a VERIFIED destination
             // proof disposes it.
-            val relocationStateWritten = writeProofRelocationRecord(context, target, provenance.recordText(target))
+            val relocationStateWritten =
+                writeProofRelocationRecord(context, target, provenance.recordText(target), sharedWithMe = sharedWithMe)
             if (!relocationStateWritten) {
                 // Without recoverable state the source proof is NOT destroyed: the old
                 // record stays at the source path (the caller's bytes have not moved yet
@@ -1499,14 +1585,14 @@ class DownloadOfflineFileManager(
                 // source record is invalidated only when the relocation state exists (the
                 // sweep re-writes the destination proof — a record at the vacated source
                 // path must never survive to lend its generation).
-                runCatching { recordFile.delete() }
+                disposeRecoveryRecord(recordFile)
                 deletePublishedProvenance(context, source)
                 return false
             }
             // VERIFIED DESTINATION PROOF (issue: round 23 #14): the written record must
             // read back before any state is disposed.
             if (readPublishedProvenance(context, target) == null) {
-                runCatching { recordFile.delete() }
+                disposeRecoveryRecord(recordFile)
                 deletePublishedProvenance(context, source)
                 return false
             }
@@ -1619,9 +1705,23 @@ class DownloadOfflineFileManager(
             // the publication with its captured proof) from a PROVEN INTERVENING EDIT,
             // and never auto-uploads arbitrary changed targets.
             val recordFile = recoveryRecordFile(context, recoveryFile)
-            // ATOMIC WRITE + SCOPE SIDECAR FIRST (issue: round 25 #6), as in the relocation
-            // record: the scope index exists before the record itself.
-            if (!writeScopeSidecar(recordFile, userDrive.userId, userDrive.driveId, file.id, target.absolutePath)) {
+            // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
+            // scope index exists before the record itself, and names the destination's
+            // ACTUAL realm flavor and storage kind — an interrupted cache or shared-Realm
+            // publication is later validated against its captured destination, never
+            // against a universally resolved ordinary offline path.
+            val capturedStorageKind =
+                if (target.absolutePath == file.getOfflineFile(context, userDrive.userId)?.absolutePath) "offline" else "cache"
+            if (!writeScopeSidecar(
+                    recordFile,
+                    userDrive.userId,
+                    userDrive.driveId,
+                    file.id,
+                    target.absolutePath,
+                    sharedWithMe = userDrive.sharedWithMe,
+                    storageKind = capturedStorageKind,
+                )
+            ) {
                 return@runCatching false
             }
             atomicWriteText(
@@ -1797,9 +1897,15 @@ class DownloadOfflineFileManager(
                     continue
                 }
                 when {
-                    !record.legacy && record.userId == userDrive.userId &&
+                    // THE RECOVERED LEGACY SCOPE IS HONORED (issue: round 26 #7): a record
+                    // whose scope was RESOLVED — including a legacy v1 record whose account
+                    // was conclusively recovered from its validated canonical path — is
+                    // matched by its recovered user id, so two signed-in accounts on the
+                    // same drive/file ids no longer share exclusions. Only an
+                    // UNATTRIBUTABLE record (scope unresolved) stays account-independent.
+                    record.scopeResolved && record.userId == userDrive.userId &&
                         record.driveId == userDrive.driveId -> ids.add(record.fileId)
-                    record.legacy && record.driveId == userDrive.driveId -> ids.add(record.fileId)
+                    !record.scopeResolved && record.driveId == userDrive.driveId -> ids.add(record.fileId)
                     else -> Unit
                 }
             }
@@ -1832,10 +1938,20 @@ class DownloadOfflineFileManager(
                 if (recordFile.name.startsWith("proofmove_")) {
                     // PENDING RELOCATION STATE GOVERNS ITS TARGET PATH (issue: round 24
                     // #5): an unresolved proofmove record means the destination's proof is
-                    // mid-relocation — and an unreadable one may govern any path, so it
-                    // fails closed.
+                    // mid-relocation. A DAMAGED BODY IS INDEPENDENTLY SCOPED (issue: round
+                    // 26 #6): the scope index decides exactly like an ordinary corrupt
+                    // record — identities/paths demonstrably outside it progress; inside
+                    // it (or without a sidecar) fails closed. The previous blanket
+                    // fail-closed blocked unrelated files and accounts forever.
                     val parts = runCatching { recordFile.readText().split("\n", limit = 3) }.getOrNull()
-                    if (parts == null || parts.size < 3) return true
+                    if (parts == null || parts.size < 3 || parts[0].trim() != "1") {
+                        val scope = readScopeSidecar(recordFile) ?: return true
+                        val scopeIdentity = scope.fileId == fileId &&
+                            scope.driveId == userDrive.driveId && scope.userId == userDrive.userId
+                        val scopePath = targetPath != null && IOFile(scope.targetPath).absolutePath == targetPath
+                        if (scopeIdentity || scopePath) return true
+                        continue
+                    }
                     if (targetPath != null && IOFile(parts[1]).absolutePath == targetPath) return true
                     continue
                 }
@@ -1853,9 +1969,12 @@ class DownloadOfflineFileManager(
                     if (scopeIdentity || scopePath) return true
                     continue
                 }
+                // THE RECOVERED LEGACY SCOPE IS HONORED (issue: round 26 #7): a resolved
+                // scope — including a conclusively recovered legacy v1 account — is compared
+                // by user id; only an UNATTRIBUTABLE record stays account-independent.
                 val identityMatches = record.fileId == fileId &&
                     record.driveId == userDrive.driveId &&
-                    (record.legacy || record.userId == userDrive.userId)
+                    (if (record.scopeResolved) record.userId == userDrive.userId else true)
                 if (identityMatches || (targetPath != null && IOFile(record.targetPath).absolutePath == targetPath)) {
                     return true
                 }
@@ -1928,18 +2047,29 @@ class DownloadOfflineFileManager(
                                 // subject (a rollback or a later writer removed them). The
                                 // retained proof text cannot recreate bytes: the superseded
                                 // relocation state is disposed unverified.
-                                runCatching { recordFile.delete() }.getOrDefault(false)
+                                disposeRecoveryRecord(recordFile)
                             else -> {
                                 val scope = UserDrive(userId = proofUserId, driveId = proofDriveId)
+                                // THE CAPTURED REALM FLAVOR (issue: round 26 #5): the sidecar
+                                // names the destination's realm — a shared-scope relocation
+                                // validates its owner in the shared realm.
+                                val moveScopeShared = readScopeSidecar(recordFile)?.sharedWithMe == true
                                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                                     OfflineFileCoordination.withFileLock(scope, proofFileId) {
                                         val targetHash = UploadFile.sha256OrNull(target)
                                         when {
+                                            // A FAILED TARGET HASH IS UNRESOLVED (issue: round 26
+                                            // #4): the retained proof is never rewritten onto
+                                            // bytes whose identity could not be read, and the
+                                            // operation record is never disposed over them — the
+                                            // previous null-hash fallthrough entered the write
+                                            // branch WITHOUT any ownership check.
+                                            targetHash == null -> false
                                             // HASH EQUALITY IS CONTENT EVIDENCE, NOT OWNERSHIP
                                             // AUTHORITY (issue: round 25 #4): the recorded
                                             // identity must STILL exclusively own the target's
                                             // canonical path before the proof may be rewritten.
-                                            targetHash != null && targetHash != proofContentHash -> {
+                                            targetHash != proofContentHash -> {
                                                 // SUPERSEDED BY A VERIFIED ROLLBACK OR LATER
                                                 // PUBLICATION (issue: round 25 #5): a crash
                                                 // between the rollback's record disposal and the
@@ -1957,23 +2087,47 @@ class DownloadOfflineFileManager(
                                                         File(id = proofFileId, driveId = proofDriveId),
                                                         scope,
                                                     ) &&
-                                                    currentOwnerHolds(context, scope, proofFileId, target)
+                                                    currentOwnerHolds(
+                                                        context, scope, proofFileId, target,
+                                                        sharedWithMe = moveScopeShared,
+                                                    )
                                                 if (supersededByVerified) {
-                                                    runCatching { recordFile.delete() }.getOrDefault(false)
+                                                    disposeRecoveryRecord(recordFile)
                                                 } else false
                                             }
-                                            targetHash != null && !currentOwnerHolds(context, scope, proofFileId, target) ->
+                                            !currentOwnerHolds(
+                                                context, scope, proofFileId, target,
+                                                sharedWithMe = moveScopeShared,
+                                            ) ->
                                                 // The path's ownership moved since the record was
                                                 // written: the retained proof is never written over
                                                 // another owner's state (issue: round 25 #4).
                                                 false
                                             else -> runCatching {
+                                                // THE EXPECTED PUBLICATION IDENTITY (issue: round
+                                                // 26 #4): a target that already carries a
+                                                // self-certifying proof with a DIFFERENT
+                                                // publication id is owned by a NEWER publication or
+                                                // restoration — replaying the retained proof would
+                                                // replace that fresh identity with the older
+                                                // operation's. The superseded operation is disposed
+                                                // WITHOUT replaying its proof; an equal identity (or
+                                                // an absent target proof) is the recovery of the
+                                                // operation's own state and may be written.
+                                                val currentProof = readPublishedProvenance(context, target)
+                                                val retainedPublicationId =
+                                                    proofFields.getOrNull(8)?.trim()?.toLongOrNull() ?: 0L
+                                                if (currentProof != null && currentProof.certifiesBytes(target) &&
+                                                    currentProof.publicationId != retainedPublicationId
+                                                ) {
+                                                    return@runCatching disposeRecoveryRecord(recordFile)
+                                                }
                                                 val recordTarget = verifiedProvenanceFileFor(context, target)
                                                 val written = recordTarget != null && runCatching {
                                                     atomicWriteText(recordTarget, proofText)
                                                 }.getOrDefault(false) &&
                                                     readPublishedProvenance(context, target) != null
-                                                if (written) runCatching { recordFile.delete() }
+                                                if (written) disposeRecoveryRecord(recordFile)
                                                 written
                                             }.getOrDefault(false)
                                         }
@@ -2005,12 +2159,31 @@ class DownloadOfflineFileManager(
                 val recoveryFile = IOFile(record.recoveryPath)
                 val target = IOFile(record.targetPath)
                 val recordScope = UserDrive(userId = record.userId, driveId = record.driveId)
+                // THE CAPTURED REALM FLAVOR AND DESTINATION KIND (issue: round 26 #5): the
+                // scope sidecar written before the record carries them; a legacy record
+                // without a sidecar keeps the ordinary offline defaults.
+                val capturedScopeSidecar = readScopeSidecar(record.recordFile)
+                val capturedShared = capturedScopeSidecar?.sharedWithMe == true
+                val capturedStorageKind = capturedScopeSidecar?.storageKind ?: "offline"
                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withFileLock(recordScope, record.fileId) {
                         runCatching { reconcileOneRecovery(context, record, recordScope, recoveryFile, target) }.getOrDefault(false)
                     }
                 }
                 if (!resolved) allResolved = false
+            }
+            // ORPHAN SIDECAR RECONCILIATION (issue: round 26 #8): a scope index whose
+            // record body no longer exists has nothing left to scope — the operation was
+            // disposed (or its record never completed its interrupted write). The index is
+            // removed so uniquely named indexes cannot accumulate permanently; a pending
+            // operation's index (its body still present) is never touched. An undeletable
+            // orphan is harmless (it is never enumerated) and does not fail the pass.
+            runCatching {
+                stagingDirectory(context).listFiles { f -> f.name.endsWith(".scope") }?.forEach { sidecar ->
+                    if (!IOFile(sidecar.path.removeSuffix(".scope")).exists()) {
+                        runCatching { sidecar.delete() }
+                    }
+                }
             }
             return allResolved
         }
@@ -2027,7 +2200,7 @@ class DownloadOfflineFileManager(
                 // leaves the target with its own readable proof; anything else is
                 // unresolved durable state.
                 if (readPublishedProvenance(context, target) == null) return false
-                runCatching { record.recordFile.delete() }
+                disposeRecoveryRecord(record.recordFile)
                 return true
             }
             // SELF-CERTIFYING DISPOSAL REQUIRES THE RECORDED OWNER (issue: round 23 #2):
@@ -2041,7 +2214,7 @@ class DownloadOfflineFileManager(
                 )
             ) {
                 runCatching { recoveryFile.delete() }
-                runCatching { record.recordFile.delete() }
+                disposeRecoveryRecord(record.recordFile)
                 return true
             }
             // The backup's IMMUTABLE verification basis (issue: round 23 #2): the record's
@@ -2062,14 +2235,21 @@ class DownloadOfflineFileManager(
                 // not be a DIFFERENT later publication's proof (completing the interrupted
                 // operation over it would regress a newer publication token).
                 val currentRecord = readPublishedProvenance(context, target)
-                if (!currentOwnerHolds(context, recordScope, record.fileId, target)) return false
+                if (!currentOwnerHolds(
+                        context, recordScope, record.fileId, target,
+                        sharedWithMe = capturedShared,
+                        storageKind = capturedStorageKind,
+                    )
+                ) {
+                    return false
+                }
                 if (currentRecord != null && currentRecord.contentHash != record.expectedPublicationHash) return false
                 if (record.expectedPublicationRecordText != null) {
                     if (!atomicWriteText(provenanceFileFor(context, target), record.expectedPublicationRecordText)) return false
                     if (readPublishedProvenance(context, target) == null) return false
                 }
                 runCatching { recoveryFile.delete() }
-                runCatching { record.recordFile.delete() }
+                disposeRecoveryRecord(record.recordFile)
                 return true
             }
             if (backupHash != null && currentTargetHash != null && currentTargetHash == backupHash) {
@@ -2080,7 +2260,14 @@ class DownloadOfflineFileManager(
                 // rewrite; the re-established record carries a FRESH publication identity
                 // (issue: round 25 #10) so a same-bytes re-establishment is visible to the
                 // publication-token comparison.
-                if (!currentOwnerHolds(context, recordScope, record.fileId, target)) return false
+                if (!currentOwnerHolds(
+                        context, recordScope, record.fileId, target,
+                        sharedWithMe = capturedShared,
+                        storageKind = capturedStorageKind,
+                    )
+                ) {
+                    return false
+                }
                 if (record.oldRecordText != null) {
                     val refreshed = refreshedRecordText(record.oldRecordText, target) ?: return false
                     if (!atomicWriteText(provenanceFileFor(context, target), refreshed)) return false
@@ -2089,7 +2276,7 @@ class DownloadOfflineFileManager(
                     deletePublishedProvenance(context, target)
                 }
                 runCatching { recoveryFile.delete() }
-                runCatching { record.recordFile.delete() }
+                disposeRecoveryRecord(record.recordFile)
                 return true
             }
             if (target.exists() && currentTargetHash != null) {
@@ -2145,7 +2332,7 @@ class DownloadOfflineFileManager(
                 )
                 if (!preserved) return false
                 runCatching { recoveryFile.delete() }
-                runCatching { record.recordFile.delete() }
+                disposeRecoveryRecord(record.recordFile)
                 return true
             } else if (!target.exists()) {
                 // A MISSING target: the VERIFIED restore is the only resolution. Its
@@ -2154,7 +2341,14 @@ class DownloadOfflineFileManager(
                 // CURRENT OWNERSHIP AUTHORITY (issue: round 25 #4): the restore onto a
                 // path the recorded owner no longer exclusively holds is deferred — the
                 // changed-target branch's live ownership check applies here too.
-                if (!currentOwnerHolds(context, recordScope, record.fileId, target)) return false
+                if (!currentOwnerHolds(
+                        context, recordScope, record.fileId, target,
+                        sharedWithMe = capturedShared,
+                        storageKind = capturedStorageKind,
+                    )
+                ) {
+                    return false
+                }
                 return restoreRecoveryCopy(
                     context = context,
                     recoveryFile = recoveryFile,
@@ -2233,9 +2427,9 @@ class DownloadOfflineFileManager(
                 // crash window whose residue (restored R1 plus the retained R2 relocation
                 // proof) the sweep then mismatched forever. Disposing here closes the
                 // window; any caller's own deletion is an idempotent no-op.
-                runCatching { proofRelocationRecordFile(context, target).delete() }
+                disposeRecoveryRecord(proofRelocationRecordFile(context, target))
                 runCatching { recoveryFile.delete() }
-                runCatching { recordFile.delete() }
+                disposeRecoveryRecord(recordFile)
                 true
             } finally {
                 // The unpublished stage never lingers (issue: round 24 #21 discipline).
@@ -2726,7 +2920,7 @@ class DownloadOfflineFileManager(
                 // #2): provenance and bytes are published together — a failed move now
                 // RESTORES the recoverable old bytes and their proof (issue: round 20 #10)
                 // instead of deleting the new bytes with the old ones already gone.
-                if (!movePublishedProvenance(provenanceContext, staged, target)) {
+                if (!movePublishedProvenance(provenanceContext, staged, target, sharedWithMe = userDrive.sharedWithMe)) {
                     val restored = recoveryFile != null && restoreRecoveryCopy(
                         context = provenanceContext,
                         recoveryFile = recoveryFile,
@@ -3016,7 +3210,8 @@ class DownloadOfflineFileManager(
                             coroutineContext.ensureActive()
                             deletePublishedProvenance(context, target)
                             when {
-                                staged.renameTo(target) && movePublishedProvenance(context, staged, target) -> {
+                                staged.renameTo(target) &&
+                                    movePublishedProvenance(context, staged, target, sharedWithMe = userDrive.sharedWithMe) -> {
                                     runCatching { recoveryFile?.delete() }
                                     recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
                                     // TYPED UNRESOLVED (issue: round 24 #19/#20): an

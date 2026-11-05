@@ -587,6 +587,7 @@ class MainViewModel(
                                                                                         application,
                                                                                         oldCopy,
                                                                                         newCopy,
+                                                                                        sharedWithMe = sharedScope.sharedWithMe,
                                                                                     )
                                                                                 }.getOrDefault(false)
                                                                                 if (!proofMoved) {
@@ -928,6 +929,7 @@ class MainViewModel(
                                                                     application,
                                                                     sourceBytes,
                                                                     destinationBytes,
+                                                                    sharedWithMe = sharedScope.sharedWithMe,
                                                                 )
                                                             if (!proofMoved) {
                                                                 // POSITIVE EDIT REGISTRATION ONLY (issue:

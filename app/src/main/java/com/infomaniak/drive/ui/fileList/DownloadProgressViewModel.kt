@@ -95,7 +95,16 @@ class DownloadProgressViewModel : ViewModel() {
             downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
             return@launch
         }
-        if (file.isObsoleteOrNotIntact(outputFile) || file.isOffline || file.isInOfflineFolder) {
+        // EVERY COMPLETION BRANCH THROUGH THE SCOPED OUTCOME (issue: round 26 #21): an
+        // intact non-offline cache whose provenance classification is not PROVEN (a
+        // previous PUBLISHED_UNRESOLVED publication among others) previously fell through
+        // to the coarse fallback and reported 100% without new evidence — the same
+        // externally observable defect the first fast path fixed. Unproven caches now
+        // enter the coordinated download/publication flow, which re-establishes the
+        // scoped record; the trailing else completes only on the proven outcome.
+        if (file.isObsoleteOrNotIntact(outputFile) || file.isOffline || file.isInOfflineFolder ||
+            !DownloadOfflineFileManager.cacheBytesProvenCurrent(context, outputFile, file, userDrive)
+        ) {
             // PRESERVATION-REQUIRED IS NOT USABLE-COMPLETE (issue: round 22 #7): KEEP_LOCAL
             // certifies preservation, not usability — a pending record after the original
             // disappeared, a failed snapshot registration, or unproven historical content
