@@ -1115,14 +1115,35 @@ class MainViewModel(
                                                                     !transferProof.positivelyForeignTo(node, sharedScope) &&
                                                                     !proofCleavesToBytes -> {
                                                                     if (!stagedTransfer.renameTo(destinationBytes)) return@runCatching false
-                                                                    runCatching {
+                                                                    // THE REGISTRATION IS THE TRANSFER'S OUTCOME
+                                                                    // (review-35 #10): the Boolean result AND any
+                                                                    // exception propagate, and EXACT DURABLE REVISION
+                                                                    // OWNERSHIP is verified over the destination bytes
+                                                                    // before success — a failed or unverified
+                                                                    // registration fails the transfer, and the durable
+                                                                    // pending marker below retains the retry intent.
+                                                                    val registered = runCatching {
                                                                         OfflineFolderController.registerDirtySnapshot(
                                                                             context = application,
                                                                             file = node,
                                                                             offlineFile = destinationBytes,
                                                                             userDrive = sharedScope,
                                                                         )
-                                                                    }.onFailure(Sentry::captureException)
+                                                                    }.onFailure(Sentry::captureException).getOrDefault(false) &&
+                                                                        runCatching {
+                                                                            val destinationHash = UploadFile.sha256OrNull(destinationBytes)
+                                                                            destinationHash != null && UploadFile.hasDurableOriginalRevisionOwnership(
+                                                                                fileName = node.name,
+                                                                                remoteFolder = node.parentId,
+                                                                                driveId = sharedScope.driveId,
+                                                                                userId = sharedScope.userId,
+                                                                                fileModifiedAt = Date(destinationBytes.lastModified()),
+                                                                                fileSize = destinationBytes.length(),
+                                                                                contentHash = destinationHash,
+                                                                                originalFileId = node.id,
+                                                                            )
+                                                                        }.getOrDefault(false)
+                                                                    if (!registered) return@runCatching false
                                                                 }
                                                                 // VERIFIED-CLEAN RELOCATION (review-33 #6, review-34
                                                                 // #5): the published-source contract prepares before
@@ -1173,14 +1194,30 @@ class MainViewModel(
                                                                 else -> {
                                                                     if (!stagedTransfer.renameTo(destinationBytes)) return@runCatching false
                                                                     if (sourceClassifiedEdit) {
-                                                                        runCatching {
+                                                                        // THE REGISTRATION IS THE TRANSFER'S OUTCOME
+                                                                        // (review-35 #10), as in the dirty-edit branch.
+                                                                        val registered = runCatching {
                                                                             OfflineFolderController.registerDirtySnapshot(
                                                                                 context = application,
                                                                                 file = node,
                                                                                 offlineFile = destinationBytes,
                                                                                 userDrive = sharedScope,
                                                                             )
-                                                                        }.onFailure(Sentry::captureException)
+                                                                        }.onFailure(Sentry::captureException).getOrDefault(false) &&
+                                                                            runCatching {
+                                                                                val destinationHash = UploadFile.sha256OrNull(destinationBytes)
+                                                                                destinationHash != null && UploadFile.hasDurableOriginalRevisionOwnership(
+                                                                                    fileName = node.name,
+                                                                                    remoteFolder = node.parentId,
+                                                                                    driveId = sharedScope.driveId,
+                                                                                    userId = sharedScope.userId,
+                                                                                    fileModifiedAt = Date(destinationBytes.lastModified()),
+                                                                                    fileSize = destinationBytes.length(),
+                                                                                    contentHash = destinationHash,
+                                                                                    originalFileId = node.id,
+                                                                                )
+                                                                            }.getOrDefault(false)
+                                                                        if (!registered) return@runCatching false
                                                                     } else {
                                                                         FileController.markFileAsOffline(
                                                                             customRealm = sharedRealm,
@@ -1426,31 +1463,62 @@ class MainViewModel(
                                 // path RETAINS the source metadata (row, ancestry and bytes) —
                                 // the move re-processes on a later pass.
                                 if (requiredPathsPersisted) {
-                                    // THE UNLINK IS ALL-OR-NOTHING (review-34 #5): a recovery-
-                                    // aware removal that would RETAIN the row must never lose its
-                                    // parent backlink — both are removed together only when no
-                                    // unresolved recovery governs the source identity.
-                                    val sourceRemovalUnblocked = !DownloadOfflineFileManager.hasUnresolvedRecovery(
-                                        application,
-                                        userDrive,
-                                        file.id,
-                                        null,
-                                    )
-                                    if (sourceRemovalUnblocked) {
-                                        // The source backlink is removed only AFTER the destination's
-                                        // committed graph verified (issue: round 21 #8).
-                                        FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
-                                            runCatching { localFolder.children.remove(file) }
+                                    // EVERY RETAINED DESCENDANT IS CHECKED (review-35 #9): the
+                                    // removal is recursive — an ORDINARY descendant's pending
+                                    // plain-cache recovery (identity-matched, any destination
+                                    // kind) can retain it exactly like the moved root's own
+                                    // recovery. The source graph's full identity set is
+                                    // validated before ANY retirement.
+                                    val sourceGraphWalker = ArrayDeque<File>()
+                                    FileController.getFileById(currentDriveRealm, file.id)?.let { sourceRoot ->
+                                        sourceGraphWalker.add(sourceRoot)
+                                    }
+                                    val sourceGraphSeen = mutableSetOf<Int>()
+                                    var sourceGraphUnblocked = true
+                                    while (sourceGraphWalker.isNotEmpty()) {
+                                        val sourceRow = sourceGraphWalker.removeFirst()
+                                        if (!sourceGraphSeen.add(sourceRow.id)) continue
+                                        if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                                                application,
+                                                userDrive,
+                                                sourceRow.id,
+                                                null,
+                                            )
+                                        ) {
+                                            sourceGraphUnblocked = false
+                                            break
                                         }
+                                        sourceRow.children.forEach { sourceGraphWalker.add(it) }
+                                    }
+                                    if (sourceGraphUnblocked) {
+                                        // THE REMOVAL IS ALL-OR-NOTHING (review-35 #9): the
+                                        // recovery-aware removal may RETAIN the row (a preservation
+                                        // failure or a recovery decision) — the backlink is
+                                        // retired only when the source row is ACTUALLY GONE, in the
+                                        // same metadata outcome; a retained row keeps its required
+                                        // ancestry and backlink for the later pass.
                                         FileController.removeFile(
                                             fileId = file.id,
                                             customRealm = currentDriveRealm,
                                             userDrive = userDrive,
                                         )
+                                        if (FileController.getFileById(currentDriveRealm, file.id) == null) {
+                                            // The source backlink is removed only AFTER the destination's
+                                            // committed graph verified (issue: round 21 #8) AND the source
+                                            // row actually retired (review-35 #9).
+                                            FileController.updateFile(file.parentId, currentDriveRealm) { localFolder ->
+                                                runCatching { localFolder.children.remove(file) }
+                                            }
+                                        } else {
+                                            SentryLog.i(
+                                                "MainViewModel",
+                                                "Deferred source unlink of ${file.id}: the recovery-aware removal retained the row",
+                                            )
+                                        }
                                     } else {
                                         SentryLog.i(
                                             "MainViewModel",
-                                            "Deferred source removal of ${file.id}: unresolved recovery governs it",
+                                            "Deferred source removal of ${file.id}: unresolved recovery governs a retained descendant",
                                         )
                                     }
                                 } else {
