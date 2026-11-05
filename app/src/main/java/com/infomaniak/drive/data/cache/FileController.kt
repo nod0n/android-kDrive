@@ -154,6 +154,20 @@ object FileController {
         }
     }
 
+    /**
+     * SYNCHRONOUS path persistence for flows whose own later step depends on the persisted
+     * path within the same operation (issue: round 24 #14): the detached coroutine of
+     * [generateAndSavePath] can complete only AFTER the caller finished — a cross-Realm
+     * move's source removal could outrun it, and an interruption in that window left the
+     * relocated shared row with a blank path that ordinary consumers' scope cannot
+     * regenerate (their realm no longer holds the ancestry). Runs through the same
+     * coordinated, transaction-fresh [savePath].
+     */
+    internal fun persistResolvedPath(fileId: Int, userDrive: UserDrive, generatedPath: String): Boolean {
+        if (generatedPath.isBlank()) return false
+        return savePath(userDrive, fileId, generatedPath)
+    }
+
     private fun savePath(userDrive: UserDrive, fileId: Int, generatedPath: String) {
         getRealmInstance(userDrive).use { realm ->
             // Ancestry coordination + TRANSACTION-FRESH derivation (issue: round 12 #7): the

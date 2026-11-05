@@ -1002,12 +1002,16 @@ class DownloadOfflineFileManager(
 
         /**
          * The identity recorded with published bytes (issues: round 16 #12/#13, round 17 #13,
-         * round 18 #2/#12, round 20 #3): the FULL owner and generation identity — producing
-         * version, modification baseline and the accepted revision identity (revisedAt,
-         * updatedAt), the owning ACCOUNT, drive and file row, the exact published location,
-         * and the IMMUTABLE CONTENT IDENTITY (the SHA-256 of the bytes as published — a
-         * metadata-only record can never authorize destructive cleanliness after mutable
-         * access; a same-size same-second edit breaks the identity).
+         * round 18 #2/#12, round 20 #3, round 24 #11): the FULL owner and generation identity
+         * — producing version, modification baseline and the accepted revision identity
+         * (revisedAt, updatedAt), the owning ACCOUNT, drive and file row, the exact published
+         * location, and the IMMUTABLE CONTENT IDENTITY (the SHA-256 of the bytes as
+         * published — a metadata-only record can never authorize destructive cleanliness
+         * after mutable access; a same-size same-second edit breaks the identity) — plus the
+         * PUBLICATION IDENTITY: a fresh random value written by EVERY publication, so a
+         * later publication or restoration of the SAME generation is distinguishable from
+         * the recorded one (a request-time token comparison can never be satisfied by a
+         * re-publication's coarse-equal record).
          */
         internal data class PublishedProvenance(
             val version: Int,
@@ -1018,6 +1022,9 @@ class DownloadOfflineFileManager(
             val driveId: Int,
             val fileId: Int,
             val contentHash: String?,
+            /** Fresh per-publication value (0 = a pre-nonce record): the request-time
+             * publication/restoration token's distinguishing field (issue: round 24 #11). */
+            val publicationId: Long = 0,
             val absolutePath: String,
         ) {
             /** STRICT owner identity (issue: round 20 #11): the record must name THIS row,
@@ -1050,7 +1057,12 @@ class DownloadOfflineFileManager(
         }
 
         private fun PublishedProvenance.recordText(target: IOFile): String =
-            "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${contentHash ?: ""}|${target.absolutePath}"
+            "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${contentHash ?: ""}|$publicationId|${target.absolutePath}"
+
+        /** A fresh per-publication identity (issue: round 24 #11): 64 random bits — two
+         * publications colliding is negligible, and a re-publication of the SAME generation
+         * always differs from the recorded one. */
+        private fun newPublicationId(): Long = UUID.randomUUID().leastSignificantBits
 
         /**
          * Associates PUBLISHED bytes (cache or offline destination) with the content generation
@@ -1082,6 +1094,7 @@ class DownloadOfflineFileManager(
                     driveId = userDrive.driveId,
                     fileId = file.id,
                     contentHash = UploadFile.sha256OrNull(target),
+                    publicationId = newPublicationId(),
                     absolutePath = target.absolutePath,
                 )
                 if (provenance.contentHash == null) return@runCatching false
@@ -1144,6 +1157,7 @@ class DownloadOfflineFileManager(
                     driveId = userDrive.driveId,
                     fileId = row.id,
                     contentHash = verifiedContentHash,
+                    publicationId = newPublicationId(),
                     absolutePath = target.absolutePath,
                 )
                 recordFile.writeText(provenance.recordText(target))
@@ -1154,11 +1168,14 @@ class DownloadOfflineFileManager(
         internal fun readPublishedProvenance(context: Context, publishedFile: IOFile): PublishedProvenance? = runCatching {
             val parts = provenanceFileFor(context, publishedFile).readText().trim().split("|")
             require(parts.size >= 8)
-            // FORMAT LADDER (issue: round 20 #3): 8-field records are the pre-hash format —
-            // their location is parts[7] and they carry NO byte identity (they can certify
-            // nothing about content); 9+-field records carry the immutable content hash at
-            // index 7 and re-join the location after it.
+            // FORMAT LADDER (issues: round 20 #3, round 24 #11): 8-field records are the
+            // pre-hash format — their location is parts[7] and they carry NO byte identity
+            // (they can certify nothing about content); 9-field records carry the immutable
+            // content hash at index 7 and re-join the location after it; 10-field records
+            // carry the fresh per-publication identity at index 8 (0 for a pre-nonce
+            // record) and re-join the location after it.
             val legacyHashless = parts.size == 8
+            val publicationId = if (parts.size >= 10) parts[8].trim().toLongOrNull() ?: 0L else 0L
             val provenance = PublishedProvenance(
                 version = parts[0].trim().toInt(),
                 lastModifiedAt = parts[1].trim().toLong(),
@@ -1168,8 +1185,15 @@ class DownloadOfflineFileManager(
                 driveId = parts[5].trim().toInt(),
                 fileId = parts[6].trim().toInt(),
                 contentHash = if (legacyHashless) null else parts[7].trim().takeIf { it.isNotEmpty() },
+                publicationId = publicationId,
                 // The location is the LAST field and re-joins any '|' inside it.
-                absolutePath = (if (legacyHashless) parts.drop(7) else parts.drop(8)).joinToString("|"),
+                absolutePath = (
+                    when {
+                        legacyHashless -> parts.drop(7)
+                        parts.size >= 10 -> parts.drop(9)
+                        else -> parts.drop(8)
+                    }
+                    ).joinToString("|"),
             )
             // LOCATION identity (issue: round 18 #12): a record read at a different absolute
             // path than the one it names describes bytes elsewhere — never proof here. Legacy
