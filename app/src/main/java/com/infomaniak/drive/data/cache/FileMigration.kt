@@ -475,12 +475,15 @@ class FileMigration : RealmMigration {
         // - Added `File.offlineIntentStamp` — the DURABLE INTENT STAMP bumped by every
         //   pending-marker transition, so an unmark/repin (ABA) sequence never reproduces a
         //   captured observation's stamp in the destructive absence predicates. GUARDED
-        //   addField with a zero DEFAULT: existing rows keep the pre-stamp semantics (a
-        //   zero stamp only ever matches another zero), no backfill needed.
+        //   plain addField (Realm-Java API — FieldAttribute has no DEFAULT_VALUE here):
+        //   a newly added REQUIRED primitive column is filled with the zero value for
+        //   every EXISTING row, which IS the required default — existing rows keep the
+        //   pre-stamp semantics (a zero stamp only ever matches another zero), no backfill
+        //   needed and none performed.
         if (oldVersionTemp == 15L) {
             schema[File::class.java.simpleName]?.apply {
                 if (!hasField(File::offlineIntentStamp.name)) {
-                    addField(File::offlineIntentStamp.name, Long::class.java, FieldAttribute.DEFAULT_VALUE(0L))
+                    addField(File::offlineIntentStamp.name, Long::class.java)
                 }
             }
             oldVersionTemp++

@@ -629,6 +629,7 @@ class DownloadOfflineFileManager(
         target: IOFile,
         staged: IOFile,
         verificationBasis: File? = null,
+        explicitUnresolvedGeneration: Boolean = false,
     ): PublicationOutcome = publishStagedOfflineFile(
         userDrive = userDrive,
         isInheritedDownload = isInheritedDownload,
@@ -637,6 +638,7 @@ class DownloadOfflineFileManager(
         staged = staged,
         onPublishedLocked = { completePublishedFileLocked(context, file, target) },
         verificationBasis = verificationBasis,
+        explicitUnresolvedGeneration = explicitUnresolvedGeneration,
     )
 
     /**
