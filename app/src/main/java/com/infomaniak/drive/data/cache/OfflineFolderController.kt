@@ -1056,13 +1056,18 @@ object OfflineFolderController {
      */
     fun preserveInheritedCopyBeforeRemoval(file: File, userDrive: UserDrive, realm: Realm? = null): PreservationOutcome {
         val context = Realm.getApplicationContext() ?: return PreservationOutcome.PRESERVED
-        if (file.isOffline || file.isFolder() || !file.isInOfflineFolder) return PreservationOutcome.CONTENT_SAFE
-        // THE COMPLETE REALM FLAVOR + UNRESOLVED SHARED PATHS DEFER (issue: round 28 #7):
-        // a shared row's path resolves through the CAPTURED shared graph; a shared path
-        // that still cannot be resolved is UNRESOLVED — removal defers (PRESERVED), it is
-        // never "nothing to preserve" (the previous ordinary lookup could return no path
-        // and let a shared row be removed without its bytes being classified).
+        // THE UNRESOLVED-SHARED-PATH GUARD PRECEDES THE PIN SHORTCUT (issues: round 28
+        // #7, round 29 #3): physical ownership is resolved WITH THE CAPTURED FLAVOR before
+        // any classification shortcut — an explicit pin carrying BOTH inherited coverage
+        // and an unresolved shared path defers removal (its inherited bytes cannot be
+        // located or classified), never "nothing to preserve".
         val offlineFile = file.getOfflineFile(context, userDrive.userId, sharedWithMe = userDrive.sharedWithMe)
+        if (file.isOffline || file.isFolder() || !file.isInOfflineFolder) {
+            if (!file.isFolder() && userDrive.sharedWithMe && offlineFile == null) {
+                return PreservationOutcome.PRESERVED
+            }
+            return PreservationOutcome.CONTENT_SAFE
+        }
         if (offlineFile == null) {
             return if (userDrive.sharedWithMe) PreservationOutcome.PRESERVED else PreservationOutcome.CONTENT_SAFE
         }

@@ -560,16 +560,13 @@ open class File(
             // return no path (allowing row removal without preserving shared bytes) or an
             // ordinary row's different location.
             val offlineFile = getOfflineFile(context, userDrive.userId, sharedWithMe = userDrive.sharedWithMe) ?: run {
-                // THE RECOVERY CHECK DOES NOT NEED THE TARGET (issue: round 25 #7): an
-                // unresolvable path with an unresolved recovery governing this IDENTITY
-                // retains the owning row — the previous order returned true for a null
-                // path and let the row (the retained bytes' required metadata) be deleted.
-                return !DownloadOfflineFileManager.hasUnresolvedRecovery(
-                    context,
-                    UserDrive(userDrive.userId, driveId),
-                    id,
-                    null,
-                )
+                // THE PATH CANNOT BE ESTABLISHED (issues: round 25 #7, round 29 #3):
+                // PHYSICAL OWNERSHIP IS UNKNOWN — the disposal defers (false) regardless
+                // of any recovery record's presence or the row's pin status. The previous
+                // !hasUnresolvedRecovery let a record-less unresolvable path report
+                // SUCCESSFUL disposal, and the caller then deleted the owning row over
+                // bytes no one could locate or classify.
+                return false
             }
             // Never drop the bytes backing a pending upload when the cache row goes away
             // (issue #1902); the upload still reads from this file.

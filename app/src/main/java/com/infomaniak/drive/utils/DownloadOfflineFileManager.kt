@@ -932,56 +932,101 @@ class DownloadOfflineFileManager(
                                 // recovery, exclusive-ownership and non-foreign authority.
                                 val basisPath = verificationBasis
                                     ?.getOfflineFile(context, userDrive.userId)?.path
+                                // THE EXECUTING CONTEXT INSIDE THE ACQUIRED SECTION
+                                // (issue: round 29 #2): the publication released its
+                                // coordination; a cancelled worker waiting here must not
+                                // classify, snapshot, advance or retire.
+                                ensureActive()
                                 var retirementAuthorized = true
                                 if (basisPath != null && basisPath != offlineFile.path) {
                                     val basisCopy = IOFile(basisPath)
                                     if (basisCopy.exists()) {
+                                        // AUTHORITY PRE-FLIGHT BEFORE ANY CLASSIFICATION OR
+                                        // SNAPSHOT (issues: round 29 #1): the live identity,
+                                        // the old location, exclusive ownership, non-foreign
+                                        // provenance, recovery exclusions and URI consumers
+                                        // are validated FIRST — the previous order registered
+                                        // every differing/unreadable source as the live row's
+                                        // edit BEFORE the ownership checks could reject a
+                                        // relocated row or a newly recovery-managed path, and
+                                        // the recovery-resolution override belonged to
+                                        // validated reconciliation, not this flow.
                                         val currentBasisHash = UploadFile.sha256OrNull(basisCopy)
                                         val basisUri = android.net.Uri.fromFile(basisCopy).toString()
                                         val preAdvanceRow = liveRow?.let { realm.copyFromRealm(it, 1) }
+                                        val authorityHolds = preAdvanceRow != null &&
+                                            OfflineFolderController.exclusivePathOwner(
+                                                realm, context, userDrive, basisPath,
+                                            ) == preAdvanceRow.id &&
+                                            readPublishedProvenance(context, basisCopy)
+                                                ?.positivelyForeignTo(preAdvanceRow, userDrive) != true &&
+                                            !UploadFile.hasPendingUpload(uri = basisUri) &&
+                                            !UploadFile.hasRetainedUnsentUpload(uri = basisUri) &&
+                                            !hasUnresolvedRecovery(context, userDrive, file.id, basisPath)
                                         when {
-                                            // AN INTERVENING OR UNREADABLE REVISION AT A
-                                            // (issue: round 28 #2): register it durably under
-                                            // the row's CURRENT identity; the advancement is
-                                            // skipped so the owning metadata stays with the
-                                            // retained bytes.
-                                            currentBasisHash == null || currentBasisHash != verifiedBasisSourceHash -> {
-                                                if (preAdvanceRow != null) {
-                                                    runCatching {
+                                            // AUTHORITY LOST: the row moved, the path was
+                                            // re-owned, a foreign record names it, a URI
+                                            // consumer or recovery owns it — nothing at A is
+                                            // this operation's to classify; the advancement is
+                                            // skipped so the row keeps its old owning
+                                            // location.
+                                            !authorityHolds -> {
+                                                retirementAuthorized = false
+                                                SentryLog.i(
+                                                    TAG,
+                                                    "Old-path authority lost for ${file.id}; advancement deferred",
+                                                )
+                                            }
+                                            // THE EXACT VERIFIED REVISION: the retirement
+                                            // candidate (subject to the advancement below).
+                                            currentBasisHash != null && currentBasisHash == verifiedBasisSourceHash -> Unit
+                                            // A READABLE DIFFERING REVISION WITH FULL
+                                            // AUTHORITY: classified through the COMMON content
+                                            // classification — a PROVEN edit registers as the
+                                            // row's snapshot (NO recovery-resolution override);
+                                            // foreign, clean and uncertain bytes are deferred
+                                            // unregistered. UNREADABLE bytes are UNCERTAIN,
+                                            // never a proven edit.
+                                            currentBasisHash != null -> {
+                                                val classifiedEdit = currentBasisHash != verifiedBasisSourceHash &&
+                                                    OfflineFolderController.protectionStateOf(
+                                                        preAdvanceRow ?: liveRow ?: return@withFileLock,
+                                                        basisCopy,
+                                                        userDrive,
+                                                    ) == OfflineFolderController.CopyProtection.DIRTY
+                                                if (classifiedEdit && preAdvanceRow != null) {
+                                                    val registered = runCatching {
                                                         OfflineFolderController.registerDirtySnapshot(
                                                             context = context,
                                                             file = preAdvanceRow,
                                                             offlineFile = basisCopy,
                                                             userDrive = userDrive,
-                                                            allowPendingRecoveryResolution = true,
                                                         )
-                                                    }
+                                                    }.getOrDefault(false)
+                                                    if (!registered) retirementAuthorized = false
+                                                } else {
+                                                    retirementAuthorized = false
                                                 }
+                                                SentryLog.i(
+                                                    TAG,
+                                                    "Old-path revision for ${file.id} classified; advancement deferred",
+                                                )
+                                            }
+                                            // UNREADABLE OLD BYTES (issue: round 29 #1):
+                                            // uncertain — the advancement defers, nothing is
+                                            // registered, nothing is deleted.
+                                            else -> {
                                                 retirementAuthorized = false
                                                 SentryLog.i(
                                                     TAG,
-                                                    "Preserved intervening revision at the old path of ${file.id}; advancement deferred",
+                                                    "Unreadable old-path bytes for ${file.id}; advancement deferred",
                                                 )
                                             }
-                                            // A LIVE URI CONSUMER OWNS THE OLD BYTES (issue:
-                                            // round 28 #3): retiring A would break the upload's
-                                            // stored source; the copy at B does not repair it.
-                                            UploadFile.hasPendingUpload(uri = basisUri) ||
-                                                UploadFile.hasRetainedUnsentUpload(uri = basisUri) -> retirementAuthorized = false
-                                            // AN UNRESOLVED RECOVERY GOVERNS THE OLD PATH (issue:
-                                            // round 28 #3): the sweep owns its resolution.
-                                            hasUnresolvedRecovery(context, userDrive, file.id, basisPath) -> retirementAuthorized = false
-                                            // THE ROW NO LONGER EXCLUSIVELY OWNS THE OLD PATH,
-                                            // OR A FOREIGN RECORD NAMES IT (issue: round 28 #3):
-                                            // re-owned or foreign-attributed bytes are never
-                                            // this operation's to discard.
-                                            preAdvanceRow == null ||
-                                                OfflineFolderController.exclusivePathOwner(
-                                                    realm, context, userDrive, basisPath,
-                                                ) != preAdvanceRow.id ||
-                                                readPublishedProvenance(context, basisCopy)
-                                                    ?.positivelyForeignTo(preAdvanceRow, userDrive) == true -> retirementAuthorized = false
                                         }
+                                        // RE-CHECK BEFORE THE COMMIT/UNLINK FOLLOWING
+                                        // POTENTIALLY LENGTHY HASH/SNAPSHOT WORK (issue:
+                                        // round 29 #2).
+                                        ensureActive()
                                     }
                                 }
                                 if (retirementAuthorized) {
