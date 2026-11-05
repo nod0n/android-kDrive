@@ -1728,6 +1728,83 @@ class DownloadOfflineFileManager(
             return !sidecar.exists() || runCatching { sidecar.delete() }.getOrDefault(false)
         }
 
+        /** THE TRI-STATE SIDECAR AUTHORITY (issue: round 28 #10): an ABSENT sidecar is
+         * LEGACY authority (resolvable from the canonical path + live owner); an existing
+         * sidecar that is malformed or fails its body cross-check is INVALID — it never
+         * substitutes another realm/kind; a decodable, cross-checked sidecar is RESOLVED. */
+        private sealed class ScopedAuthority {
+            object AbsentLegacy : ScopedAuthority()
+            object Invalid : ScopedAuthority()
+            class Resolved(val scope: RecoveredScope) : ScopedAuthority()
+        }
+
+        private fun readScopeAuthority(
+            recordFile: IOFile,
+            expectedFileId: Int? = null,
+            expectedTargetPath: String? = null,
+        ): ScopedAuthority {
+            val sidecarFile = IOFile(recordFile.path + ".scope")
+            if (!sidecarFile.exists()) return ScopedAuthority.AbsentLegacy
+            val scope = readScopeSidecar(recordFile, expectedFileId, expectedTargetPath)
+                ?: return ScopedAuthority.Invalid
+            return ScopedAuthority.Resolved(scope)
+        }
+
+        /**
+         * LEGACY AUTHORITY RESOLUTION (issue: round 28 #10): a record with NO scope
+         * sidecar resolves its destination kind and realm flavor from its VALIDATED
+         * CANONICAL target path and the LIVE EXCLUSIVE owner, across BOTH captured flavors
+         * and all three destination kinds (offline/cache/converted — the previous blanket
+         * ordinary-offline default gave legacy cache/shared records no convergence route).
+         * Returns the resolved authority, or null when AMBIGUOUS (no resolver matches a
+         * live exclusive owner in either flavor): the caller defers explicitly, never
+         * substituting defaults. On success the resolved authority is PERSISTED in the
+         * framed s2| form — later passes use captured, not re-derived, authority.
+         */
+        private fun resolveLegacyScopeAuthority(
+            context: Context,
+            recordFile: IOFile,
+            fileId: Int,
+            userId: Int,
+            driveId: Int,
+            targetPath: String,
+        ): RecoveredScope? = runCatching {
+            for (sharedWithMe in listOf(false, true)) {
+                val scope = UserDrive(userId = userId, driveId = driveId, sharedWithMe = sharedWithMe)
+                FileController.getRealmInstance(scope).use { realm ->
+                    runCatching { realm.refresh() }
+                    val row = FileController.getFileById(realm, fileId) ?: return@use
+                    val resolvers = sequenceOf(
+                        "offline" to row.getOfflineFile(context, userId, sharedWithMe = sharedWithMe)?.absolutePath,
+                        "cache" to row.getCacheFile(context, scope).absolutePath,
+                        "converted" to row.getConvertedPdfCache(context, scope).absolutePath,
+                    )
+                    for ((kind, resolvedPath) in resolvers) {
+                        if (resolvedPath == targetPath &&
+                            appContextForOwnership()?.let { ctx ->
+                                OfflineFolderController.exclusivePathOwner(realm, ctx, scope, targetPath)
+                            } == row.id
+                        ) {
+                            // PERSIST THE RESOLVED FRAMED AUTHORITY (best effort: a failed
+                            // write leaves the record legacy — a later pass re-resolves).
+                            runCatching {
+                                writeScopeSidecar(recordFile, userId, driveId, fileId, targetPath, sharedWithMe, kind)
+                            }
+                            return@runCatching RecoveredScope(
+                                userId = userId,
+                                driveId = driveId,
+                                fileId = fileId,
+                                targetPath = targetPath,
+                                sharedWithMe = sharedWithMe,
+                                storageKind = kind,
+                            )
+                        }
+                    }
+                }
+            }
+            null // genuine ambiguity: the caller defers explicitly
+        }.getOrNull()
+
         /**
          * CURRENT CANONICAL OWNERSHIP AUTHORITY (issues: round 25 #4, round 26 #5): the
          * record's owner row must still EXIST in the record's ACTUAL Realm flavor, still
@@ -2393,18 +2470,36 @@ class DownloadOfflineFileManager(
                                 // THE CAPTURED REALM FLAVOR (issue: round 26 #5): the sidecar
                                 // names the destination's realm — a shared-scope relocation
                                 // validates its owner in the shared realm.
-                                val moveScope = readScopeSidecar(
+                                // THE TRI-STATE SIDECAR AUTHORITY (issue: round 28 #10):
+                                // an invalid CURRENT index defers the replay (no substituted
+                                // realm/kind); an ABSENT (legacy) index resolves from the
+                                // canonical path + live exclusive owner and persists the
+                                // framed authority; ambiguity defers.
+                                val moveScopeShared: Boolean
+                                val moveScopeKind: String
+                                when (val moveAuthority = readScopeAuthority(
                                     recordFile,
                                     expectedFileId = proofFileId,
                                     expectedTargetPath = target.absolutePath,
-                                )
-                                val moveScopeShared = moveScope?.sharedWithMe == true
-                                // THE CAPTURED DESTINATION KIND RIDES EVERY REPLAY (issue:
-                                // round 28 #9): the previous arm forwarded only the realm
-                                // flavor and let both ownership validations default to
-                                // "offline" — a cache/converted relocation could never
-                                // satisfy an offline-path ownership query.
-                                val moveScopeKind = moveScope?.storageKind ?: "offline"
+                                )) {
+                                    is ScopedAuthority.Invalid -> return@runCatching false
+                                    is ScopedAuthority.AbsentLegacy -> {
+                                        val resolved = resolveLegacyScopeAuthority(
+                                            context,
+                                            recordFile,
+                                            proofFileId,
+                                            proofUserId,
+                                            proofDriveId,
+                                            target.absolutePath,
+                                        ) ?: return@runCatching false
+                                        moveScopeShared = resolved.sharedWithMe
+                                        moveScopeKind = resolved.storageKind
+                                    }
+                                    is ScopedAuthority.Resolved -> {
+                                        moveScopeShared = moveAuthority.scope.sharedWithMe
+                                        moveScopeKind = moveAuthority.scope.storageKind
+                                    }
+                                }
                                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                                     OfflineFileCoordination.withFileLock(scope, proofFileId) {
                                         val targetHash = UploadFile.sha256OrNull(target)
@@ -2558,18 +2653,39 @@ class DownloadOfflineFileManager(
             // legacy record without a sidecar keeps the documented conservative defaults
             // (the same ordinary-offline semantics its scope resolution already used);
             // nothing here falls back to the current account or invents a scope.
-            // THE CANONICAL CROSS-CHECK (issue: round 27 #10): the index must agree with
-            // the record body it scopes — a mismatched sidecar is undecodable for this
-            // operation (the conservative defaults below are the documented legacy
-            // semantics, and the identity fields always come from the record itself,
-            // never the sidecar).
-            val capturedScopeSidecar = readScopeSidecar(
+            // THE TRI-STATE SIDECAR AUTHORITY (issue: round 28 #10): an INVALID CURRENT
+            // index (malformed, or failing its body cross-check) defers this record with
+            // NO substituted realm/kind — wrong authority is never compiled from a broken
+            // index. An ABSENT (legacy) index resolves its kind/flavor from the validated
+            // canonical path + the LIVE EXCLUSIVE owner across captured flavors and all
+            // three destination kinds, and PERSISTS the resolved framed authority; genuine
+            // ambiguity defers explicitly. The identity fields always come from the record
+            // itself, never the sidecar.
+            val capturedShared: Boolean
+            val capturedStorageKind: String
+            when (val authority = readScopeAuthority(
                 record.recordFile,
                 expectedFileId = record.fileId,
                 expectedTargetPath = record.targetPath,
-            )
-            val capturedShared = capturedScopeSidecar?.sharedWithMe == true
-            val capturedStorageKind = capturedScopeSidecar?.storageKind ?: "offline"
+            )) {
+                is ScopedAuthority.Invalid -> return false
+                is ScopedAuthority.AbsentLegacy -> {
+                    val resolved = resolveLegacyScopeAuthority(
+                        context,
+                        record.recordFile,
+                        record.fileId,
+                        record.userId,
+                        record.driveId,
+                        record.targetPath,
+                    ) ?: return false
+                    capturedShared = resolved.sharedWithMe
+                    capturedStorageKind = resolved.storageKind
+                }
+                is ScopedAuthority.Resolved -> {
+                    capturedShared = authority.scope.sharedWithMe
+                    capturedStorageKind = authority.scope.storageKind
+                }
+            }
             if (!recoveryFile.exists()) {
                 // The backup is gone: a completed publication (or completed restore)
                 // leaves the target with its own readable proof; anything else is
