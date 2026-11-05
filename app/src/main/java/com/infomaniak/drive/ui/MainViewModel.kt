@@ -547,7 +547,46 @@ class MainViewModel(
                                         sharedRealm.where(File::class.java)
                                             .equalTo(File::id.name, file.id)
                                             .findFirst()?.let { preRoot ->
-                                                if (preRoot.isOffline || preRoot.isInOfflineFolder) {
+                                                // THE FRESH REALM DESCENDANT GRAPH IS THE RECOVERY
+                                                // CHECK'S SOURCE, VALIDATED BEFORE THE ROOT-FLAG AND
+                                                // PHYSICAL-PATH GATES (review-34 #2, hoisted review-35
+                                                // #3): every descendant row's ACTUAL identity and old
+                                                // path is checked — including rows whose physical
+                                                // target is ABSENT (bytes retained in unresolved
+                                                // recovery), which a physical walk cannot see, and
+                                                // rows whose recovery governs them by identity at
+                                                // ANOTHER location, which a shared root id would
+                                                // miss. ROOT FLAGS NEVER ESTABLISH WHAT DESCENDANTS
+                                                // OWN: an ordinary shared folder containing a pinned
+                                                // recovery-governed descendant defers here, before
+                                                // any ancestry transaction.
+                                                val graphRows = ArrayDeque<File>().apply { add(preRoot) }
+                                                val graphSeen = mutableSetOf<Int>()
+                                                var graphGoverned = false
+                                                while (graphRows.isNotEmpty()) {
+                                                    val graphRow = graphRows.removeFirst()
+                                                    if (!graphSeen.add(graphRow.id)) continue
+                                                    val graphRowOldPath = graphRow
+                                                        .getOfflineFile(application, sharedScope.userId)?.absolutePath
+                                                    if (DownloadOfflineFileManager.hasUnresolvedRecovery(
+                                                            application,
+                                                            sharedScope,
+                                                            graphRow.id,
+                                                            graphRowOldPath,
+                                                        )
+                                                    ) {
+                                                        graphGoverned = true
+                                                        break
+                                                    }
+                                                    graphRow.children.forEach { graphRows.add(it) }
+                                                }
+                                                if (graphGoverned) {
+                                                    mergeAllowed = false
+                                                    SentryLog.i(
+                                                        TAG,
+                                                        "Deferred shared move of ${file.id}: a descendant's recovery governs its old location",
+                                                    )
+                                                } else if (preRoot.isOffline || preRoot.isInOfflineFolder) {
                                                     val oldBytes = preRoot.getOfflineFile(application, sharedScope.userId)
                                                         ?.takeIf { it.exists() }
                                                     if (oldBytes != null) {
@@ -582,33 +621,6 @@ class MainViewModel(
                                                                 // to later bytes at the old location.
                                                                 val relocatedPairs = mutableListOf<Pair<IOFile, IOFile>>()
                                                                 var subtreeOk = true
-                                                                // THE FRESH REALM DESCENDANT GRAPH IS THE RECOVERY
-                                                                // CHECK'S SOURCE (review-34 #2): every descendant
-                                                                // row's ACTUAL identity and old path is checked —
-                                                                // including rows whose physical target is ABSENT
-                                                                // (bytes retained in unresolved recovery), which a
-                                                                // physical walk cannot see, and rows whose
-                                                                // recovery governs them by identity at ANOTHER
-                                                                // location, which a shared root id would miss.
-                                                                val graphRows = ArrayDeque<File>().apply { add(preRoot) }
-                                                                val graphSeen = mutableSetOf<Int>()
-                                                                while (graphRows.isNotEmpty() && subtreeOk) {
-                                                                    val graphRow = graphRows.removeFirst()
-                                                                    if (!graphSeen.add(graphRow.id)) continue
-                                                                    val graphRowOldPath = graphRow
-                                                                        .getOfflineFile(application, sharedScope.userId)?.absolutePath
-                                                                    if (DownloadOfflineFileManager.hasUnresolvedRecovery(
-                                                                            application,
-                                                                            sharedScope,
-                                                                            graphRow.id,
-                                                                            graphRowOldPath,
-                                                                        )
-                                                                    ) {
-                                                                        subtreeOk = false
-                                                                        break
-                                                                    }
-                                                                    graphRow.children.forEach { graphRows.add(it) }
-                                                                }
                                                                 val treeWalker = ArrayDeque<IOFile>().apply { add(oldBytes) }
                                                                 while (treeWalker.isNotEmpty()) {
                                                                     val node = treeWalker.removeFirst()
