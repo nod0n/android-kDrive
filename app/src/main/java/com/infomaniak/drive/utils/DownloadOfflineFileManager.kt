@@ -702,6 +702,28 @@ class DownloadOfflineFileManager(
 
         val okHttpClient = AccountUtils.getHttpClient(userDrive.userId, null)
 
+        // THE NO-SPIN GATE (issue: round 26 #20), BEFORE any transfer: with no supported
+        // response-bound identity route, an already-published EXPLICITLY UNRESOLVED copy
+        // covering the CURRENT remote generation gains nothing from another identical
+        // download. The durable unresolved state is retained (marker stays, no completion
+        // claim, no intent clear) and the attempt defers — evidence (a metadata advance, a
+        // lost or non-certifying record/copy) re-justifies the transfer on a later pass.
+        if (unresolvedPublicationAlreadyCoversCurrentGeneration(
+                context = context,
+                file = file,
+                target = offlineFile,
+                userDrive = userDrive,
+                okHttpClient = okHttpClient,
+            )
+        ) {
+            lastTransferGenerationUnresolved = true
+            SentryLog.i(
+                downloadWorker.workerTag(),
+                "Download of ${file.id} deferred: an explicitly unresolved publication already covers this generation and no new evidence exists",
+            )
+            return@withContext ListenableWorker.Result.failure()
+        }
+
         val response = downloadFileResponseAsync(
             fileUrl = ApiRoutes.downloadFile(file),
             okHttpClient = okHttpClient,
@@ -3076,6 +3098,45 @@ class DownloadOfflineFileManager(
          * partial bytes — or delete existing bytes — at the destination. The destination is
          * never touched before the staged copy is complete.
          */
+        /**
+         * THE NO-SPIN UNRESOLVED REDRIVE GATE (issue: round 26 #20): the download endpoint
+         * carries no revision token and no identity header is parsed anywhere in the client,
+         * so a stable download can only ever be published EXPLICITLY UNRESOLVED (version-0
+         * record) — no supported response-bound validation path exists (metadata-only
+         * authority stays withdrawn). When the target already holds an explicitly unresolved
+         * publication that CERTIFIES its bytes for this identity AND the row's CURRENT remote
+         * generation equals the generation the record was published for, a fresh transfer
+         * adds NO evidence: the identical bytes are not re-downloaded; the durable unresolved
+         * state is retained and the attempt defers. Evidence that re-justifies the transfer:
+         * an absent/mismatched/non-certifying record, a metadata advance in the fresh
+         * details, or an indeterminate details answer (the re-drive runs and re-establishes
+         * the state). This gate NEVER reports a verified completion — it only prevents the
+         * identical-bytes transfer spin.
+         */
+        internal suspend fun unresolvedPublicationAlreadyCoversCurrentGeneration(
+            context: Context,
+            file: File,
+            target: IOFile,
+            userDrive: UserDrive,
+            okHttpClient: OkHttpClient,
+        ): Boolean = runCatching {
+            val proof = readPublishedProvenance(context, target) ?: return@runCatching false
+            if (proof.version != 0) return@runCatching false // a PROVEN record is not the spin state
+            if (!(proof.identifies(file, userDrive) && proof.certifiesBytes(target))) {
+                return@runCatching false
+            }
+            val fresh = ApiRepository.getFileDetails(
+                file = File(id = file.id, driveId = userDrive.driveId),
+                okHttpClient = okHttpClient,
+            )
+            val row = fresh.data?.takeIf { fresh.isSuccess() && it.id == file.id }
+                ?: return@runCatching false // indeterminate: allow the re-drive
+            // NEW EVIDENCE = a changed remote generation since the unresolved publication
+            // (revision or modification baseline moved): re-download it; equal generations
+            // add nothing the transfer could establish.
+            row.revisedAt == proof.revisedAt && row.lastModifiedAt == proof.lastModifiedAt
+        }.getOrDefault(false)
+
         /**
          * The post-download details re-fetch (OUTSIDE every lock) that the worker's and the
          * direct callers' generation binding runs before any publication (issues: round 22
