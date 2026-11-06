@@ -2267,6 +2267,21 @@ class DownloadOfflineFileManager(
         }.getOrDefault(true)
 
         /**
+         * Whether a provenance record OR its observation exists for [publishedFile] — the
+         * byte-deletion release guard's "registry state existed" leg: a FAILED release over
+         * EXISTING state defers the byte disposal (the round-16-#12 invariant — a record's
+         * generation evidence must never outlive its bytes at a path a later byte-identical
+         * reuse can inherit), while a failed release over NO state (the absent zero-state;
+         * typically the missing registry prefix directory's acknowledgment on a normal
+         * first use) cannot orphan anything and must not block disposal. A read failure
+         * fails CLOSED (defer).
+         */
+        internal fun provenanceRegistryStateExists(context: Context, publishedFile: IOFile): Boolean = runCatching {
+            val recordFile = provenanceFileFor(context, publishedFile)
+            recordFile.exists() || IOFile(recordFile.path + ".obs").exists()
+        }.getOrDefault(true)
+
+        /**
          * ATOMIC RECORD WRITE (issue: round 25 #6): the text is written to a unique
          * temporary file in the same directory and RENAMED into place — an interrupted
          * write can no longer leave a torn (undecodable) record at the operational path.

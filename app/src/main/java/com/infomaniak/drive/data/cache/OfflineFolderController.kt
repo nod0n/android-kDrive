@@ -2000,7 +2000,20 @@ object OfflineFolderController {
         // sidecar-BEFORE-bytes order is the established crash-safe direction (the same
         // order as File.deleteCaches): a crash between the two leaves sidecar-less bytes —
         // the conservative unproven state — never an orphaned sidecar.
-        DownloadOfflineFileManager.deletePublishedProvenance(context, offlineFile)
+        // THE RELEASE GUARD FAILS CLOSED (the byte-deletion hardening): when registry
+        // state existed and the release failed, deleting the bytes would durably create
+        // exactly the orphaned record the invariant forbids — so the disposal DEFERS
+        // ENTIRELY (the bytes stay; the retained accounting and the coverage restoration
+        // below apply) and a later pass retries the removal sidecar and bytes TOGETHER.
+        // A failed release over NO registry state (the absent zero-state — typically the
+        // missing prefix directory's acknowledgment for a never-published copy) cannot
+        // orphan anything and must not block disposal.
+        if (DownloadOfflineFileManager.provenanceRegistryStateExists(context, offlineFile) &&
+            !DownloadOfflineFileManager.deletePublishedProvenance(context, offlineFile)
+        ) {
+            SentryLog.e(TAG, "Failed to release the published provenance; disposal deferred: ${offlineFile.path}")
+            return false
+        }
         // A FAILED DELETION IS NOT A DISPOSAL (issue: round 25 #7 — the same contract as
         // File.deleteCaches): java.io.File.delete() reports failure by returning FALSE
         // (it throws only SecurityException), so the Boolean is checked — runCatching
