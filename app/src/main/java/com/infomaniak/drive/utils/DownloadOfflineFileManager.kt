@@ -5304,45 +5304,102 @@ class DownloadOfflineFileManager(
                                                     // a pre-existing row that legitimately differs from
                                                     // the proof's version/lastModifiedAt is the
                                                     // operation's own authorization baseline — never a
-                                                    // permanent supersession of the same operation; a
-                                                    // row that was ABSENT at capture (0) skips the
-                                                    // generation test (its appearance is the expected
-                                                    // commit — no baseline is invented) and the live
-                                                    // intent + publication-id gates govern. A v6
-                                                    // journal keeps its transitional proof-based
-                                                    // comparison (documented; no v6 journal ever
-                                                    // shipped). Legacy v1–v5 journals carry no capture:
-                                                    // their validated transition is the CONTENT
-                                                    // generation comparison against the proof — a real
-                                                    // check, never a Boolean-only admission and never a
-                                                    // stamp waiver; the intent at their capture is an
-                                                    // unprovable historical fact and is never invented
-                                                    // (the residual limit is documented, not waived
-                                                    // away).
+                                                    // permanent supersession of the same operation.
+                                                    // THE INTENT STAMP IS INDEPENDENT (review-45 R6):
+                                                    // a captured stamp is compared whatever the
+                                                    // captured row's version was — a version-less or
+                                                    // absent row no longer skips the unpin-repin test
+                                                    // when a stamp was captured. A row ABSENT at
+                                                    // capture (the all-zeros capture) has NO baseline
+                                                    // and NONE IS INVENTED: its appearance CANNOT be
+                                                    // attributed (the operation's own commit and a
+                                                    // post-capture repin are indistinguishable without
+                                                    // a request-time stamp the writer cannot capture) —
+                                                    // the residual is STRUCTURAL and explicitly OPEN,
+                                                    // never read as repin permission (the round-44
+                                                    // "expected commit" framing is RETRACTED); the live
+                                                    // intent + publication-id gates still govern those
+                                                    // journals. Pre-v7 journals take the destination-
+                                                    // side baseline below (review-45 R7).
                                                     val matchingState = destinationState as? DestinationRowState.Matching
+                                                    // THE LEGACY DESTINATION-SIDE BASELINE (review-45
+                                                    // R7): when the journal captured the destination's
+                                                    // PRIOR publication record, THAT record's
+                                                    // generation is the destination's OWN metadata at
+                                                    // capture — the comparison runs against it (a real
+                                                    // destination-side check, never the proof's
+                                                    // source-derived one), ending the false permanent
+                                                    // supersession of pre-existing differing rows for
+                                                    // exactly those journals. Without a captured prior
+                                                    // record the destination's at-capture generation is
+                                                    // UNPROVABLE: the proof-based comparison stays as
+                                                    // the FAIL-SAFE (a changed or never-matching row
+                                                    // supersedes → the validated rollback + the durable
+                                                    // redrive — churn that converges, never a wrong
+                                                    // publish), and the limit is documented OPEN: no
+                                                    // stamp or phase is invented, the admission is
+                                                    // never Boolean-only.
+                                                    val legacyDestinationBaseline =
+                                                        parsed.previousDestinationRecordText?.takeIf { it.isNotEmpty() }?.let { priorText ->
+                                                            runCatching {
+                                                                parseProvenanceText(priorText, expectedPath = parsed.targetPath)
+                                                            }.getOrNull()?.takeIf { it.absolutePath == parsed.targetPath }
+                                                        }
                                                     val supersededAuthorization = matchingState != null && when (parsed.version) {
-                                                        7 ->
-                                                            if (parsed.recordedDestinationVersion != null &&
-                                                                parsed.recordedDestinationVersion > 0
-                                                            ) {
-                                                                matchingState.rowVersion != parsed.recordedDestinationVersion ||
-                                                                    matchingState.rowLastModifiedAt != parsed.recordedDestinationLastModifiedAt ||
-                                                                    (parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
-                                                                        parsed.recordedIntentStamp != matchingState.intentStamp)
-                                                            } else {
-                                                                // A ROW ABSENT AT CAPTURE: the expected
-                                                                // appearance — no generation baseline
-                                                                // exists and none is invented.
-                                                                false
+                                                        7 -> {
+                                                            // THE INTENT STAMP IS INDEPENDENT OF THE
+                                                            // CONTENT BASELINE (review-45 R6): a
+                                                            // captured stamp is compared against the
+                                                            // live stamp WHATEVER the captured row's
+                                                            // version was — a version-less row no
+                                                            // longer skips the unpin-repin test.
+                                                            val stampSupersedes =
+                                                                parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
+                                                                    parsed.recordedIntentStamp != matchingState.intentStamp
+                                                            // THE CONTENT BASELINE IS WHATEVER THE
+                                                            // CAPTURE SAW: a versioned row's
+                                                            // version+lastModifiedAt; a version-less
+                                                            // PRESENT row's lastModifiedAt alone (a
+                                                            // version appearing later is a change — a
+                                                            // zero version is a real captured
+                                                            // baseline, never a skip permission).
+                                                            val generationSupersedes = when {
+                                                                parsed.recordedDestinationVersion != null &&
+                                                                    parsed.recordedDestinationVersion > 0 ->
+                                                                    matchingState.rowVersion != parsed.recordedDestinationVersion ||
+                                                                        matchingState.rowLastModifiedAt != parsed.recordedDestinationLastModifiedAt
+                                                                parsed.recordedDestinationLastModifiedAt != null &&
+                                                                    parsed.recordedDestinationLastModifiedAt > 0L ->
+                                                                    matchingState.rowLastModifiedAt != parsed.recordedDestinationLastModifiedAt
+                                                                else -> false
                                                             }
-                                                        6 ->
-                                                            matchingState.rowVersion != validatedTargetProof.version ||
-                                                                matchingState.rowLastModifiedAt != validatedTargetProof.lastModifiedAt ||
-                                                                (parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
-                                                                    parsed.recordedIntentStamp != matchingState.intentStamp)
-                                                        else ->
-                                                            matchingState.rowVersion != validatedTargetProof.version ||
-                                                                matchingState.rowLastModifiedAt != validatedTargetProof.lastModifiedAt
+                                                            stampSupersedes || generationSupersedes
+                                                        }
+                                                        else -> {
+                                                            val generationSupersedes = if (legacyDestinationBaseline != null) {
+                                                                matchingState.rowVersion != legacyDestinationBaseline.version ||
+                                                                    matchingState.rowLastModifiedAt != legacyDestinationBaseline.lastModifiedAt
+                                                            } else {
+                                                                // THE STRUCTURAL RESIDUAL (explicitly
+                                                                // OPEN, review-45 R7): a pre-v7 journal
+                                                                // without a captured prior destination
+                                                                // record has no destination-side
+                                                                // baseline; the proof-based comparison
+                                                                // fails safe (rollback + redrive) but a
+                                                                // never-matching pre-existing row churns
+                                                                // every pass. The intent at such a
+                                                                // journal's capture is unprovable — no
+                                                                // stamp or phase is invented, the
+                                                                // comparison is a real check, and the
+                                                                // limit is NOT claimed closed.
+                                                                matchingState.rowVersion != validatedTargetProof.version ||
+                                                                    matchingState.rowLastModifiedAt != validatedTargetProof.lastModifiedAt
+                                                            }
+                                                            val stampSupersedes =
+                                                                parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
+                                                                    parsed.recordedIntentStamp != matchingState.intentStamp
+                                                            generationSupersedes || stampSupersedes
+                                                        }
                                                     }
                                                     // THE TWO VALIDATED RESOLUTION ROUTES (review-41
                                                     // #9): with the complete operation validated, the
