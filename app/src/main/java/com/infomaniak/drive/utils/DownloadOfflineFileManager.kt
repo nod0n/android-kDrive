@@ -20,6 +20,7 @@ package com.infomaniak.drive.utils
 import android.content.Context
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import androidx.concurrent.futures.await
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -1099,7 +1100,16 @@ class DownloadOfflineFileManager(
         // the offline path (a user file could live there), never shared between concurrent
         // workers. In-progress bytes are never visible at the offline path. An unestablishable
         // staging container (review-41 #4) fails the download before any network work.
-        val staged = newStagedFile(context, file) ?: return@withContext ListenableWorker.Result.failure()
+        // THE STAGE BREADCRUMB (the account-first failure triage, 2026-11-06): this arm was
+        // the only per-file failure with NO breadcrumb at all — an unestablishable staging
+        // container (the mkdirs or the parent directory's fsync on external media) failed
+        // every download silently. android.util.Log under the worker's tag, so the ordinary
+        // tag-filtered logcat read sees it; stage + file id only, never secrets.
+        val staged = newStagedFile(context, file)
+        if (staged == null) {
+            Log.i(downloadWorker.workerTag(), "stage: staging container unavailable for file ${file.id}")
+            return@withContext ListenableWorker.Result.failure()
+        }
         lastDownloadedFile = staged
         makeSureFileExists(staged) ?: return@withContext ListenableWorker.Result.failure()
 
@@ -1351,6 +1361,10 @@ class DownloadOfflineFileManager(
                 }
                 ListenableWorker.Result.success()
             } else {
+                // THE STAGE BREADCRUMB (the account-first failure triage, 2026-11-06): a
+                // download response that saved no bytes failed here with NO breadcrumb — the
+                // second fully-silent normal-failure arm. Stage + file id only, never secrets.
+                Log.i(downloadWorker.workerTag(), "stage: download saved no bytes for file ${file.id}")
                 runCatching { staged.delete() }
                 ListenableWorker.Result.failure()
             }
