@@ -41,19 +41,26 @@ object ApiRoutes {
     private const val fileWithQuery = "with=capabilities,categories,conversion_capabilities,dropbox,dropbox.capabilities," +
             "external_import,is_favorite,path,sharelink,sorted_name,supported_by"
     private const val fileExtraWithQuery = "$fileWithQuery,users,version"
-    // THE VERSION EXPANSION ON LISTING AND ACTIVITY ROWS (review-54 F4): the ingested
-    // rows carry the version COUNT so the server-hash preservation tuple
-    // (File.serverGenerationTupleMatches) compares KNOWN counts — without it, every
-    // listing/activity refresh structurally failed the strict tuple and cleared the
-    // stored hash, degrading verified copies to the metadata tier and re-driving them
-    // after each walk. Existing metadata, no behavior change beyond the more precise
-    // ingestion.
+    // NO VERSION EXPANSION ON THE LISTING/ACTIVITY ROUTES (review-55, the official
+    // evidence disposition): the review-54 F4 expansion (files.version / file.version)
+    // was REMOVED — the official public documentation's `with` enums for the file
+    // activities routes omit file.version (they carry file/file.capabilities/.../
+    // file.supported_by), and the listing/continue and batch public docs return 404
+    // (no contract). An undocumented parameter must not ship on core listing/sync
+    // routes on pattern-guessing alone. COST (the strict tuple's design, unchanged):
+    // listing/activity-ingested rows carry no version count, so
+    // File.serverGenerationTupleMatches's count leg is UNKNOWN on every such refresh
+    // and the stored serverContentHash clears per the strict known-field rule —
+    // verified copies degrade to the metadata tier and re-establish after each walk.
+    // The hash-clearing is the conservative PRESERVATION rule working as documented;
+    // the minimal next design (a bounded details-with-version/hash refresh on the
+    // walk's incoming rows before decision/ingestion) is documented in the review-55
+    // coder report, NOT implemented here.
     private const val activitiesWithQuery = "with=file,file.capabilities,file.categories,file.conversion_capabilities," +
-            "file.dropbox,file.dropbox.capabilities,file.is_favorite,file.sharelink,file.sorted_name,file.supported_by," +
-            "file.version"
+            "file.dropbox,file.dropbox.capabilities,file.is_favorite,file.sharelink,file.sorted_name,file.supported_by"
     private const val listingFilesWithQuery = "with=files,files.capabilities,files.categories,files.conversion_capabilities," +
             "files.dropbox,files.dropbox.capabilities,files.external_import,files.is_favorite," +
-            "files.sharelink,files.sorted_name,files.supported_by,files.version"
+            "files.sharelink,files.sorted_name,files.supported_by"
     const val activitiesWithExtraQuery = "$activitiesWithQuery,file.external_import"
     private const val sharedFileWithQuery = "with=capabilities,conversion_capabilities,supported_by"
 
