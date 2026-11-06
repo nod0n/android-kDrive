@@ -166,6 +166,15 @@ object OfflineFolderController {
                 // the walk's per-file clearing takes each descendant's lock one at a time in the
                 // consistent per-file order.
                 synchronized(OfflineFileCoordination.rootIntentMonitor) {
+                    // Refresh AFTER acquiring coordination (issue: round 13 #7 — the same
+                    // rule addOfflineRoot implements above): this Realm may have been opened
+                    // before the monitor wait, and a removal completing while this removal
+                    // queued must be visible BEFORE the covered-by-ancestor decision — on a
+                    // non-looper thread the snapshot advances only on an explicit refresh,
+                    // and a stale ancestor record would keep a nested subtree "covered"
+                    // while its covering root record is already gone, stranding its
+                    // coverage with nothing left to revisit it.
+                    runCatching { realm.refresh() }
                     // If the folder is still covered by an ancestor root, everything below stays
                     // covered: only the root record goes away.
                     val isCoveredByAncestorRoot = isInsideActiveRoot(realm, folderId)
