@@ -191,6 +191,11 @@ class DownloadProgressViewModel : ViewModel() {
                 DownloadOfflineFileManager.withDownloadResponse(
                     fileUrl = ApiRoutes.downloadFile(file),
                     okHttpClient = okHttpClient,
+                    // THE ESTABLISHMENT'S DOWNLOAD IS NO-CACHE (review-54 F3): these
+                    // staged bytes feed the coordinated plain-cache publication's
+                    // generation establishment — a cached stale 200 would hash the old
+                    // generation and loop the retry.
+                    noCache = true,
                     downloadInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor { progress ->
                         downloadProgressLiveData.postValue(progress)
                     },
