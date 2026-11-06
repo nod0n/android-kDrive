@@ -7068,12 +7068,12 @@ class DownloadOfflineFileManager(
                         // the owned recovery path (review-46 D2 — never left at the
                         // canonical name to block or be promoted); unrelated evidence is
                         // never retired and no default false→complete exists.
-                        when (removeObservationBoundTo(context, target, failedPublicationId)) {
+                        when (removeObservationBoundTo(context, target, failedPublicationId, checkCancelled)) {
                             ObservationRetirement.Failed -> false
-                            else -> when (removeObservationExactText(context, target, oldObservation.text)) {
+                            else -> when (removeObservationExactText(context, target, oldObservation.text, checkCancelled)) {
                                 ObservationRetirement.Failed -> false
                                 else -> when (
-                                    removeObservationExactText(context, target, attemptedObservationText)
+                                    removeObservationExactText(context, target, attemptedObservationText, checkCancelled)
                                 ) {
                                     ObservationRetirement.Failed -> false
                                     // THE COHERENT QUARANTINE (review-46 D2), as in the
@@ -7128,7 +7128,7 @@ class DownloadOfflineFileManager(
                             // canonical — the observation happens here, never inside a
                             // runCatching.
                             checkCancelled()
-                            when (removeObservationBoundTo(context, target, failedPublicationId)) {
+                            when (removeObservationBoundTo(context, target, failedPublicationId, checkCancelled)) {
                                 // THE FAILED ATTEMPT'S OBSERVATION IS RETIRED CONDITIONALLY
                                 // FIRST (review-47 E1): never overwritten as a side effect of
                                 // the rebind write; a Failed retirement retains.
@@ -7163,7 +7163,7 @@ class DownloadOfflineFileManager(
                                         writeReboundRestorationObservation(context, target, capturedParsed, restorationPublicationId)
                                     isRestorationReboundText(canonicalText, target, restorationPublicationId) -> true
                                     else -> when (
-                                        removeObservationExactText(context, target, attemptedObservationText)
+                                        removeObservationExactText(context, target, attemptedObservationText, checkCancelled)
                                     ) {
                                         ObservationRetirement.Failed -> false
                                         ObservationRetirement.Retired, ObservationRetirement.Absent -> {
@@ -7276,13 +7276,13 @@ class DownloadOfflineFileManager(
             // happens here, after every preceding blocking read, never inside a
             // runCatching.
             checkCancelled()
-            return when (removeObservationBoundTo(context, target, failedPublicationId)) {
+            return when (removeObservationBoundTo(context, target, failedPublicationId, checkCancelled)) {
                 ObservationRetirement.Retired, ObservationRetirement.Absent ->
                     // The failed attempt's observation (or none) — the obligation is met.
                     true
                 ObservationRetirement.Failed -> false
                 ObservationRetirement.NotEligible -> when (
-                    removeObservationExactText(context, target, attemptedObservationText)
+                    removeObservationExactText(context, target, attemptedObservationText, checkCancelled)
                 ) {
                     ObservationRetirement.Failed -> false
                     ObservationRetirement.NotEligible ->
@@ -8065,6 +8065,10 @@ class DownloadOfflineFileManager(
             // canonical is never deleted.
             val currentBytes = runCatching { observationFile.readBytes() }.getOrNull() ?: return false
             if (sha256HexOfBytes(currentBytes) != payloadSha256) return false
+            // THE EXECUTING CONTEXT AFTER THE FRESH-READ IDENTITY VALIDATION, BEFORE THE
+            // DELETE (review-49 G4): the last blocking validation → the first destructive
+            // effect span is never unobserved. The check is OUTSIDE the runCatching.
+            checkCancelled()
             // STEP 4 — RETIRE: the conditional delete, durably acknowledged.
             if (!runCatching { observationFile.delete() }.getOrDefault(false)) return false
             if (!UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) return false
@@ -8090,12 +8094,20 @@ class DownloadOfflineFileManager(
             object Failed : ObservationRetirement()
         }
 
-        /** THE FAILED-PUBLICATION RETIREMENT (review-43 #2, typed review-46 D1): retires the
-         * target's observation ONLY when it is a parseable observation bound to
-         * [boundPublicationId] in the current format. The typed outcome distinguishes the
-         * durable success, the acknowledged absence, the unrelated evidence, and the failed
-         * read/delete/fsync/verification of eligible (or unclassifiable) evidence. */
-        private fun removeObservationBoundTo(context: Context, target: IOFile, boundPublicationId: Long?): ObservationRetirement {
+        /** THE FAILED-PUBLICATION RETIREMENT (review-43 #2, typed review-46 D1, review-49
+         * G4): retires the target's observation ONLY when it is a parseable observation
+         * bound to [boundPublicationId] in the current format. The typed outcome
+         * distinguishes the durable success, the acknowledged absence, the unrelated
+         * evidence, and the failed read/delete/fsync/verification of eligible (or
+         * unclassifiable) evidence. [checkCancelled] is observed AFTER the read and the
+         * binding validation, immediately before the delete — the read→delete span is
+         * never unobserved. */
+        private fun removeObservationBoundTo(
+            context: Context,
+            target: IOFile,
+            boundPublicationId: Long?,
+            checkCancelled: () -> Unit,
+        ): ObservationRetirement {
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
             // A SYMLINK AT THE CANONICAL NAME IS UNKNOWN (review-48 F4): dangling or not,
             // its content is not this target's evidence — never read through it, never
@@ -8126,6 +8138,10 @@ class DownloadOfflineFileManager(
             if (parsed.format != ObservationFormat.CURRENT || parsed.publicationId != boundPublicationId) {
                 return ObservationRetirement.NotEligible
             }
+            // THE EXECUTING CONTEXT AFTER THE READ AND THE VALIDATION, BEFORE THE DELETE
+            // (review-49 G4): the read→delete span is never unobserved. The check is
+            // OUTSIDE the runCatching — a cancellation propagates, never swallowed.
+            checkCancelled()
             // THE DURABLE RETIREMENT (review-43 #2 discipline, typed review-46 D1): a
             // failed delete, acknowledgment or absence verification of ELIGIBLE evidence
             // is Failed — the retry owner is preserved.
@@ -8139,14 +8155,21 @@ class DownloadOfflineFileManager(
             }
         }
 
-        /** THE EXACT-TEXT RETIREMENT (review-45 R4, typed review-46 D1): retires the
-         * target's observation ONLY when its exact current text equals the expected captured
-         * evidence — the operation's OWN captured attempt or old observation. Parsing alone
-         * is never permission; a current text that does not equal the expected one is
-         * NotEligible (preserved untouched); a failed read/delete/fsync/verification of
-         * MATCHING text is Failed (the caller retains); the acknowledged absence of a prior
-         * unlink is established before success. */
-        private fun removeObservationExactText(context: Context, target: IOFile, expectedText: String?): ObservationRetirement {
+        /** THE EXACT-TEXT RETIREMENT (review-45 R4, typed review-46 D1, review-49 G4):
+         * retires the target's observation ONLY when its exact current text equals the
+         * expected captured evidence — the operation's OWN captured attempt or old
+         * observation. Parsing alone is never permission; a current text that does not
+         * equal the expected one is NotEligible (preserved untouched); a failed
+         * read/delete/fsync/verification of MATCHING text is Failed (the caller retains);
+         * the acknowledged absence of a prior unlink is established before success.
+         * [checkCancelled] is observed AFTER the read and the equality validation,
+         * immediately before the delete. */
+        private fun removeObservationExactText(
+            context: Context,
+            target: IOFile,
+            expectedText: String?,
+            checkCancelled: () -> Unit,
+        ): ObservationRetirement {
             if (expectedText == null) return ObservationRetirement.NotEligible
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
             // A SYMLINK AT THE CANONICAL NAME IS UNKNOWN (review-48 F4) — never read
@@ -8162,6 +8185,11 @@ class DownloadOfflineFileManager(
             val current = runCatching { observationFile.readText().trim() }.getOrNull()
                 ?: return ObservationRetirement.Failed
             if (current != expectedText) return ObservationRetirement.NotEligible
+            // THE EXECUTING CONTEXT AFTER THE READ AND THE EQUALITY VALIDATION, BEFORE
+            // THE DELETE (review-49 G4): the read→delete span is never unobserved. The
+            // check is OUTSIDE the runCatching — a cancellation propagates, never
+            // swallowed.
+            checkCancelled()
             return if (runCatching { observationFile.delete() }.getOrDefault(false) &&
                 UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
                 !observationFile.exists()
