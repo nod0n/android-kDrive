@@ -501,8 +501,12 @@ class FileMigration : RealmMigration {
         if (oldVersionTemp == 16L) {
             schema[File::class.java.simpleName]?.apply {
                 if (!hasField(File::serverContentHash.name)) {
+                    // Realm's addField creates String columns NULLABLE by default (the
+                    // reference-type default in RealmObjectSchema's FieldMetaData) — exactly
+                    // the model's `String?` shape. An explicit setNullable(true) on the
+                    // already-nullable column throws IllegalStateException, so no conversion
+                    // is performed (device-verified: the redundant call aborted a real 16→17).
                     addField(File::serverContentHash.name, String::class.java)
-                        .setNullable(File::serverContentHash.name, true)
                 }
             }
             oldVersionTemp++
