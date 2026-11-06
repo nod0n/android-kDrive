@@ -1933,14 +1933,26 @@ class DownloadOfflineFileManager(
          */
         private fun atomicWriteText(target: IOFile, text: String): Boolean = runCatching {
             val temp = IOFile(target.parentFile, "${target.name}.${UUID.randomUUID()}.tmp")
-            java.io.FileOutputStream(temp).use { stream ->
-                stream.write(text.toByteArray())
-                stream.flush()
-                stream.fd.sync()
-            }
-            if (!temp.renameTo(target)) {
+            try {
+                java.io.FileOutputStream(temp).use { stream ->
+                    stream.write(text.toByteArray())
+                    stream.flush()
+                    stream.fd.sync()
+                }
+                if (!temp.renameTo(target)) {
+                    runCatching { temp.delete() }
+                    return@runCatching false
+                }
+            } catch (writeFailure: Throwable) {
+                // THE OWN-TEMP CLEANUP (review-50 H2): a failed write or rename removes
+                // ONLY the temp file THIS invocation created — unrelated pre-existing
+                // tmp/unknown bytes are preserved, and the successfully published target
+                // is never touched (post-rename the temp path is already gone, so a later
+                // failure's cleanup is a no-op on it). The original exception propagates —
+                // the cleanup never replaces it; the outer runCatching maps it to false
+                // exactly as before.
                 runCatching { temp.delete() }
-                return@runCatching false
+                throw writeFailure
             }
             // THE DIRECTORY ENTRY IS DURABLE (review-37 #9): the rename's persistence is
             // established by synchronizing the containing directory.
@@ -7752,17 +7764,26 @@ class DownloadOfflineFileManager(
          * the payload is written to a temp file, its contents fsynced, renamed onto the
          * slot, and the slot's directory entry acknowledged — a partial copy never becomes
          * the slot, so a present slot always holds COMPLETE bytes (the sha verification
-         * then proves the identity). Mirrors atomicWriteText for binary payloads. */
+         * then proves the identity). Mirrors atomicWriteText for binary payloads. A failed
+         * write or rename removes ONLY the temp file this invocation created (review-50
+         * H2) — unrelated pre-existing tmp bytes are preserved and the published target is
+         * never touched — and the original exception propagates (the cleanup never
+         * replaces it). */
         private fun atomicWriteBytes(target: IOFile, bytes: ByteArray): Boolean = runCatching {
             val temp = IOFile(target.parentFile, "${target.name}.${UUID.randomUUID()}.tmp")
-            java.io.FileOutputStream(temp).use { stream ->
-                stream.write(bytes)
-                stream.flush()
-                stream.fd.sync()
-            }
-            if (!temp.renameTo(target)) {
+            try {
+                java.io.FileOutputStream(temp).use { stream ->
+                    stream.write(bytes)
+                    stream.flush()
+                    stream.fd.sync()
+                }
+                if (!temp.renameTo(target)) {
+                    runCatching { temp.delete() }
+                    return@runCatching false
+                }
+            } catch (writeFailure: Throwable) {
                 runCatching { temp.delete() }
-                return@runCatching false
+                throw writeFailure
             }
             val directoryFd = android.system.Os.open(
                 target.parentFile?.absolutePath ?: return@runCatching false,
@@ -8157,12 +8178,64 @@ class DownloadOfflineFileManager(
             // identity equals the current canonical's and whose slot is free is THIS
             // operation's own unfinished reservation — its name is reused directly, never
             // duplicated. (A stale-identity pending entry was already released by the
-            // reconciliation; the allocation is manifest-aware regardless.)
+            // reconciliation; the allocation is manifest-aware regardless.) It stays the
+            // FIRST reuse priority: an unfinished reservation is resolved at its own name
+            // exactly once, so a completed copy can never strand it as a stale pending
+            // entry at the gate.
             val reused = existingManifest?.entries?.firstOrNull {
                 it.state == QuarantineEntryState.PENDING &&
                     it.sha256Hex == payloadSha256 &&
                     quarantinedSlotKind(recordFile, it.slotName) == QuarantineSlotKind.MOVED &&
                     !slotExistsExcludingSymlinks(IOFile(recordFile.parentFile, it.slotName))
+            }
+            if (reused == null) {
+                // THE VERIFIED-SLOT REUSE (review-50 H2): an existing entry of THIS
+                // operation recording THIS payload's identity whose slot is PRESENT and
+                // VERIFIED (NOFOLLOW + the sha re-checked) means the preservation already
+                // exists durably — the reserve/copy/commit steps are SKIPPED entirely (no
+                // new allocation, no repeat copy, NO replay growth: N passes with a
+                // persistent fresh-read/delete/fsync failure produce exactly one slot and
+                // one entry). The required directories are re-acknowledged and the phase
+                // is made durably COMMITTED (a promotable PENDING via the upsert's one
+                // allowed transition) BEFORE the final fresh-read identity check, the
+                // cancellation observation, and the conditional delete — a changed
+                // canonical is never deleted (unchanged). Existing multiple slots are
+                // never silently forgotten: the gate verifies every present slot.
+                val verified = existingManifest?.entries?.firstOrNull {
+                    it.sha256Hex == payloadSha256 && run {
+                        val candidate = IOFile(recordFile.parentFile, it.slotName)
+                        slotExistsExcludingSymlinks(candidate) && slotMatchesManifest(candidate, payloadSha256)
+                    }
+                }
+                if (verified != null) {
+                    // THE EXECUTING CONTEXT BEFORE THE FIRST BLOCKING ACK (the review-48
+                    // F3 / review-49 G4 discipline).
+                    checkCancelled()
+                    // THE REQUIRED DIRECTORIES RE-ACKNOWLEDGED (review-50 H2): the slots
+                    // and the manifest share the record's parent directory — one
+                    // acknowledgment covers the evidence's and the phase's durability
+                    // before anything is retired.
+                    if (!UploadFile.synchronizeDirectoryEntry(recordFile.parentFile)) return false
+                    if (verified.state == QuarantineEntryState.PENDING &&
+                        !upsertQuarantineManifestEntry(
+                            recordFile, target, scope, verified.slotName,
+                            QuarantineEntryState.COMMITTED, payloadSha256,
+                        )
+                    ) {
+                        return false
+                    }
+                    // THE FRESH-READ IDENTITY BEFORE THE DELETE (review-49 G3): the
+                    // canonical must still hash to the preserved identity — a changed
+                    // canonical is never deleted.
+                    val currentBytes = runCatching { observationFile.readBytes() }.getOrNull() ?: return false
+                    if (sha256HexOfBytes(currentBytes) != payloadSha256) return false
+                    // THE EXECUTING CONTEXT AFTER THE LAST BLOCKING VALIDATION, BEFORE
+                    // THE DELETE (review-49 G4) — the check is OUTSIDE the runCatching.
+                    checkCancelled()
+                    if (!runCatching { observationFile.delete() }.getOrDefault(false)) return false
+                    if (!UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) return false
+                    return !observationFile.exists()
+                }
             }
             val slotFile = if (reused != null) {
                 IOFile(recordFile.parentFile, reused.slotName)
