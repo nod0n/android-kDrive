@@ -3903,7 +3903,17 @@ class DownloadOfflineFileManager(
         private sealed class OldObservationCapture {
             object Absent : OldObservationCapture()
 
+            /** A CURRENT-format old observation — its publication-id binding can be
+             * re-established coherently at the restoration. */
             class Valid(val text: String) : OldObservationCapture()
+
+            /** A LEGACY-format old observation (review-46 D2): its binding is location-only
+             * and can never be established coherently for a new publication id — it is
+             * QUARANTINED at restore (preserved under the operation-owned recovery path,
+             * the canonical name left absent), never re-bound (a manufactured binding) and
+             * never left at the canonical name (a later capture would promote it to
+             * evidence it never carried, or fail closed forever). */
+            class Legacy(val text: String) : OldObservationCapture()
 
             class Damaged(val rawBytes: ByteArray) : OldObservationCapture()
 
@@ -4167,6 +4177,11 @@ class DownloadOfflineFileManager(
             val oldObservationEncoded = when (oldObservation) {
                 is OldObservationCapture.Absent -> "A" to ""
                 is OldObservationCapture.Valid -> oldObservation.text to ""
+                // THE INTRINSIC FORMAT IS NOT STORED (review-46 D2): a LEGACY capture is
+                // carried exactly like a CURRENT one — the format is the text's own
+                // grammar, re-derived at decode (capturedOldObservation), which yields
+                // the explicit Legacy state (quarantined at restore, never re-bound).
+                is OldObservationCapture.Legacy -> oldObservation.text to ""
                 is OldObservationCapture.Damaged -> "D" to oldObservation.rawBytes.toHexString()
                 OldObservationCapture.Unreadable -> return@runCatching false
             }
@@ -4223,6 +4238,11 @@ class DownloadOfflineFileManager(
             !oldObservationCaptured -> null
             oldObservationDamagedBytes != null -> OldObservationCapture.Damaged(oldObservationDamagedBytes)
             oldObservationText == null -> OldObservationCapture.Absent
+            // THE CARRIED TEXT'S OWN GRAMMAR DECIDES (review-46 D2): the format is
+            // intrinsic to the observation — a LEGACY capture decodes as the explicit
+            // Legacy state (quarantined at restore), a CURRENT one as Valid.
+            parseObservationBinding(oldObservationText)?.format == ObservationFormat.LEGACY ->
+                OldObservationCapture.Legacy(oldObservationText)
             else -> OldObservationCapture.Valid(oldObservationText)
         }
 
@@ -6617,6 +6637,7 @@ class DownloadOfflineFileManager(
                                 record.restorationPublicationId,
                                 record.expectedPublicationRecordText,
                                 record.attemptedObservationText,
+                                record.recordFile,
                             )
                         ) {
                             return false
@@ -6640,6 +6661,7 @@ class DownloadOfflineFileManager(
                                 restorationId,
                                 record.expectedPublicationRecordText,
                                 record.attemptedObservationText,
+                                record.recordFile,
                             )
                         ) {
                             return false
@@ -6666,6 +6688,7 @@ class DownloadOfflineFileManager(
                             null,
                             record.expectedPublicationRecordText,
                             record.attemptedObservationText,
+                            record.recordFile,
                         )
                     ) {
                         return false
@@ -6891,10 +6914,16 @@ class DownloadOfflineFileManager(
             val rawBytes = runCatching { observationFile.readBytes() }.getOrNull()
                 ?: return OldObservationCapture.Unreadable
             val text = runCatching { String(rawBytes, Charsets.UTF_8).trim() }.getOrNull()
-            return if (!text.isNullOrEmpty() && parseObservationBinding(text) != null) {
-                OldObservationCapture.Valid(text)
-            } else {
-                OldObservationCapture.Damaged(rawBytes)
+            val parsed = text?.takeIf { it.isNotEmpty() }?.let { parseObservationBinding(it) }
+            // THE INTRINSIC FORMAT IS DISTINGUISHED (review-46 D2): the captured text's OWN
+            // grammar decides — a CURRENT observation's id binding can be re-established
+            // coherently at the restoration; a LEGACY observation's location-only binding
+            // can never be, and is carried as the explicit Legacy state (quarantined at
+            // restore, never re-bound, never left at the canonical name).
+            return when {
+                parsed == null -> OldObservationCapture.Damaged(rawBytes)
+                parsed.format == ObservationFormat.CURRENT -> OldObservationCapture.Valid(text)
+                else -> OldObservationCapture.Legacy(text)
             }
         }
 
@@ -6911,7 +6940,14 @@ class DownloadOfflineFileManager(
          * the VALIDATED TRANSITION. Over an UNPROVEN restoration (no publication at all)
          * a stale carried observation's own publication is provably gone: it is retired
          * and its absence verified, never re-bound to an invented identity and never kept
-         * to block every later capture. */
+         * to block every later capture. THE COHERENT QUARANTINE (review-46 D2): a LEGACY
+         * old observation is never re-bound (its location-only binding cannot be
+         * established for a new publication id without MANUFACTURING evidence) and no
+         * unclassifiable leftover is left at the canonical name (a dead-id CURRENT
+         * observation there fails every later capture) — both are MOVED verbatim to the
+         * operation-owned recovery path ([quarantineObservation]); the canonical name is
+         * left honestly absent. [recordFile] is this operation's own recovery record —
+         * the quarantine base is derived from it. */
         private fun restoreOldObservationState(
             context: Context,
             target: IOFile,
@@ -6919,6 +6955,7 @@ class DownloadOfflineFileManager(
             restorationPublicationId: Long?,
             failedOperationProofText: String?,
             attemptedObservationText: String?,
+            recordFile: IOFile,
         ): Boolean {
             val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
             return when (oldObservation) {
@@ -6928,8 +6965,8 @@ class DownloadOfflineFileManager(
                     // retirement. A Failed at either rung — the eligible (or
                     // unclassifiable) evidence's read/delete/fsync/verification failed —
                     // RETAINS: the retry owner is preserved, never collapsed into a
-                    // reported success. A NotEligible leftover is the preserved unrelated
-                    // evidence (the R4 policy below) and the branch completes.
+                    // reported success. A NotEligible leftover advances to the next rung
+                    // or takes the coherent quarantine (the D2 policy below).
                     when (removeObservationBoundTo(context, target, failedPublicationId)) {
                         ObservationRetirement.Retired, ObservationRetirement.Absent ->
                             // The failed attempt's observation (or none) — the obligation is met.
@@ -6947,20 +6984,43 @@ class DownloadOfflineFileManager(
                             // residue, removable by exact-text identity, never by
                             // parseability). A leftover that matches neither identity —
                             // another publication's, a LEGACY sidecar, an unparseable
-                            // payload — is NOT this operation's evidence to retire: parsing
-                            // alone is never permission and the restoration proof's
-                            // existence is never permission either. It is PRESERVED
-                            // UNTOUCHED while the coherent rollback completes — its
-                            // disposition belongs to the operation that owns it; no absence
-                            // is fabricated and the unknown propagates as the preserved
-                            // state itself (a later capture on such a path fails closed —
-                            // the honest consequence of evidence this operation cannot
-                            // classify). The branch completes only through the typed
-                            // outcomes: retired, acknowledged-absent, or preserved-unknown.
+                            // payload — is NOT this operation's evidence to retire:
+                            // parsing alone is never permission and the restoration
+                            // proof's existence is never permission either. THE COHERENT
+                            // QUARANTINE (review-46 D2) is its disposition: it is MOVED
+                            // verbatim to the operation-owned recovery path — never
+                            // deleted (no arbitrary delete), never left at the canonical
+                            // name (a dead-id CURRENT observation there fails every later
+                            // capture forever — the original #4 stuck state; a LEGACY
+                            // sidecar there is promoted to evidence it never carried) —
+                            // and the canonical name is left honestly absent. A failed
+                            // move RETAINS. The branch completes only through the typed
+                            // outcomes: retired, acknowledged-absent, or quarantined.
                             ObservationRetirement.Failed -> false
-                            ObservationRetirement.Retired, ObservationRetirement.Absent, ObservationRetirement.NotEligible -> true
+                            // THE EXACT OPERATION OBLIGATION (review-45 R4) meets THE
+                            // COHERENT QUARANTINE (review-46 D2): a leftover matching
+                            // neither identity is no longer left at the canonical name —
+                            // a dead-id CURRENT observation there fails every later
+                            // capture forever (the original #4 stuck state), and a LEGACY
+                            // sidecar is promoted to evidence it never carried. It is
+                            // MOVED to the operation-owned recovery path (bytes preserved,
+                            // the canonical name honestly absent); a failed move RETAINS.
+                            ObservationRetirement.NotEligible ->
+                                quarantineObservation(context, target, recordFile)
+                            ObservationRetirement.Retired, ObservationRetirement.Absent -> true
                         }
                     }
+                }
+                is OldObservationCapture.Legacy -> {
+                    // THE LEGACY QUARANTINE (review-46 D2): a LEGACY observation's
+                    // binding is location-only — re-binding it to the restoration's
+                    // publication id would MANUFACTURE evidence it never carried, and
+                    // leaving it at the canonical name makes the next relocation capture
+                    // it as Valid (LEGACY = id-bound-at-location) and re-bind it again.
+                    // The captured text is moved VERBATIM to the operation-owned recovery
+                    // path (never deleted, never re-bound, never read as absence); the
+                    // canonical name is left honestly absent. A failed move RETAINS.
+                    quarantineObservation(context, target, recordFile)
                 }
                 is OldObservationCapture.Valid -> {
                     if (restorationPublicationId != null) {
@@ -6974,9 +7034,10 @@ class DownloadOfflineFileManager(
                         // — the capture, not parseability, is its authority), THEN the
                         // record's captured ATTEMPT text (a LEGACY-format failed attempt's
                         // residue, exact-text identity). A Failed at any rung RETAINS; a
-                        // NotEligible leftover advances the ladder or is preserved —
-                        // unrelated evidence is never retired and no default
-                        // false→complete exists.
+                        // NotEligible leftover advances the ladder or is QUARANTINED to
+                        // the owned recovery path (review-46 D2 — never left at the
+                        // canonical name to block or be promoted); unrelated evidence is
+                        // never retired and no default false→complete exists.
                         when (removeObservationBoundTo(context, target, failedPublicationId)) {
                             ObservationRetirement.Failed -> false
                             else -> when (removeObservationExactText(context, target, oldObservation.text)) {
@@ -6985,7 +7046,13 @@ class DownloadOfflineFileManager(
                                     removeObservationExactText(context, target, attemptedObservationText)
                                 ) {
                                     ObservationRetirement.Failed -> false
-                                    ObservationRetirement.Retired, ObservationRetirement.Absent, ObservationRetirement.NotEligible -> true
+                                    // THE COHERENT QUARANTINE (review-46 D2), as in the
+                                    // null/Absent branch: the unclassifiable leftover is
+                                    // moved to the owned recovery path, never left to
+                                    // block or be promoted; a failed move RETAINS.
+                                    ObservationRetirement.NotEligible ->
+                                        quarantineObservation(context, target, recordFile)
+                                    ObservationRetirement.Retired, ObservationRetirement.Absent -> true
                                 }
                             }
                         }
@@ -7011,6 +7078,55 @@ class DownloadOfflineFileManager(
                 }
                 OldObservationCapture.Unreadable -> false
             }
+        }
+
+        /**
+         * THE COHERENT QUARANTINE (review-46 D2): an observation that cannot bind
+         * coherently to the restored generation — a LEGACY sidecar (location-only
+         * binding: re-binding it to the restoration's publication id would MANUFACTURE
+         * evidence it never carried), a dead-id CURRENT observation (every later capture
+         * fails closed on it — the original #4 stuck state), or an unparseable payload —
+         * is MOVED out of the canonical name to a deterministic OPERATION-OWNED path
+         * derived from this operation's recovery record. THE BYTES ARE PRESERVED
+         * VERBATIM (a rename, never a deletion — no arbitrary delete), the canonical
+         * `.obs` name is left HONESTLY ABSENT (a later capture sees absence, not a
+         * promotion or a permanent block), and the quarantined evidence remains
+         * recoverable under the owned recovery state. The move is atomic (the registry
+         * and the staging container are siblings under the offline storage's parent —
+         * the same filesystem by construction), durably acknowledged in BOTH parents,
+         * and verified both ways. A failed move RETAINS (the caller keeps the recovery
+         * state and the sweep replays). An absent canonical name first establishes its
+         * directory acknowledgment (the D1 doctrine: exists() is never the
+         * acknowledgment) and is already the honest restored state.
+         * HONEST LIMITS: quarantined files are inert to every sweep enumeration (which
+         * keys on exact `.recovery`/`.scope` suffixes) and are never automatically
+         * restored or reconciled — their disposition belongs to the operator, at the
+         * recorded operation-owned name; a per-target journal record name means
+         * sequential quarantines for the same target allocate increasing numeric
+         * suffixes so earlier preserved evidence is never clobbered.
+         */
+        private fun quarantineObservation(context: Context, target: IOFile, recordFile: IOFile): Boolean {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!observationFile.exists()) {
+                return UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)
+            }
+            // THE COLLISION-FREE OWNED NAME: the record-derived base never overwrites a
+            // prior quarantine — the first free numbered suffix is allocated, so earlier
+            // quarantined evidence is preserved, never clobbered.
+            var quarantineFile = IOFile(recordFile.path + ".obs.q")
+            var suffix = 2
+            while (quarantineFile.exists()) {
+                quarantineFile = IOFile(recordFile.path + ".obs.q" + suffix)
+                suffix++
+            }
+            val moved = runCatching { observationFile.renameTo(quarantineFile) }.getOrDefault(false)
+            if (!moved || !quarantineFile.exists() || observationFile.exists()) return false
+            // THE DIRECTORY ACKNOWLEDGMENTS: the source parent's entry (the removal) and,
+            // when distinct, the destination parent's entry (the appearance) are both
+            // established before the move is reported.
+            if (!UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) return false
+            return quarantineFile.parentFile == observationFile.parentFile ||
+                UploadFile.synchronizeDirectoryEntry(quarantineFile.parentFile)
         }
 
         /** THE TYPED OBSERVATION RETIREMENT OUTCOME (review-46 D1): the retirement's honest
@@ -7282,6 +7398,7 @@ class DownloadOfflineFileManager(
                         restorationPublicationId,
                         failedOperationProofText,
                         attemptedObservationText,
+                        recordFile,
                     )
                 ) {
                     return@runCatching false
