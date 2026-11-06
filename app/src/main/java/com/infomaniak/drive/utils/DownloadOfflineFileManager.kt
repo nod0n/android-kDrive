@@ -257,6 +257,13 @@ class DownloadOfflineFileManager(
         // SAF's ancestry decisions (delete D after finding no owned descendants, then this
         // phase commits F under the deleted D). Order: intent monitor → file lock →
         // Realm/FS mutation — never the monitor from inside an already-held file lock.
+        // WHICH DEFERRAL PRODUCED committed == false (the account-first failure's
+        // misleading breadcrumb, 2026-11-06): the two destination-chain gates below defer
+        // with the SAME false return as the genuine CAS loss, so the shared generic log
+        // wrongly claimed a concurrent-writer race on every chain deferral. The chain
+        // gates set this flag and keep their OWN accurate messages; the generic log fires
+        // only for the actual race.
+        var deferredOnIncompleteChain = false
         val committed = synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
                 // THE EXECUTING CONTEXT INSIDE THE ACQUIRED SECTION (issue: round 29 #2's
@@ -277,22 +284,13 @@ class DownloadOfflineFileManager(
                 // the check returned false, leaving the old row at the emptied location).
                 // The same validation is re-applied to the boundary-committed identity
                 // before the metadata commit.
-                fun destinationChainExists(parentId: Int, realm: Realm): Boolean {
-                    var currentId: Int? = parentId
-                    val visited = mutableSetOf<Int>()
-                    while (currentId != null && currentId > 0) {
-                        if (!visited.add(currentId)) return false
-                        if (FileController.getFileById(realm, currentId) == null) return false
-                        currentId = FileController.getFileById(realm, currentId)?.parentId
-                    }
-                    return true
-                }
                 val prePreservationChainOk = remoteFile.parentId <= 0 ||
                     FileController.getRealmInstance(userDrive).use { realm ->
                         runCatching { realm.refresh() }
-                        destinationChainExists(remoteFile.parentId, realm)
+                        FileController.destinationChainExists(realm, remoteFile.parentId)
                     }
                 if (!prePreservationChainOk) {
+                    deferredOnIncompleteChain = true
                     SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its destination chain is incomplete")
                     return@withFileLock false
                 }
@@ -344,9 +342,10 @@ class DownloadOfflineFileManager(
                 // write.
                 val commitChainOk = commitFile.parentId <= 0 ||
                     FileController.getRealmInstance(userDrive).use { realm ->
-                        destinationChainExists(commitFile.parentId, realm)
+                        FileController.destinationChainExists(realm, commitFile.parentId)
                     }
                 if (!commitChainOk) {
+                    deferredOnIncompleteChain = true
                     SentryLog.i(TAG, "Deferring refresh of file ${file.id}: its destination chain broke during preservation")
                     return@withFileLock false
                 }
@@ -370,7 +369,11 @@ class DownloadOfflineFileManager(
             }
         }
         if (!committed) {
-            SentryLog.i(TAG, "Deferring refresh of file ${file.id}: a newer generation was committed while the metadata response was in flight")
+            // The chain-deferral arms already logged their own accurate messages; the
+            // generic concurrent-writer wording fires only for the actual CAS loss.
+            if (!deferredOnIncompleteChain) {
+                SentryLog.i(TAG, "Deferring refresh of file ${file.id}: a newer generation was committed while the metadata response was in flight")
+            }
             return ListenableWorker.Result.failure()
         }
 

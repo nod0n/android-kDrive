@@ -1629,6 +1629,15 @@ object FileController {
             // converge — the previous fixed hop budgets (32, then 512) permanently rejected
             // deeper complete chains and left holes above the budget unreachable forever,
             // because every invocation restarted from the same descendant.
+            // THE DRIVE ROOT IS THE TERMINAL BOUNDARY (the account-first failure's root
+            // cause, 2026-11-06): the root row (id ROOT_ID) is a presentation boundary the
+            // listings never materialize (the root listing's saveRemoteFiles receives
+            // remoteFolder = null) and no other chain walk looks past it — the previous
+            // parentId<=0 termination demanded a cached root row with a non-positive
+            // parent, so every chain that reached the drive root deferred (the identical
+            // convention defect as the manager's destinationChainExists, fixed in the same
+            // round). A missing REAL intermediate parent or a cycle still defers.
+            if (parentId == ROOT_ID) return true
             if (!visited.add(parentId)) return false
             parentId = getFileById(realm, parentId)?.parentId ?: return false
         }
@@ -2400,11 +2409,27 @@ object FileController {
      * Whether [parentId]'s COMPLETE ancestor chain currently exists (issue: round 18 #24):
      * every ancestor of a destination — not just the immediate parent, whose own ancestry
      * could be missing — must be present before a commit may link rows beneath it.
+     *
+     * THE DRIVE ROOT IS THE TERMINAL BOUNDARY (the account-first failure's root cause,
+     * 2026-11-06): the root row (id ROOT_ID) is a presentation boundary the listings never
+     * materialize (the root listing's saveRemoteFiles receives remoteFolder = null and
+     * skips the insertion), and every other chain walk in the codebase terminates AT it
+     * (generatePath's folder.id == ROOT_ID, removeOrphanFiles' parentId > ROOT_ID,
+     * reachesRootOrIndependentRoot's currentId != ROOT_ID). The previous parentId<=0
+     * termination walked PAST the root and demanded a cached root row with a non-positive
+     * parent, so EVERY chain that reached the drive root deferred — the observed
+     * real-account signature (every bulk-offline download failed "its destination chain is
+     * incomplete" before any byte moved). The protections are unchanged: a missing REAL
+     * intermediate parent, a cycle, or any missing non-root row still defers; usableAncestryChain
+     * carries the identical convention fix. firstMissingAncestorId may still name the root
+     * as the next ancestry to resolve — harmless post-fix, since a validator stops AT the
+     * root whatever its row's shape.
      */
     internal fun destinationChainExists(realm: Realm, parentId: Int): Boolean {
         var currentId: Int? = parentId
         val visited = mutableSetOf<Int>()
         while (currentId != null && currentId > 0) {
+            if (currentId == ROOT_ID) return true
             if (!visited.add(currentId)) return false
             val row = getFileById(realm, currentId) ?: return false
             currentId = row.parentId
