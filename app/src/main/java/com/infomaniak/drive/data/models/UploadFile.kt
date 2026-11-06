@@ -1017,8 +1017,7 @@ open class UploadFile(
         ): Uri? {
             return runCatching {
                 val folder = IOFile(context.filesDir, OFFLINE_SNAPSHOTS_FOLDER)
-                val folderExisted = folder.exists()
-                if (!folderExisted && !folder.mkdirs()) return@runCatching null
+                if (!folder.exists() && !folder.mkdirs()) return@runCatching null
                 val snapshot = IOFile(folder, "offline_${fileId}_${driveId}_${UUID.randomUUID()}")
                 source.copyTo(snapshot, overwrite = true)
                 if (!snapshot.setLastModified(fileModifiedAt.time)) return@runCatching null
@@ -1026,12 +1025,16 @@ open class UploadFile(
                 // registration's success permits deleting the ORIGINAL edit — an
                 // unsynchronized copy could vanish in a crash while the upload record and
                 // the original's removal persist. The copied bytes' data and the directory
-                // entries (the snapshot's entry, and the snapshots directory's own entry
-                // when it was just created) are synchronized first. Any failure returns
-                // null — the caller never registers, never deletes the original.
+                // entries are synchronized first. Any failure returns null — the caller
+                // never registers, never deletes the original.
                 if (!synchronizeFileContents(snapshot)) return@runCatching null
                 if (!synchronizeDirectoryEntry(folder)) return@runCatching null
-                if (!folderExisted && !synchronizeDirectoryEntry(context.filesDir)) return@runCatching null
+                // THE PARENT ENTRY IS SYNCHRONIZED ON EVERY ACKNOWLEDGMENT (review-39 #2):
+                // a first attempt whose parent synchronization failed leaves the snapshots
+                // directory PRESENT — a retry must not read that existence as the durability
+                // acknowledgment that failed. The prerequisite is retried unconditionally;
+                // exists() never substitutes for the fsync acknowledgment.
+                if (!synchronizeDirectoryEntry(context.filesDir)) return@runCatching null
                 snapshot.toUri()
             }.getOrNull()
         }

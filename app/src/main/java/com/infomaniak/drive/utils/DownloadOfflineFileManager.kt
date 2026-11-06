@@ -3303,6 +3303,33 @@ class DownloadOfflineFileManager(
             IOFile(File.getOfflineFolder(context).parentFile, STAGING_FOLDER).apply { if (!exists()) mkdirs() }
 
         /**
+         * THE ORDERED DURABLE DESTINATION HIERARCHY (review-39 #2): every NEWLY CREATED
+         * ancestor of the publication target has its directory entry synchronized IN
+         * CREATION ORDER (topmost missing ancestor first, each inside its then-existing
+         * parent) — a multi-level mkdirs synchronized only at the final containing
+         * directory never establishes the intermediate entries. When the whole chain
+         * already exists, the immediate parent's entry is synchronized anyway: a previous
+         * attempt's unacknowledged creation is retried here, and exists() never
+         * substitutes for the durability acknowledgment. Returns false when any creation
+         * or synchronization fails; the caller retains instead of publishing.
+         */
+        internal fun ensureDurableDestinationHierarchy(target: IOFile): Boolean {
+            val missing = ArrayDeque<IOFile>()
+            var ancestor: IOFile? = target.parentFile
+            while (ancestor != null && !ancestor.exists()) {
+                missing.addFirst(ancestor)
+                ancestor = ancestor.parentFile
+            }
+            if (ancestor == null) return false
+            for (directory in missing) {
+                if (!directory.mkdir()) return false
+                if (!UploadFile.synchronizeDirectoryEntry(directory.parentFile)) return false
+            }
+            if (missing.isEmpty() && !UploadFile.synchronizeDirectoryEntry(target.parentFile)) return false
+            return true
+        }
+
+        /**
          * A unique staged file per transfer: identical downloads by concurrent workers (e.g. an
          * ancestor and a nested root) never collide (issue: round 3 #2).
          */
@@ -5796,6 +5823,15 @@ class DownloadOfflineFileManager(
             // propagates; the untouched target keeps its bytes and proof, and the sweep
             // reconciles the (never-mutated) recovery state.
             checkCancelled()
+            // THE DESTINATION HIERARCHY IS DURABLY CREATED (review-39 #2): every newly
+            // created ancestor's entry is synchronized in creation order BEFORE the
+            // replacement — the rename publishes into a hierarchy whose durability is
+            // established, never inferred from existence; a previously unacknowledged
+            // creation is retried here.
+            if (!ensureDurableDestinationHierarchy(target)) {
+                runCatching { staged.delete() }
+                return PublicationOutcome.FAILED
+            }
             // The OLD provenance is invalidated BEFORE the bytes are replaced (issue: round
             // 16 #12): a crash between the rename and the new sidecar write must never leave
             // the new bytes carrying the previous generation's provenance.
@@ -6168,6 +6204,13 @@ class DownloadOfflineFileManager(
                             // publication must not proceed from it to the proof invalidation
                             // and the rename.
                             coroutineContext.ensureActive()
+                            // THE DESTINATION HIERARCHY IS DURABLY CREATED (review-39 #2), as
+                            // in the coordinated publication: the rename publishes into a
+                            // hierarchy whose creation is acknowledged in order.
+                            if (!ensureDurableDestinationHierarchy(target)) {
+                                runCatching { staged.delete() }
+                                PublicationOutcome.FAILED
+                            } else {
                             deletePublishedProvenance(context, target)
                             when {
                                 staged.renameTo(target) &&
@@ -6240,6 +6283,7 @@ class DownloadOfflineFileManager(
                                     }
                                     PublicationOutcome.FAILED
                                 }
+                            }
                             }
                         }
                     }

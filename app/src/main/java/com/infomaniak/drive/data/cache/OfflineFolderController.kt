@@ -805,6 +805,13 @@ object OfflineFolderController {
                                 ) {
                                     return@runCatching false
                                 }
+                                // THE DESTINATION HIERARCHY IS DURABLY CREATED (review-39 #2):
+                                // the relocation's rename publishes into a hierarchy whose
+                                // creation is acknowledged in order, never inferred from
+                                // existence.
+                                if (!DownloadOfflineFileManager.ensureDurableDestinationHierarchy(target)) {
+                                    return@runCatching false
+                                }
                                 // THE PUBLISHED BYTES' DIRECTORY ENTRY IS DURABLE (review-38
                                 // #2): the relocation's rename is persisted BEFORE the
                                 // completion rebinds the observation — a

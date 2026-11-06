@@ -1112,7 +1112,14 @@ class MainViewModel(
                                                                 stagedHash != null && stagedHash == sourceHash
                                                             if (!stagedOk) return@runCatching false
                                                             stagedTransfer.setLastModified(sourceBytes.lastModified())
-                                                            destinationBytes.parentFile?.mkdirs()
+                                                            // THE DESTINATION HIERARCHY IS DURABLY CREATED
+                                                            // (review-39 #2): every newly created ancestor's
+                                                            // entry is synchronized in creation order before the
+                                                            // transfer's rename publishes into it; exists() never
+                                                            // substitutes for the durability acknowledgment.
+                                                            if (!DownloadOfflineFileManager.ensureDurableDestinationHierarchy(destinationBytes)) {
+                                                                return@runCatching false
+                                                            }
                                                             // THE PROOF CLASSIFIES BEFORE ANY DESTINATION EFFECT
                                                             // (review-34 #6): the source's proof is read against
                                                             // the ACTUAL source bytes — a proof whose hash
