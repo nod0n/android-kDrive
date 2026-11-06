@@ -3150,6 +3150,13 @@ class DownloadOfflineFileManager(
                     // generation) and the relocation state RETAINS the original proof for
                     // the sweep's replay onto the moved bytes.
                     ProofRelocationFlow.STAGED_PUBLICATION -> {
+                        // THE DISPOSAL RESULT IS ACKNOWLEDGED (review-45 R2): a failed
+                        // disposal leaves the journal retained for the sweep's replay —
+                        // the designed convergence (the state's captured source-bound
+                        // proof is the replay authority, independent of the live source
+                        // record). The vacated source record is still invalidated per the
+                        // staged contract; the prepare's failure return propagates the
+                        // abort to every caller either way.
                         disposeRecoveryRecord(recordFile)
                         deletePublishedProvenance(context, source)
                     }
@@ -3179,7 +3186,14 @@ class DownloadOfflineFileManager(
                         ) {
                             return false
                         }
+                        // THE DISPOSAL RESULT IS ACKNOWLEDGED (review-45 R2): a failed
+                        // disposal retains the journal for the sweep's replay — the
+                        // designed convergence; the prepare's failure return propagates
+                        // the abort to every caller either way, and the retained state
+                        // (with the restored prior destination evidence) is exactly the
+                        // sweep's validated retry input.
                         runCatching { proofRelocationRecordFile(context, target)?.let { disposeRecoveryRecord(it) } }
+                            .getOrDefault(false)
                     }
                 }
                 return false
@@ -3189,6 +3203,13 @@ class DownloadOfflineFileManager(
             if (readPublishedProvenance(context, target) == null) {
                 when (flow) {
                     ProofRelocationFlow.STAGED_PUBLICATION -> {
+                        // THE DISPOSAL RESULT IS ACKNOWLEDGED (review-45 R2): a failed
+                        // disposal leaves the journal retained for the sweep's replay —
+                        // the designed convergence (the state's captured source-bound
+                        // proof is the replay authority, independent of the live source
+                        // record). The vacated source record is still invalidated per the
+                        // staged contract; the prepare's failure return propagates the
+                        // abort to every caller either way.
                         disposeRecoveryRecord(recordFile)
                         deletePublishedProvenance(context, source)
                     }
@@ -3211,7 +3232,14 @@ class DownloadOfflineFileManager(
                         ) {
                             return false
                         }
+                        // THE DISPOSAL RESULT IS ACKNOWLEDGED (review-45 R2): a failed
+                        // disposal retains the journal for the sweep's replay — the
+                        // designed convergence; the prepare's failure return propagates
+                        // the abort to every caller either way, and the retained state
+                        // (with the restored prior destination evidence) is exactly the
+                        // sweep's validated retry input.
                         runCatching { proofRelocationRecordFile(context, target)?.let { disposeRecoveryRecord(it) } }
+                            .getOrDefault(false)
                     }
                 }
                 return false
@@ -5854,10 +5882,14 @@ class DownloadOfflineFileManager(
                                                 // cleared; a still-failing barrier retains.
                                                 val coherent = proofEstablished && observationEstablished &&
                                                     payloadDurabilityEstablished(target)
-                                                if (coherent) {
-                                                    disposeRecoveryRecord(recordFile)
-                                                }
-                                                coherent
+                                                // THE DISPOSAL RESULT IS THE ARM'S (review-45 R2): a
+                                                // coherent state whose journal disposal failed is NOT
+                                                // a resolved state — the journal still governs the
+                                                // path and the sweep must replay it; the arm returns
+                                                // the acknowledged disposal, never a success with the
+                                                // record retained. A failed disposal retains
+                                                // everything (the backup/owned-retry discipline).
+                                                coherent && disposeRecoveryRecord(recordFile)
                                                     }.getOrRethrowCancellation(false)
                                                     else -> runCatching {
                                                         // THE OWNER-CHECKED ROLLBACK (review-34 #3): the
@@ -5997,8 +6029,13 @@ class DownloadOfflineFileManager(
                                                                 IOFile(provenanceFileFor(context, target).path + ".obs").delete()
                                                             }
                                                         }
+                                                        // THE DISPOSAL RESULT IS THE ARM'S (review-45
+                                                        // R2): a failed disposal leaves the journal
+                                                        // governing the path — the rollback is never
+                                                        // reported complete while the record remains;
+                                                        // the sweep replays it (the steps above are
+                                                        // idempotent, the retained state converges).
                                                         disposeRecoveryRecord(recordFile)
-                                                        true
                                                     }.getOrRethrowCancellation(false)
                                                 }
                                             }
@@ -6483,6 +6520,15 @@ class DownloadOfflineFileManager(
                                     currentEvidence.record.publicationId == record.restorationPublicationId)
                     }
                     if (!rewriteAuthorized) return false
+                    // THE EXECUTING CONTEXT AFTER THE LAST BLOCKING VALIDATION (review-45
+                    // R3): restorationEstablished's certifying hash runs only when the ids
+                    // match and can block — the round-44 check above it sits BEFORE that
+                    // hash. The context is observed again HERE, immediately before the
+                    // first effect of either sub-path (the observation restore on the
+                    // already-restored path; the identity persist and the proof rewrite
+                    // on the other); the throw propagates and the durable state is
+                    // retained.
+                    checkCancelled()
                     if (restorationEstablished) {
                         // THE ALREADY-RESTORED CONVERGENCE (review-44 N2): the persisted
                         // restoration's proof and bytes are verified by the gate above —
