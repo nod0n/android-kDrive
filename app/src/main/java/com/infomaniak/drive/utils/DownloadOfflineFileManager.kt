@@ -7451,8 +7451,10 @@ class DownloadOfflineFileManager(
          * skips) / "S" superseded-AMBIGUOUS / "L" legacy-ambiguous. BACKWARD COMPATIBILITY:
          * the reader accepts OBSQ4 and every older format (OBSQ3/V2/V1, parsed without the
          * R letter — an R under a non-OBSQ4 header is UNREADABLE, fail-closed); the writer
-         * emits OBSQ4 only; an OLDER build reading an OBSQ4 manifest fails the R parse →
-         * UNREADABLE → retain — also fail-closed. An S read from ANY header is AMBIGUOUS
+         * emits OBSQ4 only; an OLDER build reading an OBSQ4 manifest fails at the HEADER
+         * check — the OBSQ4 constant is unknown to it — → UNREADABLE → retain, WITH OR
+         * WITHOUT an R entry (CORRECTING the round-51 claim of an "R parse" failure:
+         * fail-closed either way, but the failure point is the header, review-52 K-docs). An S read from ANY header is AMBIGUOUS
          * (review-51 J1 — an inherited rename-era S that an OBSQ3-era build carried into an
          * OBSQ3 manifest is indistinguishable from a protocol release BY THE LETTER ALONE,
          * so the state's meaning is conservative everywhere and only R is trusted). A V1/V2
@@ -7767,18 +7769,23 @@ class DownloadOfflineFileManager(
             }
         }
 
-        /** THE VERIFIED-CARRIER PROMOTION (review-51 J2): advances an existing entry's
-         * phase to COMMITTED — the durability commitment the canonical delete rests on —
-         * ONLY after the helper itself (never trusting the caller) has re-verified the
-         * slot's ACTUAL bytes: the NOFOLLOW existence check, the sha re-hash against the
-         * SAME recorded identity, and the slot's directory acknowledgment. NEVER an
-         * unconditional weak→M transition: the verification IS the condition, and the
-         * transition applies only at the SAME recorded sha, the SAME owned slot name, and
-         * the manifest's own validated scope binding (read + bound here). The manifest
-         * rewrite passes its readback; a failure leaves the entry's old state untouched
-         * (the caller retains — no M downgrade, no lost ambiguity). An already-COMMITTED
-         * entry is the idempotent success. A missing or unverifiable slot returns false —
-         * a phase is never promoted on metadata alone. */
+        /** THE VERIFIED-CARRIER PROMOTION (review-51 J2, the ordering review-52 K-promote):
+         * advances an existing entry's phase to COMMITTED — the durability commitment the
+         * canonical delete rests on. THE ORDER IS READ → BIND → ENTRY-VALIDATE → SLOT →
+         * PHASE: the manifest is read and bound to the target/operation/scope, and the
+         * recorded entry is validated at the SAME slot name and sha, BEFORE ANY SLOT I/O —
+         * a second caller can never trigger slot I/O on an unbound manifest. Only then the
+         * helper itself (never trusting the caller) re-verifies the slot's ACTUAL bytes:
+         * the NOFOLLOW existence check, the sha re-hash against the SAME recorded
+         * identity, and the slot's directory acknowledgment. NEVER an unconditional weak→M
+         * transition: the verification IS the condition, and the transition applies only
+         * at the SAME recorded sha, the SAME owned slot name, and the manifest's own
+         * validated scope binding. The manifest rewrite passes its readback; a failure
+         * leaves the entry's old state untouched (the caller retains — no M downgrade, no
+         * lost ambiguity). An already-COMMITTED entry is the idempotent success — AFTER its
+         * own slot re-verification (a slot lost between the caller's lookup and this
+         * helper retains instead of deleting). A missing or unverifiable slot returns
+         * false — a phase is never promoted on metadata alone. */
         private fun promoteVerifiedCarrier(
             recordFile: IOFile,
             target: IOFile,
@@ -7786,10 +7793,7 @@ class DownloadOfflineFileManager(
             slotName: String,
             sha256Hex: String,
         ): Boolean {
-            val slotFile = IOFile(recordFile.parentFile, slotName)
-            if (!slotExistsExcludingSymlinks(slotFile)) return false
-            if (!slotMatchesManifest(slotFile, sha256Hex)) return false
-            if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
+            // READ + BIND + ENTRY VALIDATION BEFORE ANY SLOT I/O (review-52 K-promote).
             return when (val state0 = readQuarantineManifest(recordFile)) {
                 is QuarantineManifestState.Unreadable -> false
                 is QuarantineManifestState.Absent -> false
@@ -7798,6 +7802,17 @@ class DownloadOfflineFileManager(
                     if (!manifestBindsToOperation(manifest, target, recordFile, scope)) return false
                     val existing = manifest.entries.firstOrNull { it.slotName == slotName } ?: return false
                     if (existing.sha256Hex != sha256Hex) return false
+                    // THE ACTUAL SLOT VERIFICATION (review-51 J2, kept): the NOFOLLOW
+                    // existence, the re-hash against the SAME recorded identity, and the
+                    // slot's directory acknowledgment — a phase is never promoted on
+                    // metadata alone.
+                    val slotFile = IOFile(recordFile.parentFile, slotName)
+                    if (!slotExistsExcludingSymlinks(slotFile)) return false
+                    if (!slotMatchesManifest(slotFile, sha256Hex)) return false
+                    if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
+                    // THE PHASE: an already-COMMITTED entry is the idempotent success;
+                    // otherwise the NARROW write to M at the same recorded sha/slot/scope,
+                    // with the readback.
                     if (existing.state == QuarantineEntryState.COMMITTED) return true
                     writeQuarantineManifest(
                         recordFile,
