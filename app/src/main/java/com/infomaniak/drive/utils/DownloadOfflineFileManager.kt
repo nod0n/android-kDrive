@@ -10105,7 +10105,11 @@ class DownloadOfflineFileManager(
                     staged,
                     payloadIdentity,
                     userDrive,
-                    unresolvedRecord = explicitUnresolvedGeneration,
+                    // THE WRITER AND THE GATE AGREE BY CONSTRUCTION: the record's spin
+                    // state is the publication's COMPUTED unresolved decision (the
+                    // both-unknown arm included), not the explicit flag alone — the
+                    // promotion flow's !generationResolved precedent.
+                    unresolvedRecord = unresolvedGeneration,
                     destination = target,
                     serverHash = established?.serverHash,
                     contentHashOverride = established?.localSha256,
@@ -10202,7 +10206,7 @@ class DownloadOfflineFileManager(
                             staged,
                             // THE INTENDED DESTINATION BINDING (issue: round 32 #5).
                             expectedObservationLocation = target.absolutePath,
-                            requireObservation = explicitUnresolvedGeneration,
+                            requireObservation = unresolvedGeneration,
                         )
                         attemptedObservationCaptureText =
                             (capturedAttempt as? AttemptedObservationCapture.Valid)?.text
@@ -10273,10 +10277,10 @@ class DownloadOfflineFileManager(
                         sharedWithMe = userDrive.sharedWithMe,
                         storageKind = destinationStorageKind(provenanceContext, file, target, userDrive),
                         // EXPLICIT OPERATION EVIDENCE (issue: round 32 #4): the observation
-                        // requirement comes from this publication's own unresolved flag —
+                        // requirement comes from this publication's own unresolved decision —
                         // never version == 0, which a verified-uploaded/version-less proof
                         // shares.
-                        requireObservation = explicitUnresolvedGeneration,
+                        requireObservation = unresolvedGeneration,
                     )
                 ) {
                     val restored = recoveryFile != null && recoveryRecordFile(provenanceContext, recoveryFile)
