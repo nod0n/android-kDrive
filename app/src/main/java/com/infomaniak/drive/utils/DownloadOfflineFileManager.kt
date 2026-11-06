@@ -4059,6 +4059,7 @@ class DownloadOfflineFileManager(
             row: File,
             offlineFile: IOFile,
             userDrive: UserDrive,
+            persistedHashRow: File? = null,
         ): Boolean {
             if (row.storedOfflineCopyState(context, offlineFile, userDrive) !=
                 com.infomaniak.drive.data.models.StoredOfflineCopyState.PROVEN_CURRENT
@@ -4066,7 +4067,20 @@ class DownloadOfflineFileManager(
                 return false
             }
             val proof = readPublishedProvenance(context, offlineFile) ?: return false
-            return proof.serverHash != null && proof.serverHash == row.serverContentHash
+            // THE HASH EVIDENCE COMES FROM A PERSISTED ROW ONLY (review-54 F1): an
+            // incoming activity/listing row is hash-less by construction (its route does
+            // not request the hash expansion) — its null can never refute a verified
+            // copy, and an in-memory hash is never the authorized ingestion's value.
+            // When the caller supplies the PERSISTED row, the hash leg reads ITS stored
+            // value and ONLY while the persisted row's complete generation tuple matches
+            // the incoming row exactly (the strict known-field rule, review-54 F4) — no
+            // old-hash transfer across changed metadata: a changed generation has no
+            // hash evidence to inherit. The METADATA legs still judge the INCOMING row
+            // (this `row`), never the persisted one.
+            val hashRow = persistedHashRow
+            if (hashRow != null && !hashRow.serverGenerationTupleMatches(row)) return false
+            val storedHash = hashRow?.serverContentHash ?: row.serverContentHash
+            return proof.serverHash != null && proof.serverHash == storedHash
         }
 
         /**

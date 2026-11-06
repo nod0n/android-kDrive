@@ -41,11 +41,19 @@ object ApiRoutes {
     private const val fileWithQuery = "with=capabilities,categories,conversion_capabilities,dropbox,dropbox.capabilities," +
             "external_import,is_favorite,path,sharelink,sorted_name,supported_by"
     private const val fileExtraWithQuery = "$fileWithQuery,users,version"
+    // THE VERSION EXPANSION ON LISTING AND ACTIVITY ROWS (review-54 F4): the ingested
+    // rows carry the version COUNT so the server-hash preservation tuple
+    // (File.serverGenerationTupleMatches) compares KNOWN counts — without it, every
+    // listing/activity refresh structurally failed the strict tuple and cleared the
+    // stored hash, degrading verified copies to the metadata tier and re-driving them
+    // after each walk. Existing metadata, no behavior change beyond the more precise
+    // ingestion.
     private const val activitiesWithQuery = "with=file,file.capabilities,file.categories,file.conversion_capabilities," +
-            "file.dropbox,file.dropbox.capabilities,file.is_favorite,file.sharelink,file.sorted_name,file.supported_by"
+            "file.dropbox,file.dropbox.capabilities,file.is_favorite,file.sharelink,file.sorted_name,file.supported_by," +
+            "file.version"
     private const val listingFilesWithQuery = "with=files,files.capabilities,files.categories,files.conversion_capabilities," +
             "files.dropbox,files.dropbox.capabilities,files.external_import,files.is_favorite," +
-            "files.sharelink,files.sorted_name,files.supported_by"
+            "files.sharelink,files.sorted_name,files.supported_by,files.version"
     const val activitiesWithExtraQuery = "$activitiesWithQuery,file.external_import"
     private const val sharedFileWithQuery = "with=capabilities,conversion_capabilities,supported_by"
 

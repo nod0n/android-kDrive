@@ -1374,6 +1374,11 @@ object SyncOfflineUtils {
             (
                 !DownloadOfflineFileManager.offlineCopyIsServerContentVerified(
                     context, remoteFile, remoteOfflineFile, userDrive,
+                    // THE HASH EVIDENCE IS THE PERSISTED ROW'S (review-54 F1): the
+                    // incoming activity row is hash-less by construction — its metadata
+                    // legs are judged, but the stored hash is read from the LIVE row and
+                    // only while its generation tuple matches the incoming row exactly.
+                    persistedHashRow = liveRow,
                 ) || pathChanged
                 )
         ) {
@@ -1451,6 +1456,9 @@ object SyncOfflineUtils {
         if (liveRow.isMarkedAsOffline &&
             !DownloadOfflineFileManager.offlineCopyIsServerContentVerified(
                 context, remoteFile, remoteOfflineFile, userDrive,
+                // THE HASH EVIDENCE IS THE PERSISTED ROW'S (review-54 F1), as in the
+                // download-need arm above.
+                persistedHashRow = liveRow,
             )
         ) {
             // A pending marker alone does not prove that any worker owns the refresh (issue:

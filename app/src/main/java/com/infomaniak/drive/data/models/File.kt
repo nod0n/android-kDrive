@@ -500,22 +500,33 @@ open class File(
     }
 
     /**
-     * THE SERVER-GENERATION TUPLE (review-53 D2): the server metadata fields that decide
-     * whether a stored [serverContentHash] still describes THIS row's accepted
-     * generation. The hash is stored only from the dedicated details-with-hash response
-     * (the authorized producer), so a hash survives a hash-less ingestion (listing,
-     * activity, generic refresh) ONLY when the incoming row carries the exact same
-     * tuple; any advance or unknown field (a null on either side of a nullable pair) is
-     * a CHANGE and clears it — a preserved hash must never outlive the generation it
-     * was captured for. This is a conservative PRESERVATION test, not a same-content
-     * proof: [FileVersion.number] is a version COUNT, not a revision identity, and full
-     * tuple equality does not exclude an ABA content change — the establishment and
+     * THE SERVER-GENERATION TUPLE (review-53 D2; review-54 F4's strict known-field rule):
+     * the server metadata fields that decide whether a stored [serverContentHash] still
+     * describes THIS row's accepted generation. The hash is stored only from the
+     * dedicated details-with-hash response (the authorized producer), so a hash survives
+     * a hash-less ingestion (listing, activity, generic refresh) ONLY when the incoming
+     * row carries the exact same tuple; any advance or unknown field is a CHANGE and
+     * clears it — a preserved hash must never outlive the generation it was captured
+     * for. THE STRICT KNOWN-FIELD RULE (review-54 F4): a NULLABLE field is a tuple
+     * member only when BOTH sides carry a known value — null on either side (including
+     * null==null) is unknown, never an equality; the code now matches the documented
+     * rule literally (the previous null==null-true read let two unknowns pass as a
+     * match). The folder-listing and file-activity routes request the version expansion
+     * (ApiRoutes listingFilesWithQuery / activitiesWithQuery), so the normal offline
+     * ingestion paths compare KNOWN counts; routes that structurally cannot carry the
+     * count (the shared-with-me listing) clear the stored hash on every refresh — the
+     * conservative disposition and its cost are documented in the implementation report.
+     * This is a conservative PRESERVATION test, not a same-content proof:
+     * [FileVersion.number] is a version COUNT, not a revision identity, and full tuple
+     * equality does not exclude an ABA content change — the establishment and
      * currentness ladders remain the only verification authority.
      */
     internal fun serverGenerationTupleMatches(other: File): Boolean =
         id == other.id && driveId == other.driveId &&
             revisedAt == other.revisedAt && updatedAt == other.updatedAt &&
-            lastModifiedAt == other.lastModifiedAt && size == other.size &&
+            lastModifiedAt == other.lastModifiedAt &&
+            size != null && other.size != null && size == other.size &&
+            (version?.number ?: 0) > 0 && (other.version?.number ?: 0) > 0 &&
             version?.number == other.version?.number
 
     /**
