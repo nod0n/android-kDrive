@@ -725,6 +725,32 @@ class MainViewModel(
                                                                         }
                                                                         false
                                                                     } else {
+                                                                        // THE BYTE-EFFECTS TRANSITION PRECEDES THE
+                                                                        // FIRST EFFECT (review-39 #9): every prepared
+                                                                        // child's journal durably records that byte
+                                                                        // effects may start BEFORE the tree rename — a
+                                                                        // durable P then strictly means no effect
+                                                                        // began. A failed transition aborts every
+                                                                        // preparation (nothing has moved yet).
+                                                                        val allByteEffectsArmed = preparedPairs.all { (_, newCopy) ->
+                                                                            runCatching {
+                                                                                DownloadOfflineFileManager.beginRelocationByteEffects(
+                                                                                    application,
+                                                                                    newCopy,
+                                                                                )
+                                                                            }.getOrDefault(false)
+                                                                        }
+                                                                        if (!allByteEffectsArmed) {
+                                                                            preparedPairs.forEach { (_, newCopy) ->
+                                                                                runCatching {
+                                                                                    DownloadOfflineFileManager.disposePreparedProofRelocation(
+                                                                                        application,
+                                                                                        newCopy,
+                                                                                    )
+                                                                                }
+                                                                            }
+                                                                            false
+                                                                        } else {
                                                                         // THE RENAME EFFECT AND ITS DURABILITY ARE
                                                                         // SEPARATE SUCCESSES (review-39 #3): only an
                                                                         // actual rename FAILURE (nothing moved)
@@ -785,6 +811,7 @@ class MainViewModel(
                                                                         // THE FAILURE IS PROPAGATED (review-33 #6): a
                                                                         // deferral, never a logged success.
                                                                         renameSucceeded && renameDurable && relocationsComplete
+                                                                        }
                                                                     }
                                                                 }
                                                             }.getOrDefault(false)
@@ -1220,6 +1247,28 @@ class MainViewModel(
                                                                         )
                                                                     }.getOrDefault(false)
                                                                     if (!relocationPrepared) return@runCatching false
+                                                                    // THE BYTE-EFFECTS TRANSITION PRECEDES THE FIRST
+                                                                    // EFFECT (review-39 #9): the journal durably
+                                                                    // records that byte effects may start BEFORE the
+                                                                    // rename — a durable P then strictly means no
+                                                                    // effect began. A failed transition aborts the
+                                                                    // caller's own preparation (nothing has moved
+                                                                    // yet; the intact source keeps its proof).
+                                                                    if (!runCatching {
+                                                                            DownloadOfflineFileManager.beginRelocationByteEffects(
+                                                                                application,
+                                                                                destinationBytes,
+                                                                            )
+                                                                        }.getOrDefault(false)
+                                                                    ) {
+                                                                        runCatching {
+                                                                            DownloadOfflineFileManager.disposePreparedProofRelocation(
+                                                                                application,
+                                                                                destinationBytes,
+                                                                            )
+                                                                        }
+                                                                        return@runCatching false
+                                                                    }
                                                                     if (!stagedTransfer.renameTo(destinationBytes)) {
                                                                         // THE RENAME TOUCHED NOTHING (review-33 #6): the
                                                                         // caller's own preparation is disposed and the

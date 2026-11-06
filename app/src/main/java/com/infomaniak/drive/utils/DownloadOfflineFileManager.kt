@@ -3081,14 +3081,15 @@ class DownloadOfflineFileManager(
                 }
                 runCatching { sourceObs.delete() }
             }
+            // THE MOVED PHASE IS ACKNOWLEDGED BEFORE THE SOURCE EVIDENCE DELETES (review-39
+            // #9): the B→M transition is durably written and verified by decode FIRST — a
+            // failed transition retains (the journal stays at the byte-effects phase, never
+            // pre-byte authority) and the source proof is deleted only after the moved
+            // phase is durable.
+            if (!transitionRelocationPhase(context, target, "M")) {
+                return false
+            }
             deletePublishedProvenance(context, source)
-            // THE DURABLE PHASE ADVANCE (review-38 #6): the byte effect is done — the
-            // journal's recorded phase moves from prepared to moved so the replay's
-            // repair authority follows the record, not an inference. A failed advance
-            // leaves the prepared phase durable: every downstream guard (source hash,
-            // source ownership, tuple) still fails closed over the moved state, so a
-            // stale phase retains — it never relaxes a check.
-            advanceRelocationPhase(context, target)
             // THE STATE OUTLIVES THE COMPLETION WHEN THE CALLER'S METADATA COMMIT IS STILL
             // PENDING (review-34 #3): the subtree relocation completes its children while
             // the rows still resolve to the old paths — disposal happens only after that
@@ -3097,17 +3098,29 @@ class DownloadOfflineFileManager(
             return true
         }
 
-        /** THE DURABLE PHASE ADVANCE (review-38 #6): rewrites a v4 journal's phase field
-         * from the prepared state ("P") to the moved state ("M") after the byte effect,
-         * atomically and only when the CURRENT journal still decodes as this exact
-         * prepared operation. Every other field round-trips verbatim from the decoded
-         * record; a failure or a concurrent change leaves the journal untouched. */
-        private fun advanceRelocationPhase(context: Context, target: IOFile) {
-            runCatching {
+        /** THE DURABLE PHASE TRANSITION (review-38 #6, review-39 #9): rewrites a v4
+         * journal's phase field with an EXACT-operation conditional — the CURRENT journal
+         * must still decode as a v4 record at the transition's legal source phase ("P"
+         * arms byte effects; "B" or an already-recorded "M" completes them), and every
+         * other field round-trips verbatim from that decode. The write is the durable
+         * atomic writer and the result is VERIFIED BY DECODE before success is reported;
+         * any failure or concurrent change reports false and the caller retains — a
+         * stale or unverified phase never relaxes a check. */
+        private fun transitionRelocationPhase(context: Context, target: IOFile, toPhase: String): Boolean {
+            if (toPhase != "B" && toPhase != "M") return false
+            return runCatching {
                 val recordFile = proofRelocationRecordFile(context, target)
-                val parsed = parseProofMoveRecord(recordFile) ?: return@runCatching
-                if (parsed.version < 4 || parsed.recordedPhase != "P") return@runCatching
-                atomicWriteText(
+                val parsed = parseProofMoveRecord(recordFile) ?: return@runCatching false
+                if (parsed.version < 4) return@runCatching false
+                when (toPhase) {
+                    "B" -> if (parsed.recordedPhase != "P") return@runCatching false
+                    // Completing a staged-flow journal whose bytes were already at the
+                    // target when it was written is an idempotent success.
+                    else -> if (parsed.recordedPhase != "B" && parsed.recordedPhase != "M") {
+                        return@runCatching false
+                    }
+                }
+                val rewritten = atomicWriteText(
                     recordFile,
                     listOf(
                         "4",
@@ -3118,11 +3131,24 @@ class DownloadOfflineFileManager(
                         parsed.recordedSourceProofText ?: "",
                         parsed.previousDestinationRecordText ?: "",
                         "${if (parsed.recordedSourceSharedWithMe == true) 1 else 0}|" +
-                            "${parsed.recordedSourceStorageKind ?: "offline"}|M",
+                            "${parsed.recordedSourceStorageKind ?: "offline"}|$toPhase",
                     ).joinToString("\n"),
                 )
-            }
+                // THE TRANSITION IS VERIFIED BY DECODE (review-39 #9): a reported success
+                // whose read-back does not decode at the target phase is a failure — the
+                // caller retains.
+                rewritten && parseProofMoveRecord(recordFile)?.recordedPhase == toPhase
+            }.getOrDefault(false)
         }
+
+        /** THE BYTE-EFFECTS TRANSITION (review-39 #9): durably records that this exact
+         * operation's byte effects MAY start — written BEFORE the first rename or copy of
+         * every prepared relocation, so a durable "P" phase strictly means no byte effect
+         * began. A failed transition aborts the caller's still-pre-byte preparation; a
+         * crashed operation between this transition and the byte effect replays with the
+         * honest "B" state instead of pre-byte authority. */
+        internal fun beginRelocationByteEffects(context: Context, target: IOFile): Boolean =
+            transitionRelocationPhase(context, target, "B")
 
         /** DISPOSES A COMPLETED RELOCATION'S STATE (review-34 #3): called after the
          * caller's metadata commit succeeded, for completions retained via
@@ -4330,59 +4356,74 @@ class DownloadOfflineFileManager(
                                                         sourceProof.revisedAt == targetProof.revisedAt &&
                                                         sourceProof.updatedAt == targetProof.updatedAt &&
                                                         sourceProof.publicationId == targetProof.publicationId
-                                                    // FRESH SOURCE OWNERSHIP (review-37 #7): the copy flow
-                                                    // KEEPS its source bytes after destination publication —
-                                                    // source hash equality alone never proves the pre-byte
-                                                    // phase. The live row must STILL exclusively resolve to
-                                                    // the recorded source under the captured coordination.
                                                     // THE SOURCE'S OWN AUTHORITY (review-38 #6): a v4
                                                     // journal records the SOURCE's Realm flavor and
-                                                    // storage kind — the destination sidecar's scope
-                                                    // describes the DESTINATION, and the cross-Realm
-                                                    // copy flow's source lives in another realm (the
-                                                    // destination graph commits while the source row
-                                                    // still resolves to the recorded source in its
-                                                    // OWN realm). A legacy v2/v3 journal records
-                                                    // neither: the VALIDATED TRANSITION checks the
-                                                    // exclusive source ownership in BOTH candidate
-                                                    // flavors — the row's own realm must resolve the
-                                                    // recorded source exclusively — and NEVER the
-                                                    // source hash alone nor the destination row's
-                                                    // location.
+                                                    // storage kind — the source ownership validates
+                                                    // through its RECORDED scope, never the destination
+                                                    // sidecar's. FRESH OWNERSHIP stays required (review-37
+                                                    // #7): the live row must still exclusively resolve to
+                                                    // the recorded source under the captured coordination.
                                                     val sourceOwnership = sourceHash != null &&
-                                                        sourceProof != null && sourceHash == sourceProof.contentHash && (
-                                                        if (parsed.version >= 4 && parsed.recordedSourceSharedWithMe != null) {
-                                                            currentOwnerHolds(
-                                                                context, scope, proofFileId, sourceFile,
-                                                                sharedWithMe = parsed.recordedSourceSharedWithMe,
-                                                                storageKind = parsed.recordedSourceStorageKind
-                                                                    ?: moveScopeKind,
-                                                            )
-                                                        } else {
-                                                            currentOwnerHolds(
-                                                                context, scope, proofFileId, sourceFile,
-                                                                sharedWithMe = moveScopeShared,
-                                                                storageKind = moveScopeKind,
-                                                            ) || currentOwnerHolds(
-                                                                context, scope, proofFileId, sourceFile,
-                                                                sharedWithMe = !moveScopeShared,
-                                                                storageKind = moveScopeKind,
-                                                            )
-                                                        }
+                                                        sourceProof != null && sourceHash == sourceProof.contentHash &&
+                                                        parsed.recordedSourceSharedWithMe != null &&
+                                                        currentOwnerHolds(
+                                                            context, scope, proofFileId, sourceFile,
+                                                            sharedWithMe = parsed.recordedSourceSharedWithMe,
+                                                            storageKind = parsed.recordedSourceStorageKind
+                                                                ?: moveScopeKind,
                                                         )
-                                                    // THE DURABLE PHASE (review-38 #6): a v4 journal's
-                                                    // recorded phase gates the pre-byte repair — only a
-                                                    // PREPARED journal repairs from the captured prior
-                                                    // evidence (a moved journal's bytes sit at the
-                                                    // destination; the missing-target arm never
-                                                    // rewrites them). A legacy journal has no recorded
-                                                    // phase: the validated transition above remains its
-                                                    // phase authority.
-                                                    val phaseRecordedPrepared = parsed.version < 4 ||
+                                                    // THE DURABLE PHASE (review-38 #6, review-39 #9): only a
+                                                    // v4 journal whose recorded phase is strictly PREPARED
+                                                    // repairs from the captured prior evidence — the
+                                                    // byte-effects transition is durably written BEFORE the
+                                                    // first rename/copy, so a durable P means no byte
+                                                    // effect began. A LEGACY journal carries NO phase fact:
+                                                    // retained source bytes and source ownership do NOT
+                                                    // establish no-effects (the copy flow retains its
+                                                    // source by design), so the either-flavor inference is
+                                                    // RETRACTED — legacy convergence runs only through the
+                                                    // validated recovery/rollback routes.
+                                                    val phaseRecordedPrepared = parsed.version >= 4 &&
                                                         parsed.recordedPhase == "P"
                                                     tupleEqual && sourceOwnership && phaseRecordedPrepared
                                                 }.getOrDefault(false)
-                                                if (!resolveAbortedDestinationRecord(
+                                                // THE EXPLICIT POST-COPY RECONCILIATION (review-39 #9): a
+                                                // B/M journal whose destination vanished is NEVER
+                                                // pre-byte authority — but when the COPY flow's source
+                                                // transition validates independently (the recorded
+                                                // source proof binds the bytes that still sit at the
+                                                // recorded source under the recorded source authority),
+                                                // the byte effect left nothing to recover at the
+                                                // destination and the journal disposes WITHOUT any
+                                                // destination mutation. A vacated source fails this
+                                                // validation and retains; no hash or location inference
+                                                // substitutes for the missing phase fact.
+                                                val postCopyResolved = parsed.version >= 4 &&
+                                                    parsed.recordedPhase != "P" &&
+                                                    parsed.recordedSourcePath != null &&
+                                                    parsed.recordedSourceProofText != null &&
+                                                    parsed.recordedSourceSharedWithMe != null && runCatching {
+                                                    val sourceFile = IOFile(parsed.recordedSourcePath)
+                                                    val sourceHash = if (sourceFile.exists()) UploadFile.sha256OrNull(sourceFile) else null
+                                                    val sourceProof = runCatching {
+                                                        parseProvenanceText(
+                                                            parsed.recordedSourceProofText,
+                                                            expectedPath = parsed.recordedSourcePath,
+                                                        )
+                                                    }.getOrNull()?.takeIf { it.absolutePath == parsed.recordedSourcePath }
+                                                    sourceFile.exists() && sourceHash != null && sourceProof != null &&
+                                                        sourceHash == sourceProof.contentHash &&
+                                                        currentOwnerHolds(
+                                                            context, scope, proofFileId, sourceFile,
+                                                            sharedWithMe = parsed.recordedSourceSharedWithMe,
+                                                            storageKind = parsed.recordedSourceStorageKind
+                                                                ?: moveScopeKind,
+                                                        )
+                                                }.getOrDefault(false)
+                                                if (postCopyResolved) {
+                                                    disposeRecoveryRecord(recordFile)
+                                                    true
+                                                } else if (!resolveAbortedDestinationRecord(
                                                         context,
                                                         target,
                                                         publicationIdOfRecordText(parsed.proofText),

@@ -805,6 +805,18 @@ object OfflineFolderController {
                                 ) {
                                     return@runCatching false
                                 }
+                                // THE BYTE-EFFECTS TRANSITION PRECEDES THE FIRST EFFECT (review-39
+                                // #9): the journal durably records that byte effects may start
+                                // BEFORE the rename — a durable P then strictly means no effect
+                                // began. A failed transition aborts this operation's own still-
+                                // pre-byte preparation (the captured prior destination evidence
+                                // is restored, the journal disposed).
+                                if (!DownloadOfflineFileManager.beginRelocationByteEffects(context, target)) {
+                                    runCatching {
+                                        DownloadOfflineFileManager.disposePreparedProofRelocation(context, target)
+                                    }
+                                    return@runCatching false
+                                }
                                 // THE DESTINATION HIERARCHY IS DURABLY CREATED (review-39 #2):
                                 // the relocation's rename publishes into a hierarchy whose
                                 // creation is acknowledged in order, never inferred from
