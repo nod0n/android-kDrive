@@ -1887,13 +1887,23 @@ class DownloadOfflineFileManager(
                 .recordText(target)
         }.getOrNull()
 
-        internal fun deletePublishedProvenance(context: Context, publishedFile: IOFile) {
-            runCatching { provenanceFileFor(context, publishedFile).delete() }
+        internal fun deletePublishedProvenance(context: Context, publishedFile: IOFile): Boolean = runCatching {
+            val recordFile = provenanceFileFor(context, publishedFile)
+            val recordDeleted = !recordFile.exists() || recordFile.delete()
             // THE OBSERVATION DIES WITH ITS PUBLICATION (issue: round 29 #7): a disposed
             // proof never lends its attempt's retry evidence to bytes later published at
             // the same path.
-            runCatching { IOFile(provenanceFileFor(context, publishedFile).path + ".obs").delete() }
-        }
+            val observationFile = IOFile(recordFile.path + ".obs")
+            val observationDeleted = !observationFile.exists() || observationFile.delete()
+            // THE DELETION IS DURABLY ACKNOWLEDGED (review-43 #2): the registry directory's
+            // entry state is synchronized after the removals — the registry and the payload
+            // may live on DIFFERENT filesystems, and an unsynchronized deletion can be lost
+            // in a crash while the payload-side state persists, resurrecting a disposed
+            // proof over restored bytes. A failed deletion or acknowledgment is reported,
+            // never silently swallowed.
+            val directoryAcknowledged = UploadFile.synchronizeDirectoryEntry(recordFile.parentFile)
+            recordDeleted && observationDeleted && directoryAcknowledged
+        }.getOrDefault(false)
 
         /**
          * Whether a provenance record FILE exists for [publishedFile] (issue: round 25 #11):
@@ -6036,10 +6046,19 @@ class DownloadOfflineFileManager(
                 if (failedPublicationId == null || currentEvidence.record.publicationId != failedPublicationId) {
                     false
                 } else {
-                    deletePublishedProvenance(context, target)
-                    // THE REMOVAL IS VERIFIED: the record's absence is re-read as typed
-                    // evidence — a failed deletion never reads as a verified absence.
-                    readPublishedProvenanceEvidence(context, target) is PublishedProvenanceEvidence.Absent
+                    // THE REMOVAL IS DURABLY ACKNOWLEDGED AND COMPLETELY VERIFIED (review-43
+                    // #2): the exact failed proof AND its observation are removed through the
+                    // acknowledged deletion (the containing registry directory is
+                    // synchronized — the registry and the payload may live on different
+                    // filesystems, and an unsynchronized deletion can be lost in a crash
+                    // while the recovery-state deletion persists, resurrecting the failed
+                    // proof over the restored bytes); the COMPLETE absent state — the record
+                    // as typed absence AND the observation file's absence — is verified
+                    // BEFORE any fallback authority is deleted. A failure retains the whole
+                    // recovery state.
+                    deletePublishedProvenance(context, target) &&
+                        readPublishedProvenanceEvidence(context, target) is PublishedProvenanceEvidence.Absent &&
+                        !IOFile(provenanceFileFor(context, target).path + ".obs").exists()
                 }
             }
         }
@@ -6097,6 +6116,13 @@ class DownloadOfflineFileManager(
             // the restore before any target mutation, and a cache/converted destination's
             // stage never attempts the cross-filesystem rename.
             val stage = recoveryStageFor(context, target) ?: return@runCatching false
+            // THE COMPLETE DESTINATION HIERARCHY IS ESTABLISHED BEFORE PUBLICATION
+            // (review-43 #3): every ancestor's entry in its own parent — existing
+            // directories included — is acknowledged before the rename publishes into it;
+            // getOfflineFile's mkdirs or a prior failed acknowledgment left present-but-
+            // unacknowledged ancestors whose loss makes the restored copy unreachable
+            // once its fallback is gone.
+            if (!ensureDurableDestinationHierarchy(target)) return@runCatching false
             try {
                 val stagedOk = runCatching {
                     recoveryFile.copyTo(stage, overwrite = true)
@@ -6131,6 +6157,15 @@ class DownloadOfflineFileManager(
                 // VERIFIED RESULT: the published bytes are re-hashed against the immutable
                 // backup hash before any state is disposed.
                 if (UploadFile.sha256OrNull(target) != backupHashNow) return@runCatching false
+                // THE COMPLETE PAYLOAD BARRIER AFTER THE FINAL TIMESTAMP AND RENAME
+                // (review-43 #3): the restored payload's contents, its own filename entry
+                // and the WHOLE ancestor-entry chain are acknowledged BEFORE any backup or
+                // journal disposal — the immediate parent synchronization alone left
+                // unacknowledged ancestors (getOfflineFile's mkdirs recreates them
+                // unacknowledged), and the barrier retries the complete chain even when
+                // the directories already exist; a still-failing barrier retains the
+                // backup and the recovery record.
+                if (!payloadDurabilityEstablished(target)) return@runCatching false
                 if (oldRecordText != null) {
                     // A FRESH RESTORATION IDENTITY (issue: round 25 #10): the re-written
                     // proof carries a NEW publication id — the reused old text's id made a
