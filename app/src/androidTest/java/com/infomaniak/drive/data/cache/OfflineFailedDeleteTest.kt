@@ -18,6 +18,7 @@
 package com.infomaniak.drive.data.cache
 
 import android.content.Context
+import android.content.ContextWrapper
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.infomaniak.drive.data.models.File
@@ -43,32 +44,52 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import java.util.Date
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * THE FAILED-DELETION CONTRACT OF THE OFFLINE COPY CLEANUP (the round-64 N1 fix + the
  * sidecar-release guard) on real Realm/file semantics — this is why the test is
  * instrumentation and not a JVM mock.
  *
+ * THE SANDBOX (the first device run's finding, honored honestly): the offline tree under
+ * real external media is FUSE-backed and IGNORED the chmod-based unlink refusal — the run's
+ * three ENVIRONMENT LIMITATION failures were the probe correctly refusing a vacuous pass.
+ * This fixture routes a ContextWrapper's `externalMediaDirs` into a random fixture-owned
+ * directory under the app's PRIVATE cache (real POSIX semantics), so the PRODUCTION path
+ * derivation (`File.getOfflineFolder` → `getOfflineFile`) and the PRODUCTION unlinks run
+ * unmodified against a filesystem that honors directory permissions. The provenance
+ * registry root derives from the same `getOfflineFolder(context).parentFile`, so the
+ * seeded records and the guard's release consistently live INSIDE the sandbox — the
+ * shared-by-hash registry prefix directories are never chmod'ed, never deleted, and the
+ * real external-media registry is never touched. HONEST LIMIT: the REAL external-media
+ * (FUSE) unlink behavior stays UNTESTED by this sandbox variant — the first run's recorded
+ * limitation stands, and no pass here may be read as covering it.
+ *
+ * THE CLASSIFICATION (the first device run's second finding, honored): a SYNC_OFFLINE
+ * record seeded WITHOUT `uploadAt` classifies the copy PENDING_UPLOAD (hasPendingUpload
+ * matches uploadAt-null records) and the cleanup short-circuits before its commit — the
+ * run's stamp-0 and retained-bytes failures. The seeded record is therefore a COMPLETED
+ * upload (`uploadAt` set): the classification arm is UPLOADED — which does not
+ * short-circuit — and the cleanup proceeds to its deletion decision.
+ *
  * THE SCENARIOS (each asserts OBSERVABLE state, never implementation internals):
  *  1. absent-zero-state + failed unlink: no registry state exists, the byte deletion is
  *     still attempted and fails, the disposal defers, the coverage is restored. THE ATTEMPT
  *     EVIDENCE is the intent-stamp ADVANCE: the committing transaction (the only writer of
  *     that bump) ran, so the cleanup reached its deletion decision — a protective
- *     short-circuit (a pin, a pending upload, an unproven-historical classification) never
- *     reaches the commit and leaves the stamp untouched.
+ *     short-circuit never reaches the commit and leaves the stamp untouched.
  *  2. existing state + release SUCCEEDS + failed unlink: a REAL provenance record is seeded
  *     through the PRODUCTION writer over the actual seeded bytes; the release consumes it
  *     BEFORE the byte deletion, so its disappearance after the run is DIRECT evidence the
- *     deletion was attempted (ruling out every protective-gate short-circuit — including
- *     any misclassification the seeded SYNC_OFFLINE record could have caused).
+ *     deletion was attempted (ruling out every protective-gate short-circuit).
  *  3. existing state + release FAILS: the seeded record at its EXACT production-derived
  *     path is replaced by a non-empty directory — an unlink of a non-empty directory
  *     deterministically fails on every POSIX filesystem — so the production release
  *     genuinely fails over EXISTING registry state and the disposal defers ENTIRELY: the
  *     record path is RETAINED alongside the bytes, and the coverage restoration still
- *     applies (a later pass retries sidecar and bytes together). NO shared-directory
- *     permission mutations anywhere: the obstruction lives only at this fixture's own
- *     record path and its explicit cleanup restores that exact slot.
+ *     applies. NO shared-directory permission mutations anywhere: the obstruction lives
+ *     only at this fixture's own record path, inside the sandbox, and its cleanup restores
+ *     that exact slot on every exit.
  *  4. successful deletion: the bytes go, the record is released, the counters tell the
  *     truth, the coverage stays cleared.
  *  5. abort between the failed deletion and the restoration: the flags stay cleared (the
@@ -77,44 +98,50 @@ import java.util.UUID
  *     fails these tests loudly — the intended canary.
  *  6. a live pin committed meanwhile is never overwritten by the restoration.
  *
+ * EVERY scenario seeds its OWN unique identity (a per-method counter drives the row's
+ * name/path), so no case depends on JUnit method order and no registry slot or offline
+ * path is ever shared between cases (the first run's cross-method seed leak is structurally
+ * excluded).
+ *
  * THE ENVIRONMENT-REFUSAL PROBE (no vacuous passes): in every locked-directory scenario a
  * sacrificial file is created in the directory BEFORE it is locked, then unlink()ed AFTER
  * the lock, and its PERSISTENCE is asserted — the actual refusal is proven before the main
- * operation runs. A FUSE-backed external-media layer may ignore chmod: if the probe shows
- * unlinks still succeeding, the test FAILS with an explicit environment-limitation message.
- * A failure is the honest report; NO pass or skip is ever counted as contract proof.
- * `setWritable`'s return is the fixture's prerequisite only.
+ * operation runs. The unlock is covered by `finally` from the lock attempt onward: ANY
+ * throw (the creation, the lock, the probe or the block) restores the directory and removes
+ * the sacrificial file. `setWritable`'s return is the fixture's prerequisite only.
  *
  * THE FIXTURE IS FULLY SYNTHETIC AND DISPOSABLE: a random realm in the instrumentation
  * target's cacheDir; the synthetic scope (user/drive/file ids) is RANDOMIZED PER CLASS LOAD
- * (a 50k-value space — no fixed scope collisions between fixture runs or parallel
- * residue); the seeded offline subtree, the seeded registry records (removed by their EXACT
- * production-derived paths in cleanup — never a registry DIRECTORY, which is shared-by-hash
- * infrastructure) and the upload records (by URI) are the ONLY state removed in cleanup —
- * never other users' data, and NO shared-directory permission mutations anywhere (the
- * owner installation may hold a real logged-in account, so nothing outside this fixture's
- * own paths is ever touched). No owner data, no account, no network. The coder executes
- * nothing — the orchestrator runs this on a device.
+ * and the per-method identities within it are unique; the ENTIRE sandbox directory (the
+ * offline subtree AND the sandbox-side registry records, obstruction included) is one
+ * deleteRecursively in cleanup; the upload records are deleted by URI. The shared-by-hash
+ * registry directories, the real external-media tree and the real registry are never
+ * mutated or deleted. No owner data, no account, no network. The coder executes nothing —
+ * the orchestrator runs this on a device.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class OfflineFailedDeleteTest {
 
     companion object {
-        private val context: Context = ApplicationProvider.getApplicationContext()
+        private val baseContext: Context = ApplicationProvider.getApplicationContext()
 
-        // THE RANDOMIZED SYNTHETIC SCOPE (per class load): no fixed ids, so parallel or
-        // sequential fixture residue can never collide on the offline subtree, the upload
-        // records or the rows.
+        // THE RANDOMIZED SYNTHETIC SCOPE (per class load) + THE SANDBOX: the offline tree
+        // and the sandbox-side registry both live under one fixture-owned cache directory.
         private val scopeBase =
             9_200_000 + ((UUID.randomUUID().leastSignificantBits % 50_000L).toInt() * 4)
         private val USER_ID = scopeBase + 1
         private val DRIVE_ID = scopeBase + 2
-        private val FILE_ID = scopeBase + 3
-        private val PARENT_ID = scopeBase + 4
+        private const val FILE_ID = 9_200_003
+        private const val PARENT_ID = 9_200_004
         private val userDrive = UserDrive(userId = USER_ID, driveId = DRIVE_ID)
-        private const val FILE_NAME = "fixture-failed-delete.bin"
-        private const val ROW_PATH = "/fixture/failed-delete/"
-        private const val PAYLOAD = "fixture offline copy payload — synthetic bytes"
+        private val sandboxRoot = IOFile(baseContext.cacheDir, "offline-sandbox-${UUID.randomUUID()}")
+        private val sandboxOffline = IOFile(sandboxRoot, "offline")
+        private val sandboxContext: Context = object : ContextWrapper(baseContext) {
+            override fun getExternalMediaDirs(): Array<out java.io.File> = arrayOf(sandboxOffline)
+        }
+
+        private val FILE_UID = "${FILE_ID}_$DRIVE_ID"
+        private val methodCounter = AtomicInteger(0)
 
         private lateinit var fixtureConfig: RealmConfiguration
         private val storedRecordUris = mutableListOf<Uri>()
@@ -127,27 +154,30 @@ class OfflineFailedDeleteTest {
                 .schemaVersion(FileMigration.DB_VERSION)
                 .modules(RealmModules.LocalFilesModule())
                 .name("offline-failed-delete-${UUID.randomUUID()}")
-                .directory(context.cacheDir)
+                .directory(baseContext.cacheDir)
                 .build()
         }
 
         /**
-         * Seeds the offline bytes, the matching SYNC_OFFLINE upload record (which
-         * classifies the copy UPLOADED — a non-short-circuiting arm: the cleanup proceeds
-         * to its deletion decision), the covered row, and — when [seedProvenance] — a REAL
-         * provenance record through the PRODUCTION writer over the actual bytes. Returns
-         * the SEEDED BYTE FILE (an [IOFile] — NOT the model row).
+         * Seeds THIS method's own unique identity: the offline bytes under the sandbox, the
+         * matching COMPLETED SYNC_OFFLINE upload record (uploadAt set — the UPLOADED
+         * classification arm, which does not short-circuit), the covered row, and — when
+         * [seedProvenance] — a REAL provenance record through the PRODUCTION writer over
+         * the actual bytes. Returns the SEEDED BYTE FILE (an [IOFile] — NOT the model row).
          */
         private fun seedCoveredCopy(realm: Realm, seedProvenance: Boolean): IOFile {
+            val methodName = "m${methodCounter.incrementAndGet()}-${UUID.randomUUID()}"
+            val fileName = "fixture-$methodName.bin"
+            val rowPath = "/fixture/$methodName/"
             val rowModel = File().apply {
-                uid = "${FILE_ID}_$DRIVE_ID"
+                uid = FILE_UID
                 id = FILE_ID
                 parentId = PARENT_ID
                 driveId = DRIVE_ID
-                name = FILE_NAME
-                path = ROW_PATH
+                name = fileName
+                path = rowPath
             }
-            val offlineFile = rowModel.getOfflineFile(context, USER_ID)!!
+            val offlineFile = rowModel.getOfflineFile(sandboxContext, USER_ID)!!
             offlineFile.parentFile?.mkdirs()
             offlineFile.writeText(PAYLOAD)
 
@@ -157,10 +187,15 @@ class OfflineFailedDeleteTest {
                         uri = Uri.fromFile(offlineFile).toString(),
                         driveId = DRIVE_ID,
                         fileModifiedAt = Date(offlineFile.lastModified()),
-                        fileName = FILE_NAME,
+                        fileName = fileName,
                         fileSize = offlineFile.length(),
                         remoteFolder = PARENT_ID,
                         originalFileId = FILE_ID,
+                        // A COMPLETED upload (uploadAt set): the classification arm is
+                        // UPLOADED — hasPendingUpload/hasRetainedUnsentUpload match only
+                        // uploadAt-null records, which would short-circuit the cleanup
+                        // before its commit (the first device run's finding).
+                        uploadAt = Date(offlineFile.lastModified()),
                         contentHash = UploadFile.sha256OrNull(offlineFile),
                         type = UploadFile.Type.SYNC_OFFLINE.name,
                         userId = USER_ID,
@@ -173,7 +208,7 @@ class OfflineFailedDeleteTest {
                 // never a hand-mirrored registry file.
                 check(
                     writePublishedProvenance(
-                        context = context,
+                        context = sandboxContext,
                         target = offlineFile,
                         file = rowModel,
                         userDrive = userDrive,
@@ -185,12 +220,12 @@ class OfflineFailedDeleteTest {
             realm.executeTransaction { transactionRealm ->
                 transactionRealm.copyToRealmOrUpdate(
                     File().apply {
-                        uid = "${FILE_ID}_$DRIVE_ID"
+                        uid = FILE_UID
                         id = FILE_ID
                         parentId = PARENT_ID
                         driveId = DRIVE_ID
-                        name = FILE_NAME
-                        path = ROW_PATH
+                        name = fileName
+                        path = rowPath
                         isInOfflineFolder = true
                         isMarkedAsOffline = false
                     },
@@ -209,8 +244,9 @@ class OfflineFailedDeleteTest {
          * runs in `finally` from the moment the lock is attempted, so ANY throw (the
          * creation, the lock, the probe or the block) still restores the directory and
          * removes the sacrificial file. `setWritable`'s return is only the prerequisite —
-         * a chmod-ignoring FUSE layer surfaces as an explicit environment-limitation
-         * failure, never as a vacuous contract pass.
+         * the sandbox's POSIX semantics make the refusal deterministic; a filesystem that
+         * ignored it would surface as an explicit environment-limitation failure, never a
+         * vacuous contract pass.
          */
         private inline fun withProvenLockedDirectory(dir: IOFile, block: () -> Unit) {
             val sacrificial = IOFile(dir, "probe-${UUID.randomUUID()}.tmp")
@@ -221,9 +257,8 @@ class OfflineFailedDeleteTest {
                 val deleted = runCatching { sacrificial.delete() }.getOrDefault(true)
                 check(!deleted && sacrificial.exists()) {
                     "ENVIRONMENT LIMITATION: unlinks still succeed after the directory was made " +
-                        "unwritable (external-media FUSE may ignore chmod) — the real failed-unlink " +
-                        "contract cannot be exercised on this filesystem; this is a reported " +
-                        "unsupported mechanism, NOT a contract pass"
+                        "unwritable — the real failed-unlink contract cannot be exercised on this " +
+                        "filesystem; this is a reported unsupported mechanism, NOT a contract pass"
                 }
                 block()
             } finally {
@@ -239,7 +274,7 @@ class OfflineFailedDeleteTest {
         Realm.getInstance(fixtureConfig).use { realm ->
             val offlineFile = seedCoveredCopy(realm, seedProvenance = false)
             assertFalse(
-                provenanceRecordFileExists(context, offlineFile),
+                provenanceRecordFileExists(sandboxContext, offlineFile),
                 "scenario setup: the absent-zero-state arm holds no registry state",
             )
             val stampBefore = liveRow(realm).offlineIntentStamp
@@ -248,7 +283,7 @@ class OfflineFailedDeleteTest {
             withProvenLockedDirectory(offlineFile.parentFile!!) {
                 val detached = realm.copyFromRealm(liveRow(realm), 1)
                 OfflineFolderController.clearFileCoverage(
-                    context = context,
+                    context = sandboxContext,
                     realm = realm,
                     file = detached,
                     userDrive = userDrive,
@@ -279,7 +314,7 @@ class OfflineFailedDeleteTest {
         Realm.getInstance(fixtureConfig).use { realm ->
             val offlineFile = seedCoveredCopy(realm, seedProvenance = true)
             assertTrue(
-                provenanceRecordFileExists(context, offlineFile),
+                provenanceRecordFileExists(sandboxContext, offlineFile),
                 "scenario setup: the seeded synthetic proof must exist before the run",
             )
             val stampBefore = liveRow(realm).offlineIntentStamp
@@ -288,7 +323,7 @@ class OfflineFailedDeleteTest {
             withProvenLockedDirectory(offlineFile.parentFile!!) {
                 val detached = realm.copyFromRealm(liveRow(realm), 1)
                 OfflineFolderController.clearFileCoverage(
-                    context = context,
+                    context = sandboxContext,
                     realm = realm,
                     file = detached,
                     userDrive = userDrive,
@@ -298,7 +333,7 @@ class OfflineFailedDeleteTest {
             }
 
             assertFalse(
-                provenanceRecordFileExists(context, offlineFile),
+                provenanceRecordFileExists(sandboxContext, offlineFile),
                 "ATTEMPT EVIDENCE: the release runs BEFORE the byte deletion — its absence " +
                     "after the run proves deleteOfflineCopy was reached and the deletion " +
                     "attempted (no protective-gate short-circuit passed vacuously)",
@@ -317,7 +352,7 @@ class OfflineFailedDeleteTest {
     fun failedReleaseOverExistingStateDefersEntirely() {
         Realm.getInstance(fixtureConfig).use { realm ->
             val offlineFile = seedCoveredCopy(realm, seedProvenance = true)
-            val recordFile = provenanceFileFor(context, offlineFile)
+            val recordFile = provenanceFileFor(sandboxContext, offlineFile)
             assertTrue(
                 recordFile.exists(),
                 "scenario setup: the seeded record must exist at its production-derived path",
@@ -331,8 +366,8 @@ class OfflineFailedDeleteTest {
             // fails on every POSIX filesystem, so the production release genuinely fails
             // over EXISTING registry state, with no chmod anywhere and no effect on any
             // other record sharing the hash prefix. The obstruction lives only at this
-            // fixture's own record path, and the try/finally below removes it on EVERY
-            // exit — an assertion failure must never leak it (the B3 review concern); the
+            // fixture's own record path, inside the sandbox, and the try/finally below
+            // removes it on EVERY exit — an assertion failure must never leak it; the
             // @AfterAll backstop re-sweeps the same exact path.
             var bodyFailure: Throwable? = null
             try {
@@ -343,7 +378,7 @@ class OfflineFailedDeleteTest {
 
                 val detached = realm.copyFromRealm(liveRow(realm), 1)
                 OfflineFolderController.clearFileCoverage(
-                    context = context,
+                    context = sandboxContext,
                     realm = realm,
                     file = detached,
                     userDrive = userDrive,
@@ -375,8 +410,8 @@ class OfflineFailedDeleteTest {
                     val obstructionChild = IOFile(recordFile, "obstruction.bin")
                     if (obstructionChild.exists()) check(obstructionChild.delete()) { "the obstruction child must be removable" }
                     if (recordFile.isDirectory) check(recordFile.delete()) { "the obstruction directory must be removable" }
-                    runCatching { deletePublishedProvenance(context, offlineFile) }
-                    check(!provenanceRecordFileExists(context, offlineFile)) {
+                    runCatching { deletePublishedProvenance(sandboxContext, offlineFile) }
+                    check(!provenanceRecordFileExists(sandboxContext, offlineFile)) {
                         "the fixture's own record slot must be clean after its cleanup"
                     }
                 }
@@ -399,7 +434,7 @@ class OfflineFailedDeleteTest {
 
             val detached = realm.copyFromRealm(liveRow(realm), 1)
             OfflineFolderController.clearFileCoverage(
-                context = context,
+                context = sandboxContext,
                 realm = realm,
                 file = detached,
                 userDrive = userDrive,
@@ -408,7 +443,7 @@ class OfflineFailedDeleteTest {
             )
 
             assertFalse(offlineFile.exists(), "a confirmed deletion removed the bytes")
-            assertFalse(provenanceRecordFileExists(context, offlineFile), "the record is released with the bytes")
+            assertFalse(provenanceRecordFileExists(sandboxContext, offlineFile), "the record is released with the bytes")
             assertEquals(1, result.removedOfflineFilesCount)
             assertEquals(0, result.keptOfflineFilesCount)
             assertFalse(liveRow(realm).isInOfflineFolder, "a deleted copy's coverage stays cleared")
@@ -430,7 +465,7 @@ class OfflineFailedDeleteTest {
             withProvenLockedDirectory(offlineFile.parentFile!!) {
                 val detached = realm.copyFromRealm(liveRow(realm), 1)
                 OfflineFolderController.clearFileCoverage(
-                    context = context,
+                    context = sandboxContext,
                     realm = realm,
                     file = detached,
                     userDrive = userDrive,
@@ -475,7 +510,7 @@ class OfflineFailedDeleteTest {
             withProvenLockedDirectory(offlineFile.parentFile!!) {
                 val detached = realm.copyFromRealm(liveRow(realm), 1)
                 OfflineFolderController.clearFileCoverage(
-                    context = context,
+                    context = sandboxContext,
                     realm = realm,
                     file = detached,
                     userDrive = userDrive,
@@ -498,31 +533,12 @@ class OfflineFailedDeleteTest {
 
     @AfterAll
     fun cleanup() {
-        // ONLY this fixture's own state — exact own records, exact own subtree:
-        //  - the seeded provenance records: released through the production release, then
-        //    deleted by their EXACT production-derived paths (record + observation);
-        //  - the stored upload records by their URIs;
-        //  - the random own-cacheDir realm;
-        //  - the synthetic user's offline subtree (the randomized scope's own branch).
-        // Never any other user's data, never a registry DIRECTORY (they are shared
-        // by-hash infrastructure).
-        runCatching {
-            seededRegistryFiles.forEach { seeded ->
-                runCatching { deletePublishedProvenance(context, seeded) }
-                // THE EXACT OWN RECORD-SLOT BACKSTOP (never the shared prefix directory):
-                // re-sweeps any obstruction residue at this fixture's own record path only,
-                // plus its .obs sibling.
-                runCatching {
-                    val recordFile = provenanceFileFor(context, seeded)
-                    recordFile.deleteRecursively()
-                    IOFile(recordFile.path + ".obs").delete()
-                }
-            }
-        }
+        // ONLY this fixture's own state: the ENTIRE sandbox (the offline subtree AND the
+        // sandbox-side registry records/obstruction — one fixture-owned tree), the upload
+        // records by URI, and the random own-cacheDir realm. The shared-by-hash registry
+        // directories, the real external-media tree and the real registry are NEVER touched.
+        runCatching { sandboxRoot.deleteRecursively() }
         runCatching { if (storedRecordUris.isNotEmpty()) UploadFile.deleteAllFromUris(storedRecordUris) }
         runCatching { Realm.deleteRealm(fixtureConfig) }
-        runCatching {
-            IOFile(File.getOfflineFolder(context), "$USER_ID").deleteRecursively()
-        }
     }
 }
