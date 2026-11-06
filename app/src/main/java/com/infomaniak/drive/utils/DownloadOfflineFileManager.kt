@@ -5038,6 +5038,13 @@ class DownloadOfflineFileManager(
                         return false
                     }
                 }
+                // THE DURABILITY BARRIER BEFORE DISPOSAL (review-40 #4): the visible
+                // expected publication's payload and destination hierarchy are
+                // synchronized before the backup and the recovery record are retired —
+                // the failed rename-synchronization prerequisite is retried here, a
+                // matching hash never substitutes for the acknowledgment, and a
+                // still-failing barrier retains the backup and the owned retry.
+                if (!payloadDurabilityEstablished(target)) return false
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
                 return true
@@ -5065,6 +5072,11 @@ class DownloadOfflineFileManager(
                 } else {
                     deletePublishedProvenance(context, target)
                 }
+                // THE DURABILITY BARRIER BEFORE DISPOSAL (review-40 #4), as in the
+                // expected-publication arm: the already-restored generation's payload and
+                // destination hierarchy are synchronized before the backup and record are
+                // retired; a still-failing barrier retains the owned retry.
+                if (!payloadDurabilityEstablished(target)) return false
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
                 return true
