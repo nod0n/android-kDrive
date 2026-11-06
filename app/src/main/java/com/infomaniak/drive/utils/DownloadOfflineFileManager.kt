@@ -5329,6 +5329,15 @@ class DownloadOfflineFileManager(
                                                         fullyValidated &&
                                                             (destinationState is DestinationRowState.NotClaiming ||
                                                                 supersededAuthorization) -> {
+                                                            // THE EXECUTING CONTEXT AFTER THE BLOCKING
+                                                            // VALIDATION (review-43 #9): the fresh destination
+                                                            // state, the superseded comparison and the full
+                                                            // validation above can block — a cancelled sweep is
+                                                            // observed HERE, immediately before this route's
+                                                            // FIRST destructive effect (the source proof write
+                                                            // or its live verification); the throw propagates
+                                                            // and the durable journal is retained.
+                                                            checkCancelled()
                                                             // THE SOURCE'S PROOF IS DURABLY RESTORED AND
                                                             // VERIFIED (review-40 #10, gated review-41 #7,
                                                             // format-aware review-42 #7): the captured
@@ -5550,6 +5559,14 @@ class DownloadOfflineFileManager(
                                                 // decoder's payload.
                                                 val retainedPublicationId =
                                                     publicationIdOfRecordText(parsed.proofText) ?: 0L
+                                                // THE EXECUTING CONTEXT AFTER THE BLOCKING VALIDATION
+                                                // (review-43 #9): the typed evidence read and the
+                                                // ownership query can block — a cancelled sweep is
+                                                // observed HERE, immediately before this arm's FIRST
+                                                // destructive effect (the supersession's journal
+                                                // disposal or the retained proof write); the throw
+                                                // propagates and the durable journal is retained.
+                                                checkCancelled()
                                                 if (currentProof != null && currentProof.certifiesBytes(target) &&
                                                     currentProof.publicationId != retainedPublicationId
                                                 ) {
@@ -5609,7 +5626,7 @@ class DownloadOfflineFileManager(
                                                     disposeRecoveryRecord(recordFile)
                                                 }
                                                 coherent
-                                                    }.getOrDefault(false)
+                                                    }.getOrRethrowCancellation(false)
                                                     else -> runCatching {
                                                         // THE OWNER-CHECKED ROLLBACK (review-34 #3): the
                                                         // interrupted relocation has its bytes at the
@@ -5694,6 +5711,14 @@ class DownloadOfflineFileManager(
                                                         ) {
                                                             return@runCatching false
                                                         }
+                                                        // THE EXECUTING CONTEXT AFTER THE BLOCKING
+                                                        // VALIDATION (review-43 #9): the ownership queries
+                                                        // and the tuple parsing can block — a cancelled
+                                                        // sweep is observed HERE, immediately before the
+                                                        // FIRST destructive effect (the source proof
+                                                        // write); the throw propagates and the durable
+                                                        // journal is retained.
+                                                        checkCancelled()
                                                         // THE READBACK VERIFIES THE EXPECTED COMPLETE RECORD
                                                         // (review-35 #7), not merely "some provenance".
                                                         val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
@@ -5742,7 +5767,7 @@ class DownloadOfflineFileManager(
                                                         }
                                                         disposeRecoveryRecord(recordFile)
                                                         true
-                                                    }.getOrDefault(false)
+                                                    }.getOrRethrowCancellation(false)
                                                 }
                                             }
                                         }
@@ -5908,8 +5933,16 @@ class DownloadOfflineFileManager(
                 // synchronization prerequisite is retried here, and a matching hash never
                 // substitutes for the acknowledgment.
                 if (!payloadDurabilityEstablished(target)) return false
+                // THE DISPOSAL IS ACKNOWLEDGED BEFORE ANY FALLBACK LEAVES (review-43
+                // #11, all arms): the record's disposal result is honored — a stop
+                // between an ignored backup-first deletion and the record deletion left
+                // a live journal without its fallback, which the missing-backup arm's
+                // certifying-proof predicate cannot recognize (indefinite exclusion);
+                // a failed disposal retains both, and the next sweep re-runs the arm.
+                // The backup's own deletion after confirmed disposal is inert residue
+                // when it fails (no record references it).
+                if (!disposeRecoveryRecord(record.recordFile)) return false
                 runCatching { recoveryFile.delete() }
-                disposeRecoveryRecord(record.recordFile)
                 return true
             }
             // SELF-CERTIFYING DISPOSAL REQUIRES THE RECORDED OWNER (issue: round 23 #2):
@@ -5988,8 +6021,14 @@ class DownloadOfflineFileManager(
                     // missing-backup arm: the self-certified bytes' contents and directory
                     // entry are synchronized before the backup and journal are retired.
                     if (!payloadDurabilityEstablished(target)) return false
+                    // THE DISPOSAL IS ACKNOWLEDGED BEFORE ANY FALLBACK LEAVES (review-43
+                    // #11, all arms): the record's disposal result is honored — a stop
+                    // between an ignored backup-first deletion and the record deletion
+                    // left a live journal without its fallback (indefinite exclusion);
+                    // a failed disposal retains both. The backup's own deletion after
+                    // confirmed disposal is inert residue when it fails.
+                    if (!disposeRecoveryRecord(record.recordFile)) return false
                     runCatching { recoveryFile.delete() }
-                    disposeRecoveryRecord(record.recordFile)
                     return true
                 }
                 // THE VALIDATED ROLLBACK REMAINS REACHABLE (review-40 #7): an ambiguous
@@ -6129,8 +6168,14 @@ class DownloadOfflineFileManager(
                 // matching hash never substitutes for the acknowledgment, and a
                 // still-failing barrier retains the backup and the owned retry.
                 if (!payloadDurabilityEstablished(target)) return false
+                // THE DISPOSAL IS ACKNOWLEDGED BEFORE ANY FALLBACK LEAVES (review-43
+                // #11, all arms): the record's disposal result is honored — a stop
+                // between an ignored backup-first deletion and the record deletion
+                // left a live journal without its fallback (indefinite exclusion); a
+                // failed disposal retains both. The backup's own deletion after
+                // confirmed disposal is inert residue when it fails.
+                if (!disposeRecoveryRecord(record.recordFile)) return false
                 runCatching { recoveryFile.delete() }
-                disposeRecoveryRecord(record.recordFile)
                 return true
             }
             if (backupHash != null && currentTargetHash != null && currentTargetHash == backupHash) {
@@ -6215,8 +6260,14 @@ class DownloadOfflineFileManager(
                 // destination hierarchy are synchronized before the backup and record are
                 // retired; a still-failing barrier retains the owned retry.
                 if (!payloadDurabilityEstablished(target)) return false
+                // THE DISPOSAL IS ACKNOWLEDGED BEFORE ANY FALLBACK LEAVES (review-43
+                // #11, all arms): the record's disposal result is honored — a stop
+                // between an ignored backup-first deletion and the record deletion
+                // left a live journal without its fallback (indefinite exclusion); a
+                // failed disposal retains both. The backup's own deletion after
+                // confirmed disposal is inert residue when it fails.
+                if (!disposeRecoveryRecord(record.recordFile)) return false
                 runCatching { recoveryFile.delete() }
-                disposeRecoveryRecord(record.recordFile)
                 return true
             }
             if (target.exists() && currentTargetHash != null) {
@@ -6304,8 +6355,15 @@ class DownloadOfflineFileManager(
                     allowPendingRecoveryResolution = true,
                 )
                 if (!preserved) return false
+                // THE DISPOSAL IS ACKNOWLEDGED BEFORE ANY FALLBACK LEAVES (review-43
+                // #11, all arms): the record's disposal result is honored — a stop
+                // between an ignored backup-first deletion and the record deletion
+                // left a live journal without its fallback (indefinite exclusion); a
+                // failed disposal retains both, and the re-registration rerun is
+                // idempotent. The backup's own deletion after confirmed disposal is
+                // inert residue when it fails.
+                if (!disposeRecoveryRecord(record.recordFile)) return false
                 runCatching { recoveryFile.delete() }
-                disposeRecoveryRecord(record.recordFile)
                 return true
             } else if (!target.exists()) {
                 // A MISSING target: the VERIFIED restore is the only resolution. Its
@@ -6614,9 +6672,25 @@ class DownloadOfflineFileManager(
                 // crash window whose residue (restored R1 plus the retained R2 relocation
                 // proof) the sweep then mismatched forever. Disposing here closes the
                 // window; any caller's own deletion is an idempotent no-op.
-                disposeRecoveryRecord(proofRelocationRecordFile(context, target) ?: return@runCatching false)
+                // THE DISPOSAL IS ACKNOWLEDGED BEFORE THE FALLBACK LEAVES (review-43 #11):
+                // the previous order ignored both disposal results and deleted the backup
+                // FIRST — a stop between the backup deletion and the record deletion left
+                // an unproven restored target, no backup, and a live journal the
+                // missing-backup arm cannot recognize (indefinite exclusion). BOTH records
+                // are disposed and their results honored BEFORE the backup is deleted: a
+                // failed disposal retains (the verified restore re-runs idempotently on
+                // the next sweep with the backup still present); only after BOTH confirmed
+                // disposals does the fallback backup go — a backup-deletion failure after
+                // confirmed disposal is inert residue (no record references it) and the
+                // restoration is reported. Pre-existing stranded states from the OLD order
+                // (a journal already without its backup) retain honestly through the
+                // missing-backup arm's own gates — no clean proof is invented for
+                // historical bytes.
+                val relocationRecordDisposed =
+                    disposeRecoveryRecord(proofRelocationRecordFile(context, target) ?: return@runCatching false)
+                if (!relocationRecordDisposed) return@runCatching false
+                if (!disposeRecoveryRecord(recordFile)) return@runCatching false
                 runCatching { recoveryFile.delete() }
-                disposeRecoveryRecord(recordFile)
                 true
             } finally {
                 // The unpublished stage never lingers (issue: round 24 #21 discipline).
