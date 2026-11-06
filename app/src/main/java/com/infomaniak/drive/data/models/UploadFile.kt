@@ -494,13 +494,45 @@ open class UploadFile(
          * source ownership, or a content identity that could not be read: record and snapshot
          * stay intact for [retryUnreconciledOriginals] (issue: round 17 #4).
          */
+        /** THE ORIGINAL ROW'S ACTUAL REALM FLAVOR (review-39 #8): the ordinary flavor first,
+         * then the shared one — the Realm files are per-drive and per-user respectively, so
+         * a row is located by opening each candidate and looking up the id. Null when the
+         * row exists in neither flavor (validated absence). */
+        private fun locateOriginalRowFlavor(record: UploadFile): UserDrive? {
+            val ordinary = UserDrive(userId = record.userId, driveId = record.driveId)
+            return listOf(ordinary, ordinary.copy(sharedWithMe = true)).firstOrNull { scope ->
+                runCatching {
+                    FileController.getRealmInstance(scope).use { realm ->
+                        runCatching { realm.refresh() }
+                        realm.where(File::class.java)
+                            .equalTo(File::id.name, record.originalFileId)
+                            .findFirst() != null
+                    }
+                }.getOrDefault(false)
+            }
+        }
+
         private fun reconcileOriginalCopyCleanBaseline(record: UploadFile): Boolean {
             val context = Realm.getApplicationContext() ?: return false
             // LEGACY rule (issue: round 18 #7): no trustworthy ownership/content proof —
             // conclude without advancing ANY row's baseline, and without selecting an
             // arbitrary name+parent match.
             if (record.originalFileId <= 0) return true
-            val userDrive = UserDrive(userId = record.userId, driveId = record.driveId)
+            // THE ROW'S ACTUAL REALM FLAVOR (review-39 #8): the reconciliation previously
+            // opened the ORDINARY Realm for every record — a shared-only original's row
+            // lives in the shared Realm, the ordinary lookup found nothing, and the
+            // no-advance early return read as a CONCLUDED reconciliation, disposing the
+            // snapshot and the record before the shared recovery could ever use that
+            // evidence. The row is LOCATED first — ordinary flavor, then shared — and the
+            // whole reconciliation (lock, Realm, path derivation, ownership) runs in the
+            // row's actual flavor; absence in BOTH flavors is a validated no-advance, not
+            // a single-realm lookup's blind spot.
+            val userDrive = locateOriginalRowFlavor(record) ?: run {
+                // Absent in both flavors: there is no row whose baseline could advance —
+                // the legacy no-advance conclusion applies with the location actually
+                // validated (review-39 #8).
+                return true
+            }
             val candidateId = record.originalFileId
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 var deferred = false
@@ -510,7 +542,10 @@ open class UploadFile(
                         val liveRow = realm.where(File::class.java)
                             .equalTo(File::id.name, candidateId)
                             .findFirst() ?: return@withFileLock
-                        val original = liveRow.getOfflineFile(context, userDrive.userId)
+                        // THE CAPTURED FLAVOR DERIVES THE PATH (issue: round 27 #9d, review-39
+                        // #8): a shared-only original's offline path resolves under its own
+                        // Realm flavor, never the ordinary default.
+                        val original = liveRow.getOfflineFile(context, userDrive.userId, sharedWithMe = userDrive.sharedWithMe)
                             ?: return@withFileLock
                         if (!original.exists()) return@withFileLock
                         // EXCLUSIVE source ownership before any provenance effect (issues:
@@ -791,47 +826,6 @@ open class UploadFile(
                     .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
                     .equalTo(UploadFile::fileSize.name, fileSize)
                     .isNull(UploadFile::uploadAt.name)
-                    .apply { if (originalFileId != null && originalFileId > 0) equalTo(UploadFile::originalFileId.name, originalFileId) }
-                    .findAll()
-                candidates.any { recordProvesContent(it, contentHash) }
-            }
-            return customRealm?.let(block) ?: getRealmInstance().use(block)
-        }
-
-        /**
-         * READ-ONLY COMPLETED-UPLOAD ownership check for the ORIGINAL revision (review-38 #3):
-         * [hasDurableOriginalRevisionOwnership]'s `uploadAt == null` requirement matches
-         * PENDING/retained-unsent snapshots — local snapshot ownership, never an upload
-         * completion. This query requires an ACTIVE COMPLETED record: [uploadAt] is set by
-         * [uploadFinished] alone (the transfer's actual completion) and a cancelled record
-         * (deletedAt != null) is never completion. The caller's successful content hash is
-         * REQUIRED and the candidate must PROVE those bytes — the exact owner, bytes and
-         * revision (identity fields plus the stable original id when known) are bound
-         * together, so a completed transfer of different content grants nothing. When the
-         * row is later discarded the evidence is gone and the caller must retain — no
-         * predicate substitutes for the missing durable completion.
-         */
-        fun hasCompletedOriginalRevisionOwnership(
-            fileName: String,
-            remoteFolder: Int,
-            driveId: Int,
-            userId: Int,
-            fileModifiedAt: Date,
-            fileSize: Long,
-            contentHash: String,
-            originalFileId: Int? = null,
-            customRealm: Realm? = null,
-        ): Boolean {
-            val block: (Realm) -> Boolean = { realm ->
-                val candidates = realm.uploadTable
-                    .equalTo(UploadFile::fileName.name, fileName)
-                    .equalTo(UploadFile::remoteFolder.name, remoteFolder)
-                    .equalTo(UploadFile::driveId.name, driveId)
-                    .equalTo(UploadFile::userId.name, userId)
-                    .equalTo(UploadFile::fileModifiedAt.name, fileModifiedAt)
-                    .equalTo(UploadFile::type.name, Type.SYNC_OFFLINE.name)
-                    .isNotNull(UploadFile::uploadAt.name)
-                    .isNull(UploadFile::deletedAt.name)
                     .apply { if (originalFileId != null && originalFileId > 0) equalTo(UploadFile::originalFileId.name, originalFileId) }
                     .findAll()
                 candidates.any { recordProvesContent(it, contentHash) }

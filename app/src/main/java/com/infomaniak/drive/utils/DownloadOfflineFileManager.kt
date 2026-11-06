@@ -3541,38 +3541,14 @@ class DownloadOfflineFileManager(
          * version establishes absence — a legacy-ambiguous observation converges only when
          * INDEPENDENT durable evidence proves the operation legitimately carried none: the
          * bytes are an exact uploaded revision owned by the record's own row. */
-        private fun legacyAmbiguityResolvedByCompletedUpload(
-            context: Context,
-            bytesFile: IOFile,
-            fileId: Int,
-            userDrive: UserDrive,
-        ): Boolean = runCatching {
-            val bytesHash = UploadFile.sha256OrNull(bytesFile) ?: return@runCatching false
-            FileController.getRealmInstance(userDrive).use { realm ->
-                // REFRESH FAILURE FAILS CLOSED (review-38 #5): a stale Realm view never
-                // grants completion authority.
-                runCatching { realm.refresh() }.onFailure { return@use false }
-                val row = FileController.getFileById(realm, fileId) ?: return@use false
-                // THE COMPLETED-UPLOAD AUTHORITY (review-38 #3): the retracted pending-
-                // ownership query matched `uploadAt == null` records — RETAINED-UNSENT
-                // snapshots whose ownership is local snapshot ownership, never an upload
-                // completion. Only an ACTIVE COMPLETED record (uploadAt set by uploadFinished
-                // alone; a cancelled record is never completion) bound to the record's own
-                // row identity and PROVING the target bytes' hash is independent durable
-                // evidence that this exact content was genuinely uploaded. A purged row
-                // leaves the ambiguity unresolved (retain); no predicate substitutes.
-                UploadFile.hasCompletedOriginalRevisionOwnership(
-                    fileName = row.name,
-                    remoteFolder = row.parentId,
-                    driveId = userDrive.driveId,
-                    userId = userDrive.userId,
-                    fileModifiedAt = Date(bytesFile.lastModified()),
-                    fileSize = bytesFile.length(),
-                    contentHash = bytesHash,
-                    originalFileId = fileId,
-                )
-            }
-        }.getOrDefault(false)
+        // THE COMPLETED-UPLOAD CONVERGENCE ROUTE IS REMOVED (review-39 #7): neither the
+        // retracted pending-ownership query nor the completed-upload query binds its
+        // evidence to a recovery journal's publication id, operation or observation
+        // requirement, and the upload schema carries no such binding — an exact-operation
+        // authority needs a durable, operation-bound completion record that does not
+        // exist. Ambiguous legacy evidence converges only through the independently
+        // validated target evidence or the validated rollback transition, and otherwise
+        // retains.
 
         /** THE AMBIGUITY-AWARE OBSERVATION RESOLUTION (review-34 #8, review-37 #3): a carried
          * text establishes as always; an ambiguous legacy absence converges through
@@ -3589,9 +3565,16 @@ class DownloadOfflineFileManager(
             userDrive: UserDrive? = null,
         ): Boolean = when {
             carriedText != null -> establishRecoveredObservation(context, target, carriedText, expectedPublicationId)
-            ambiguous -> targetObservationEvidenceComplete(context, target, expectedPublicationId) ||
-                (fileId != null && userDrive != null &&
-                    legacyAmbiguityResolvedByCompletedUpload(context, target, fileId, userDrive))
+            // THE COMPLETED-UPLOAD CONVERGENCE IS RETRACTED (review-39 #7): a completed
+            // upload of matching bytes proves ITS OWN operation's completion — nothing
+            // binds it to THIS journal's publication id, operation or observation
+            // requirement, and the upload schema carries no such binding. An unrelated
+            // completed row must never read as evidence that this operation's observation
+            // was legitimately absent: an ambiguous legacy observation converges ONLY
+            // through the independently validated target evidence (or the validated
+            // rollback transition) and otherwise RETAINS — honest unresolved, never fake
+            // convergence.
+            ambiguous -> targetObservationEvidenceComplete(context, target, expectedPublicationId)
             else -> true
         }
 
@@ -4932,14 +4915,11 @@ class DownloadOfflineFileManager(
                         when {
                             expectedPublicationId == null -> return false
                             targetProof.publicationId != expectedPublicationId -> Unit
-                            else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId) &&
-                                !legacyAmbiguityResolvedByCompletedUpload(
-                                    context,
-                                    target,
-                                    record.fileId,
-                                    UserDrive(userId = record.userId, driveId = record.driveId, sharedWithMe = capturedShared),
-                                )
-                            ) {
+                            // THE COMPLETED-UPLOAD CONVERGENCE IS RETRACTED (review-39 #7), as
+                            // in the observation resolver: equal bytes bind no operation — the
+                            // ambiguous evidence converges only through the validated target
+                            // evidence and otherwise retains.
+                            else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId)) {
                                 return false
                             }
                         }
