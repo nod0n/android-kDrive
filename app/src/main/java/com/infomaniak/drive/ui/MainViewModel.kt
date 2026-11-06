@@ -1139,6 +1139,10 @@ class MainViewModel(
                                                     val transferred = destinationReplaceable &&
                                                         sourceBytes != null && destinationBytes != null && runCatching {
                                                         val stagedTransfer = DownloadOfflineFileManager.newStagedFile(application, node)
+                                                            // THE STAGING CONTAINER IS A REQUIRED PREREQUISITE
+                                                            // (review-41 #4): an unestablishable container fails
+                                                            // the transfer before any byte is copied.
+                                                            ?: return@runCatching false
                                                         try {
                                                             sourceBytes.copyTo(stagedTransfer, overwrite = true)
                                                             // THE STAGED BYTES ARE DURABLE BEFORE PUBLICATION

@@ -578,7 +578,7 @@ class DownloadOfflineFileManager(
                 if (!cacheBytesProvenCurrent(context, cacheFile, file, userDrive)) {
                     null
                 } else {
-                    val candidate = newStagedFile(context, file)
+                    val candidate = newStagedFile(context, file) ?: return@withContext CachePromotionOutcome.FAILED
                     // EXPLICIT Boolean success AFTER the actual copy (round-16 compile fix #2):
                     // File.copyTo returns the destination File, so getOrDefault(false) against
                     // it inferred a File/Boolean least-upper-bound instead of a condition.
@@ -968,8 +968,9 @@ class DownloadOfflineFileManager(
 
         // Download into a unique, app-owned staged file (issue: round 3 #2): never a sibling of
         // the offline path (a user file could live there), never shared between concurrent
-        // workers. In-progress bytes are never visible at the offline path.
-        val staged = newStagedFile(context, file)
+        // workers. In-progress bytes are never visible at the offline path. An unestablishable
+        // staging container (review-41 #4) fails the download before any network work.
+        val staged = newStagedFile(context, file) ?: return@withContext ListenableWorker.Result.failure()
         lastDownloadedFile = staged
         makeSureFileExists(staged) ?: return@withContext ListenableWorker.Result.failure()
 
@@ -2276,8 +2277,8 @@ class DownloadOfflineFileManager(
          * a verified destination proof disposes it. The old proof is never destroyed
          * without recoverable relocation state.
          */
-        private fun proofRelocationRecordFile(context: Context, target: IOFile): IOFile =
-            IOFile(stagingDirectory(context), "proofmove_${provenanceKeyHex(target)}.recovery")
+        private fun proofRelocationRecordFile(context: Context, target: IOFile): IOFile? =
+            durableStagingDirectory(context)?.let { IOFile(it, "proofmove_${provenanceKeyHex(target)}.recovery") }
 
         private fun writeProofRelocationRecord(
             context: Context,
@@ -2307,6 +2308,9 @@ class DownloadOfflineFileManager(
                 AttemptedObservationCapture.Invalid -> return@runCatching false
             }
             val recordFile = proofRelocationRecordFile(context, target)
+                // THE RECOVERY CONTAINER IS A REQUIRED PREREQUISITE (review-41 #4): the
+                // journal is written only into a durably established staging directory.
+                ?: return@runCatching false
             // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
             // scope index exists before the record, so an interrupted or later-corrupted
             // record is still scoped (identities demonstrably outside it progress), and it
@@ -2848,7 +2852,7 @@ class DownloadOfflineFileManager(
                     // touched: the caller's bytes keep their classification evidence. A
                     // failed restore RETAINS the state for the sweep's retry.
                     ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION -> {
-                        val stateParsed = parseProofMoveRecord(proofRelocationRecordFile(context, target))
+                        val stateParsed = proofRelocationRecordFile(context, target)?.let { parseProofMoveRecord(it) }
                         // AN UNDECODABLE JOURNAL IS RETAINED (review-35 #5): a parse failure
                         // never substitutes "no previous destination proof" — the destination
                         // is left untouched and the state stays for the sweep.
@@ -2866,7 +2870,7 @@ class DownloadOfflineFileManager(
                         ) {
                             return false
                         }
-                        runCatching { disposeRecoveryRecord(proofRelocationRecordFile(context, target)) }
+                        runCatching { proofRelocationRecordFile(context, target)?.let { disposeRecoveryRecord(it) } }
                     }
                 }
                 return false
@@ -2880,7 +2884,7 @@ class DownloadOfflineFileManager(
                         deletePublishedProvenance(context, source)
                     }
                     ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION -> {
-                        val stateParsed = parseProofMoveRecord(proofRelocationRecordFile(context, target))
+                        val stateParsed = proofRelocationRecordFile(context, target)?.let { parseProofMoveRecord(it) }
                         // AN UNDECODABLE JOURNAL IS RETAINED (review-35 #5): a parse failure
                         // never substitutes "no previous destination proof" — the destination
                         // is left untouched and the state stays for the sweep.
@@ -2898,7 +2902,7 @@ class DownloadOfflineFileManager(
                         ) {
                             return false
                         }
-                        runCatching { disposeRecoveryRecord(proofRelocationRecordFile(context, target)) }
+                        runCatching { proofRelocationRecordFile(context, target)?.let { disposeRecoveryRecord(it) } }
                     }
                 }
                 return false
@@ -3149,7 +3153,7 @@ class DownloadOfflineFileManager(
             // PENDING (review-34 #3): the subtree relocation completes its children while
             // the rows still resolve to the old paths — disposal happens only after that
             // commit succeeds, so a failed merge retains every child's rollback authority.
-            if (disposeOnSuccess) runCatching { proofRelocationRecordFile(context, target).delete() }
+            if (disposeOnSuccess) proofRelocationRecordFile(context, target)?.let { runCatching { it.delete() } }
             return true
         }
 
@@ -3168,6 +3172,7 @@ class DownloadOfflineFileManager(
             if (toPhase != "B" && toPhase != "M") return false
             return runCatching {
                 val recordFile = proofRelocationRecordFile(context, target)
+                    ?: return@runCatching false
                 val parsed = parseProofMoveRecord(recordFile) ?: return@runCatching false
                 if (!parsed.phaseAuthoritative) return@runCatching false
                 when (toPhase) {
@@ -3229,7 +3234,7 @@ class DownloadOfflineFileManager(
          * [completePreparedProofMove] with disposeOnSuccess = false. The rows, bytes,
          * proof and observation agree at the destination — only the journal is cleared. */
         internal fun disposeCompletedRelocationState(context: Context, target: IOFile) {
-            runCatching { proofRelocationRecordFile(context, target).delete() }
+            proofRelocationRecordFile(context, target)?.let { runCatching { it.delete() } }
         }
 
         /** THE COMMIT-VERIFIED JOURNAL DISPOSAL (review-35 #4): an identity-changing
@@ -3332,7 +3337,7 @@ class DownloadOfflineFileManager(
          * relocation-flow preparation (review-33 #4) and is left entirely alone here.
          */
         internal fun disposePreparedProofRelocation(context: Context, target: IOFile) {
-            val stateFile = proofRelocationRecordFile(context, target)
+            val stateFile = proofRelocationRecordFile(context, target) ?: return
             val parsed = parseProofMoveRecord(stateFile)
             if (parsed == null) {
                 return
@@ -3410,20 +3415,33 @@ class DownloadOfflineFileManager(
          * App-owned staging directory on the SAME volume as the offline storage (so publication
          * is an atomic rename), but OUTSIDE it: remote file paths can never resolve here, so no
          * user content can be staged-over or mistaken for residue (issue: round 3 #2).
+         * Returns null when the directory cannot even be created; READ paths (decodes,
+         * sweeps) perform no synchronization and treat an uncreatable container as
+         * unresolved evidence.
          */
-        private fun stagingDirectory(context: Context): IOFile =
-            IOFile(File.getOfflineFolder(context).parentFile, STAGING_FOLDER).apply {
-                if (!exists()) {
-                    mkdirs()
-                    // THE STAGING DIRECTORY'S OWN ENTRY IS ACKNOWLEDGED WHEN CREATED
-                    // (review-40 #3). A failed acknowledgment does not block the staging
-                    // protocol: the staged files' own atomic writes and publication
-                    // renames acknowledge their immediate entries, and the staging tree
-                    // itself is reconstructible — the sweep's journal-driven replay
-                    // re-stages what a lost staging directory held.
-                    runCatching { UploadFile.synchronizeDirectoryEntry(parentFile) }
-                }
+        private fun stagingDirectory(context: Context): IOFile? =
+            IOFile(File.getOfflineFolder(context).parentFile ?: return null, STAGING_FOLDER).takeIf { directory ->
+                directory.exists() || directory.mkdirs()
             }
+
+        /**
+         * THE DURABLE ESTABLISHMENT OF THE RECOVERY CONTAINER (review-41 #4): the staging
+         * directory holds recovery backups, `.recovery` bodies, scope sidecars and
+         * proof-move journals — INDISPENSABLE recovery state, never merely disposable
+         * download stages. Its own entry in its parent is therefore a REQUIRED PREREQUISITE:
+         * it is acknowledged on EVERY establishment — a creation whose synchronization
+         * failed left the directory existing-but-unacknowledged, and a retry that only saw
+         * exists() skipped the failed prerequisite (a crash losing the staging-root entry
+         * could lose both a backup and its operation association, which no sweep can
+         * reconstruct from journals inside the lost directory). A failed acknowledgment
+         * PROPAGATES: no recovery write and no dependent destructive operation runs after
+         * it — every caller fails closed and retains.
+         */
+        private fun durableStagingDirectory(context: Context): IOFile? {
+            val directory = stagingDirectory(context) ?: return null
+            if (!UploadFile.synchronizeDirectoryEntry(directory.parentFile ?: return null)) return null
+            return directory
+        }
 
         /**
          * THE ORDERED DURABLE DESTINATION HIERARCHY (review-39 #2, reworked review-40 #3,
@@ -3468,13 +3486,17 @@ class DownloadOfflineFileManager(
 
         /**
          * A unique staged file per transfer: identical downloads by concurrent workers (e.g. an
-         * ancestor and a nested root) never collide (issue: round 3 #2).
+         * ancestor and a nested root) never collide (issue: round 3 #2). Created only inside a
+         * DURABLY ESTABLISHED staging container (review-41 #4) — a backup or download stage
+         * whose container's entry is unacknowledged is never created; null fails the caller.
          */
-        internal fun newStagedFile(context: Context, file: File): IOFile =
-            IOFile(stagingDirectory(context), "${file.id}_${file.driveId}_${UUID.randomUUID()}.part")
+        internal fun newStagedFile(context: Context, file: File): IOFile? =
+            durableStagingDirectory(context)?.let {
+                IOFile(it, "${file.id}_${file.driveId}_${UUID.randomUUID()}.part")
+            }
 
-        private fun recoveryRecordFile(context: Context, recoveryFile: IOFile): IOFile =
-            IOFile(stagingDirectory(context), "${recoveryFile.name}.recovery")
+        private fun recoveryRecordFile(context: Context, recoveryFile: IOFile): IOFile? =
+            durableStagingDirectory(context)?.let { IOFile(it, "${recoveryFile.name}.recovery") }
 
         /**
          * DURABLE ROLLBACK ASSOCIATION (issues: round 21 #9/#10, round 22 #2): every
@@ -3700,6 +3722,10 @@ class DownloadOfflineFileManager(
                 AttemptedObservationCapture.Invalid -> return@runCatching false
             }
             val recordFile = recoveryRecordFile(context, recoveryFile)
+                // THE RECOVERY CONTAINER IS A REQUIRED PREREQUISITE (review-41 #4): the
+                // sidecar and record are written only into a durably established staging
+                // directory.
+                ?: return@runCatching false
             // ATOMIC WRITE + SCOPE SIDECAR FIRST (issues: round 25 #6, round 26 #5): the
             // scope index exists before the record itself, and names the destination's
             // ACTUAL realm flavor and storage kind — an interrupted cache or shared-Realm
@@ -3936,7 +3962,7 @@ class DownloadOfflineFileManager(
         internal fun pendingRecoveryFileIds(context: Context, userDrive: UserDrive): Set<Int>? {
             val files = runCatching {
                 stagingDirectory(context)
-                    .listFiles { f -> f.name.endsWith(".recovery") }
+                    ?.listFiles { f -> f.name.endsWith(".recovery") }
             }.getOrNull()
             // ENUMERATION FAILURE IS UNRESOLVED, NEVER ABSENCE (issue: round 24 #3): the
             // previous mapNotNull chain also made a null listing and every UNREADABLE
@@ -4061,7 +4087,7 @@ class DownloadOfflineFileManager(
          * body cross-check.
          */
         internal fun readRelocationReceipt(context: Context, target: IOFile): RelocationReceipt? {
-            val recordFile = proofRelocationRecordFile(context, target)
+            val recordFile = proofRelocationRecordFile(context, target) ?: return null
             val parsed = parseProofMoveRecord(recordFile) ?: return null
             if (parsed.observationFieldDamaged || !parsed.identitiesValid) return null
             val sharedWithMe = when (val authority = readScopeAuthority(
@@ -4124,7 +4150,7 @@ class DownloadOfflineFileManager(
             targetPath: String?,
         ): Boolean {
             val files = runCatching {
-                stagingDirectory(context).listFiles { f -> f.name.endsWith(".recovery") }
+                stagingDirectory(context)?.listFiles { f -> f.name.endsWith(".recovery") }
             }.getOrNull()
             // ENUMERATION FAILURE IS UNRESOLVED, NEVER ABSENCE (issue: round 24 #3): the
             // previous `?.any{} == true` turned a null listing into a fail-OPEN answer
@@ -4276,7 +4302,7 @@ class DownloadOfflineFileManager(
          */
         internal fun reconcileInterruptedRecoveries(context: Context): Boolean {
             val records = runCatching {
-                stagingDirectory(context).listFiles { f -> f.name.endsWith(".recovery") }?.toList() ?: emptyList()
+                stagingDirectory(context)?.listFiles { f -> f.name.endsWith(".recovery") }?.toList() ?: emptyList()
             }.getOrDefault(emptyList())
             var allResolved = true
             for (recordFile in records) {
@@ -4909,7 +4935,7 @@ class DownloadOfflineFileManager(
             // orphan is harmless (it is never enumerated) and does not fail the pass.
             runCatching {
                 synchronized(OfflineFileCoordination.rootIntentMonitor) {
-                    stagingDirectory(context).listFiles { f -> f.name.endsWith(".scope") }?.forEach { sidecar ->
+                    stagingDirectory(context)?.listFiles { f -> f.name.endsWith(".scope") }?.forEach { sidecar ->
                         if (!IOFile(sidecar.path.removeSuffix(".scope")).exists()) {
                             runCatching { sidecar.delete() }
                         }
@@ -5361,7 +5387,11 @@ class DownloadOfflineFileManager(
             if (backupHashNow == null || (expectedBackupHash != null && backupHashNow != expectedBackupHash)) {
                 return@runCatching false
             }
-            val stage = IOFile(stagingDirectory(context), "restore_${UUID.randomUUID()}.part")
+            // THE RESTORE'S STAGE IS WRITTEN INTO A DURABLY ESTABLISHED CONTAINER
+            // (review-41 #4): the staged backup bytes are recovery state — an
+            // unestablishable container fails the restore before any target mutation.
+            val stageContainer = durableStagingDirectory(context) ?: return@runCatching false
+            val stage = IOFile(stageContainer, "restore_${UUID.randomUUID()}.part")
             try {
                 val stagedOk = runCatching {
                     recoveryFile.copyTo(stage, overwrite = true)
@@ -5406,7 +5436,7 @@ class DownloadOfflineFileManager(
                 // crash window whose residue (restored R1 plus the retained R2 relocation
                 // proof) the sweep then mismatched forever. Disposing here closes the
                 // window; any caller's own deletion is an idempotent no-op.
-                disposeRecoveryRecord(proofRelocationRecordFile(context, target))
+                disposeRecoveryRecord(proofRelocationRecordFile(context, target) ?: return@runCatching false)
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(recordFile)
                 true
@@ -6030,6 +6060,15 @@ class DownloadOfflineFileManager(
             // locks and validates against the exact backed-up generation.
             val oldTargetMtime = if (target.exists()) target.lastModified() else 0L
             val recoveryFile = if (target.exists()) newStagedFile(provenanceContext, file) else null
+            if (target.exists() && recoveryFile == null) {
+                // THE RECOVERY CONTAINER IS A REQUIRED PREREQUISITE (review-41 #4): a
+                // backup for an existing target cannot be staged into an unestablished
+                // container — the publication fails BEFORE any destructive step, retaining
+                // the old bytes and their proof and the pending intent. A null here is
+                // never read as "nothing to back up".
+                runCatching { staged.delete() }
+                return PublicationOutcome.FAILED
+            }
             // copyTo returns the DESTINATION file, not a success flag — the backup is
             // validated explicitly (complete bytes) after the copy (issue: round 21 #1).
             val recoveryOk = recoveryFile == null || runCatching {
@@ -6080,7 +6119,7 @@ class DownloadOfflineFileManager(
                 ))
             if (!recoveryOk || !recoveryRecorded) {
                 runCatching { recoveryFile?.delete() }
-                recoveryFile?.let { runCatching { recoveryRecordFile(provenanceContext, it).delete() } }
+                recoveryFile?.let { rf -> recoveryRecordFile(provenanceContext, rf)?.let { runCatching { it.delete() } } }
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
             }
@@ -6147,21 +6186,24 @@ class DownloadOfflineFileManager(
                         requireObservation = explicitUnresolvedGeneration,
                     )
                 ) {
-                    val restored = recoveryFile != null && restoreRecoveryCopy(
-                        context = provenanceContext,
-                        recoveryFile = recoveryFile,
-                        target = target,
-                        recordFile = recoveryRecordFile(provenanceContext, recoveryFile),
-                        oldRecordText = oldRecordText,
-                        oldTargetMtimeMillis = oldTargetMtime,
-                    )
+                    val restored = recoveryFile != null && recoveryRecordFile(provenanceContext, recoveryFile)
+                        ?.let { rf ->
+                            restoreRecoveryCopy(
+                                context = provenanceContext,
+                                recoveryFile = recoveryFile,
+                                target = target,
+                                recordFile = rf,
+                                oldRecordText = oldRecordText,
+                                oldTargetMtimeMillis = oldTargetMtime,
+                            )
+                        } == true
                     if (restored) {
                         // THE ROLLBACK SUPERSEDES THE FAILED PUBLICATION'S PROOF (issue:
                         // round 24 #5): a verified restore put the previous generation and
                         // its proof back — the relocation record for the failed proof is
                         // disposed here, so the next sweep can never write it over the
                         // restored bytes.
-                        runCatching { proofRelocationRecordFile(provenanceContext, target).delete() }
+                        proofRelocationRecordFile(provenanceContext, target)?.let { runCatching { it.delete() } }
                     }
                     if (!restored) {
                         if (recoveryFile == null) {
@@ -6177,7 +6219,7 @@ class DownloadOfflineFileManager(
                     return PublicationOutcome.FAILED
                 }
                 runCatching { recoveryFile?.delete() }
-                recoveryFile?.let { runCatching { recoveryRecordFile(provenanceContext, it).delete() } }
+                recoveryFile?.let { rf -> recoveryRecordFile(provenanceContext, rf)?.let { runCatching { it.delete() } } }
                 // Record the PUBLISHED bytes' clean baseline separately from the accepted
                 // server metadata (issue: round 15 #6): edit detection judges the copy
                 // against the baseline its bytes were actually written under until a
@@ -6275,6 +6317,10 @@ class DownloadOfflineFileManager(
             // coordinated core; missing or mismatched provenance fails and the caller
             // enqueues a fresh download.
             val staged = newStagedFile(context, authoritativeFile)
+                // THE STAGING CONTAINER IS A REQUIRED PREREQUISITE (review-41 #4): no stage
+                // is created in an unestablished container — the transfer fails before any
+                // network work.
+                ?: return PublicationOutcome.FAILED
             // THE TRY EXPRESSION IS THE RETURNED VALUE (review-32 compile repair): the
             // outer staging finally spans creation through publication while the try
             // block's last expression (the actual typed outcome) is forwarded explicitly
@@ -6445,6 +6491,13 @@ class DownloadOfflineFileManager(
                         // #10).
                         val oldTargetMtime = if (target.exists()) target.lastModified() else 0L
                         val recoveryFile = if (target.exists()) newStagedFile(context, file) else null
+            if (target.exists() && recoveryFile == null) {
+                // THE RECOVERY CONTAINER IS A REQUIRED PREREQUISITE (review-41 #4), as in
+                // the coordinated publication: a null from a failed establishment is never
+                // read as "nothing to back up" — the publication fails before any
+                // destructive step.
+                return@runCatching PublicationOutcome.FAILED
+            }
                         // copyTo returns the DESTINATION file, not a success flag — the
                         // backup is validated explicitly (complete bytes) after the copy
                         // (issue: round 21 #1).
@@ -6488,7 +6541,7 @@ class DownloadOfflineFileManager(
                             ))
                         if (!recoveryOk || !recoveryRecorded) {
                             runCatching { recoveryFile?.delete() }
-                            recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
+                            recoveryFile?.let { rf -> recoveryRecordFile(context, rf)?.let { runCatching { it.delete() } } }
                             runCatching { staged.delete() }
                             PublicationOutcome.FAILED
                         } else {
@@ -6531,7 +6584,7 @@ class DownloadOfflineFileManager(
                                         requireObservation = !generationResolved,
                                     ) -> {
                                     runCatching { recoveryFile?.delete() }
-                                    recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
+                                    recoveryFile?.let { rf -> recoveryRecordFile(context, rf)?.let { runCatching { it.delete() } } }
                                     // TYPED UNRESOLVED (issue: round 24 #19/#20): an
                                     // unestablished generation is PUBLISHED_UNRESOLVED —
                                     // never an unconditional PUBLISHED the preview could
@@ -6549,7 +6602,7 @@ class DownloadOfflineFileManager(
                                         runCatching { provenanceFileFor(context, target).writeText(oldRecordText) }
                                     }
                                     runCatching { recoveryFile?.delete() }
-                                    recoveryFile?.let { runCatching { recoveryRecordFile(context, it).delete() } }
+                                    recoveryFile?.let { rf -> recoveryRecordFile(context, rf)?.let { runCatching { it.delete() } } }
                                     SentryLog.e(TAG, "Failed to publish staged file to ${target.path}")
                                     PublicationOutcome.FAILED
                                 }
@@ -6559,20 +6612,23 @@ class DownloadOfflineFileManager(
                                     // proof (issue: round 20 #10), VERIFIED before the recovery
                                     // state is disposed (issue: round 21 #9); with nothing
                                     // recoverable (fresh publication) fail closed.
-                                    val restored = recoveryFile != null && restoreRecoveryCopy(
-                                        context = context,
-                                        recoveryFile = recoveryFile,
-                                        target = target,
-                                        recordFile = recoveryRecordFile(context, recoveryFile),
-                                        oldRecordText = oldRecordText,
-                                        oldTargetMtimeMillis = oldTargetMtime,
-                                    )
+                                    val restored = recoveryFile != null &&
+                                        recoveryRecordFile(context, recoveryFile)?.let { rf ->
+                                            restoreRecoveryCopy(
+                                                context = context,
+                                                recoveryFile = recoveryFile,
+                                                target = target,
+                                                recordFile = rf,
+                                                oldRecordText = oldRecordText,
+                                                oldTargetMtimeMillis = oldTargetMtime,
+                                            )
+                                        } == true
                                     if (restored) {
                                         // THE ROLLBACK SUPERSEDES THE FAILED PUBLICATION'S
                                         // PROOF (issue: round 24 #5), as in the coordinated
                                         // publication: the verified restore owns the target's
                                         // proof again — the relocation record is disposed.
-                                        runCatching { proofRelocationRecordFile(context, target).delete() }
+                                        proofRelocationRecordFile(context, target)?.let { runCatching { it.delete() } }
                                     }
                                     if (!restored && recoveryFile == null) {
                                         runCatching { target.delete() }
@@ -6831,6 +6887,7 @@ class DownloadOfflineFileManager(
                     return PublicationOutcome.FAILED
                 }
                 val staged = newStagedFile(appContext, file)
+                    ?: return PublicationOutcome.FAILED
                 try {
                     runCatching {
                         writeStaged(staged)
