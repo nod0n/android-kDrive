@@ -7789,6 +7789,46 @@ class DownloadOfflineFileManager(
                 UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)
         }
 
+        /** THE LEGACY-AMBIGUITY RECOVERY (review-50 H1): a rename-era entry (a legacy
+         * PENDING/SUPERSEDED MOVED slot, or an upgraded LEGACY_AMBIGUOUS entry) whose slot
+         * is MISSING is honestly OPEN — the old protocol's phases prove nothing about an
+         * execution, and the recorded sha alone carries no evidence once the recovery
+         * carrier is disposed. THE ONLY SAFE EXITS: the canonical STILL hashes to the
+         * RECORDED identity — then the verified exact bytes are preserved DURABLY in the
+         * OWNED RECORDED slot (the canonical is untouched: no destructive canonical change
+         * before the evidence exists) and the entry is cleared to COMMITTED, the strongest
+         * possible state — or the caller RETAINS, permanently: no operator disposition or
+         * approval mechanism is invented, and the recorded sha stays in the manifest for
+         * the operator. The entry is NEVER routed through PENDING: a legacy missing slot
+         * must never read as the new protocol's provably never-executed reservation (that
+         * would conflate the rename-era ambiguity with the copy-then-retire proof). THE
+         * CRASH/REPLAY WINDOWS all retain or promote verified evidence: before the copy
+         * the entry is unchanged (the recovery re-runs on the next pass); the temp+rename
+         * copy leaves the slot either ABSENT or COMPLETE, and the present+verified rules
+         * then promote it to COMMITTED — never loss, never a false release; the recorded
+         * entry itself IS the reservation (its name and sha are already durable), so no
+         * new reservation is written. Returns the recovered COMMITTED entry, or null when
+         * the canonical cannot be read, does not hash to the recorded identity, or the
+         * durable preservation failed — the caller retains in every null case. */
+        private fun recoverLegacyAmbiguousSlot(
+            observationFile: IOFile,
+            recordFile: IOFile,
+            entry: QuarantineManifestEntry,
+            checkCancelled: () -> Unit,
+        ): QuarantineManifestEntry? {
+            val currentBytes = runCatching { observationFile.readBytes() }.getOrNull() ?: return null
+            if (sha256HexOfBytes(currentBytes) != entry.sha256Hex) return null
+            // THE EXECUTING CONTEXT AFTER THE IDENTITY VALIDATION, BEFORE THE COPY (the
+            // review-48 F3 / review-49 G4 discipline): the recovery's first destructive
+            // effect is the slot write; the check is OUTSIDE the runCatching.
+            checkCancelled()
+            val slotFile = IOFile(recordFile.parentFile, entry.slotName)
+            if (!atomicWriteBytes(slotFile, currentBytes)) return null
+            if (!slotMatchesManifest(slotFile, entry.sha256Hex)) return null
+            if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return null
+            return entry.copy(state = QuarantineEntryState.COMMITTED)
+        }
+
         /**
          * THE QUARANTINE MANIFEST RECONCILIATION (review-49 G3): runs at the TOP of the
          * observation restore — BEFORE any branch mutation that could recreate the
@@ -7810,17 +7850,28 @@ class DownloadOfflineFileManager(
          *     retain;
          *   - a PENDING CAPTURED entry with a missing slot stays PENDING — its payload is
          *     record-carried and the repair is independent of the move protocol;
-         *   - THE LEGACY UPGRADE (V1/V2 — no assumed historical no-move, no never-shipped
-         *     waiver): every legacy MOVED entry with a missing slot becomes
-         *     LEGACY_AMBIGUOUS (its sha kept, honestly OPEN — the old protocol's phases
-         *     prove nothing); a legacy entry with a PRESENT verified slot is promoted to
-         *     COMMITTED (the bytes exist — the strongest evidence); a legacy CAPTURED
-         *     entry stays PENDING (record-carried). The upgrade writes OBSQ3 with THIS
-         *     record's own validated scope.
-         * SUPERSEDED and LEGACY_AMBIGUOUS entries are skipped for loss detection (review-49
-         * G2) — their present slots are still verified, their recorded identities kept.
-         * The rewrite (any state change or the format upgrade) is atomic + readback-
-         * verified; the cancellation is observed before the first rewrite.
+         *   - THE LEGACY/INHERITED MISSING-SLOT RULE (review-50 H1 — the round-49
+         *     L-then-skip was the old unsafe inference renamed and is GONE): a MISSING
+         *     slot on a rename-era entry (a legacy PENDING/SUPERSEDED MOVED slot) or on
+         *     an ALREADY-UPGRADED LEGACY_AMBIGUOUS entry (whatever the current header)
+         *     has exactly TWO safe exits — the canonical still hashes to the RECORDED
+         *     identity, in which case the verified exact bytes are preserved DURABLY in
+         *     the OWNED RECORDED slot (the canonical untouched) and the entry is cleared
+         *     to COMMITTED ([recoverLegacyAmbiguousSlot]; never routed through PENDING —
+         *     a legacy missing slot never reads as the new protocol's never-executed
+         *     proof) — or the restore RETAINS, PERMANENTLY (no operator disposition is
+         *     invented; the recorded sha stays). A legacy SUPERSEDED CAPTURED entry with
+         *     a missing slot is normalized to PENDING (its payload's carrier is the
+         *     record, available now — the record-carried repair applies).
+         *   - a PRESENT slot with a matching sha on a LEGACY-provenance entry (A/S/L) is
+         *     CLEARED TO COMMITTED (the bytes exist durably — the strongest evidence); a
+         *     mismatch retains. A new-protocol SUPERSEDED/LEGACY_AMBIGUOUS entry with a
+         *     present verified slot keeps its state (verified at the gate).
+         * The new-protocol PENDING/SUPERSEDED rules (the keep/supersede/retain above and
+         * the gate's skip) are UNCHANGED — the copy-then-retire proof stands for entries
+         * this protocol created (review-50: closed). The rewrite (any state change or the
+         * format upgrade) is atomic + readback-verified; the cancellation is observed
+         * before the first rewrite and before each recovery copy.
          */
         private fun reconcileQuarantineManifest(
             context: Context,
@@ -7844,7 +7895,18 @@ class DownloadOfflineFileManager(
                         if (slotExistsExcludingSymlinks(slotFile)) {
                             if (!slotMatchesManifest(slotFile, entry.sha256Hex)) return false
                             if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
-                            if (entry.state == QuarantineEntryState.PENDING) {
+                            // A PRESENT SLOT WITH A MATCHING SHA IS VERIFIED EVIDENCE (the
+                            // mismatch retained above): a PENDING entry is promoted (the
+                            // copy completed, the phase write did not), and a LEGACY-
+                            // provenance entry — a rename-era A/S or an upgraded L — is
+                            // CLEARED TO COMMITTED: the bytes exist durably, the strongest
+                            // possible state (review-50 H1: a matching legacy slot commits).
+                            // A new-protocol SUPERSEDED/LEGACY_AMBIGUOUS entry keeps its
+                            // state (its release semantics stand; the bytes are verified at
+                            // the gate regardless).
+                            if (entry.state == QuarantineEntryState.PENDING ||
+                                (bound.legacy && entry.state != QuarantineEntryState.COMMITTED)
+                            ) {
                                 changed = true
                                 updatedEntries.add(entry.copy(state = QuarantineEntryState.COMMITTED))
                             } else {
@@ -7858,10 +7920,20 @@ class DownloadOfflineFileManager(
                                 QuarantineSlotKind.CAPTURED -> updatedEntries.add(entry)
                                 QuarantineSlotKind.MOVED -> {
                                     if (bound.legacy) {
-                                        // THE LEGACY UPGRADE: the old protocol's A proves
-                                        // nothing — honestly OPEN, never assumed pending.
+                                        // THE LEGACY MISSING-SLOT RULE (review-50 H1): the
+                                        // rename-era A proves nothing about an execution —
+                                        // the ONLY safe exits are the canonical still
+                                        // hashing to the recorded identity (recover: the
+                                        // verified bytes preserved durably in the recorded
+                                        // slot, cleared to COMMITTED) or the PERMANENT
+                                        // retain. Never routed through PENDING; never
+                                        // released; no L-then-skip at the gate.
+                                        val recovered = recoverLegacyAmbiguousSlot(
+                                            observationFile, recordFile, entry, checkCancelled,
+                                        )
+                                        if (recovered == null) return false
                                         changed = true
-                                        updatedEntries.add(entry.copy(state = QuarantineEntryState.LEGACY_AMBIGUOUS))
+                                        updatedEntries.add(recovered)
                                     } else {
                                         // THE NEW PROTOCOL: the canonical was never removed
                                         // by this operation while the entry is PENDING.
@@ -7879,7 +7951,50 @@ class DownloadOfflineFileManager(
                                 }
                                 null -> return false
                             }
-                            QuarantineEntryState.SUPERSEDED, QuarantineEntryState.LEGACY_AMBIGUOUS -> updatedEntries.add(entry)
+                            QuarantineEntryState.SUPERSEDED -> when (quarantinedSlotKind(recordFile, entry.slotName)) {
+                                QuarantineSlotKind.CAPTURED -> {
+                                    if (bound.legacy) {
+                                        // A legacy S on a CAPTURED slot is the same
+                                        // inference-era release (review-50 H1): the payload's
+                                        // carrier is the RECORD, available now — normalized
+                                        // to PENDING so the record-carried repair applies.
+                                        changed = true
+                                        updatedEntries.add(entry.copy(state = QuarantineEntryState.PENDING))
+                                    } else {
+                                        updatedEntries.add(entry)
+                                    }
+                                }
+                                QuarantineSlotKind.MOVED -> {
+                                    if (bound.legacy) {
+                                        // A V2 S MOVED entry is the old presence inference
+                                        // treated as a proven release (review-50 H1) — the
+                                        // SAME conservative rule as the legacy A above:
+                                        // recover-or-retain, never a release.
+                                        val recovered = recoverLegacyAmbiguousSlot(
+                                            observationFile, recordFile, entry, checkCancelled,
+                                        )
+                                        if (recovered == null) return false
+                                        changed = true
+                                        updatedEntries.add(recovered)
+                                    } else {
+                                        updatedEntries.add(entry)
+                                    }
+                                }
+                                null -> return false
+                            }
+                            QuarantineEntryState.LEGACY_AMBIGUOUS -> {
+                                // THE ALREADY-UPGRADED AMBIGUITY (review-50 H1): an L entry
+                                // — whatever the current header says — with a missing slot
+                                // stays honestly OPEN: recover-or-retain, NEVER a release
+                                // (the round-49 gate skip here was the unsafe inference
+                                // renamed).
+                                val recovered = recoverLegacyAmbiguousSlot(
+                                    observationFile, recordFile, entry, checkCancelled,
+                                )
+                                if (recovered == null) return false
+                                changed = true
+                                updatedEntries.add(recovered)
+                            }
                         }
                     }
                     if (changed || bound.legacy) {
@@ -7906,9 +8021,15 @@ class DownloadOfflineFileManager(
          *   - a PRESENT slot: the recorded sha must match whatever the state (a mismatch
          *     retains — the recorded identity and the existing bytes are never waived) +
          *     the slot's directory acknowledgment;
-         *   - a MISSING slot on a SUPERSEDED or LEGACY_AMBIGUOUS entry: skipped for loss
-         *     detection (review-49 G2 — a released reservation is never loss; the legacy
-         *     entries are honestly OPEN, never claimed proven);
+         *   - a MISSING slot on a SUPERSEDED entry: skipped for loss detection (review-49
+         *     G2 — a released reservation is never loss; NEW-PROTOCOL only: the
+         *     reconciliation normalizes every legacy/inherited S before the gate, so an S
+         *     here is the copy-then-retire release of a provably never-executed
+         *     reservation);
+         *   - a MISSING slot on a LEGACY_AMBIGUOUS entry: RETAIN (review-50 H1 — the
+         *     ambiguity is never a release; the reconciliation recovers or retains every
+         *     such entry before the gate, so reaching this branch is out-of-band and the
+         *     honest response is the permanent retain — no L-then-skip at the disposal);
          *   - a MISSING slot on a COMMITTED entry: REAL LOSS → retain (never waived);
          *   - a MISSING slot on a PENDING CAPTURED entry: the pending write is finished
          *     FROM THE RECORD (the payload must hash to the recorded identity; the slot is
@@ -7947,7 +8068,12 @@ class DownloadOfflineFileManager(
                             continue
                         }
                         when (entry.state) {
-                            QuarantineEntryState.SUPERSEDED, QuarantineEntryState.LEGACY_AMBIGUOUS -> continue
+                            QuarantineEntryState.SUPERSEDED -> continue
+                            // A MISSING LEGACY-AMBIGUOUS SLOT IS NEVER A RELEASE
+                            // (review-50 H1): the reconciliation recovers or retains every
+                            // such entry before this gate; reaching it here means the
+                            // ambiguity was never resolved — the restore retains.
+                            QuarantineEntryState.LEGACY_AMBIGUOUS -> return false
                             QuarantineEntryState.COMMITTED -> return false
                             QuarantineEntryState.PENDING -> when (quarantinedSlotKind(recordFile, entry.slotName)) {
                                 QuarantineSlotKind.CAPTURED -> {
