@@ -4322,7 +4322,11 @@ class DownloadOfflineFileManager(
             // staging XXH3 must reproduce the captured server hash — the strongest
             // available check that the hash is over exactly these bytes.
             onHashCheck()
-            val computed = ServerContentHash.hashStreaming(staged.inputStream().buffered(), onCheck = onHashCheck)
+            // THE STREAM IS CALLER-OWNED (the hashStreaming contract): closed on every path —
+            // success, mismatch, cancellation and read failure.
+            val computed = staged.inputStream().buffered().use { stream ->
+                ServerContentHash.hashStreaming(stream, onCheck = onHashCheck)
+            }
             onHashCheck()
             if (computed != serverHash) return null
             return GenerationEstablishment.Established(
@@ -10962,10 +10966,12 @@ class DownloadOfflineFileManager(
                     // suspend coroutineContext — the ACTUAL context is captured once and
                     // the hook drives its ensureActive.
                     val establishmentContext = coroutineContext
-                    val computed = ServerContentHash.hashStreaming(
-                        stagedFile.inputStream().buffered(),
-                        onCheck = { establishmentContext.ensureActive() },
-                    )
+                    // THE STREAM IS CALLER-OWNED (the hashStreaming contract): it is closed
+                    // on every path here — success, mismatch, cancellation and read failure —
+                    // so repeated verification accumulates no descriptors.
+                    val computed = stagedFile.inputStream().buffered().use { stream ->
+                        ServerContentHash.hashStreaming(stream, onCheck = { establishmentContext.ensureActive() })
+                    }
                     coroutineContext.ensureActive()
                     if (computed == serverHash.canonical) {
                         GenerationEstablishment.Established(
