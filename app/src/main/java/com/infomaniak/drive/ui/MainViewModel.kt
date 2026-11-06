@@ -1156,7 +1156,19 @@ class MainViewModel(
                                                                 stagedTransfer.length() == sourceBytes.length() &&
                                                                 stagedHash != null && stagedHash == sourceHash
                                                             if (!stagedOk) return@runCatching false
-                                                            stagedTransfer.setLastModified(sourceBytes.lastModified())
+                                                            // THE TIMESTAMP SETTER'S RESULT IS REQUIRED, AND
+                                                            // THE CONTENTS ARE SYNCHRONIZED AFTER THEIR FINAL
+                                                            // MUTATION (review-40 #13): the staged file's mtime is
+                                                            // part of the published payload — a failed write
+                                                            // fails the transfer, and the data is re-synchronized
+                                                            // AFTER the timestamp change, before the rename; the
+                                                            // earlier staging sync covered only the copy.
+                                                            if (!stagedTransfer.setLastModified(sourceBytes.lastModified())) {
+                                                                return@runCatching false
+                                                            }
+                                                            if (!UploadFile.synchronizeFileContents(stagedTransfer)) {
+                                                                return@runCatching false
+                                                            }
                                                             // THE DESTINATION HIERARCHY IS DURABLY CREATED
                                                             // (review-39 #2): every newly created ancestor's
                                                             // entry is synchronized in creation order before the

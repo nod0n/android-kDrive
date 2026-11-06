@@ -5350,6 +5350,12 @@ class DownloadOfflineFileManager(
                 }.getOrDefault(false)
                 if (!stagedOk) return@runCatching false
                 if (!stage.setLastModified(oldTargetMtimeMillis)) return@runCatching false
+                // THE CONTENTS ARE SYNCHRONIZED AFTER THEIR FINAL MUTATION (review-40 #13):
+                // the staged copy's data was synchronized at staging, but the timestamp
+                // write above is part of the restored payload — the data is re-synchronized
+                // after it, before the rename publishes the restore; the network
+                // publication's finalization order applies to every stage kind.
+                if (!UploadFile.synchronizeFileContents(stage)) return@runCatching false
                 // ATOMIC PUBLICATION of the verified stage: the rename replaces the target
                 // in one step; a failed rename leaves the target exactly as it was.
                 if (!stage.renameTo(target)) return@runCatching false
