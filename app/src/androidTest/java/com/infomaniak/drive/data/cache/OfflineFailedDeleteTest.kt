@@ -93,9 +93,15 @@ import java.util.concurrent.atomic.AtomicInteger
  *  4. successful deletion: the bytes go, the record is released, the counters tell the
  *     truth, the coverage stays cleared.
  *  5. abort between the failed deletion and the restoration: the flags stay cleared (the
- *     reviving authority owns the row). The three-invocation abort shape matches
- *     clearFileCoverage's actual isAborted() call sites; a refactor changing the call count
- *     fails these tests loudly — the intended canary.
+ *     reviving authority owns the row). DATED CALL-SITE CORRECTION (the first sandbox run
+ *     found the postfix predicate `{ invocation++ >= 3 }` compared 0,1,2 and never
+ *     aborted, so the restoration ran): this UPLOADED-with-bytes file path reaches
+ *     EXACTLY THREE of clearFileCoverage's FIVE isAborted() sites — the committing
+ *     transaction, the post-commit revalidation and the restoration guard; the
+ *     folder-branch and missing-target transactions are unreachable on this path and the
+ *     traversal-entry check lives in clearCoverageRecursively (not driven here). The
+ *     predicate pre-increments and the exact count is ASSERTED — a refactor changing the
+ *     call count fails these tests loudly, the intended canary.
  *  6. a live pin committed meanwhile is never overwritten by the restoration.
  *
  * EVERY scenario seeds its OWN unique identity (a per-method counter drives the row's
@@ -457,11 +463,16 @@ class OfflineFailedDeleteTest {
         Realm.getInstance(fixtureConfig).use { realm ->
             val offlineFile = seedCoveredCopy(realm, seedProvenance = false)
             val result = OfflineFolderController.RemovalResult()
+            val stampBefore = liveRow(realm).offlineIntentStamp
 
-            // The abort predicate: false for the committing transaction and the post-commit
-            // revalidation (so the deletion IS attempted), TRUE at the restoration guard.
+            // The abort predicate over the EXACT three-call shape of this path (source-traced
+            // at fdc452348): call 1 is the committing transaction, call 2 the post-commit
+            // revalidation — both must stay false so the deletion IS attempted — and call 3
+            // the restoration guard, which aborts. PRE-increment: the original postfix form
+            // compared 0,1,2 and never aborted — the first sandbox run's restoration-ran
+            // failure.
             var invocation = 0
-            val abortsAfterDeletionAttempt = { invocation++ >= 3 }
+            val abortsAfterDeletionAttempt = { ++invocation >= 3 }
 
             withProvenLockedDirectory(offlineFile.parentFile!!) {
                 val detached = realm.copyFromRealm(liveRow(realm), 1)
@@ -478,7 +489,20 @@ class OfflineFailedDeleteTest {
 
             assertTrue(offlineFile.exists())
             assertEquals(1, result.keptOfflineFilesCount)
+            assertEquals(
+                3,
+                invocation,
+                "BRANCH-REACH CANARY: isAborted() must be called EXACTLY three times on this " +
+                    "path (commit, revalidation, restoration guard) — any other count means the " +
+                    "abort fired at the wrong site or the call sites changed",
+            )
             val abandoned = liveRow(realm)
+            assertNotEquals(
+                stampBefore,
+                abandoned.offlineIntentStamp,
+                "ATTEMPT EVIDENCE: the stamp bump proves the committing transaction ran — " +
+                    "the flags-clearing commit, not a protective short-circuit",
+            )
             assertFalse(
                 abandoned.isInOfflineFolder,
                 "the reviving authority owns the row — a restoration run here must fail this test",
@@ -529,6 +553,12 @@ class OfflineFailedDeleteTest {
                 "the restoration must not have restored inherited coverage over the pin",
             )
             assertFalse(pinned.isMarkedAsOffline, "the pin's own marker semantics are untouched")
+            assertEquals(
+                3,
+                invocation,
+                "BRANCH-REACH CANARY: the pin is committed at the THIRD isAborted() call (the " +
+                    "restoration guard) — a different count commits the pin at a different site",
+            )
         }
     }
 
