@@ -9359,7 +9359,9 @@ class DownloadOfflineFileManager(
          * any classification and both classify readable revisions through the COMMON content
          * classification — factored into one boundary so neither flow can drift back to
          * snapshotting before validating, or advancing over a registered edit. */
-        private sealed class OldSourceDisposition {
+        // TEST-VISIBLE (the round-58 pattern): the dispositions the convergence-regression
+        // fixture asserts on; no behavior change.
+        internal sealed class OldSourceDisposition {
             /** No old bytes exist at the old path: nothing to preserve, nothing to retire. */
             object Absent : OldSourceDisposition()
 
@@ -9394,7 +9396,11 @@ class DownloadOfflineFileManager(
          * snapshot work happen here, so the caller re-checks its executing context before
          * committing anything the classification authorized.
          */
-        private fun classifyOldSourceWithAuthority(
+        // TEST-VISIBLE (the round-58 pattern): the post-publication advance's authorization
+        // classifier — the convergence-regression fixture asserts ITS outcomes (which old
+        // sources authorize the row's advancement and retirement) against seeded sandbox
+        // state. Pure classification; no behavior change for the in-module callers.
+        internal fun classifyOldSourceWithAuthority(
             realm: Realm,
             context: Context,
             userDrive: UserDrive,
