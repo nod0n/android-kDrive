@@ -1031,7 +1031,7 @@ open class UploadFile(
                 // null — the caller never registers, never deletes the original.
                 if (!synchronizeFileContents(snapshot)) return@runCatching null
                 if (!synchronizeDirectoryEntry(folder)) return@runCatching null
-                if (!folderExisted && !synchronizeDirectoryEntry(IOFile(context.filesDir))) return@runCatching null
+                if (!folderExisted && !synchronizeDirectoryEntry(context.filesDir)) return@runCatching null
                 snapshot.toUri()
             }.getOrNull()
         }
