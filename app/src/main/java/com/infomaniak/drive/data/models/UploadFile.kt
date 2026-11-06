@@ -975,6 +975,35 @@ open class UploadFile(
         }
 
         /**
+         * THE BYTE-DURABILITY PRIMITIVES (review-38 #2): a record's synchronized text does
+         * not synchronize the BYTE FILES the record depends on. These two platform
+         * primitives establish the missing ordering — the file's DATA (the standard java.io
+         * FileDescriptor.sync(), as in the journal protocol's atomic record write) and a
+         * DIRECTORY ENTRY (android.system.Os.open with O_RDONLY + Os.fsync — the
+         * platform-supported directory-durability primitive). Both report false on any
+         * failure so callers retain their authority instead of reporting a durability they
+         * cannot prove; hashing/readback proves nothing about durability.
+         */
+        fun synchronizeFileContents(file: IOFile): Boolean = runCatching {
+            java.io.FileInputStream(file).use { stream -> stream.fd.sync() }
+            true
+        }.getOrDefault(false)
+
+        fun synchronizeDirectoryEntry(directory: IOFile): Boolean = runCatching {
+            val directoryFd = android.system.Os.open(
+                directory.absolutePath,
+                android.system.OsConstants.O_RDONLY,
+                0,
+            )
+            try {
+                android.system.Os.fsync(directoryFd)
+            } finally {
+                android.system.Os.close(directoryFd)
+            }
+            true
+        }.getOrDefault(false)
+
+        /**
          * Allocates a unique, durable snapshot file for one upload revision of an offline copy.
          * Unlike the shared upload cache (hash-named, evictable), each snapshot is a distinct
          * file under filesDir, so a later revision can never overwrite a still-pending one.
@@ -987,10 +1016,22 @@ open class UploadFile(
             driveId: Int,
         ): Uri? {
             return runCatching {
-                val folder = IOFile(context.filesDir, OFFLINE_SNAPSHOTS_FOLDER).apply { if (!exists()) mkdirs() }
+                val folder = IOFile(context.filesDir, OFFLINE_SNAPSHOTS_FOLDER)
+                val folderExisted = folder.exists()
+                if (!folderExisted && !folder.mkdirs()) return@runCatching null
                 val snapshot = IOFile(folder, "offline_${fileId}_${driveId}_${UUID.randomUUID()}")
                 source.copyTo(snapshot, overwrite = true)
-                snapshot.setLastModified(fileModifiedAt.time)
+                if (!snapshot.setLastModified(fileModifiedAt.time)) return@runCatching null
+                // THE SNAPSHOT IS DURABLE BEFORE REGISTRATION SUCCEEDS (review-38 #2): the
+                // registration's success permits deleting the ORIGINAL edit — an
+                // unsynchronized copy could vanish in a crash while the upload record and
+                // the original's removal persist. The copied bytes' data and the directory
+                // entries (the snapshot's entry, and the snapshots directory's own entry
+                // when it was just created) are synchronized first. Any failure returns
+                // null — the caller never registers, never deletes the original.
+                if (!synchronizeFileContents(snapshot)) return@runCatching null
+                if (!synchronizeDirectoryEntry(folder)) return@runCatching null
+                if (!folderExisted && !synchronizeDirectoryEntry(IOFile(context.filesDir))) return@runCatching null
                 snapshot.toUri()
             }.getOrNull()
         }

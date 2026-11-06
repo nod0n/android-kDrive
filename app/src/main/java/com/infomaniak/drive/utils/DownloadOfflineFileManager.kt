@@ -584,7 +584,12 @@ class DownloadOfflineFileManager(
                     // it inferred a File/Boolean least-upper-bound instead of a condition.
                     val copied = runCatching {
                         cacheFile.copyTo(candidate, overwrite = true)
-                        true
+                        // THE STAGED BYTES ARE DURABLE BEFORE PUBLICATION (review-38 #2):
+                        // the rename publishes them and the promotion's success lets the
+                        // cache be cleaned — an unsynchronized stage could vanish while
+                        // the published state persists.
+                        UploadFile.synchronizeFileContents(candidate) &&
+                            UploadFile.synchronizeDirectoryEntry(candidate.parentFile)
                     }.getOrDefault(false)
                     if (copied) {
                         candidate
@@ -4575,6 +4580,15 @@ class DownloadOfflineFileManager(
                                                             return@runCatching false
                                                         }
                                                         if (!target.renameTo(sourceFile)) return@runCatching false
+                                                        // THE ROLLBACK'S DIRECTORY ENTRY IS DURABLE
+                                                        // (review-38 #2): the rename moved the bytes to
+                                                        // the restored source — its persistence is
+                                                        // established BEFORE the journal is disposed; a
+                                                        // rename-success/fsync-failure state retains the
+                                                        // record for the sweep.
+                                                        if (!UploadFile.synchronizeDirectoryEntry(sourceFile.parentFile)) {
+                                                            return@runCatching false
+                                                        }
                                                         // Only the operation's OWN prepared destination
                                                         // evidence is removed; a later publication's record
                                                         // is left intact.
@@ -5064,13 +5078,22 @@ class DownloadOfflineFileManager(
                 val stagedOk = runCatching {
                     recoveryFile.copyTo(stage, overwrite = true)
                     stage.exists() && stage.length() == recoveryFile.length() &&
-                        UploadFile.sha256OrNull(stage) == backupHashNow
+                        // THE RESTORE'S STAGED BYTES ARE DURABLE BEFORE PUBLICATION
+                        // (review-38 #2): the rename replaces the target's bytes.
+                        UploadFile.sha256OrNull(stage) == backupHashNow &&
+                        UploadFile.synchronizeFileContents(stage) &&
+                        UploadFile.synchronizeDirectoryEntry(stage.parentFile)
                 }.getOrDefault(false)
                 if (!stagedOk) return@runCatching false
                 if (!stage.setLastModified(oldTargetMtimeMillis)) return@runCatching false
                 // ATOMIC PUBLICATION of the verified stage: the rename replaces the target
                 // in one step; a failed rename leaves the target exactly as it was.
                 if (!stage.renameTo(target)) return@runCatching false
+                // THE RESTORE'S DIRECTORY ENTRY IS DURABLE (review-38 #2): the rename
+                // replaced the target's bytes — its persistence is established BEFORE the
+                // recovery state is disposed; an unsynchronized restore could lose both
+                // the restored bytes and the backup authority in a crash.
+                if (!UploadFile.synchronizeDirectoryEntry(target.parentFile)) return@runCatching false
                 // VERIFIED RESULT: the published bytes are re-hashed against the immutable
                 // backup hash before any state is disposed.
                 if (UploadFile.sha256OrNull(target) != backupHashNow) return@runCatching false
@@ -5717,7 +5740,13 @@ class DownloadOfflineFileManager(
             // validated explicitly (complete bytes) after the copy (issue: round 21 #1).
             val recoveryOk = recoveryFile == null || runCatching {
                 target.copyTo(recoveryFile, overwrite = true)
-                recoveryFile.exists() && recoveryFile.length() == target.length()
+                recoveryFile.exists() && recoveryFile.length() == target.length() &&
+                    // THE BACKUP IS DURABLE BEFORE THE ORIGINAL IS REPLACED (review-38 #2):
+                    // the backup is the rollback authority the rename spends — its bytes'
+                    // data and its directory entry must survive the crash that undoes an
+                    // unsynchronized replacement.
+                    UploadFile.synchronizeFileContents(recoveryFile) &&
+                    UploadFile.synchronizeDirectoryEntry(recoveryFile.parentFile)
             }.getOrDefault(false)
             // A backup without a computable content hash is never kept (issue: round 22
             // #2): the reconciliation could not verify anything against it.
@@ -5772,6 +5801,15 @@ class DownloadOfflineFileManager(
             // the new bytes carrying the previous generation's provenance.
             deletePublishedProvenance(provenanceContext, target)
             if (staged.renameTo(target)) {
+                // THE PUBLISHED BYTES' DIRECTORY ENTRY IS DURABLE (review-38 #2): the
+                // rename must be persisted before any evidence disposal — a
+                // rename-success/fsync-failure state reports FAILED and RETAINS the
+                // backup and its durable record for the sweep's reconciliation (the
+                // target's provenance was already invalidated; the retained recovery
+                // record's expected-publication hash identifies exactly this state).
+                if (!UploadFile.synchronizeDirectoryEntry(target.parentFile)) {
+                    return PublicationOutcome.FAILED
+                }
                 // The staged record travels onto the target with the rename (issue: round 18
                 // #2): provenance and bytes are published together — a failed move now
                 // RESTORES the recoverable old bytes and their proof (issue: round 20 #10)
@@ -5934,8 +5972,14 @@ class DownloadOfflineFileManager(
                     // merge with the failure default into a non-Boolean condition.
                     cacheBytesProvenCurrent(context, cacheFile, authoritativeFile, userDrive) && runCatching {
                         cacheFile.copyTo(staged, overwrite = true)
-                        capturedPromotionToken = capturedCachePublicationToken(context, cacheFile)
-                        true
+                        // THE STAGED BYTES ARE DURABLE BEFORE PUBLICATION (review-38 #2),
+                        // as in the worker promotion: the rename publishes them and the
+                        // promotion's cleanup spends the cache.
+                        UploadFile.synchronizeFileContents(staged) &&
+                            UploadFile.synchronizeDirectoryEntry(staged.parentFile) && run {
+                            capturedPromotionToken = capturedCachePublicationToken(context, cacheFile)
+                            true
+                        }
                     }.getOrDefault(false)
                 }
             }
@@ -6077,7 +6121,11 @@ class DownloadOfflineFileManager(
                         // (issue: round 21 #1).
                         val recoveryOk = recoveryFile == null || runCatching {
                             target.copyTo(recoveryFile, overwrite = true)
-                            recoveryFile.exists() && recoveryFile.length() == target.length()
+                            recoveryFile.exists() && recoveryFile.length() == target.length() &&
+                                // THE BACKUP IS DURABLE BEFORE THE ORIGINAL IS REPLACED
+                                // (review-38 #2), as in the coordinated publication.
+                                UploadFile.synchronizeFileContents(recoveryFile) &&
+                                UploadFile.synchronizeDirectoryEntry(recoveryFile.parentFile)
                         }.getOrDefault(false)
                         // A backup without a computable content hash is never kept (issue:
                         // round 22 #2); its durable record carries the owner scope, file
@@ -6123,6 +6171,13 @@ class DownloadOfflineFileManager(
                             deletePublishedProvenance(context, target)
                             when {
                                 staged.renameTo(target) &&
+                                    // THE PUBLISHED BYTES' DIRECTORY ENTRY IS DURABLE (review-38
+                                    // #2), as in the coordinated publication: the rename's
+                                    // persistence is established BEFORE the backup and its
+                                    // record are disposed; a rename-success/fsync-failure state
+                                    // falls to the failure branches and retains the recovery
+                                    // authority for the sweep.
+                                    UploadFile.synchronizeDirectoryEntry(target.parentFile) &&
                                     movePublishedProvenance(
                                         context,
                                         staged,

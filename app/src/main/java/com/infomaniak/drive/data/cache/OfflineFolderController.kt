@@ -805,12 +805,19 @@ object OfflineFolderController {
                                 ) {
                                     return@runCatching false
                                 }
-                                val renamed = oldOfflineFile.renameTo(target)
+                                // THE PUBLISHED BYTES' DIRECTORY ENTRY IS DURABLE (review-38
+                                // #2): the relocation's rename is persisted BEFORE the
+                                // completion rebinds the observation — a
+                                // rename-success/fsync-failure state defers with the journal
+                                // retained, and the sweep replays it onto the moved bytes.
+                                val renamed = oldOfflineFile.renameTo(target) &&
+                                    UploadFile.synchronizeDirectoryEntry(target.parentFile)
                                 if (!renamed) {
-                                    // The rename touched nothing; the prepared destination
-                                    // state is inert (a record without bytes) and the sweep's
-                                    // missing-target arm disposes the retained relocation
-                                    // state with the source proof intact.
+                                    // The rename touched nothing (or its directory entry could
+                                    // not be persisted); the prepared destination state is
+                                    // inert or replay-ready and the sweep resolves the
+                                    // retained relocation state with the source authority
+                                    // intact.
                                     return@runCatching false
                                 }
                                 // THE PROOF AND OBSERVATION COMPLETE TOGETHER (issue: round

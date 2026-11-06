@@ -725,7 +725,14 @@ class MainViewModel(
                                                                         }
                                                                         false
                                                                     } else {
-                                                                        val renamed = oldBytes.renameTo(newBytes)
+                                                                        // THE PUBLISHED BYTES' DIRECTORY ENTRY IS
+                                                                        // DURABLE (review-38 #2): each relocation's
+                                                                        // rename is persisted BEFORE its completion runs;
+                                                                        // a rename-success/fsync-failure state defers the
+                                                                        // merge with the prepared journals retained for
+                                                                        // the sweep's replay.
+                                                                        val renamed = oldBytes.renameTo(newBytes) &&
+                                                                            UploadFile.synchronizeDirectoryEntry(newBytes.parentFile)
                                                                         var relocationsComplete = renamed
                                                                         if (renamed) {
                                                                             preparedPairs.forEach { (oldCopy, newCopy) ->
@@ -1089,6 +1096,16 @@ class MainViewModel(
                                                         val stagedTransfer = DownloadOfflineFileManager.newStagedFile(application, node)
                                                         try {
                                                             sourceBytes.copyTo(stagedTransfer, overwrite = true)
+                                                            // THE STAGED BYTES ARE DURABLE BEFORE PUBLICATION
+                                                            // (review-38 #2): the staged file becomes the final
+                                                            // payload by rename — its data and its directory
+                                                            // entry are synchronized before the verification
+                                                            // and the rename.
+                                                            if (!UploadFile.synchronizeFileContents(stagedTransfer) ||
+                                                                !UploadFile.synchronizeDirectoryEntry(stagedTransfer.parentFile)
+                                                            ) {
+                                                                return@runCatching false
+                                                            }
                                                             val stagedHash = UploadFile.sha256OrNull(stagedTransfer)
                                                             val stagedOk = stagedTransfer.exists() &&
                                                                 stagedTransfer.length() == sourceBytes.length() &&
@@ -1121,6 +1138,15 @@ class MainViewModel(
                                                                     !transferProof.positivelyForeignTo(node, sharedScope) &&
                                                                     !proofCleavesToBytes -> {
                                                                     if (!stagedTransfer.renameTo(destinationBytes)) return@runCatching false
+                                                                    // THE PUBLISHED BYTES' DIRECTORY ENTRY IS DURABLE
+                                                                    // (review-38 #2): the rename is persisted BEFORE the
+                                                                    // registration succeeds — a
+                                                                    // rename-success/fsync-failure state returns false,
+                                                                    // the durable pending intent retains the retry, and
+                                                                    // nothing reports a durability it cannot prove.
+                                                                    if (!UploadFile.synchronizeDirectoryEntry(destinationBytes.parentFile)) {
+                                                                        return@runCatching false
+                                                                    }
                                                                     // THE REGISTRATION IS THE TRANSFER'S OUTCOME
                                                                     // (review-35 #10): the Boolean result AND any
                                                                     // exception propagate, and EXACT DURABLE REVISION
@@ -1190,6 +1216,15 @@ class MainViewModel(
                                                                         }
                                                                         return@runCatching false
                                                                     }
+                                                                    // THE PUBLISHED BYTES' DIRECTORY ENTRY IS DURABLE
+                                                                    // (review-38 #2): the rename is persisted BEFORE the
+                                                                    // completion rebinds the observation — a
+                                                                    // rename-success/fsync-failure state returns false and
+                                                                    // RETAINS the journal for the sweep's replay onto the
+                                                                    // moved bytes.
+                                                                    if (!UploadFile.synchronizeDirectoryEntry(destinationBytes.parentFile)) {
+                                                                        return@runCatching false
+                                                                    }
                                                                     if (!runCatching {
                                                                             DownloadOfflineFileManager.completePreparedProofMove(
                                                                                 application,
@@ -1207,6 +1242,13 @@ class MainViewModel(
                                                                 // #12/#13 contract).
                                                                 else -> {
                                                                     if (!stagedTransfer.renameTo(destinationBytes)) return@runCatching false
+                                                                    // THE PUBLISHED BYTES' DIRECTORY ENTRY IS DURABLE
+                                                                    // (review-38 #2), as in the verified-clean branch:
+                                                                    // the rename is persisted before the registration
+                                                                    // or the offline mark reports the transfer's outcome.
+                                                                    if (!UploadFile.synchronizeDirectoryEntry(destinationBytes.parentFile)) {
+                                                                        return@runCatching false
+                                                                    }
                                                                     if (sourceClassifiedEdit) {
                                                                         // THE REGISTRATION IS THE TRANSFER'S OUTCOME
                                                                         // (review-35 #10), as in the dirty-edit branch.
