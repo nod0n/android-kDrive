@@ -517,8 +517,16 @@ object OfflineFolderUtils {
                                     ) {
                                         freshRow.isInOfflineFolder = true
                                         val offlineFile = freshRow.getOfflineFile(context, userDrive.userId)
+                                        // THE COMPLETION TIER (review-53 §4, stage 5), as in
+                                        // the walk's download decision: the marker's work
+                                        // completes only at the content-verified tier — a
+                                        // metadata-current (v2) copy still owes its
+                                        // verification re-drive, and the worker's no-spin gate
+                                        // bounds the body re-download.
                                         val needsDownload = offlineFile == null ||
-                                            !freshRow.isOfflineAndProvenCurrent(context, offlineFile, userDrive)
+                                            !DownloadOfflineFileManager.offlineCopyIsServerContentVerified(
+                                                context, freshRow, offlineFile, userDrive,
+                                            )
                                         if (needsDownload && (offlineFile == null ||
                                                 !UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString()))
                                         ) {
