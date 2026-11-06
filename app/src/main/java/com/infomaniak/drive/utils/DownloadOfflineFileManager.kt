@@ -926,25 +926,27 @@ class DownloadOfflineFileManager(
                             // still equals the freshly fetched generation. A restoration
                             // or a newer attempt wrote a fresh publication id and thereby
                             // spent the old attempt's evidence.
+                            // THE SHARED OBSERVATION GRAMMAR (review-55 G1): the resumption
+                            // parses through the ONE validated decoder — the v2 observation
+                            // is no longer invisible here and the frame grammar cannot
+                            // diverge again. Only the id-bound frames (both current
+                            // grammars) can bind — the frame gate never accepted the legacy
+                            // grammar and still does not; a damaged or unknown frame fails
+                            // the identity (the resumption simply does not fire — never a
+                            // fabricated advance).
                             val attemptObservation = runCatching {
                                 IOFile(provenanceFileFor(context, offlineFile).path + ".obs")
-                                    .readText().trim().split("|")
-                            }.getOrNull()?.takeIf {
-                                (it.size >= 8 && it[0] == "1") || (it.size >= 9 && it[0] == "2")
-                            }
+                                    .readText().trim()
+                            }.getOrNull()?.let { parseObservationBinding(it) }
+                                ?.takeIf { it.format != ObservationFormat.LEGACY }
                             val attemptIdentityHolds = attemptObservation != null &&
-                                // THE FRAME DECIDES THE LOCATION INDEX (review-53 §5,
-                                // stage 6): the v2 observation inserts the seen hash basis
-                                // before the location; the identity fields 1-6 are shared.
-                                attemptObservation.drop(
-                                    if (attemptObservation[0] == "1") 7 else 8
-                                ).joinToString("|") == offlineFile.absolutePath &&
-                                attemptObservation[1].toLongOrNull() == bindingProof.publicationId &&
-                                attemptObservation[2].toIntOrNull() == (freshForAdvance.version?.number ?: 0) &&
-                                attemptObservation[3].toLongOrNull() == freshForAdvance.size &&
-                                attemptObservation[4].toLongOrNull() == freshForAdvance.revisedAt &&
-                                attemptObservation[5].toLongOrNull() == freshForAdvance.lastModifiedAt &&
-                                attemptObservation[6].toLongOrNull() == freshForAdvance.updatedAt
+                                attemptObservation.location == offlineFile.absolutePath &&
+                                attemptObservation.publicationId == bindingProof.publicationId &&
+                                attemptObservation.prefix[2].toIntOrNull() == (freshForAdvance.version?.number ?: 0) &&
+                                attemptObservation.prefix[3].toLongOrNull() == freshForAdvance.size &&
+                                attemptObservation.prefix[4].toLongOrNull() == freshForAdvance.revisedAt &&
+                                attemptObservation.prefix[5].toLongOrNull() == freshForAdvance.lastModifiedAt &&
+                                attemptObservation.prefix[6].toLongOrNull() == freshForAdvance.updatedAt
                             if (!attemptIdentityHolds) return@withFileLock
                             // THE MOVED ROW'S COVERAGE AND ANCESTRY (issue: round 29 masked
                             // flow A): the conditional advance re-points the row at the
@@ -2017,8 +2019,8 @@ class DownloadOfflineFileManager(
                 // DAMAGED PRESENCE IS NOT RESOLUTION (review-35 #11): the caller defers
                 // and the surviving evidence is never silently accepted as absence.
                 parsed == null -> false
-                parsed.format == ObservationFormat.CURRENT && parsed.publicationId == currentPublicationId -> true
-                parsed.format == ObservationFormat.CURRENT -> runCatching { observationFile.delete() }.getOrDefault(false)
+                parsed.carriesPublicationId && parsed.publicationId == currentPublicationId -> true
+                parsed.carriesPublicationId -> runCatching { observationFile.delete() }.getOrDefault(false)
                 else -> true
             }
         }.getOrDefault(false)
@@ -2935,32 +2937,70 @@ class DownloadOfflineFileManager(
 
         /** THE PARSED OBSERVATION (issue: round 32 #6): an explicit FORMAT with a NULLABLE
          * publication id. The legacy grammar's second field is the VERSION — never an
-         * attempt identity — and must never be compared against a publication id; only
-         * the current format carries one. */
-        private enum class ObservationFormat { CURRENT, LEGACY }
+         * attempt identity — and must never be compared against a publication id; both
+         * current grammars carry one. [CURRENT] is the seven-fixed-field frame-1
+         * observation; [CURRENT_V2] (review-53 §5 stage 6; the central parse review-55
+         * G1) is its eight-fixed-field extension carrying the seen hash basis before the
+         * location. */
+        private enum class ObservationFormat { CURRENT, CURRENT_V2, LEGACY }
 
         private class ParsedObservation(
             val format: ObservationFormat,
             val prefix: List<String>,
             /** The COMPLETE location tail — pipe-containing destinations stay intact. */
             val location: String,
-            /** The attempt id of the CURRENT format only; a legacy observation has none. */
+            /** The attempt id of the CURRENT formats only; a legacy observation has none. */
             val publicationId: Long?,
-        )
+        ) {
+            /** TRUE for the id-bound grammars ([ObservationFormat.CURRENT],
+             * [ObservationFormat.CURRENT_V2]): prefix[1] is the attempt id. A legacy
+             * observation's second field is its version — never an id. Every id-binding
+             * consumer branches on this — never on an ad-hoc frame test — so the
+             * observation grammars cannot diverge again (review-55 G1). */
+            val carriesPublicationId: Boolean
+                get() = format != ObservationFormat.LEGACY
+        }
 
         /**
          * THE OBSERVATION'S FIXED-PREFIX PARSE (issues: round 30 #6, round 31 #4, round 32
          * #6): the location is the ENTIRE tail after the fixed prefix — a destination
          * containing '|' occupies several components and must never be recovered by
-         * position from the end, in EITHER format. EVERY typed prefix field is validated
+         * position from the end, in ANY format. EVERY typed prefix field is validated
          * (attempt id, version, nullable size, all three timestamps). The CURRENT grammar
-         * (seven fixed fields, attempt id at prefix[1]) is tried first; the LEGACY grammar
-         * (six fixed fields, version at prefix[1]) accepts the remaining valid shapes —
-         * including pipe-containing paths — and carries a NULL publication id, never its
-         * version-as-id. Returns null for an unparseable observation.
+         * (seven fixed fields, attempt id at prefix[1]); the CURRENT_V2 grammar
+         * (review-53 §5 stage 6; the central parse review-55 G1) adds the seen hash basis
+         * as an EIGHTH fixed field before the location, validated as the exact encoded
+         * basis and preserved verbatim inside the prefix through every rebind; the LEGACY
+         * grammar (six fixed fields, version at prefix[1]) accepts the remaining valid
+         * shapes — including pipe-containing paths — and carries a NULL publication id,
+         * never its version-as-id. A malformed or unknown frame — including a damaged
+         * "2" frame — returns null and NEVER falls through to another grammar
+         * (fail-closed: an unknown or damaged observation is unparseable, never
+         * reinterpreted). Returns null for an unparseable observation.
          */
         private fun parseObservationBinding(text: String): ParsedObservation? {
             val fields = text.split("|")
+            // THE V2 OBSERVATION FRAME (review-53 §5 stage 6; the central parse
+            // review-55 G1): eight fixed fields — the CURRENT grammar's fields 1-6 plus
+            // the seen hash basis at prefix[7] — with the location as the ENTIRE tail
+            // from index 8. The basis must decode as the exact encoded basis; a damaged
+            // basis fails the frame here and is never reinterpreted as another grammar.
+            val v2Format = fields.size >= 9 && fields[0] == "2" &&
+                fields[1].toLongOrNull() != null &&
+                fields[2].toIntOrNull() != null &&
+                (fields[3].isEmpty() || fields[3].toLongOrNull() != null) &&
+                fields[4].toLongOrNull() != null &&
+                fields[5].toLongOrNull() != null &&
+                fields[6].toLongOrNull() != null &&
+                decodeObservedHashBasis(fields[7]) != null
+            if (v2Format) {
+                return ParsedObservation(
+                    format = ObservationFormat.CURRENT_V2,
+                    prefix = fields.take(8),
+                    location = fields.drop(8).joinToString("|"),
+                    publicationId = fields[1].toLong(),
+                )
+            }
             val currentFormat = fields.size >= 8 && fields[0] == "1" &&
                 fields[1].toLongOrNull() != null &&
                 fields[2].toIntOrNull() != null &&
@@ -3760,8 +3800,9 @@ class DownloadOfflineFileManager(
         /**
          * THE PREPARED PROOF-MOVE PHASE 2 (issues: round 28 #13, round 30 #6, round 32
          * #4/#6): the observation travels with the moved record — the COMPLETE location
-         * tail is re-bound (fixed-prefix parse, pipes safe, both formats), the write is
-         * atomic and read back, and a CURRENT-format observation's attempt id must equal
+         * tail is re-bound (fixed-prefix parse, pipes safe, all formats), the write is
+         * atomic and read back, and an id-bound observation's attempt id (either current
+         * grammar) must equal
          * the record now sitting at the target (a LEGACY observation carries no id — never
          * its version). A failure RETAINS the recoverable relocation state (the sweep
          * replays it onto the already-moved bytes) and fails the move.
@@ -3781,7 +3822,7 @@ class DownloadOfflineFileManager(
                 val reboundText = (parsed.prefix + target.absolutePath).joinToString("|")
                 val rebound = parseObservationBinding(reboundText) ?: return false
                 if (rebound.location != target.absolutePath) return false
-                if (rebound.format == ObservationFormat.CURRENT &&
+                if (rebound.carriesPublicationId &&
                     rebound.publicationId != readPublishedProvenance(context, target)?.publicationId
                 ) {
                     return false
@@ -4465,7 +4506,7 @@ class DownloadOfflineFileManager(
             }
             val operationId = readPublishedProvenance(context, publishedFile)?.publicationId
             val idBound = when (parsed.format) {
-                ObservationFormat.CURRENT -> operationId != null && parsed.publicationId == operationId
+                ObservationFormat.CURRENT, ObservationFormat.CURRENT_V2 -> operationId != null && parsed.publicationId == operationId
                 ObservationFormat.LEGACY -> true
             }
             if (!idBound || parsed.location != expectedObservationLocation) {
@@ -4498,7 +4539,7 @@ class DownloadOfflineFileManager(
             val rebound = parseObservationBinding(reboundText) ?: return false
             if (rebound.location != target.absolutePath) return false
             when (parsed.format) {
-                ObservationFormat.CURRENT -> if (parsed.publicationId != expectedPublicationId || expectedPublicationId == null) {
+                ObservationFormat.CURRENT, ObservationFormat.CURRENT_V2 -> if (parsed.publicationId != expectedPublicationId || expectedPublicationId == null) {
                     return false
                 }
                 ObservationFormat.LEGACY -> if (expectedPublicationId == null) return false
@@ -4526,9 +4567,9 @@ class DownloadOfflineFileManager(
             val parsed = parseObservationBinding(obsFile.readText().trim()) ?: return@runCatching false
             if (parsed.location != target.absolutePath) return@runCatching false
             when (parsed.format) {
-                // ONLY the current format's id binding validates the evidence as THIS
-                // operation's; a legacy observation proves nothing about the identity.
-                ObservationFormat.CURRENT -> expectedPublicationId != null &&
+                // ONLY an id-bound observation validates the evidence as THIS operation's;
+                // a legacy observation proves nothing about the identity.
+                ObservationFormat.CURRENT, ObservationFormat.CURRENT_V2 -> expectedPublicationId != null &&
                     parsed.publicationId == expectedPublicationId
                 ObservationFormat.LEGACY -> false
             }
@@ -5740,7 +5781,7 @@ class DownloadOfflineFileManager(
                                                     val carriedObservationBound = parsed.observationText == null ||
                                                         parseObservationBinding(parsed.observationText)?.let { bound ->
                                                             bound.location == sourceFile.absolutePath &&
-                                                                (bound.format != ObservationFormat.CURRENT ||
+                                                                (!bound.carriesPublicationId ||
                                                                     bound.publicationId == validatedSourceProof.publicationId)
                                                         } == true
                                                     val fullyValidated = tupleEqual && targetProof != null &&
@@ -6078,7 +6119,7 @@ class DownloadOfflineFileManager(
                                                                     .getOrNull()?.let { parseObservationBinding(it) }
                                                                 when {
                                                                     destinationBinding != null &&
-                                                                        destinationBinding.format == ObservationFormat.CURRENT &&
+                                                                        destinationBinding.carriesPublicationId &&
                                                                         destinationBinding.publicationId == validatedTargetProof.publicationId &&
                                                                         destinationBinding.location == target.absolutePath -> true
                                                                     parsed.observationText != null ->
@@ -6211,7 +6252,7 @@ class DownloadOfflineFileManager(
                                                                                 writtenBack == parsed.observationText &&
                                                                                     parseObservationBinding(writtenBack)?.let { bound ->
                                                                                         bound.location == sourceFile.absolutePath &&
-                                                                                            (bound.format != ObservationFormat.CURRENT ||
+                                                                                            (!bound.carriesPublicationId ||
                                                                                                 bound.publicationId == validatedSourceProof.publicationId)
                                                                                     } == true
                                                                             } == true
@@ -7405,13 +7446,14 @@ class DownloadOfflineFileManager(
             val text = runCatching { String(rawBytes, Charsets.UTF_8).trim() }.getOrNull()
             val parsed = text?.takeIf { it.isNotEmpty() }?.let { parseObservationBinding(it) }
             // THE INTRINSIC FORMAT IS DISTINGUISHED (review-46 D2): the captured text's OWN
-            // grammar decides — a CURRENT observation's id binding can be re-established
-            // coherently at the restoration; a LEGACY observation's location-only binding
-            // can never be, and is carried as the explicit Legacy state (quarantined at
-            // restore, never re-bound, never left at the canonical name).
+            // grammar decides — an id-bound observation's (either current grammar) id
+            // binding can be re-established coherently at the restoration; a LEGACY
+            // observation's location-only binding can never be, and is carried as the
+            // explicit Legacy state (quarantined at restore, never re-bound, never left
+            // at the canonical name).
             return when {
                 parsed == null -> OldObservationCapture.Damaged(rawBytes)
-                parsed.format == ObservationFormat.CURRENT -> OldObservationCapture.Valid(text)
+                parsed.carriesPublicationId -> OldObservationCapture.Valid(text)
                 else -> OldObservationCapture.Legacy(text)
             }
         }
@@ -7536,12 +7578,14 @@ class DownloadOfflineFileManager(
                         }
                     } else {
                         // THE EXPLICIT SOURCE-BOUND ID REBIND (review-47 E1): a captured
-                        // CURRENT old observation carries the OLD publication's id O, and
+                        // id-bound old observation (either current grammar) carries the
+                        // OLD publication's id O, and
                         // the restoration proof carries the fresh persisted id R (the
                         // same-bytes ABA guard) — the generic establishment's
                         // id-equality check could therefore never accept it, and every
                         // restore of such a target retained forever. The rebind is
-                        // EXPLICIT and SOURCE-BOUND: the captured text must parse CURRENT,
+                        // EXPLICIT and SOURCE-BOUND: the captured text must parse as an
+                        // id-bound observation,
                         // carry the operation's ACTUAL captured OLD proof's own
                         // publication id (from the record's retained old proof — threaded
                         // to every restore call site; never the failed proof, never a
@@ -7554,7 +7598,7 @@ class DownloadOfflineFileManager(
                         val oldPublicationId = oldOperationProofText?.let { publicationIdOfRecordText(it) }
                         val capturedParsed = parseObservationBinding(oldObservation.text)
                         if (capturedParsed == null || oldPublicationId == null ||
-                            capturedParsed.format != ObservationFormat.CURRENT ||
+                            !capturedParsed.carriesPublicationId ||
                             capturedParsed.publicationId != oldPublicationId ||
                             capturedParsed.location != target.absolutePath
                         ) {
@@ -7814,14 +7858,17 @@ class DownloadOfflineFileManager(
         }
 
         /** THE EXPLICIT SOURCE-BOUND ID REBIND WRITE (review-47 E1): the caller has verified
-         * that [capturedParsed] parses CURRENT, carries the operation's captured OLD proof's
-         * own publication id, and binds to this exact target. The id field (prefix[1] — the
-         * CURRENT grammar's id slot, verified against parseObservationBinding) is rewritten
+         * that [capturedParsed] parses as an ID-BOUND observation (either current grammar),
+         * carries the operation's captured OLD proof's
+         * own publication id, and binds to this exact target. The id field (prefix[1] —
+         * either current grammar's id slot, verified against parseObservationBinding) is
+         * rewritten
          * to the PERSISTED restoration id; every other prefix field (the receipt/version/
-         * size/timestamp fields) and the whole location tail are preserved verbatim. The
+         * size/timestamp fields, and the v2 frame's seen-hash basis — preserved VERBATIM,
+         * review-55 G1) and the whole location tail are preserved verbatim. The
          * write is atomic + durably acknowledged (the atomicWriteText chain) and VERIFIED by
-         * readback: the written text is exact, parses CURRENT, carries R, and binds to the
-         * target. The generic establishRecoveredObservation check is NOT weakened and an
+         * readback: the written text is exact, parses as id-bound, carries R, and binds to
+         * the target. The generic establishRecoveredObservation check is NOT weakened and an
          * arbitrary J is never rebound — this write runs only behind the caller's
          * exact-source check against the record's old proof. The id is the one already
          * persisted into the recovery record: a replay recognizes the same R and the same
@@ -7837,7 +7884,7 @@ class DownloadOfflineFileManager(
             reboundPrefix[1] = restorationPublicationId.toString()
             val reboundText = (reboundPrefix + target.absolutePath).joinToString("|")
             val rebound = parseObservationBinding(reboundText) ?: return false
-            if (rebound.format != ObservationFormat.CURRENT ||
+            if (!rebound.carriesPublicationId ||
                 rebound.publicationId != restorationPublicationId ||
                 rebound.location != target.absolutePath
             ) {
@@ -7851,18 +7898,19 @@ class DownloadOfflineFileManager(
             val readBack = runCatching { targetObs.readText().trim() }.getOrNull() ?: return false
             val readParsed = parseObservationBinding(readBack) ?: return false
             return readBack == reboundText &&
-                readParsed.format == ObservationFormat.CURRENT &&
+                readParsed.carriesPublicationId &&
                 readParsed.publicationId == restorationPublicationId &&
                 readParsed.location == target.absolutePath
         }
 
         /** THE REPLAY RECOGNITION (review-47 E1): the canonical text is THIS restoration's
-         * own re-established observation — CURRENT format, bound to the persisted
+         * own re-established observation — an id-bound format (either current grammar),
+         * bound to the persisted
          * restoration id at this exact target. An arbitrary J bound elsewhere never
          * matches. */
         private fun isRestorationReboundText(text: String, target: IOFile, restorationPublicationId: Long): Boolean {
             val parsed = parseObservationBinding(text) ?: return false
-            return parsed.format == ObservationFormat.CURRENT &&
+            return parsed.carriesPublicationId &&
                 parsed.publicationId == restorationPublicationId &&
                 parsed.location == target.absolutePath
         }
@@ -8880,7 +8928,8 @@ class DownloadOfflineFileManager(
 
         /** THE FAILED-PUBLICATION RETIREMENT (review-43 #2, typed review-46 D1, review-49
          * G4): retires the target's observation ONLY when it is a parseable observation
-         * bound to [boundPublicationId] in the current format. The typed outcome
+         * bound to [boundPublicationId] in an id-bound format (either current grammar). The
+         * typed outcome
          * distinguishes the durable success, the acknowledged absence, the unrelated
          * evidence, and the failed read/delete/fsync/verification of eligible (or
          * unclassifiable) evidence. [checkCancelled] is observed AFTER the read and the
@@ -8919,7 +8968,7 @@ class DownloadOfflineFileManager(
             // is unknown.
             val parsed = parseObservationBinding(canonicalText)
                 ?: return ObservationRetirement.NotEligible
-            if (parsed.format != ObservationFormat.CURRENT || parsed.publicationId != boundPublicationId) {
+            if (!parsed.carriesPublicationId || parsed.publicationId != boundPublicationId) {
                 return ObservationRetirement.NotEligible
             }
             // THE EXECUTING CONTEXT AFTER THE READ AND THE VALIDATION, BEFORE THE DELETE
@@ -10691,26 +10740,32 @@ class DownloadOfflineFileManager(
             // advance with equal timestamps and size is no longer suppressed. This
             // evidence decides only whether another attempt can gain anything — it is
             // never a byte-generation proof.
+            // THE SHARED OBSERVATION GRAMMAR (review-55 G1): the gate parses through the
+            // ONE validated decoder — the v2 observation is no longer invisible here, and
+            // the frame grammar can never diverge between this gate and the parser again.
+            // A damaged or unknown frame is unparseable and allows the re-drive
+            // (fail-closed, never a fabricated skip).
             val observation = runCatching {
-                IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim().split("|")
-            }.getOrNull()?.takeIf { (it.size >= 7 && it[0] == "1") || (it.size >= 9 && it[0] == "2") }
+                IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim()
+            }.getOrNull()?.let { parseObservationBinding(it) }
                 ?: return@runCatching false
             // THE OBSERVATION'S LOCATION MUST BE THIS DESTINATION (issue: round 28 #13
             // follow-up): a sidecar re-keyed by a relocation or a record at a reused path
-            // is not this destination's attempt evidence. The frame decides the location
-            // index: the v2 observation inserts the seen hash basis before the location.
-            val attemptedLocation = observation.drop(if (observation[0] == "1") 7 else 8).joinToString("|")
-            if (attemptedLocation != target.absolutePath) return@runCatching false
+            // is not this destination's attempt evidence. The COMPLETE location tail
+            // (pipes safe) is the parser's own field.
+            if (observation.location != target.absolutePath) return@runCatching false
             // THE ATTEMPT IDENTITY BINDING (issue: round 29 #6): the observation belongs
             // to the SPECIFIC publication/attempt whose record now sits at the target — a
             // restoration or re-publication writes a FRESH publication id and thereby ends
-            // the old attempt's binding (its suppression evidence is spent).
-            if (proof.publicationId != observation[1].toLongOrNull()) return@runCatching false
-            val attemptedVersion = observation[2].toIntOrNull() ?: return@runCatching false
-            val attemptedSize = observation[3].toLongOrNull()
-            val attemptedRevisedAt = observation[4].toLongOrNull() ?: return@runCatching false
-            val attemptedLastModifiedAt = observation[5].toLongOrNull() ?: return@runCatching false
-            val attemptedUpdatedAt = observation[6].toLongOrNull() ?: return@runCatching false
+            // the old attempt's binding (its suppression evidence is spent). A LEGACY
+            // observation's publication id is null — never equal, and its second field
+            // (a version) is never compared as an id.
+            if (proof.publicationId != observation.publicationId) return@runCatching false
+            val attemptedVersion = observation.prefix[2].toIntOrNull() ?: return@runCatching false
+            val attemptedSize = observation.prefix[3].toLongOrNull()
+            val attemptedRevisedAt = observation.prefix[4].toLongOrNull() ?: return@runCatching false
+            val attemptedLastModifiedAt = observation.prefix[5].toLongOrNull() ?: return@runCatching false
+            val attemptedUpdatedAt = observation.prefix[6].toLongOrNull() ?: return@runCatching false
             val metadataIdentityHolds =
                 row.revisedAt == attemptedRevisedAt &&
                     row.lastModifiedAt == attemptedLastModifiedAt &&
@@ -10718,19 +10773,20 @@ class DownloadOfflineFileManager(
                     row.size == attemptedSize &&
                     (row.version?.number ?: 0) == attemptedVersion
             if (!metadataIdentityHolds) return@runCatching false
-            // THE SEEN HASH BASIS (review-53 §5 stage 6; review-54 F6's encoding): the
-            // legacy frame carries no hash evidence — the metadata-identity match alone
-            // decides (today's behavior). The v2 frame adds the basis leg: the skip
-            // fires only when the server's CURRENT hash state is EXACTLY what the failed
-            // attempt faced — an encoded ABSENCE matches an absent/empty fresh hash; a
-            // recorded (decoded, verbatim) token must equal the fresh hash AND be an
-            // UNSUPPORTED value, because a supported basis can always gain from another
-            // attempt (the re-drive is the only route to the verified tier). A changed
-            // basis — the server added, removed, or switched algorithms — re-justifies
-            // the transfer. An undecodable recorded field is never skip evidence.
-            if (observation[0] == "1") return@runCatching true
+            // THE FRAME-1 OBSERVATION CARRIES NO HASH EVIDENCE (review-53 §5 stage 6):
+            // the metadata-identity match alone decides (today's behavior). Only the v2
+            // frame adds the basis leg — its prefix[7] is already validated as the exact
+            // encoded basis by the parse itself. The skip fires only when the server's
+            // CURRENT hash state is EXACTLY what the failed attempt faced — an encoded
+            // ABSENCE matches an absent/empty fresh hash; a recorded (decoded, verbatim)
+            // token must equal the fresh hash AND be an UNSUPPORTED value, because a
+            // supported basis can always gain from another attempt (the re-drive is the
+            // only route to the verified tier). A changed basis — the server added,
+            // removed, or switched algorithms — re-justifies the transfer. An undecodable
+            // recorded field is never skip evidence.
+            if (observation.format == ObservationFormat.CURRENT) return@runCatching true
             val freshHash = row.serverContentHash
-            when (val decodedBasis = decodeObservedHashBasis(observation[7])) {
+            when (val decodedBasis = decodeObservedHashBasis(observation.prefix[7])) {
                 null -> false
                 ObservedHashBasis.Absent -> freshHash.isNullOrEmpty()
                 is ObservedHashBasis.Seen -> when {
