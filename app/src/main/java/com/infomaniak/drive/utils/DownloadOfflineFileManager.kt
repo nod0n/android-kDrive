@@ -2326,10 +2326,16 @@ class DownloadOfflineFileManager(
             // follows the recorded phase — never a source-hash or destination-location
             // inference.
             val operationPhase = if (flow == ProofRelocationFlow.STAGED_PUBLICATION) "M" else "P"
+            // RECORD v5 (review-40 #9): the WRITE-AHEAD phase contract — the journal's P
+            // is durably written before any byte effect is authorized, B before the first
+            // mutation, M after it; a durable P therefore strictly means no byte effect
+            // began. v4 records (whose writer persisted P through the effects) stay
+            // readable as the PHASE-AMBIGUOUS format and resolve through the validated
+            // transition/rollback routes.
             atomicWriteText(
                 recordFile,
                 listOf(
-                    "4",
+                    "5",
                     target.absolutePath,
                     proofText,
                     attemptedObservationText,
@@ -2437,13 +2443,20 @@ class DownloadOfflineFileManager(
              * legacy records (neither authority was recorded). */
             val recordedSourceSharedWithMe: Boolean? = null,
             val recordedSourceStorageKind: String? = null,
-            /** THE DURABLE OPERATION PHASE (review-38 #6): "P" = prepared (the
-             * published-source flow's bytes are still at the source), "M" = moved (the
-             * bytes sit at the destination). Written at prepare, advanced by
-             * completePreparedProofMove; the replay's repair authority follows the
-             * recorded phase, never an inference from the source hash or the
-             * destination row's location. Null for v1–v3 legacy records. */
+            /** THE DURABLE OPERATION PHASE (review-38 #6): "P" = prepared, "B" = byte
+             * effects armed (review-39 #9), "M" = moved. Written at prepare, transitioned
+             * by beginRelocationByteEffects/completePreparedProofMove; the replay's
+             * repair authority follows the recorded phase, never an inference from the
+             * source hash or the destination row's location. Null for v1–v3 legacy
+             * records. */
             val recordedPhase: String? = null,
+            /** THE PHASE CONTRACT THE RECORD CARRIES (review-40 #2/#9): only a v5 record
+             * is written under the WRITE-AHEAD contract — its P durably precedes any byte
+             * effect. A v4 record's phase is AMBIGUOUS (the historical writer persisted P
+             * through the byte effects and advanced afterward): it decodes (including the
+             * B records the interim writer stranded) but never grants pre-byte authority.
+             * False for v1–v4. */
+            val phaseAuthoritative: Boolean = false,
             /** COMPLETE PROOF VALIDATION (review-34 #9): the retained proof text parses
              * under the FULL provenance grammar WITH the operation's target as its
              * expected embedded location — validated before any registry mutation. */
@@ -2599,8 +2612,9 @@ class DownloadOfflineFileManager(
                         embeddedProofLocation = embeddedLocation,
                     )
                 }
-                "4" -> {
-                    // RECORD v4 (review-38 #6): the v3 structure PLUS the EIGHTH line —
+                "4", "5" -> {
+                    // RECORD v4/v5 (review-38 #6; the write-ahead contract v5, review-40
+                    // #9): the v3 structure PLUS the EIGHTH line —
                     // the recorded SOURCE authority (the source's own Realm flavor and
                     // storage kind, distinct from the destination sidecar's) and the
                     // DURABLE OPERATION PHASE ("P" prepared / "M" moved). Every field of
@@ -2633,16 +2647,23 @@ class DownloadOfflineFileManager(
                         "offline", "cache", "converted" -> authorityParts[1].trim()
                         else -> return@runCatching null
                     }
+                    // THE COMPLETE PHASE GRAMMAR (review-40 #2): the writer, this decoder,
+                    // the read-back verification and the replay agree on {P, B, M} — the
+                    // interim writer persisted B records the previous decoder rejected,
+                    // stranding armed journals (their own read-back failed, the abort could
+                    // not dispose them, and the sidecar kept excluding the file). A v4
+                    // record's phase is DECODABLE but AMBIGUOUS (never pre-byte authority);
+                    // v5 records carry the authoritative write-ahead contract.
                     val recordedPhase = when (authorityParts[2].trim()) {
-                        "P" -> "P"
-                        "M" -> "M"
+                        "P", "B", "M" -> authorityParts[2].trim()
                         else -> return@runCatching null
                     }
+                    val phaseAuthoritative = parts[0].trim() == "5"
                     val proofFields = fields(parts[2])
                     val observationField = parts[3]
                     val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
                     ParsedProofMoveRecord(
-                        version = 4,
+                        version = parts[0].trim().toInt(),
                         targetPath = parts[1],
                         proofText = parts[2],
                         proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
@@ -2662,6 +2683,7 @@ class DownloadOfflineFileManager(
                         recordedSourceSharedWithMe = recordedSourceShared,
                         recordedSourceStorageKind = recordedSourceKind,
                         recordedPhase = recordedPhase,
+                        phaseAuthoritative = phaseAuthoritative,
                         proofLocationValid = locationValid,
                         embeddedProofLocation = embeddedLocation,
                     )
@@ -3111,18 +3133,21 @@ class DownloadOfflineFileManager(
 
         /** THE DURABLE PHASE TRANSITION (review-38 #6, review-39 #9): rewrites a v4
          * journal's phase field with an EXACT-operation conditional — the CURRENT journal
-         * must still decode as a v4 record at the transition's legal source phase ("P"
-         * arms byte effects; "B" or an already-recorded "M" completes them), and every
-         * other field round-trips verbatim from that decode. The write is the durable
-         * atomic writer and the result is VERIFIED BY DECODE before success is reported;
-         * any failure or concurrent change reports false and the caller retains — a
-         * stale or unverified phase never relaxes a check. */
+         * must still decode as a v5 (write-ahead) record at the transition's legal source
+         * phase ("P" arms byte effects; "B" or an already-recorded "M" completes them),
+         * and every other field round-trips verbatim from that decode. The write is the
+         * durable atomic writer and the result is VERIFIED BY DECODE before success is
+         * reported; any failure or concurrent change reports false and the caller retains
+         * — a stale or unverified phase never relaxes a check, and a false result NEVER
+         * means the journal is absent (review-40 #2): the abort paths dispose whatever
+         * complete record is present. Phase-ambiguous v4 records are not transitioned —
+         * they resolve through the validated recovery/rollback routes. */
         private fun transitionRelocationPhase(context: Context, target: IOFile, toPhase: String): Boolean {
             if (toPhase != "B" && toPhase != "M") return false
             return runCatching {
                 val recordFile = proofRelocationRecordFile(context, target)
                 val parsed = parseProofMoveRecord(recordFile) ?: return@runCatching false
-                if (parsed.version < 4) return@runCatching false
+                if (!parsed.phaseAuthoritative) return@runCatching false
                 when (toPhase) {
                     "B" -> if (parsed.recordedPhase != "P") return@runCatching false
                     // Completing a staged-flow journal whose bytes were already at the
@@ -3134,7 +3159,7 @@ class DownloadOfflineFileManager(
                 val rewritten = atomicWriteText(
                     recordFile,
                     listOf(
-                        "4",
+                        "5",
                         parsed.targetPath,
                         parsed.proofText,
                         parsed.observationText ?: if (parsed.observationFieldDamaged) "" else "A",
@@ -4387,7 +4412,7 @@ class DownloadOfflineFileManager(
                                                     // source by design), so the either-flavor inference is
                                                     // RETRACTED — legacy convergence runs only through the
                                                     // validated recovery/rollback routes.
-                                                    val phaseRecordedPrepared = parsed.version >= 4 &&
+                                                    val phaseRecordedPrepared = parsed.phaseAuthoritative &&
                                                         parsed.recordedPhase == "P"
                                                     tupleEqual && sourceOwnership && phaseRecordedPrepared
                                                 }.getOrDefault(false)
