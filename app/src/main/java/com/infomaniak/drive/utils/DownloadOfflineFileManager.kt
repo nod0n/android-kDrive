@@ -2735,16 +2735,20 @@ class DownloadOfflineFileManager(
          * unreadable file returns null (the caller retains and fails closed by scope).
          */
         private fun parseProofMoveRecord(recordFile: IOFile): ParsedProofMoveRecord? = runCatching {
-            // EACH VERSION'S ACTUAL FIELD COUNT (review-35 #2): the split limit must cover
-            // the CURRENT (v3) record's seven lines — the previous limit of five made every
-            // newly written v3 journal undecodable forever. A specified limit PRESERVES
-            // trailing empty fields (a v3 record legitimately ends with an empty
-            // previous-destination field); excess fields surface as a '\n' inside the last
-            // parts and are rejected explicitly by the per-version checks below. The limit
-            // covers the CURRENT version's line count (v4, review-38 #6); an older record
-            // with more lines than its version requires still rejects through its own
-            // size/newline checks.
-            val parts = recordFile.readText().split("\n", limit = 8)
+            // EACH VERSION'S ACTUAL FIELD COUNT (review-35 #2; the limit must cover the
+            // NEWEST accepted version's line count — review-44 N4): the previous limit of
+            // five made every newly written v3 journal undecodable forever, and the stale
+            // limit of eight made EVERY v6 journal undecodable — the writer's ninth line
+            // (the captured intent stamp) folded into the authority part, whose '\n' check
+            // and the v6 size check then rejected the record: every relocation failed
+            // closed at its arming transition. The limit PRESERVES trailing empty fields
+            // (a v3 record legitimately ends with an empty previous-destination field);
+            // excess fields surface as a '\n' inside the last part and are rejected
+            // explicitly by the per-version checks below. v4/v5 require EXACTLY 8 lines and
+            // v6 EXACTLY 9; an older record with more lines than its version requires still
+            // rejects through its own size/newline checks, and a journal damaged by extra
+            // lines is retained — never decoded.
+            val parts = recordFile.readText().split("\n", limit = 9)
             fun fields(proofText: String): List<String> = proofText.removePrefix(PROVENANCE_FRAME).split("|")
             // THE COMPLETE PROOF DECODE (review-34 #9): the embedded location is parsed
             // loose (any grammar) and strict (the operation's target expected) — the strict
