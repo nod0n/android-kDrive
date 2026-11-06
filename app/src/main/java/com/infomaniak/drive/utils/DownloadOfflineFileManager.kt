@@ -6834,7 +6834,12 @@ class DownloadOfflineFileManager(
                     // fail-closed for any later capture), never dropped and never read
                     // as absence.
                     val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
-                    runCatching { observationFile.writeBytes(oldObservation.rawBytes) }.getOrDefault(false) &&
+                    // THE WRITE'S BOOLEAN ACK (review-44 compile fix): File.writeBytes
+                    // returns Unit — its Result's Boolean acknowledgment is isSuccess
+                    // (no exception = the write happened); the durability chain below
+                    // (contents fsync + directory-entry acknowledgment + the byte-exact
+                    // read-back) is unchanged.
+                    runCatching { observationFile.writeBytes(oldObservation.rawBytes) }.isSuccess &&
                         UploadFile.synchronizeFileContents(observationFile) &&
                         UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
                         runCatching { observationFile.readBytes() }.getOrNull()
