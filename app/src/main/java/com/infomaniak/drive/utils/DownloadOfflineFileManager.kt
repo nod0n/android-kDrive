@@ -7702,6 +7702,11 @@ class DownloadOfflineFileManager(
          *     must hash to the recorded identity, then the slot is written at the SAME
          *     recorded name, verified, ACKed — a repair, never an invention; a captured
          *     entry with no reconstructible record payload is record corruption → retain;
+         *   - the slot is missing + the entry SUPERSEDED → skipped for loss detection
+         *     (review-49 G2 — a released reservation is never loss; a PRESENT superseded
+         *     slot is still sha-verified and ACKed; the legacy caveat: the round-48
+         *     releases were inferred, never proven — the explicit L classification lands
+         *     with review-49 G3);
          *   - the slot is missing + MOVED kind → THE CANONICAL-WAS-PRESENT RULE: when THIS
          *     PASS's branch disposed a canonical that was present at its start, the stale
          *     reservation is provably never executed and is released (marked superseded,
@@ -7734,8 +7739,25 @@ class DownloadOfflineFileManager(
                     for (entry in bound.entries.toList()) {
                         val slotFile = IOFile(recordFile.parentFile, entry.slotName)
                         if (slotExistsExcludingSymlinks(slotFile)) {
+                            // A PRESENT SLOT IS VERIFIED WHATEVER ITS STATE (review-49 G2):
+                            // the recorded identity and the existing bytes are never
+                            // waived — a mismatch retains even for a superseded entry.
                             if (!slotMatchesManifest(slotFile, entry.sha256Hex)) return false
                             if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
+                            continue
+                        }
+                        if (!entry.active) {
+                            // A MISSING SUPERSEDED SLOT IS NEVER LOSS (review-49 G2): the
+                            // released reservation is skipped for loss detection — the
+                            // five-step retain-forever trace is closed. THE LEGACY CAVEAT
+                            // IS EXPLICIT: the round-48 superseded entries were released
+                            // by the PRESENCE INFERENCE, not by a validated phase — this
+                            // skip never claims they are proven releases; their recorded
+                            // shas stay in the manifest unchanged, and the explicit
+                            // legacy classification (the L state, review-49 G3) replaces
+                            // this provisional treatment. ACTIVE entries remain fully
+                            // required below; no disposal runs without the per-entry
+                            // acknowledgments.
                             continue
                         }
                         when (quarantinedSlotKind(recordFile, entry.slotName)) {
