@@ -1645,7 +1645,18 @@ class DownloadOfflineFileManager(
                     publicationId = newPublicationId(),
                     absolutePath = target.absolutePath,
                 )
-                recordFile.writeText(provenance.recordText(target))
+                // THE PROOF IS THE DURABLE ATOMIC WRITE, ACKNOWLEDGED (review-39 #6): the
+                // record is written through the crash-consistent writer — temp data synced,
+                // atomic rename, directory entry synchronized — and its successful result
+                // is the acknowledgment BEFORE any observation retirement, reconciliation
+                // completion or snapshot/record disposal proceeds. The previous ordinary
+                // writeText + readability check could leave a readable-but-undurable proof
+                // whose reconstruction evidence (the snapshot and the completion record)
+                // the caller then removed, with no owned pending reconciliation left to
+                // repair it.
+                if (!atomicWriteText(recordFile, provenance.recordText(target))) {
+                    return@runCatching false
+                }
                 if (readPublishedProvenance(context, target) == null) return@runCatching false
                 // RETIRE THE PREVIOUS PUBLICATION'S OBSERVATION (review-33 #8, idempotent
                 // review-34 #7): the new verified-uploaded proof carries a NEW publication
