@@ -1081,19 +1081,21 @@ class CloudStorageProvider : DocumentsProvider() {
                 // shared post-download establishment runs before the coordinated
                 // plain-cache publication, OUTSIDE every lock; FAILED leaves the staged
                 // bytes to the finally-cleanup and the open fails. The typed answer
-                // travels into the publication: a COARSE_UNRESOLVED generation
+                // travels into the publication: a CoarseUnresolved generation
                 // publishes with an explicitly unresolved (version-0) proof and
-                // returns PUBLISHED_UNRESOLVED.
+                // returns PUBLISHED_UNRESOLVED; an Established one adopts the fresh
+                // metadata identity into the publication (review-53 D1).
                 val establishment = if (stagedOk) {
                     runBlocking(operationJob) {
                         DownloadOfflineFileManager.reestablishDownloadedGeneration(
                             file = file,
                             userDrive = userDrive,
                             okHttpClient = okHttpClient,
+                            staged = staged,
                         )
                     }
-                } else GenerationEstablishment.FAILED
-                if (establishment != GenerationEstablishment.FAILED) {
+                } else GenerationEstablishment.Failed
+                if (establishment !is GenerationEstablishment.Failed) {
                     // THE POST-ESTABLISHMENT BOUNDARY CHECK (issue: round 29 #10): a
                     // cancellation that landed during the establishment HTTP must not
                     // reach the publication.
@@ -1101,7 +1103,8 @@ class CloudStorageProvider : DocumentsProvider() {
                     val outcome = runBlocking(operationJob) {
                         DownloadOfflineFileManager.publishStagedCacheCopy(
                             context, file, cacheFile, userDrive, staged,
-                            generationResolved = establishment == GenerationEstablishment.ESTABLISHED,
+                            generationResolved = establishment is GenerationEstablishment.Established,
+                            established = establishment as? GenerationEstablishment.Established,
                         )
                     }
                     if (outcome == PublicationOutcome.PUBLISHED ||
