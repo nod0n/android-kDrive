@@ -6302,7 +6302,21 @@ class DownloadOfflineFileManager(
                 onVerifiedBasisHash?.invoke(null)
             }
 
-            staged.setLastModified(file.getLastModifiedInMilliSecond())
+            // THE TIMESTAMP IS PART OF THE PUBLISHED PAYLOAD (review-41 #10): the setter's
+            // result is REQUIRED and the staged file's resulting mtime is validated at the
+            // precision the stored-copy reader uses (storedOfflineCopyState compares
+            // lastModified()/1000 against the recorded generation) — an ignored failure or
+            // an imprecise result used to publish bytes whose recorded baseline the reader
+            // then classifies ABSENT_OR_STALE while the publication had already cleared
+            // the intent and let the promotion delete its source. A failure retains the old
+            // destination and the pending intent: the staged copy is discarded and nothing
+            // is replaced.
+            if (!staged.setLastModified(file.getLastModifiedInMilliSecond()) ||
+                staged.lastModified() / 1_000L != file.lastModifiedAt
+            ) {
+                runCatching { staged.delete() }
+                return PublicationOutcome.FAILED
+            }
             val provenanceContext = appContextForCheck
             if (provenanceContext == null) {
                 runCatching { staged.delete() }
@@ -6734,7 +6748,16 @@ class DownloadOfflineFileManager(
                     return@withFileLock PublicationOutcome.FAILED
                 }
                 runCatching {
-                    staged.setLastModified(file.getLastModifiedInMilliSecond())
+                    // THE TIMESTAMP IS PART OF THE PUBLISHED PAYLOAD (review-41 #10), as
+                    // in the coordinated publication: the setter's result is REQUIRED and
+                    // the staged file's resulting mtime is validated at the precision the
+                    // stored-copy reader uses — a failure retains the old cache bytes and
+                    // the pending intent, never an unusable published generation.
+                    if (!staged.setLastModified(file.getLastModifiedInMilliSecond()) ||
+                        staged.lastModified() / 1_000L != file.lastModifiedAt
+                    ) {
+                        return@runCatching PublicationOutcome.FAILED
+                    }
                     // THE PAYLOAD'S CONTENTS ARE DURABLE AFTER THEIR FINAL TIMESTAMP
                     // (review-39 #4): the staged copy's data was synchronized at staging,
                     // but the timestamp write above is part of the published payload — the
