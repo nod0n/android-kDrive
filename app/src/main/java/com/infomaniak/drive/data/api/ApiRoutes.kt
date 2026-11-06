@@ -275,6 +275,18 @@ object ApiRoutes {
 
     fun getFileDetails(file: File) = "${fileURL(file)}?$fileExtraWithQuery"
 
+    /**
+     * THE DETAILS-WITH-HASH ROUTE (review-53 D2): [getFileDetails] plus the official
+     * `with=hash` extension — the ONLY response the app treats as authorized to store
+     * the server content hash on a row (the `hash` field is the SERVER's canonical
+     * content identity; nullable; "xxh3:…" is the only algorithm this build supports).
+     * The etag is deliberately NOT requested: opaque, unused for any decision, and its
+     * delimiters add parse surface. The establishment caller builds the REQUEST itself
+     * (no-cache directive, the captured account's client — Core's ApiController takes
+     * no headers) and maps the body; this route only fixes the URL.
+     */
+    fun getFileDetailsWithHash(file: File) = "${fileURL(file)}?$fileExtraWithQuery,hash"
+
     fun createFolder(driveId: Int, parentId: Int) = "${fileURL(driveId, parentId)}/directory?$fileWithQuery"
 
     fun createOfficeFile(driveId: Int, folderId: Int) = "${fileURL(driveId, folderId)}/file?$fileWithQuery"

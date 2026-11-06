@@ -3086,6 +3086,20 @@ object FileController {
         // replace a newer stamp (the previous omission let keepOldLocalFilesData resurrect
         // an older captured observation's match).
         offlineIntentStamp = oldFile.offlineIntentStamp
+        // THE SERVER CONTENT IDENTITY FOLLOWS ITS GENERATION (review-53 D2): this merge
+        // is hash-less ingestion (listings, activities, generic refreshes — Gson
+        // deserializes null without the authorized `with=hash` response), so the live
+        // row's hash survives ONLY when the incoming row carries the EXACT same
+        // server-generation tuple (File.serverGenerationTupleMatches); any advance or
+        // unknown clears it — a hash is never kept over a newer generation. An incoming
+        // object that DOES carry a hash (only the details-with-hash route produces one)
+        // is the fresh generation's own and wins as-is — including an explicit server
+        // absence on a matching tuple, which keeps an earlier authorized value for that
+        // same generation. The stored hash is a preservation-tier hint, never a
+        // verified claim: the establishment and currentness ladders anchor on FRESH
+        // responses, not on this field.
+        serverContentHash = serverContentHash
+            ?: oldFile.serverContentHash?.takeIf { serverGenerationTupleMatches(oldFile) }
     }
 
     private fun RealmQuery<File>.getSortQueryByOrder(order: SortType): RealmQuery<File> {

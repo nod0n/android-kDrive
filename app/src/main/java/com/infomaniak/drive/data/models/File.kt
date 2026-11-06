@@ -132,6 +132,23 @@ open class File(
     @SerializedName("extension_type")
     var extensionType: String = "",
     var version: FileVersion? = null,
+    /**
+     * THE SERVER CONTENT IDENTITY (review-53 D2): the SERVER's own canonical content
+     * hash ("xxh3:…" — the only algorithm this build supports), populated by Gson ONLY
+     * when a response actually carries the `hash` field — today only the dedicated
+     * details-with-hash route requests it — and persisted on File (schema File DB 17,
+     * nullable; migrated rows stay null). Never the local SHA-256 receipt (the upload's
+     * content hash) and never an etag (opaque, unused — deliberately not requested or
+     * stored). INGESTION RULES (FileController): the hash is STORED only from that
+     * authorized response; a hash-less ingestion (listings, activities, generic
+     * refreshes — Gson deserializes null) preserves the live row's hash only while the
+     * full server-generation tuple ([serverGenerationTupleMatches]) is unchanged and
+     * clears it on any advance or unknown. Null is the honest metadata tier — never a
+     * verified claim. XXH3-64 is non-cryptographic: it certifies accidental-corruption
+     * and staleness integrity only, not adversarial integrity.
+     */
+    @SerializedName("hash")
+    var serverContentHash: String? = null,
     @SerializedName("conversion_capabilities")
     var conversion: FileConversion? = null,
 
@@ -481,6 +498,25 @@ open class File(
         }
         return StoredOfflineCopyState.PROVEN_CURRENT
     }
+
+    /**
+     * THE SERVER-GENERATION TUPLE (review-53 D2): the server metadata fields that decide
+     * whether a stored [serverContentHash] still describes THIS row's accepted
+     * generation. The hash is stored only from the dedicated details-with-hash response
+     * (the authorized producer), so a hash survives a hash-less ingestion (listing,
+     * activity, generic refresh) ONLY when the incoming row carries the exact same
+     * tuple; any advance or unknown field (a null on either side of a nullable pair) is
+     * a CHANGE and clears it — a preserved hash must never outlive the generation it
+     * was captured for. This is a conservative PRESERVATION test, not a same-content
+     * proof: [FileVersion.number] is a version COUNT, not a revision identity, and full
+     * tuple equality does not exclude an ABA content change — the establishment and
+     * currentness ladders remain the only verification authority.
+     */
+    internal fun serverGenerationTupleMatches(other: File): Boolean =
+        id == other.id && driveId == other.driveId &&
+            revisedAt == other.revisedAt && updatedAt == other.updatedAt &&
+            lastModifiedAt == other.lastModifiedAt && size == other.size &&
+            version?.number == other.version?.number
 
     /**
      * Whether the retained offline copy is PROVEN to be the accepted remote generation —

@@ -28,6 +28,14 @@ import kotlinx.parcelize.Parcelize
 open class FileVersion(
     @SerializedName("is_multiple")
     var isMultiple: Boolean = false,
+    /**
+     * THE VERSION COUNT (official API: "Get number of version" — review-53 correction):
+     * how many versions the file currently has, NOT a monotonic revision identity and
+     * never a stable identifier of one generation. A count DIFFERENCE is a safe change
+     * signal (the server saw at least one new version); count EQUALITY is not evidence
+     * of the same content or generation (pruning, re-uploads and ABA edits can hold the
+     * count steady). Every authority-bearing comparison must treat it accordingly.
+     */
     var number: Int = 0,
     @SerializedName("total_size")
     var totalSize: Long = 0,

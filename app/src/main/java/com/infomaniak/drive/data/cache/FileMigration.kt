@@ -488,6 +488,25 @@ class FileMigration : RealmMigration {
             }
             oldVersionTemp++
         }
+
+        // Migrated to version 17 (review-53 D2):
+        // - Added `File.serverContentHash` — the SERVER's canonical content identity
+        //   (the official `with=hash` details field; nullable; "xxh3:…" is the only
+        //   supported algorithm). Additive nullable column: every existing row keeps
+        //   null — absence is the honest metadata tier, never a verified claim, and
+        //   NOTHING is invented during migration. A hash is stored only later, only
+        //   from the authorized details-with-hash response, under FileController's
+        //   ingestion rules (preserve on an exact generation tuple, clear on any
+        //   advance or unknown).
+        if (oldVersionTemp == 16L) {
+            schema[File::class.java.simpleName]?.apply {
+                if (!hasField(File::serverContentHash.name)) {
+                    addField(File::serverContentHash.name, String::class.java)
+                        .setNullable(File::serverContentHash.name, true)
+                }
+            }
+            oldVersionTemp++
+        }
     }
 
     override fun equals(other: Any?): Boolean {
@@ -515,7 +534,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 16L // Must be bumped when the schema changes
+        const val DB_VERSION = 17L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }
