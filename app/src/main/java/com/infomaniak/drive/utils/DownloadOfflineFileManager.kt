@@ -7927,6 +7927,11 @@ class DownloadOfflineFileManager(
             entry: QuarantineManifestEntry,
             checkCancelled: () -> Unit,
         ): QuarantineManifestEntry? {
+            // A SYMLINK AT THE CANONICAL NAME IS UNKNOWN (review-51 J3, the review-48 F4
+            // discipline): the recovery never reads THROUGH one — a link whose target
+            // happens to hash to the recorded identity is not this target's evidence, and
+            // a dangling one would only fail the read. The caller retains (null).
+            if (isSymbolicLinkPath(observationFile)) return null
             val currentBytes = runCatching { observationFile.readBytes() }.getOrNull() ?: return null
             if (sha256HexOfBytes(currentBytes) != entry.sha256Hex) return null
             // THE EXECUTING CONTEXT AFTER THE IDENTITY VALIDATION, BEFORE THE COPY (the
@@ -8056,6 +8061,10 @@ class DownloadOfflineFileManager(
                                         // produced ONLY by this decision (review-51 J1: a
                                         // header alone never proves an old entry's origin,
                                         // so the provenance lives in the state).
+                                        // A SYMLINK AT THE CANONICAL NAME IS UNKNOWN
+                                        // (review-51 J3): never read through one — the
+                                        // pending-entry decision retains (fail-closed).
+                                        if (isSymbolicLinkPath(observationFile)) return false
                                         val currentBytes = runCatching { observationFile.readBytes() }.getOrNull()
                                         val currentSha = currentBytes?.let { sha256HexOfBytes(it) }
                                         when {
