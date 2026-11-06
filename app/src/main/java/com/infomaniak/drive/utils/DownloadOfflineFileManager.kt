@@ -3150,13 +3150,18 @@ class DownloadOfflineFileManager(
                     // generation) and the relocation state RETAINS the original proof for
                     // the sweep's replay onto the moved bytes.
                     ProofRelocationFlow.STAGED_PUBLICATION -> {
-                        // THE DISPOSAL RESULT IS ACKNOWLEDGED (review-45 R2): a failed
-                        // disposal leaves the journal retained for the sweep's replay —
-                        // the designed convergence (the state's captured source-bound
-                        // proof is the replay authority, independent of the live source
-                        // record). The vacated source record is still invalidated per the
-                        // staged contract; the prepare's failure return propagates the
-                        // abort to every caller either way.
+                        // THE DISPOSAL RESULT IS ACKNOWLEDGED (review-45 R2) — AND THE
+                        // DISPOSED STATE IS NAMED PRECISELY (review-46 D7): recordFile
+                        // here is the DESTINATION PROVENANCE FILE — this disposal clears
+                        // the operation's own PREPARED (never verified) destination
+                        // record, not the relocation journal; a failed disposal leaves
+                        // that prepared record in place. The prepare returns FALSE in
+                        // every case below, and the following
+                        // deletePublishedProvenance(source) is safe because the staged
+                        // proof text is retained in the RELOCATION JOURNAL
+                        // (proofRelocationRecordFile — the sweep's replay authority,
+                        // independent of the live source record). The vacated source
+                        // record is still invalidated per the staged contract.
                         disposeRecoveryRecord(recordFile)
                         deletePublishedProvenance(context, source)
                     }
@@ -3203,13 +3208,18 @@ class DownloadOfflineFileManager(
             if (readPublishedProvenance(context, target) == null) {
                 when (flow) {
                     ProofRelocationFlow.STAGED_PUBLICATION -> {
-                        // THE DISPOSAL RESULT IS ACKNOWLEDGED (review-45 R2): a failed
-                        // disposal leaves the journal retained for the sweep's replay —
-                        // the designed convergence (the state's captured source-bound
-                        // proof is the replay authority, independent of the live source
-                        // record). The vacated source record is still invalidated per the
-                        // staged contract; the prepare's failure return propagates the
-                        // abort to every caller either way.
+                        // THE DISPOSAL RESULT IS ACKNOWLEDGED (review-45 R2) — AND THE
+                        // DISPOSED STATE IS NAMED PRECISELY (review-46 D7): recordFile
+                        // here is the DESTINATION PROVENANCE FILE — this disposal clears
+                        // the operation's own PREPARED (never verified) destination
+                        // record, not the relocation journal; a failed disposal leaves
+                        // that prepared record in place. The prepare returns FALSE in
+                        // every case below, and the following
+                        // deletePublishedProvenance(source) is safe because the staged
+                        // proof text is retained in the RELOCATION JOURNAL
+                        // (proofRelocationRecordFile — the sweep's replay authority,
+                        // independent of the live source record). The vacated source
+                        // record is still invalidated per the staged contract.
                         disposeRecoveryRecord(recordFile)
                         deletePublishedProvenance(context, source)
                     }
@@ -5337,34 +5347,11 @@ class DownloadOfflineFileManager(
                                                     // a request-time stamp the writer cannot capture) —
                                                     // the residual is STRUCTURAL and explicitly OPEN,
                                                     // never read as repin permission (the round-44
-                                                    // "expected commit" framing is RETRACTED); the live
-                                                    // intent + publication-id gates still govern those
-                                                    // journals. Pre-v7 journals take the destination-
-                                                    // side baseline below (review-45 R7).
+                                                    // "expected commit" framing is RETRACTED). THE
+                                                    // R7 DESTINATION-SIDE BASELINE IS RETRACTED
+                                                    // (review-46 D5): pre-v7 journals take the
+                                                    // proof-based fail-safe below.
                                                     val matchingState = destinationState as? DestinationRowState.Matching
-                                                    // THE LEGACY DESTINATION-SIDE BASELINE (review-45
-                                                    // R7): when the journal captured the destination's
-                                                    // PRIOR publication record, THAT record's
-                                                    // generation is the destination's OWN metadata at
-                                                    // capture — the comparison runs against it (a real
-                                                    // destination-side check, never the proof's
-                                                    // source-derived one), ending the false permanent
-                                                    // supersession of pre-existing differing rows for
-                                                    // exactly those journals. Without a captured prior
-                                                    // record the destination's at-capture generation is
-                                                    // UNPROVABLE: the proof-based comparison stays as
-                                                    // the FAIL-SAFE (a changed or never-matching row
-                                                    // supersedes → the validated rollback + the durable
-                                                    // redrive — churn that converges, never a wrong
-                                                    // publish), and the limit is documented OPEN: no
-                                                    // stamp or phase is invented, the admission is
-                                                    // never Boolean-only.
-                                                    val legacyDestinationBaseline =
-                                                        parsed.previousDestinationRecordText?.takeIf { it.isNotEmpty() }?.let { priorText ->
-                                                            runCatching {
-                                                                parseProvenanceText(priorText, expectedPath = parsed.targetPath)
-                                                            }.getOrNull()?.takeIf { it.absolutePath == parsed.targetPath }
-                                                        }
                                                     val supersededAuthorization = matchingState != null && when (parsed.version) {
                                                         7 -> {
                                                             // THE INTENT STAMP IS INDEPENDENT OF THE
@@ -5377,44 +5364,77 @@ class DownloadOfflineFileManager(
                                                                 parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
                                                                     parsed.recordedIntentStamp != matchingState.intentStamp
                                                             // THE CONTENT BASELINE IS WHATEVER THE
-                                                            // CAPTURE SAW: a versioned row's
-                                                            // version+lastModifiedAt; a version-less
-                                                            // PRESENT row's lastModifiedAt alone (a
-                                                            // version appearing later is a change — a
-                                                            // zero version is a real captured
-                                                            // baseline, never a skip permission).
+                                                            // CAPTURE SAW (review-46 D4):
                                                             val generationSupersedes = when {
-                                                                parsed.recordedDestinationVersion != null &&
-                                                                    parsed.recordedDestinationVersion > 0 ->
+                                                                // THE ALL-ZEROS CAPTURE — the row ABSENT
+                                                                // at capture (0/0/0; reachable only from
+                                                                // a future caller after the D3
+                                                                // withdrawal) — has NO baseline and NONE
+                                                                // IS INVENTED: the appearance cannot be
+                                                                // attributed (the operation's own commit
+                                                                // and a post-capture change are
+                                                                // indistinguishable), so this capture
+                                                                // NEVER ADMITS the publication. The
+                                                                // journal takes the validated rollback
+                                                                // (fail-closed — the state retains until
+                                                                // the validated route disposes it) and
+                                                                // the destination's own durable intent
+                                                                // re-drives through the ordinary sync
+                                                                // path: churn that converges, never a
+                                                                // wrong publish. The historical intent of
+                                                                // such journals is unprovable — the
+                                                                // residual is STRUCTURAL and explicitly
+                                                                // OPEN, coded here (never a comments-only
+                                                                // promise), never read as repin permission
+                                                                // (the round-44 "expected commit" framing
+                                                                // stays RETRACTED).
+                                                                parsed.recordedIntentStamp == 0L &&
+                                                                    parsed.recordedDestinationVersion == 0 &&
+                                                                    parsed.recordedDestinationLastModifiedAt == 0L -> true
+                                                                // THE CAPTURED VERSION IS A REAL
+                                                                // BASELINE, ZERO INCLUDED: a PRESENT
+                                                                // row's captured version is compared
+                                                                // UNCONDITIONALLY — captured version
+                                                                // 0 / mtime M vs live version 5 / mtime M
+                                                                // is a change (a version appearing later
+                                                                // is a change), never admitted by the
+                                                                // mtime alone.
+                                                                parsed.recordedDestinationVersion != null ->
                                                                     matchingState.rowVersion != parsed.recordedDestinationVersion ||
                                                                         matchingState.rowLastModifiedAt != parsed.recordedDestinationLastModifiedAt
-                                                                parsed.recordedDestinationLastModifiedAt != null &&
-                                                                    parsed.recordedDestinationLastModifiedAt > 0L ->
-                                                                    matchingState.rowLastModifiedAt != parsed.recordedDestinationLastModifiedAt
                                                                 else -> false
                                                             }
                                                             stampSupersedes || generationSupersedes
                                                         }
                                                         else -> {
-                                                            val generationSupersedes = if (legacyDestinationBaseline != null) {
-                                                                matchingState.rowVersion != legacyDestinationBaseline.version ||
-                                                                    matchingState.rowLastModifiedAt != legacyDestinationBaseline.lastModifiedAt
-                                                            } else {
-                                                                // THE STRUCTURAL RESIDUAL (explicitly
-                                                                // OPEN, review-45 R7): a pre-v7 journal
-                                                                // without a captured prior destination
-                                                                // record has no destination-side
-                                                                // baseline; the proof-based comparison
-                                                                // fails safe (rollback + redrive) but a
-                                                                // never-matching pre-existing row churns
-                                                                // every pass. The intent at such a
-                                                                // journal's capture is unprovable — no
-                                                                // stamp or phase is invented, the
-                                                                // comparison is a real check, and the
-                                                                // limit is NOT claimed closed.
+                                                            // THE PRE-v7 DISPATCH (review-46 D5 — the
+                                                            // R7 destination-side baseline is
+                                                            // RETRACTED): the journal's captured prior
+                                                            // destination record proves the
+                                                            // destination's prior BYTES, not the live
+                                                            // row's metadata at capture (the row can
+                                                            // diverge from its own prior publication,
+                                                            // and the field is usually empty — both
+                                                            // published-source flows require the
+                                                            // destination bytes absent). The
+                                                            // proof-based comparison is the FAIL-SAFE:
+                                                            // a changed or never-matching row
+                                                            // supersedes → the validated rollback +
+                                                            // the durable redrive — churn that
+                                                            // converges, never a wrong publish. THE
+                                                            // LIMITS ARE EXPLICITLY OPEN: the
+                                                            // destination's at-capture generation is
+                                                            // unprovable for pre-v7 journals (the
+                                                            // same-generation unpin-repin below the
+                                                            // stamp's v6 introduction remains
+                                                            // indistinguishable); no phase or stamp is
+                                                            // fabricated for any legacy format; the
+                                                            // comparison is a real check, never called
+                                                            // authority; no format is waived as
+                                                            // unshipped.
+                                                            val generationSupersedes =
                                                                 matchingState.rowVersion != validatedTargetProof.version ||
                                                                     matchingState.rowLastModifiedAt != validatedTargetProof.lastModifiedAt
-                                                            }
                                                             val stampSupersedes =
                                                                 parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
                                                                     parsed.recordedIntentStamp != matchingState.intentStamp
