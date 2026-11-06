@@ -330,44 +330,63 @@ class OfflineFailedDeleteTest {
             // NON-EMPTY directory — an unlink of a non-empty directory deterministically
             // fails on every POSIX filesystem, so the production release genuinely fails
             // over EXISTING registry state, with no chmod anywhere and no effect on any
-            // other record sharing the hash prefix. The obstruction is this fixture's own
-            // record path alone and is removed by its own cleanup.
-            check(recordFile.delete()) { "the seeded record must be replaceable by the obstruction" }
-            check(recordFile.mkdirs()) { "the obstruction directory must be creatable at the record path" }
-            val obstructionChild = IOFile(recordFile, "obstruction.bin")
-            check(obstructionChild.createNewFile()) { "the obstruction must be non-empty (an empty directory would unlink)" }
+            // other record sharing the hash prefix. The obstruction lives only at this
+            // fixture's own record path, and the try/finally below removes it on EVERY
+            // exit — an assertion failure must never leak it (the B3 review concern); the
+            // @AfterAll backstop re-sweeps the same exact path.
+            var bodyFailure: Throwable? = null
+            try {
+                check(recordFile.delete()) { "the seeded record must be replaceable by the obstruction" }
+                check(recordFile.mkdirs()) { "the obstruction directory must be creatable at the record path" }
+                val obstructionChild = IOFile(recordFile, "obstruction.bin")
+                check(obstructionChild.createNewFile()) { "the obstruction must be non-empty (an empty directory would unlink)" }
 
-            val detached = realm.copyFromRealm(liveRow(realm), 1)
-            OfflineFolderController.clearFileCoverage(
-                context = context,
-                realm = realm,
-                file = detached,
-                userDrive = userDrive,
-                result = result,
-                isFolder = false,
-            )
+                val detached = realm.copyFromRealm(liveRow(realm), 1)
+                OfflineFolderController.clearFileCoverage(
+                    context = context,
+                    realm = realm,
+                    file = detached,
+                    userDrive = userDrive,
+                    result = result,
+                    isFolder = false,
+                )
 
-            assertTrue(
-                recordFile.exists() && obstructionChild.exists(),
-                "the failed release must RETAIN the obstructed record path — the disposal deferred entirely",
-            )
-            assertTrue(offlineFile.exists(), "the bytes are never deleted when the release fails")
-            assertEquals(1, result.keptOfflineFilesCount)
-            assertEquals(0, result.removedOfflineFilesCount)
-            val retained = liveRow(realm)
-            assertTrue(retained.isInOfflineFolder, "the coverage restoration applies to the deferred disposal")
-            assertNotEquals(stampBefore, retained.offlineIntentStamp)
-
-            // EXACT OWN-PATH CLEANUP (explicit, never broad): the obstruction's child, the
-            // obstruction directory itself, and then the record slot's residue via the
-            // production release — all at this fixture's own record path only.
-            check(obstructionChild.delete()) { "the obstruction child must be removable in cleanup" }
-            check(recordFile.delete()) { "the obstruction directory must be removable in cleanup" }
-            runCatching { deletePublishedProvenance(context, offlineFile) }
-            assertFalse(
-                provenanceRecordFileExists(context, offlineFile),
-                "the fixture's own record slot must be clean after its cleanup",
-            )
+                assertTrue(
+                    recordFile.exists() && obstructionChild.exists(),
+                    "the failed release must RETAIN the obstructed record path — the disposal deferred entirely",
+                )
+                assertTrue(offlineFile.exists(), "the bytes are never deleted when the release fails")
+                assertEquals(1, result.keptOfflineFilesCount)
+                assertEquals(0, result.removedOfflineFilesCount)
+                val retained = liveRow(realm)
+                assertTrue(retained.isInOfflineFolder, "the coverage restoration applies to the deferred disposal")
+                assertNotEquals(stampBefore, retained.offlineIntentStamp)
+            } catch (throwable: Throwable) {
+                bodyFailure = throwable
+                throw throwable
+            } finally {
+                // EXACT OWN-PATH CLEANUP ON EVERY EXIT (explicit, never broad): the
+                // obstruction's child and directory, then the record slot's residue via the
+                // production release — this fixture's own record path only. A cleanup
+                // failure fails the test when the scenario body passed (observable); when
+                // the body already failed, the body's failure stays the report and the
+                // @AfterAll backstop still re-sweeps the exact slot.
+                val cleanup = runCatching {
+                    val obstructionChild = IOFile(recordFile, "obstruction.bin")
+                    if (obstructionChild.exists()) check(obstructionChild.delete()) { "the obstruction child must be removable" }
+                    if (recordFile.isDirectory) check(recordFile.delete()) { "the obstruction directory must be removable" }
+                    runCatching { deletePublishedProvenance(context, offlineFile) }
+                    check(!provenanceRecordFileExists(context, offlineFile)) {
+                        "the fixture's own record slot must be clean after its cleanup"
+                    }
+                }
+                if (cleanup.isFailure && bodyFailure == null) {
+                    throw AssertionError(
+                        "the fixture's own obstruction cleanup failed on a passing scenario",
+                        cleanup.exceptionOrNull(),
+                    )
+                }
+            }
         }
     }
 
@@ -490,9 +509,12 @@ class OfflineFailedDeleteTest {
         runCatching {
             seededRegistryFiles.forEach { seeded ->
                 runCatching { deletePublishedProvenance(context, seeded) }
+                // THE EXACT OWN RECORD-SLOT BACKSTOP (never the shared prefix directory):
+                // re-sweeps any obstruction residue at this fixture's own record path only,
+                // plus its .obs sibling.
                 runCatching {
                     val recordFile = provenanceFileFor(context, seeded)
-                    recordFile.delete()
+                    recordFile.deleteRecursively()
                     IOFile(recordFile.path + ".obs").delete()
                 }
             }
