@@ -3150,6 +3150,16 @@ class DownloadOfflineFileManager(
         internal fun beginRelocationByteEffects(context: Context, target: IOFile): Boolean =
             transitionRelocationPhase(context, target, "B")
 
+        /** THE REPLAY DURABILITY BARRIER (review-39 #5): a matching hash and the durable
+         * registry record never substitute for the payload's own durability — the
+         * publication's failed synchronization prerequisite is RETRIED before any replay
+         * branch acknowledges publication/restoration or disposes its fallback evidence.
+         * A still-failing barrier retains the evidence for the next sweep. */
+        private fun payloadDurabilityEstablished(payload: IOFile): Boolean =
+            payload.exists() &&
+                UploadFile.synchronizeFileContents(payload) &&
+                UploadFile.synchronizeDirectoryEntry(payload.parentFile)
+
         /** DISPOSES A COMPLETED RELOCATION'S STATE (review-34 #3): called after the
          * caller's metadata commit succeeded, for completions retained via
          * [completePreparedProofMove] with disposeOnSuccess = false. The rows, bytes,
@@ -4418,7 +4428,12 @@ class DownloadOfflineFileManager(
                                                             sharedWithMe = parsed.recordedSourceSharedWithMe,
                                                             storageKind = parsed.recordedSourceStorageKind
                                                                 ?: moveScopeKind,
-                                                        )
+                                                        ) &&
+                                                        // THE RETAINED AUTHORITY IS DURABLE BEFORE THE
+                                                        // JOURNAL LEAVES (review-39 #5): the source is the
+                                                        // sole remaining authority for this generation.
+                                                        UploadFile.synchronizeFileContents(sourceFile) &&
+                                                        UploadFile.synchronizeDirectoryEntry(sourceFile.parentFile)
                                                 }.getOrDefault(false)
                                                 if (postCopyResolved) {
                                                     disposeRecoveryRecord(recordFile)
@@ -4471,7 +4486,11 @@ class DownloadOfflineFileManager(
                                                         storageKind = moveScopeKind,
                                                     )
                                                 if (supersededByVerified) {
-                                                    disposeRecoveryRecord(recordFile)
+                                                    // THE DURABILITY BARRIER BEFORE RETIREMENT (review-39
+                                                    // #5): the superseding publication's bytes and
+                                                    // directory entry are synchronized before this journal
+                                                    // is retired over them.
+                                                    payloadDurabilityEstablished(target)
                                                 } else false
                                             }
                                             else -> {
@@ -4544,12 +4563,16 @@ class DownloadOfflineFileManager(
                                                         ),
                                                     )
                                                 }.getOrDefault(false)
-                                                if (proofEstablished && observationEstablished) {
-                                                    // The row, bytes, proof and observation agree at the
-                                                    // destination — only now is the journal cleared.
+                                                // The row, bytes, proof and observation agree at the
+                                                // destination — and the payload's durability barrier
+                                                // (review-39 #5) is retried — only then is the journal
+                                                // cleared; a still-failing barrier retains.
+                                                val coherent = proofEstablished && observationEstablished &&
+                                                    payloadDurabilityEstablished(target)
+                                                if (coherent) {
                                                     disposeRecoveryRecord(recordFile)
                                                 }
-                                                proofEstablished && observationEstablished
+                                                coherent
                                                     }.getOrDefault(false)
                                                     else -> runCatching {
                                                         // THE OWNER-CHECKED ROLLBACK (review-34 #3): the
@@ -4836,6 +4859,12 @@ class DownloadOfflineFileManager(
                         )
                     }
                 if (!missingBackupComplete) return false
+                // THE DURABILITY BARRIER BEFORE DISPOSAL (review-39 #5): the visible
+                // expected bytes' contents and directory entry are synchronized before the
+                // backup and journal are retired — the publication's failed
+                // synchronization prerequisite is retried here, and a matching hash never
+                // substitutes for the acknowledgment.
+                if (!payloadDurabilityEstablished(target)) return false
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
                 return true
@@ -4907,6 +4936,10 @@ class DownloadOfflineFileManager(
                     // An explicit absence (the "A" marker / a pre-observation format) is
                     // legitimate: nothing to establish.
                 }
+                // THE DURABILITY BARRIER BEFORE DISPOSAL (review-39 #5), as in the
+                // missing-backup arm: the self-certified bytes' contents and directory
+                // entry are synchronized before the backup and journal are retired.
+                if (!payloadDurabilityEstablished(target)) return false
                 runCatching { recoveryFile.delete() }
                 disposeRecoveryRecord(record.recordFile)
                 return true
