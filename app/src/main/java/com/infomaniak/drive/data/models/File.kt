@@ -511,11 +511,16 @@ open class File(
      * member only when BOTH sides carry a known value — null on either side (including
      * null==null) is unknown, never an equality; the code now matches the documented
      * rule literally (the previous null==null-true read let two unknowns pass as a
-     * match). The folder-listing and file-activity routes request the version expansion
-     * (ApiRoutes listingFilesWithQuery / activitiesWithQuery), so the normal offline
-     * ingestion paths compare KNOWN counts; routes that structurally cannot carry the
-     * count (the shared-with-me listing) clear the stored hash on every refresh — the
-     * conservative disposition and its cost are documented in the implementation report.
+     * match). THE TUPLE'S SCOPE (review-55 G3): the tuple has NO name/parent leg —
+     * location agreement is never claimed from it; the publication CAS and the
+     * adoption block enforce the parent/name identity INDEPENDENTLY at their own
+     * boundaries. THE LISTING/ACTIVITY COUNT LEG IS UNKNOWN (review-55, the official
+     * evidence disposition): the folder-listing and file-activity routes request NO
+     * version expansion (the official activities enums omit file.version; the listing
+     * public docs are 404), so every listing/activity refresh ingests a version-less
+     * row, the count leg is unknown, and the stored hash clears per the strict rule —
+     * the conservative preservation behavior working as documented; the cost and the
+     * minimal next design are documented in the review-55 coder report.
      * This is a conservative PRESERVATION test, not a same-content proof:
      * [FileVersion.number] is a version COUNT, not a revision identity, and full tuple
      * equality does not exclude an ABA content change — the establishment and

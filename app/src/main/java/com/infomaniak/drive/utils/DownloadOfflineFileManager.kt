@@ -1890,14 +1890,24 @@ class DownloadOfflineFileManager(
             field == OBSERVED_BASIS_ABSENT -> ObservedHashBasis.Absent
             field.startsWith(OBSERVED_BASIS_ENCODED) -> {
                 val hex = field.drop(OBSERVED_BASIS_ENCODED.length)
-                val bytes = if (hex.length % 2 == 0) {
-                    hex.chunked(2)
-                        .map { it.toIntOrNull(16) }
-                        .takeIf { parsed -> parsed.all { it != null } }
-                        ?.map { it!!.toByte() }
-                        ?.toByteArray()
-                } else null
-                bytes?.let { ObservedHashBasis.Seen(String(it, Charsets.UTF_8)) }
+                // THE STRICT GRAMMAR (review-55 F6): "x" + a NON-EMPTY, EVEN-length run of
+                // LOWERCASE ASCII hex digits only — exactly the encoder's output shape; no
+                // sign and no uppercase digit decodes. The decoded bytes must be VALID
+                // UTF-8 and RE-ENCODE to the exact byte run (the lenient platform decoder
+                // substitutes U+FFFD for invalid sequences; a substituted result never
+                // round-trips byte-exactly). Anything else is null: no-skip evidence —
+                // never a mutated token, never an invented absence, never a supported
+                // token skip ('-'-the-token encoded as "x2d" still decodes to the
+                // verbatim "-", never the absence marker).
+                if (hex.isEmpty() || hex.length % 2 != 0 ||
+                    hex.any { it !in '0'..'9' && it !in 'a'..'f' }
+                ) {
+                    null
+                } else {
+                    val bytes = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                    val decoded = String(bytes, Charsets.UTF_8)
+                    if (decoded.encodeToByteArray().contentEquals(bytes)) ObservedHashBasis.Seen(decoded) else null
+                }
             }
             else -> null
         }
@@ -4227,6 +4237,12 @@ class DownloadOfflineFileManager(
          * after it (the caller's cancellation hook). Null = the metadata tier: the
          * caller publishes with an explicitly UNRESOLVED proof, preserving the stage and
          * the source evidence — never a fabricated Established over unverified bytes.
+         *
+         * THE TUPLE'S SCOPE (review-55 G3): the generation tuple has NO name/parent
+         * leg and never claims location agreement — the publication CAS (the live
+         * row's parent/name against the captured basis) and the adoption block's
+         * location guards (the adopted fresh row against the authoritative file)
+         * enforce the parent/name identity INDEPENDENTLY at their own boundaries.
          */
         private fun verifiedPromotionEstablishment(
             evidence: CapturedPromotionEvidence?,
@@ -4240,8 +4256,10 @@ class DownloadOfflineFileManager(
                 ?.takeIf { ServerContentHash.SUPPORTED_FORMAT.matches(it) }
                 ?: return null
             // THE SOURCE IDENTITY/TUPLE BINDING (review-54 F2): the captured persisted
-            // row carries the verified hash and names exactly the generation the
-            // authoritative details row describes.
+            // row carries the verified hash and its tuple (id/driveId/timestamps/size/
+            // count — no name/parent leg; location is enforced independently by the
+            // publication CAS and the adoption guards, review-55 G3) describes exactly
+            // the generation the authoritative details row describes.
             if (captured.liveRow.serverContentHash != serverHash) return null
             if (!captured.liveRow.serverGenerationTupleMatches(authoritativeFile)) return null
             // THE ACTUAL-BYTES BINDING (review-54 F2): the staged bytes ARE the source
