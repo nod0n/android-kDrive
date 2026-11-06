@@ -570,8 +570,22 @@ object FileController {
                         // requires this row, so it contributes no retention here.
                         val keptChildStillRequiresThisRow = file.isFolder() && keepFiles.isNotEmpty() &&
                                 keepFiles.any { keptId ->
-                                    getFileById(realm, keptId)?.parentId
-                                        ?.let { ancestryReachesBoundary(realm, it, fileId) } == true
+                                    when (val keptRow = getFileById(realm, keptId)) {
+                                        // THE KEPT ROW ITSELF IS UNRESOLVABLE: its requirement
+                                        // is unknown — uncertainty RETAINS the ancestry.
+                                        null -> true
+                                        else -> when (ancestryChainResolution(realm, keptRow.parentId, fileId)) {
+                                            AncestryChainResolution.REACHES -> true
+                                            // UNRESOLVED (a missing ancestor, a cycle or an
+                                            // unreadable link) RETAINS — the 64-hop cutoff and a
+                                            // missing ancestor are never permission to delete
+                                            // required ancestry; only a PROVEN complete
+                                            // non-membership walk classifies the kept child as
+                                            // moved elsewhere.
+                                            AncestryChainResolution.UNRESOLVED -> true
+                                            AncestryChainResolution.NOT_REACHING -> false
+                                        }
+                                    }
                                 }
                         if (keptChildStillRequiresThisRow) {
                             allRemoved = false
@@ -667,6 +681,26 @@ object FileController {
             hops++
         }
         return false
+    }
+
+    /** THE DURABLE ANCESTRY CHAIN RESOLUTION (review-40 #11): walks the finite parentId
+     * chain with CYCLE DETECTION and no depth cutoff, distinguishing PROVEN membership,
+     * PROVEN complete non-membership (a full walk reaching a root), and UNRESOLVED (a
+     * missing row, a cycle or an unreadable link). The retention caller treats
+     * unresolved as REQUIRED ancestry — uncertainty retains; the bounded
+     * [ancestryReachesBoundary] keeps its removal-authority semantics, where false
+     * prevents destruction. */
+    private enum class AncestryChainResolution { REACHES, NOT_REACHING, UNRESOLVED }
+
+    private fun ancestryChainResolution(realm: Realm, fromParentId: Int, boundaryId: Int): AncestryChainResolution {
+        val visited = mutableSetOf<Int>()
+        var currentId: Int? = fromParentId
+        while (currentId != null && currentId > 0) {
+            if (currentId == boundaryId) return AncestryChainResolution.REACHES
+            if (!visited.add(currentId)) return AncestryChainResolution.UNRESOLVED
+            currentId = getFileById(realm, currentId)?.parentId ?: return AncestryChainResolution.UNRESOLVED
+        }
+        return AncestryChainResolution.NOT_REACHING
     }
 
     fun renameFile(
