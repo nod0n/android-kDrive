@@ -4912,21 +4912,31 @@ class DownloadOfflineFileManager(
                                                     // on every sweep and no phase is invented (a
                                                     // v2/v3 journal's phase is unprovable).
                                                     val capturedSourceProofText = parsed.recordedSourceProofText
-                                                    val resolvedLegacySourceScope = if (parsed.recordedSourceSharedWithMe == null) {
-                                                        resolveLegacySourceScopeAuthority(
+                                                    // THE SOURCE SCOPE IS BOUND NON-NULL AT THIS BOUNDARY
+                                                    // (review-43 #6 compile fix): a CURRENT journal's
+                                                    // EXPLICITLY RECORDED scope is used verbatim — the
+                                                    // v4+ authority grammar records the flavor and the
+                                                    // whitelisted kind TOGETHER, so a recorded flavor
+                                                    // without a kind cannot decode (fail-closed retain
+                                                    // anyway, never an invented flavor); a LEGACY
+                                                    // journal's scope is resolved fresh across BOTH
+                                                    // flavors, and a null resolution (no unique
+                                                    // canonical owner) FAILS THE REPLAY here —
+                                                    // fail-closed retain, never a flavor default.
+                                                    val recordedSourceScope: Pair<Boolean, String> =
+                                                        parsed.recordedSourceSharedWithMe?.let { recordedShared ->
+                                                            val recordedKind = parsed.recordedSourceStorageKind
+                                                            if (recordedKind == null) return@runCatching false
+                                                            recordedShared to recordedKind
+                                                        } ?: resolveLegacySourceScopeAuthority(
                                                             context,
                                                             proofFileId,
                                                             proofUserId,
                                                             proofDriveId,
                                                             IOFile(sourcePath),
                                                         ) ?: return@runCatching false
-                                                    } else {
-                                                        null
-                                                    }
-                                                    val recordedSourceShared = parsed.recordedSourceSharedWithMe
-                                                        ?: resolvedLegacySourceScope.first
-                                                    val recordedSourceKind = parsed.recordedSourceStorageKind
-                                                        ?: resolvedLegacySourceScope.second
+                                                    val recordedSourceShared = recordedSourceScope.first
+                                                    val recordedSourceKind = recordedSourceScope.second
                                                     val sourceFile = IOFile(sourcePath)
                                                     val sourceHash = if (sourceFile.exists()) UploadFile.sha256OrNull(sourceFile) else null
                                                     val sourceProof = if (capturedSourceProofText != null) {
