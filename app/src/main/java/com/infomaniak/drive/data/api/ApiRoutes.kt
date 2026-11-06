@@ -52,10 +52,15 @@ object ApiRoutes {
     // File.serverGenerationTupleMatches's count leg is UNKNOWN on every such refresh
     // and the stored serverContentHash clears per the strict known-field rule —
     // verified copies degrade to the metadata tier and re-establish after each walk.
-    // The hash-clearing is the conservative PRESERVATION rule working as documented;
-    // the minimal next design (a bounded details-with-version/hash refresh on the
-    // walk's incoming rows before decision/ingestion) is documented in the review-55
-    // coder report, NOT implemented here.
+    // The hash-clearing is the conservative PRESERVATION rule working as documented.
+    // REVIEW-56 DATED CORRECTION (2026-11-06): the review-55 "re-establish after each
+    // walk" cost is SUPERSEDED — the worker's own details fetch now carries the hash
+    // (DownloadOfflineFileManager.fetchRemoteFileDetails), so the coordinated commit
+    // re-ingests the count and the hash and the early-success consumption re-admits a
+    // v3-verified copy WITHOUT a body download; the count/hash clearing still queues the
+    // worker each pass (the pending marker flickers), for one existing details fetch per
+    // affected file. The review-55 walk-level "bounded refresh" design was never
+    // implemented — the reviewer's narrower worker integration replaced it.
     private const val activitiesWithQuery = "with=file,file.capabilities,file.categories,file.conversion_capabilities," +
             "file.dropbox,file.dropbox.capabilities,file.is_favorite,file.sharelink,file.sorted_name,file.supported_by"
     private const val listingFilesWithQuery = "with=files,files.capabilities,files.categories,files.conversion_capabilities," +

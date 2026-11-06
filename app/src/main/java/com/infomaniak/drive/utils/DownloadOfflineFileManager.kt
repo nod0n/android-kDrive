@@ -559,6 +559,21 @@ class DownloadOfflineFileManager(
     /**
      * Fetches the fresh remote metadata WITHOUT committing it to Realm: the caller preserves any
      * old inherited copy first, then upserts (issue: round 3 #7).
+     *
+     * THE WITH-HASH DETAILS (review-56, the reviewer's narrow re-admission design): this is
+     * the worker's ONLY metadata fetch, so it requests the documented `hash` expansion on
+     * the same details route (the version count was already requested) and takes the
+     * CACHE-LESS view of the captured account client — this response is the ONLY authorized
+     * producer of a row's stored server content hash. The coordinated commit that follows
+     * ingests the count AND the hash, so the early-success consumption can re-admit a
+     * v3-verified copy (the persisted row's hash equal to its record's strict-valid server
+     * hash, tuple-bound) WITHOUT a body re-download; a hashless, unsupported, or changed
+     * response keeps every existing conservative path (the promotion attempt, the no-spin
+     * gate, the body download + establishment). The stored hash may be an UNSUPPORTED raw
+     * token — the raw field is persisted only from this authorized producer — and the
+     * verified tier requires equality with a STRICT-VALID record hash (an unresolved
+     * publication records no server hash at all), so an unsupported token can never verify:
+     * no special case exists or is needed.
      */
     private suspend fun fetchRemoteFileDetails(
         context: Context,
@@ -566,8 +581,17 @@ class DownloadOfflineFileManager(
     ): File {
         // Always use the captured account's HTTP client: the walk may target another account/drive
         // than the currently active one (issue #1902).
+        // THE IO WRAPPER STAYS (review-56 checklist item 1): Core's suspend pipeline
+        // resumes the response-body read and the mapping on the CALLER's context (the
+        // awaited call delivers the headers on OkHttp threads, then the body is consumed
+        // inline), so the with-hash suspend variant is not main-safe by itself — the
+        // wrapper keeps the body read off the caller's dispatcher exactly as the previous
+        // blocking fetch did. Cancellation is carried by the suspend pipeline itself (the
+        // awaited call's invokeOnCancellation, the cancel watcher, and Core's
+        // post-body-consumption ensureActive) — the established boundary; no additional
+        // check is added here.
         val fileDetails = Dispatchers.IO {
-            ApiRepository.getFileDetails(
+            ApiRepository.getFileDetailsWithHashNoCacheSuspend(
                 file = File(id = fileId, driveId = userDrive.driveId),
                 okHttpClient = AccountUtils.getHttpClient(userDrive.userId),
             )
