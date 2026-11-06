@@ -1686,7 +1686,10 @@ class DownloadOfflineFileManager(
          * 4/5/6, hash at 7, the publication id (when the grammar has one) at 8, no
          * server hash, no count requirement.
          */
-        private class ProvenanceProofFields private constructor(
+        // TEST-VISIBLE (the test-enablement round, 2026-11-06): internal — a PURE grammar
+        // type (no Android, no Realm, no behavior change); the JVM regression suite parses
+        // real production proofs through it.
+        internal class ProvenanceProofFields private constructor(
             /** 2 or 3 for the framed formats; null for a legacy unframed proof. */
             val frameVersion: Int?,
             /** The frame-stripped body fields; for a framed proof the LAST element is
@@ -1726,7 +1729,9 @@ class DownloadOfflineFileManager(
             }
         }
 
-        private fun decodeProvenanceProofFields(text: String?): ProvenanceProofFields? =
+        // TEST-VISIBLE (the test-enablement round, 2026-11-06): internal — a pure static
+        // decode; no behavior change.
+        internal fun decodeProvenanceProofFields(text: String?): ProvenanceProofFields? =
             text?.let(ProvenanceProofFields::of)
 
         private fun PublishedProvenance.recordText(target: IOFile): String {
@@ -1896,7 +1901,9 @@ class DownloadOfflineFileManager(
         private const val OBSERVED_BASIS_ABSENT = "a"
         private const val OBSERVED_BASIS_ENCODED = "x"
 
-        private fun encodeObservedHashBasis(raw: String?): String =
+        // TEST-VISIBLE (the test-enablement round, 2026-11-06): internal — pure codec
+        // helpers over the observation frame; no behavior change.
+        internal fun encodeObservedHashBasis(raw: String?): String =
             if (raw.isNullOrEmpty()) OBSERVED_BASIS_ABSENT
             else OBSERVED_BASIS_ENCODED + raw.encodeToByteArray().joinToString("") { byte ->
                 (0xFF and byte.toInt()).toString(16).padStart(2, '0')
@@ -1905,12 +1912,16 @@ class DownloadOfflineFileManager(
         /** THE DECODED BASIS: [ObservedHashBasis.Absent] (the server showed no hash),
          * [ObservedHashBasis.Seen] (the verbatim token), or null (undecodable — never
          * skip evidence). */
-        private sealed class ObservedHashBasis {
+        // TEST-VISIBLE (the test-enablement round, 2026-11-06): internal — a PURE grammar
+        // type; no behavior change.
+        internal sealed class ObservedHashBasis {
             object Absent : ObservedHashBasis()
             class Seen(val token: String) : ObservedHashBasis()
         }
 
-        private fun decodeObservedHashBasis(field: String): ObservedHashBasis? = when {
+        // TEST-VISIBLE (the test-enablement round, 2026-11-06): internal — a pure static
+        // decode; no behavior change.
+        internal fun decodeObservedHashBasis(field: String): ObservedHashBasis? = when {
             field == OBSERVED_BASIS_ABSENT -> ObservedHashBasis.Absent
             field.startsWith(OBSERVED_BASIS_ENCODED) -> {
                 val hex = field.drop(OBSERVED_BASIS_ENCODED.length)
@@ -2976,9 +2987,11 @@ class DownloadOfflineFileManager(
          * observation; [CURRENT_V2] (review-53 §5 stage 6; the central parse review-55
          * G1) is its eight-fixed-field extension carrying the seen hash basis before the
          * location. */
-        private enum class ObservationFormat { CURRENT, CURRENT_V2, LEGACY }
+        // TEST-VISIBLE (the test-enablement round, 2026-11-06): internal — PURE grammar
+        // types over the observation frame (no Android, no Realm); no behavior change.
+        internal enum class ObservationFormat { CURRENT, CURRENT_V2, LEGACY }
 
-        private class ParsedObservation(
+        internal class ParsedObservation(
             val format: ObservationFormat,
             val prefix: List<String>,
             /** The COMPLETE location tail — pipe-containing destinations stay intact. */
@@ -3012,7 +3025,9 @@ class DownloadOfflineFileManager(
          * (fail-closed: an unknown or damaged observation is unparseable, never
          * reinterpreted). Returns null for an unparseable observation.
          */
-        private fun parseObservationBinding(text: String): ParsedObservation? {
+        // TEST-VISIBLE (the test-enablement round, 2026-11-06): internal — a pure static
+        // parse; no behavior change.
+        internal fun parseObservationBinding(text: String): ParsedObservation? {
             val fields = text.split("|")
             // THE V2 OBSERVATION FRAME (review-53 §5 stage 6; the central parse
             // review-55 G1): eight fixed fields — the CURRENT grammar's fields 1-6 plus
