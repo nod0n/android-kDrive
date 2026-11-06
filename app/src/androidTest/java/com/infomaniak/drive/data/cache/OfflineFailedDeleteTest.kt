@@ -133,6 +133,7 @@ class OfflineFailedDeleteTest {
         private val DRIVE_ID = scopeBase + 2
         private const val FILE_ID = 9_200_003
         private const val PARENT_ID = 9_200_004
+        private const val PAYLOAD = "fixture offline copy payload — synthetic bytes"
         private val userDrive = UserDrive(userId = USER_ID, driveId = DRIVE_ID)
         private val sandboxRoot = IOFile(baseContext.cacheDir, "offline-sandbox-${UUID.randomUUID()}")
         private val sandboxOffline = IOFile(sandboxRoot, "offline")
