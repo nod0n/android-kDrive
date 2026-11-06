@@ -244,6 +244,11 @@ class DownloadOfflineFileManager(
         // incomplete, the transfer aborts with the OLD metadata intact: nothing is stranded,
         // and the offline sync retries (issue: round 4 #9).
         val remoteFile = fetchRemoteFileDetails(context, file.id)
+        // THE EXECUTING CONTEXT IS CAPTURED BEFORE THE COORDINATION WAIT (the round-42 #9
+        // rule): the monitor and lock waits below are not cancellation points, so the
+        // ACTUAL context is captured once here and re-checked inside the acquired section
+        // before the first effect.
+        val executingContext = coroutineContext
         // ONE coordinated operation (issue: round 11 #2): the ROOT-INTENT monitor precedes the
         // file lock (issue: round 16 #20) — the details response can CHANGE THE LOCATION
         // (parentId), a commit that reparents rows and alters the ancestry coverage
@@ -253,6 +258,14 @@ class DownloadOfflineFileManager(
         // Realm/FS mutation — never the monitor from inside an already-held file lock.
         val committed = synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, remoteFile.id) {
+                // THE EXECUTING CONTEXT INSIDE THE ACQUIRED SECTION (issue: round 29 #2's
+                // rule, the same checkCancelled-after-lock-acquisition convention the sweep
+                // applies): a transfer cancelled while waiting for the monitor or the file
+                // lock must not run the preservation boundary below — a dirty-snapshot
+                // registration can delete the old source, and a relocation journals and
+                // renames — effects a stopped transfer must never start. A cancellation
+                // thrown here propagates out of execute to the caller's established handling.
+                executingContext.ensureActive()
                 // COMPLETE DESTINATION-CHAIN validation BEFORE any preservation side
                 // effect (issue: round 18 #3, restoring the round-17 #8 intent: the
                 // boundary call below PRESERVES — migrates, snapshots or deletes — the old
