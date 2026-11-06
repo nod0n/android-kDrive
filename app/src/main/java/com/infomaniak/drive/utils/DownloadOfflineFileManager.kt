@@ -2213,6 +2213,57 @@ class DownloadOfflineFileManager(
         }.getOrNull()
 
         /**
+         * THE LEGACY SOURCE SCOPE RESOLUTION (review-43 #6): a v2/v3 journal carries no
+         * source Realm flavor, and the historical same-Realm assumption is FALSE — v3
+         * journals already recorded CROSS-REALM transfers (the ordinary-to-shared merge
+         * wrote them before the source-flavor field existed). The source's canonical owner
+         * is resolved INDEPENDENTLY ACROSS BOTH REALM FLAVORS under the caller's
+         * coordination, requiring a UNIQUE fresh canonical owner (the same discipline as
+         * the destination-side legacy resolution: both flavors examined, a partially
+         * retained cross-Realm move leaving BOTH graphs claiming the same location is
+         * AMBIGUOUS, never ordinary authority). A failed realm refresh in either flavor
+         * fails the resolution (a stale view must not produce a false unique owner). The
+         * resolved flavor is re-derived and re-validated fresh on every sweep — never
+         * defaulted from the destination's flavor, never persisted as a phase (a v2/v3
+         * phase is unprovable); ambiguity or failure retains.
+         */
+        private fun resolveLegacySourceScopeAuthority(
+            context: Context,
+            fileId: Int,
+            userId: Int,
+            driveId: Int,
+            sourceFile: IOFile,
+        ): Pair<Boolean, String>? = runCatching {
+            val candidates = mutableListOf<Pair<Boolean, String>>() // flavor to kind
+            for (sharedWithMe in listOf(false, true)) {
+                val scope = UserDrive(userId = userId, driveId = driveId, sharedWithMe = sharedWithMe)
+                FileController.getRealmInstance(scope).use { realm ->
+                    runCatching { realm.refresh() }.onFailure { return@runCatching null }
+                    val row = FileController.getFileById(realm, fileId) ?: return@use
+                    val resolvers = sequenceOf(
+                        "offline" to row.getOfflineFile(context, userId, sharedWithMe = sharedWithMe)?.absolutePath,
+                        "cache" to row.getCacheFile(context, scope).absolutePath,
+                        "converted" to row.getConvertedPdfCache(context, scope).absolutePath,
+                    )
+                    for ((kind, resolvedPath) in resolvers) {
+                        if (resolvedPath != sourceFile.absolutePath) continue
+                        // KIND-APPROPRIATE OWNERSHIP (issue: round 29 #4), as in the
+                        // destination-side resolution: ID-keyed cache and converted
+                        // destinations are structurally owned by the row whose id keys
+                        // the path.
+                        val owned = kind == "offline" &&
+                            appContextForOwnership()?.let { ctx ->
+                                OfflineFolderController.exclusivePathOwner(realm, ctx, scope, sourceFile.path)
+                            } == row.id || (kind != "offline" && row.isValid)
+                        if (owned) candidates.add(sharedWithMe to kind)
+                    }
+                }
+            }
+            if (candidates.size != 1) return@runCatching null // ambiguous or none: retain
+            candidates.single()
+        }.getOrNull()
+
+        /**
          * CURRENT CANONICAL OWNERSHIP AUTHORITY (issues: round 25 #4, round 26 #5): the
          * record's owner row must still EXIST in the record's ACTUAL Realm flavor, still
          * resolve to the record's exact target path AT ITS CAPTURED STORAGE KIND, and still
@@ -2280,7 +2331,16 @@ class DownloadOfflineFileManager(
              * realm view; [intentPresent] is the row's CURRENT durable offline intent (an
              * explicit pin or folder coverage) — an intervening unpin leaves the row and
              * path in place and must never be answered by recreating the removed copy. */
-            class Matching(val intentPresent: Boolean) : DestinationRowState()
+            class Matching(
+                val intentPresent: Boolean,
+                /** THE LIVE GENERATION THE ADMISSION COMPARES (review-43 #8): the row's
+                 * durable intent stamp and accepted content generation at the fresh read.
+                 * A v6 journal's captured stamp and the operation's captured target proof
+                 * are validated against these before any publish/rollback decision. */
+                val intentStamp: Long,
+                val rowVersion: Int,
+                val rowLastModifiedAt: Long,
+            ) : DestinationRowState()
 
             /** PROVEN non-claim: the row resolves elsewhere, or no row exists — never a
              * failed lookup. */
@@ -2320,6 +2380,13 @@ class DownloadOfflineFileManager(
                     // THE STRICT KIND WHITELIST (review-39 #10): an unknown kind fails.
                     else -> return@use DestinationRowState.Failed
                 }
+                // AN UNRESOLVED PATH IS NEVER A NON-CLAIM (review-43 #7): a null path means
+                // the row's ancestry could not be resolved — uncertainty that FAILS the
+                // decision (the caller defers), never a proven non-claim that would hand
+                // rollback permission to a committed shared row still requiring the absent
+                // destination. NotClaiming is reserved for confirmed row absence (above)
+                // and a SUCCESSFULLY RESOLVED different path.
+                if (ownedPath == null) return@use DestinationRowState.Failed
                 if (ownedPath != target.absolutePath) return@use DestinationRowState.NotClaiming
                 // ID-KEYED DESTINATIONS ARE STRUCTURALLY EXCLUSIVE (issue: round 28 #9), as
                 // in the Boolean check; a contested offline path is a CONFLICT.
@@ -2331,9 +2398,15 @@ class DownloadOfflineFileManager(
                 // THE LIVE OFFLINE INTENT (review-42 #8): the row's CURRENT durable intent
                 // must still exist for a completion to run — an intervening unpin leaves
                 // the row and its path in place, and only the live intent distinguishes a
-                // wanted copy from a removed one. (The intent STAMP generation cannot be
-                // compared: the journal and recovery formats predate the stamp's capture.)
-                DestinationRowState.Matching(intentPresent = row.isOffline || row.isInOfflineFolder)
+                // wanted copy from a removed one. The row's live intent STAMP and accepted
+                // content generation ride the typed state (review-43 #8): the admission
+                // compares the operation's captured authority against them.
+                DestinationRowState.Matching(
+                    intentPresent = row.isOffline || row.isInOfflineFolder,
+                    intentStamp = row.offlineIntentStamp,
+                    rowVersion = row.version?.number ?: 0,
+                    rowLastModifiedAt = row.lastModifiedAt,
+                )
             }
         }.getOrDefault(DestinationRowState.Failed)
 
@@ -2449,6 +2522,22 @@ class DownloadOfflineFileManager(
                 storageKind = storageKind,
             )
             if (!sidecarWritten) return@runCatching false
+            // THE CAPTURED INTENT GENERATION (review-43 #8): the destination row's durable
+            // offlineIntentStamp rides the journal (0 = the row did not exist at capture).
+            // Admission compares the LIVE stamp, so an unpin-repin sequence after the
+            // capture can never let this operation publish for the newer request. A failed
+            // fresh view FAILS THE WRITE — the capture is required, never guessed (a stale
+            // capture could only ever force the conservative superseded route, but an
+            // honest failure aborts preparation instead).
+            val destinationUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull() ?: return@runCatching false
+            val destinationDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull() ?: return@runCatching false
+            val destinationFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull() ?: return@runCatching false
+            val capturedIntentStamp = FileController.getRealmInstance(
+                UserDrive(userId = destinationUserId, driveId = destinationDriveId, sharedWithMe = sharedWithMe),
+            ).use { realm ->
+                runCatching { realm.refresh() }.getOrThrow()
+                FileController.getFileById(realm, destinationFileId)?.offlineIntentStamp ?: 0L
+            }
             // FOURTH LINE: THE CARRIED OBSERVATION (issue: round 30 #7) — the relocation
             // state retains the attempt's observation beside the proof, so the replay
             // re-establishes BOTH at the destination before disposal. FIFTH LINE: THE
@@ -2474,6 +2563,12 @@ class DownloadOfflineFileManager(
             // follows the recorded phase — never a source-hash or destination-location
             // inference.
             val operationPhase = if (flow == ProofRelocationFlow.STAGED_PUBLICATION) "M" else "P"
+            // RECORD v6 (review-43 #8): the NINTH line is the captured intent generation —
+            // the destination row's offlineIntentStamp at write time (0 = row absent then).
+            // The replay's admission compares it against the LIVE stamp, so an unpin-repin
+            // sequence after the capture supersedes this operation instead of letting it
+            // publish its captured bytes under the newer request's intent. v5's write-ahead
+            // grammar is otherwise unchanged; v4/v5 records stay decodable as before.
             // RECORD v5 (review-40 #9): the WRITE-AHEAD phase contract — the journal's P
             // is durably written before any byte effect is authorized, B before the first
             // mutation, M after it; a durable P therefore strictly means no byte effect
@@ -2483,7 +2578,7 @@ class DownloadOfflineFileManager(
             atomicWriteText(
                 recordFile,
                 listOf(
-                    "5",
+                    "6",
                     target.absolutePath,
                     proofText,
                     attemptedObservationText,
@@ -2491,6 +2586,7 @@ class DownloadOfflineFileManager(
                     recordedSourceProofText,
                     previousDestinationRecordText,
                     "${if (sourceSharedWithMe) 1 else 0}|$sourceStorageKind|$operationPhase",
+                    capturedIntentStamp.toString(),
                 ).joinToString("\n"),
             )
         }.getOrDefault(false)
@@ -2605,6 +2701,12 @@ class DownloadOfflineFileManager(
              * B records the interim writer stranded) but never grants pre-byte authority.
              * False for v1–v4. */
             val phaseAuthoritative: Boolean = false,
+            /** THE CAPTURED INTENT GENERATION (review-43 #8) — v6 journals only: the
+             * destination row's durable offlineIntentStamp at journal-write time (0 = the
+             * row did not exist at capture). Admission compares the LIVE stamp, so an
+             * unpin-repin sequence after the capture can never let the old operation
+             * publish for the newer request. Null for v1–v5. */
+            val recordedIntentStamp: Long? = null,
             /** COMPLETE PROOF VALIDATION (review-34 #9): the retained proof text parses
              * under the FULL provenance grammar WITH the operation's target as its
              * expected embedded location — validated before any registry mutation. */
@@ -2760,9 +2862,10 @@ class DownloadOfflineFileManager(
                         embeddedProofLocation = embeddedLocation,
                     )
                 }
-                "4", "5" -> {
-                    // RECORD v4/v5 (review-38 #6; the write-ahead contract v5, review-40
-                    // #9): the v3 structure PLUS the EIGHTH line —
+                "4", "5", "6" -> {
+                    // RECORD v4/v5/v6 (review-38 #6; the write-ahead contract v5, review-40
+                    // #9; the captured intent generation v6, review-43 #8): the v3
+                    // structure PLUS the EIGHTH line —
                     // the recorded SOURCE authority (the source's own Realm flavor and
                     // storage kind, distinct from the destination sidecar's) and the
                     // DURABLE OPERATION PHASE ("P" prepared / "M" moved). Every field of
@@ -2771,7 +2874,14 @@ class DownloadOfflineFileManager(
                     // as legacy — their repair keeps the validated source/destination
                     // transition (exclusive source ownership proven in the row's actual
                     // realm), never a source-hash or destination-location inference.
-                    if (parts.size != 8) return@runCatching null
+                    // THE CAPTURED INTENT GENERATION LINE (review-43 #8): a v6 journal
+                    // REQUIRES its ninth line; a v4/v5 journal requires exactly eight. An
+                    // undecodable journal is retained, never guessed.
+                    val recordVersion = parts[0].trim()
+                    if (recordVersion != "4" && recordVersion != "5" && recordVersion != "6") {
+                        return@runCatching null
+                    }
+                    if (parts.size != (if (recordVersion == "6") 9 else 8)) return@runCatching null
                     val sourceField = parts[4]
                     val previousDestinationField = parts[6]
                     val sourceAuthorityField = parts[7]
@@ -2779,6 +2889,12 @@ class DownloadOfflineFileManager(
                         previousDestinationField.contains('\n') || sourceAuthorityField.contains('\n')
                     ) {
                         return@runCatching null
+                    }
+                    val recordedIntentStamp = if (recordVersion == "6") {
+                        if (parts[8].contains('\n')) return@runCatching null
+                        parts[8].trim().toLongOrNull() ?: return@runCatching null
+                    } else {
+                        null
                     }
                     val authorityParts = sourceAuthorityField.split("|")
                     if (authorityParts.size != 3) return@runCatching null
@@ -2806,7 +2922,9 @@ class DownloadOfflineFileManager(
                         "P", "B", "M" -> authorityParts[2].trim()
                         else -> return@runCatching null
                     }
-                    val phaseAuthoritative = parts[0].trim() == "5"
+                    // v5 AND v6 carry the authoritative write-ahead contract (v6 only
+                    // adds the captured intent generation).
+                    val phaseAuthoritative = recordVersion == "5" || recordVersion == "6"
                     val proofFields = fields(parts[2])
                     val observationField = parts[3]
                     val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
@@ -2832,6 +2950,7 @@ class DownloadOfflineFileManager(
                         recordedSourceStorageKind = recordedSourceKind,
                         recordedPhase = recordedPhase,
                         phaseAuthoritative = phaseAuthoritative,
+                        recordedIntentStamp = recordedIntentStamp,
                         proofLocationValid = locationValid,
                         embeddedProofLocation = embeddedLocation,
                     )
@@ -3305,19 +3424,24 @@ class DownloadOfflineFileManager(
                         return@runCatching false
                     }
                 }
+                // THE TRANSITION PRESERVES THE RECORD'S OWN FORMAT (review-43 #8): a v6
+                // journal keeps its header and captured intent-stamp line VERBATIM through
+                // the phase rewrite — only the authority line's phase advances; a v5
+                // journal stays exactly v5.
                 val rewritten = atomicWriteText(
                     recordFile,
-                    listOf(
-                        "5",
-                        parsed.targetPath,
-                        parsed.proofText,
-                        parsed.observationText ?: if (parsed.observationFieldDamaged) "" else "A",
-                        parsed.recordedSourcePath ?: "",
-                        parsed.recordedSourceProofText ?: "",
-                        parsed.previousDestinationRecordText ?: "",
-                        "${if (parsed.recordedSourceSharedWithMe == true) 1 else 0}|" +
-                            "${parsed.recordedSourceStorageKind ?: "offline"}|$toPhase",
-                    ).joinToString("\n"),
+                    buildList {
+                        add(if (parsed.recordedIntentStamp != null) "6" else "5")
+                        add(parsed.targetPath)
+                        add(parsed.proofText)
+                        add(parsed.observationText ?: if (parsed.observationFieldDamaged) "" else "A")
+                        add(parsed.recordedSourcePath ?: "")
+                        add(parsed.recordedSourceProofText ?: "")
+                        add(parsed.previousDestinationRecordText ?: "")
+                        add("${if (parsed.recordedSourceSharedWithMe == true) 1 else 0}|" +
+                            "${parsed.recordedSourceStorageKind ?: "offline"}|$toPhase")
+                        if (parsed.recordedIntentStamp != null) add(parsed.recordedIntentStamp.toString())
+                    }.joinToString("\n"),
                 )
                 // THE TRANSITION IS VERIFIED BY DECODE (review-39 #9): a reported success
                 // whose read-back does not decode at the target phase is a failure — the
@@ -4592,6 +4716,7 @@ class DownloadOfflineFileManager(
                                         reread.recordedSourceSharedWithMe != parsed.recordedSourceSharedWithMe ||
                                         reread.recordedSourceStorageKind != parsed.recordedSourceStorageKind ||
                                         reread.recordedPhase != parsed.recordedPhase ||
+                                        reread.recordedIntentStamp != parsed.recordedIntentStamp ||
                                         reread.proofLocationValid != parsed.proofLocationValid ||
                                         reread.embeddedProofLocation != parsed.embeddedProofLocation
                                     ) {
@@ -4774,20 +4899,34 @@ class DownloadOfflineFileManager(
                                                     // source-bound proof and the source's own Realm
                                                     // flavor; a v3 journal carries the proof but
                                                     // predates the flavor field; a v2 journal predates
-                                                    // the proof field itself. The historical
-                                                    // SAME-REALM semantic (the v4 eighth line exists
-                                                    // precisely because the cross-Realm flow
-                                                    // introduced a distinct source realm) resolves
-                                                    // the legacy source scope — validated FRESH by
-                                                    // unique ownership below on every sweep, never
-                                                    // inferred into pre-byte permission; a v5-format
-                                                    // rewrite is deliberately not performed because a
-                                                    // v2/v3 journal's phase is unprovable.
+                                                    // the proof field itself. THE HISTORICAL
+                                                    // SAME-REALM ASSUMPTION IS RETRACTED (review-43
+                                                    // #6): v3 journals already recorded CROSS-REALM
+                                                    // transfers (the ordinary-to-shared merge wrote
+                                                    // them before the source-flavor field existed) —
+                                                    // the legacy source scope is resolved
+                                                    // INDEPENDENTLY ACROSS BOTH REALM FLAVORS,
+                                                    // requiring a unique fresh canonical owner, never
+                                                    // defaulted from the destination's flavor; the
+                                                    // resolution is re-derived and re-validated fresh
+                                                    // on every sweep and no phase is invented (a
+                                                    // v2/v3 journal's phase is unprovable).
                                                     val capturedSourceProofText = parsed.recordedSourceProofText
+                                                    val resolvedLegacySourceScope = if (parsed.recordedSourceSharedWithMe == null) {
+                                                        resolveLegacySourceScopeAuthority(
+                                                            context,
+                                                            proofFileId,
+                                                            proofUserId,
+                                                            proofDriveId,
+                                                            IOFile(sourcePath),
+                                                        ) ?: return@runCatching false
+                                                    } else {
+                                                        null
+                                                    }
                                                     val recordedSourceShared = parsed.recordedSourceSharedWithMe
-                                                        ?: moveScopeShared
+                                                        ?: resolvedLegacySourceScope.first
                                                     val recordedSourceKind = parsed.recordedSourceStorageKind
-                                                        ?: moveScopeKind
+                                                        ?: resolvedLegacySourceScope.second
                                                     val sourceFile = IOFile(sourcePath)
                                                     val sourceHash = if (sourceFile.exists()) UploadFile.sha256OrNull(sourceFile) else null
                                                     val sourceProof = if (capturedSourceProofText != null) {
@@ -4902,6 +5041,38 @@ class DownloadOfflineFileManager(
                                                         sharedWithMe = moveScopeShared,
                                                         storageKind = moveScopeKind,
                                                     )
+                                                    // THE SUPERSEDED-AUTHORIZATION ADMISSION (review-43
+                                                    // #8): a matching row whose LIVE accepted content
+                                                    // generation (version + lastModifiedAt) differs
+                                                    // from the operation's captured target proof — or
+                                                    // whose LIVE intent stamp differs from a v6
+                                                    // journal's captured stamp — was re-contented or
+                                                    // re-authorized AFTER the capture (an unpin-repin
+                                                    // sequence commits newer stamps; a later sync
+                                                    // commits a newer generation). The operation is
+                                                    // then SUPERSEDED: it is never admitted to publish
+                                                    // its captured bytes under the newer request's
+                                                    // intent, and takes the SAME validated rollback as
+                                                    // a proven non-claim below — the source's
+                                                    // coherence is restored, the destination's
+                                                    // prepared-record resolution runs, and the
+                                                    // destination's own durable intent (the live pin
+                                                    // under its newer stamp, redriven by the pin
+                                                    // recovery) re-requests the transfer through the
+                                                    // ordinary sync path. Legacy v1–v5 journals carry
+                                                    // no stamp: their validated transition is the
+                                                    // CONTENT generation comparison — a real check,
+                                                    // never a Boolean-only admission and never a
+                                                    // stamp waiver (a captured stamp of 0 means the
+                                                    // row did not exist at capture; the generation
+                                                    // comparison governs those operations).
+                                                    val matchingState = destinationState as? DestinationRowState.Matching
+                                                    val supersededAuthorization = matchingState != null && (
+                                                        matchingState.rowVersion != validatedTargetProof.version ||
+                                                            matchingState.rowLastModifiedAt != validatedTargetProof.lastModifiedAt ||
+                                                            (parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
+                                                                parsed.recordedIntentStamp != matchingState.intentStamp)
+                                                        )
                                                     // THE TWO VALIDATED RESOLUTION ROUTES (review-41
                                                     // #9): with the complete operation validated, the
                                                     // destination's fresh row state decides the route —
@@ -4909,13 +5080,15 @@ class DownloadOfflineFileManager(
                                                     // (the shared graph committed before the copy)
                                                     // with no later publication COMPLETES the verified
                                                     // transfer; a destination whose row does not claim
-                                                    // the target takes the VALIDATED ROLLBACK. A
-                                                    // destination row that names the target while a
-                                                    // later publication's record sits at the path is a
-                                                    // conflict that retains. Until one route resolves,
-                                                    // the source and the operation are retained — no
-                                                    // evidence is disposed while bytes, metadata and
-                                                    // intent disagree under the captured owners.
+                                                    // the target — or whose authorization was
+                                                    // superseded after the capture — takes the
+                                                    // VALIDATED ROLLBACK. A destination row that names
+                                                    // the target while a later publication's record
+                                                    // sits at the path is a conflict that retains.
+                                                    // Until one route resolves, the source and the
+                                                    // operation are retained — no evidence is disposed
+                                                    // while bytes, metadata and intent disagree under
+                                                    // the captured owners.
                                                     when {
                                                         // ROUTE C — THE VERIFIED COMPLETION (review-41 #9):
                                                         // the operation's own captured identity finishes
@@ -4936,6 +5109,12 @@ class DownloadOfflineFileManager(
                                                             // the state retains.
                                                             (destinationState as? DestinationRowState.Matching)
                                                                 ?.intentPresent == true &&
+                                                            // THE CAPTURED AUTHORITY STILL GOVERNS
+                                                            // (review-43 #8): a superseded operation is
+                                                            // never admitted to complete — its rollback
+                                                            // route below restores the source and the
+                                                            // newer intent redrives.
+                                                            !supersededAuthorization &&
                                                             // THE DESTINATION'S TYPED EVIDENCE (review-42 #5):
                                                             // a VALID record must carry this operation's own
                                                             // publication id; an INVALID (unreadable)
@@ -5136,7 +5315,20 @@ class DownloadOfflineFileManager(
                                                         // NOT-CLAIMING state — a failed lookup, refresh
                                                         // or ancestry resolution is FAILURE and defers,
                                                         // never rollback permission.
-                                                        fullyValidated && destinationState is DestinationRowState.NotClaiming -> {
+                                                        // THE SUPERSEDED AUTHORIZATION JOINS THIS ROUTE
+                                                        // (review-43 #8): a matching row whose live
+                                                        // generation or intent stamp no longer matches
+                                                        // the operation's captured authority rolls back
+                                                        // through the SAME validated body — the source's
+                                                        // proof, observation and durability are restored,
+                                                        // the destination's prepared-record resolution
+                                                        // runs, and the newer durable intent redrives the
+                                                        // transfer through the ordinary sync path. The
+                                                        // old journal is never reused as the newer
+                                                        // request's authorization.
+                                                        fullyValidated &&
+                                                            (destinationState is DestinationRowState.NotClaiming ||
+                                                                supersededAuthorization) -> {
                                                             // THE SOURCE'S PROOF IS DURABLY RESTORED AND
                                                             // VERIFIED (review-40 #10, gated review-41 #7,
                                                             // format-aware review-42 #7): the captured
@@ -5311,6 +5503,7 @@ class DownloadOfflineFileManager(
                                                             currentJournal.recordedSourceProofText == parsed.recordedSourceProofText &&
                                                             currentJournal.previousDestinationRecordText == parsed.previousDestinationRecordText &&
                                                             currentJournal.recordedPhase == parsed.recordedPhase &&
+                                                            currentJournal.recordedIntentStamp == parsed.recordedIntentStamp &&
                                                             disposeRecoveryRecord(recordFile)
                                                     }
                                                 } else false
