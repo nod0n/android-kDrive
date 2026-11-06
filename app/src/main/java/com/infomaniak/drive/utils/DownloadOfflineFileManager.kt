@@ -1426,16 +1426,22 @@ class DownloadOfflineFileManager(
          */
         private fun verifiedProvenanceFileFor(context: Context, publishedFile: IOFile): IOFile? = runCatching {
             val recordFile = provenanceFileFor(context, publishedFile)
-            val prefixDir = recordFile.parentFile
-            if (prefixDir == null) return@runCatching null
-            // THE REGISTRY PREFIX'S OWN ENTRY IS ACKNOWLEDGED WHEN CREATED (review-40
-            // #3): a bare mkdirs left the fan-out directory's entry in the registry root
-            // unsynchronized — the record inside it was durable while its containing
-            // directory was not. The read path performs no synchronization.
-            if (!prefixDir.exists()) {
-                if (!prefixDir.mkdirs()) return@runCatching null
-                if (!UploadFile.synchronizeDirectoryEntry(prefixDir.parentFile)) return@runCatching null
-            }
+            val prefixDir = recordFile.parentFile ?: return@runCatching null
+            val registryRoot = prefixDir.parentFile ?: return@runCatching null
+            // THE COMPLETE REGISTRY DIRECTORY CHAIN IS ACKNOWLEDGED ON EVERY
+            // WRITE/RE-ACKNOWLEDGMENT (review-41 #5): a creation that succeeded while its
+            // synchronization failed left an existing-but-unacknowledged directory — the
+            // retry that only saw exists() skipped the failed prerequisite — and a
+            // mkdirs() that also created the registry root never acknowledged the root's
+            // OWN entry in its parent. The root's entry in its parent and the prefix's
+            // entry in the root are therefore acknowledged on EVERY establishment call,
+            // existing directories included; a failed acknowledgment returns null so no
+            // dependent record write proceeds. The read path (provenanceFileFor /
+            // readPublishedProvenance) performs no synchronization.
+            if (!registryRoot.exists() && !registryRoot.mkdirs()) return@runCatching null
+            if (!UploadFile.synchronizeDirectoryEntry(registryRoot.parentFile)) return@runCatching null
+            if (!prefixDir.exists() && !prefixDir.mkdirs()) return@runCatching null
+            if (!UploadFile.synchronizeDirectoryEntry(registryRoot)) return@runCatching null
             recordFile
         }.getOrNull()
 
@@ -1681,12 +1687,16 @@ class DownloadOfflineFileManager(
             }.getOrDefault(false)
         }
 
-        /** THE PROOF'S DURABLE RE-ACKNOWLEDGMENT (review-40 #6): the exact current proof is
-         * re-written through the crash-consistent writer — its possibly-failed directory
-         * synchronization is the prerequisite being retried — and the destination
-         * hierarchy's ancestor chain is acknowledged, with the result verified by
-         * read-back. A readable matching proof after a rename whose acknowledgment failed
-         * is never sufficient; false retains the caller's owned retry. */
+        /** THE PROOF'S DURABLE RE-ACKNOWLEDGMENT (review-40 #6, review-41 #5): the exact
+         * current proof is re-written through the crash-consistent writer — its
+         * possibly-failed directory synchronization is the prerequisite being retried —
+         * and BOTH directory chains are acknowledged before the write: the REGISTRY chain
+         * (the record's own root and prefix entries, established through
+         * [verifiedProvenanceFileFor] — synchronizing the payload's hierarchy instead of
+         * the registry never acknowledged the proof's own directories) and the payload
+         * hierarchy's ancestor chain. The result is verified by read-back. A readable
+         * matching proof after a rename whose acknowledgment failed is never sufficient;
+         * false retains the caller's owned retry. */
         internal fun reestablishDurableProvenance(context: Context, target: IOFile): Boolean = runCatching {
             val provenance = readPublishedProvenance(context, target) ?: return@runCatching false
             val recordFile = verifiedProvenanceFileFor(context, target) ?: return@runCatching false
