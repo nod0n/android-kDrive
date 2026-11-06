@@ -1802,15 +1802,18 @@ class DownloadOfflineFileManager(
             if (unresolvedRecord) {
                 val attemptId = readPublishedProvenance(context, staged)?.publicationId
                     ?: return false
-                // THE RETRY-ELIGIBILITY BASIS (review-53 §5, stage 6): an establishment
-                // that RAN records the seen server-hash basis in the observation's v2
-                // frame — "-" for an absent hash field, the verbatim token otherwise (an
-                // unsupported algorithm included). No establishment (the public-share
-                // routes, the promotions) records the LEGACY frame: no hash evidence, so
-                // the reader allows another transfer (fail-closed, today's behavior).
-                // The basis lets the no-spin gate skip the BODY re-download while the
-                // fresh details are still checked every pass: a server that later offers
-                // a usable hash changes the observed basis and re-justifies the transfer.
+                // THE RETRY-ELIGIBILITY BASIS (review-53 §5 stage 6; review-54 F6's safe
+                // exact encoding): an establishment that RAN records the seen server-hash
+                // basis in the observation's v2 frame — the field value is the TOTAL,
+                // delimiter-free encoding ("a" for an observed absence, "x"+hex of the
+                // UTF-8 bytes for any present token, unsupported algorithms included), so
+                // a pathological token can never corrupt the frame nor fail the
+                // publication. No establishment (the public-share routes, the promotions)
+                // records the LEGACY frame: no hash evidence, so the reader allows
+                // another transfer (fail-closed, today's behavior). The basis lets the
+                // no-spin gate skip the BODY re-download while the fresh details are
+                // still checked every pass: a server that later offers a usable hash
+                // changes the observed basis and re-justifies the transfer.
                 val observationText = if (seenServerHashBasis == null) {
                     (
                         listOf(
@@ -1824,10 +1827,6 @@ class DownloadOfflineFileManager(
                         ) + destination.absolutePath
                         ).joinToString("|")
                 } else {
-                    // A basis that cannot ride a single field (a '|' or newline inside a
-                    // pathological server token) FAILS THE WRITE — never a corrupted
-                    // frame, never a falsified absence.
-                    if (seenServerHashBasis.any { it == '|' || it == '\n' }) return false
                     (
                         listOf(
                             "2",
@@ -1853,6 +1852,52 @@ class DownloadOfflineFileManager(
                 }
             }
             return readPublishedProvenance(context, staged) != null
+        }
+
+        /**
+         * THE OBSERVED HASH BASIS ENCODING (review-54 F6): the attempt observation's v2
+         * frame carries the seen server hash in a SINGLE pipe-delimited field, so a
+         * server token containing '|' or '\n' (pathological data) must never ride raw —
+         * the previous raw write FAILED the whole unresolved publication on such a
+         * token, every pass. The encoding is total, exact and delimiter-free: an
+         * observed ABSENCE is "a"; any present token is "x" plus the lowercase hex of
+         * its UTF-8 bytes — lossless and decodable back to the verbatim token, with no
+         * invented absence (a literal "-" token encodes as "x2d", never as the absence
+         * marker) and no normalization. The v2 observation frame has never shipped, so
+         * the field's encoding carries no compatibility constraint; the reader treats
+         * anything undecodable as no-skip evidence (conservative).
+         */
+        private const val OBSERVED_BASIS_ABSENT = "a"
+        private const val OBSERVED_BASIS_ENCODED = "x"
+
+        private fun encodeObservedHashBasis(raw: String?): String =
+            if (raw.isNullOrEmpty()) OBSERVED_BASIS_ABSENT
+            else OBSERVED_BASIS_ENCODED + raw.encodeToByteArray().joinToString("") { byte ->
+                (0xFF and byte.toInt()).toString(16).padStart(2, '0')
+            }
+
+        /** THE DECODED BASIS: [ObservedHashBasis.Absent] (the server showed no hash),
+         * [ObservedHashBasis.Seen] (the verbatim token), or null (undecodable — never
+         * skip evidence). */
+        private sealed class ObservedHashBasis {
+            object Absent : ObservedHashBasis()
+            class Seen(val token: String) : ObservedHashBasis()
+        }
+
+        private fun decodeObservedHashBasis(field: String): ObservedHashBasis? = when {
+            field == OBSERVED_BASIS_ABSENT -> ObservedHashBasis.Absent
+            field.startsWith(OBSERVED_BASIS_ENCODED) -> {
+                val hex = field.drop(OBSERVED_BASIS_ENCODED.length)
+                val bytes = if (hex.length % 2 == 0) {
+                    hex.chunked(2)
+                        .map { it.toIntOrNull(16) }
+                        .takeIf { parsed -> parsed.all { it != null } }
+                        ?.map { it!!.toByte() }
+                        ?.toByteArray()
+                } else null
+                bytes?.let { ObservedHashBasis.Seen(String(it, Charsets.UTF_8)) }
+            }
+            else -> null
         }
 
         /**
@@ -9404,7 +9449,7 @@ class DownloadOfflineFileManager(
             // "-" for an absent hash, the verbatim token otherwise. An establishment that
             // did not run records no basis (the legacy frame — no skip eligibility).
             val seenServerHashBasis = (establishment as? GenerationEstablishment.CoarseUnresolved)
-                ?.let { it.seenServerHash ?: "-" }
+                ?.let { encodeObservedHashBasis(it.seenServerHash) }
             val payloadIdentity = established?.fresh ?: file
             // Live intent: an inherited download requires a current pin or durable root
             // ancestry (a materialized inherited flag alone never authorizes retention); a
@@ -10366,7 +10411,7 @@ class DownloadOfflineFileManager(
                             serverHash = established?.serverHash,
                             contentHashOverride = established?.localSha256,
                             seenServerHashBasis = (establishment as? GenerationEstablishment.CoarseUnresolved)
-                                ?.let { it.seenServerHash ?: "-" },
+                                ?.let { encodeObservedHashBasis(it.seenServerHash) },
                         )
                     ) {
                         PublicationOutcome.FAILED
@@ -10672,22 +10717,25 @@ class DownloadOfflineFileManager(
                     row.size == attemptedSize &&
                     (row.version?.number ?: 0) == attemptedVersion
             if (!metadataIdentityHolds) return@runCatching false
-            // THE SEEN HASH BASIS (review-53 §5, stage 6): the legacy frame carries no
-            // hash evidence — the metadata-identity match alone decides (today's
-            // behavior). The v2 frame adds the basis leg: the skip fires only when the
-            // server's CURRENT hash state is EXACTLY what the failed attempt faced —
-            // "-" matches an absent/empty fresh hash; a recorded verbatim token must
-            // equal the fresh hash verbatim AND be an UNSUPPORTED value, because a
-            // supported basis can always gain from another attempt (the re-drive is the
-            // only route to the verified tier). A changed basis — the server added,
-            // removed, or switched algorithms — re-justifies the transfer.
+            // THE SEEN HASH BASIS (review-53 §5 stage 6; review-54 F6's encoding): the
+            // legacy frame carries no hash evidence — the metadata-identity match alone
+            // decides (today's behavior). The v2 frame adds the basis leg: the skip
+            // fires only when the server's CURRENT hash state is EXACTLY what the failed
+            // attempt faced — an encoded ABSENCE matches an absent/empty fresh hash; a
+            // recorded (decoded, verbatim) token must equal the fresh hash AND be an
+            // UNSUPPORTED value, because a supported basis can always gain from another
+            // attempt (the re-drive is the only route to the verified tier). A changed
+            // basis — the server added, removed, or switched algorithms — re-justifies
+            // the transfer. An undecodable recorded field is never skip evidence.
             if (observation[0] == "1") return@runCatching true
-            val attemptedHashBasis = observation[7]
             val freshHash = row.serverContentHash
-            when {
-                attemptedHashBasis == "-" -> freshHash.isNullOrEmpty()
-                ServerContentHash.SUPPORTED_FORMAT.matches(attemptedHashBasis) -> false
-                else -> attemptedHashBasis == freshHash
+            when (val decodedBasis = decodeObservedHashBasis(observation[7])) {
+                null -> false
+                ObservedHashBasis.Absent -> freshHash.isNullOrEmpty()
+                is ObservedHashBasis.Seen -> when {
+                    ServerContentHash.SUPPORTED_FORMAT.matches(decodedBasis.token) -> false
+                    else -> decodedBasis.token == freshHash
+                }
             }
         }
             // CANCELLATION IS NEVER A SUPPRESSION MISS (issue: round 30 #8): a cancelled
