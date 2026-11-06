@@ -2155,12 +2155,18 @@ class DownloadOfflineFileManager(
                 val ownedPath = when (storageKind) {
                     "cache" -> row.getCacheFile(context, realmScope).absolutePath
                     "converted" -> row.getConvertedPdfCache(context, realmScope).absolutePath
-                    else ->
+                    // THE STRICT KIND WHITELIST (review-39 #10): an unknown kind is a FAILED
+                    // check, never the offline resolution — the previous offline else-branch
+                    // combined with the non-"offline" exclusivity exemption let a malformed
+                    // kind (e.g. "offlin") resolve a source path while skipping exclusive
+                    // path ownership over competing claims.
+                    "offline" ->
                         // THE CAPTURED REALM FLAVOR RESOLVES THE PATH (issue: round 27
                         // #9d): a shared row whose stored path is blank previously derived
                         // its remote path through an ORDINARY UserDrive — the row was
                         // invisible there and the resolution failed forever.
                         row.getOfflineFile(context, recordScope.userId, sharedWithMe = sharedWithMe)?.absolutePath
+                    else -> return@runCatching false
                 }
                 val pathOwned = ownedPath == target.absolutePath
                 // ID-KEYED DESTINATIONS ARE STRUCTURALLY EXCLUSIVE (issue: round 28 #9):
@@ -2608,8 +2614,14 @@ class DownloadOfflineFileManager(
                         "1" -> true
                         else -> return@runCatching null
                     }
-                    val recordedSourceKind = authorityParts[1].trim().takeIf { it.isNotEmpty() }
-                        ?: return@runCatching null
+                    // THE STRICT STORAGE-KIND WHITELIST (review-39 #10): only the kinds the
+                    // ownership helper actually resolves are decodable — any other value is
+                    // an undecodable journal (retained), never a silently offline-resolved
+                    // authority that would skip exclusive path ownership.
+                    val recordedSourceKind = when (authorityParts[1].trim()) {
+                        "offline", "cache", "converted" -> authorityParts[1].trim()
+                        else -> return@runCatching null
+                    }
                     val recordedPhase = when (authorityParts[2].trim()) {
                         "P" -> "P"
                         "M" -> "M"
