@@ -6665,6 +6665,7 @@ class DownloadOfflineFileManager(
                                 record.attemptedObservationText,
                                 record.recordFile,
                                 record.oldRecordText,
+                                checkCancelled,
                             )
                         ) {
                             return false
@@ -6690,6 +6691,7 @@ class DownloadOfflineFileManager(
                                 record.attemptedObservationText,
                                 record.recordFile,
                                 record.oldRecordText,
+                                checkCancelled,
                             )
                         ) {
                             return false
@@ -6718,6 +6720,7 @@ class DownloadOfflineFileManager(
                             record.attemptedObservationText,
                             record.recordFile,
                             record.oldRecordText,
+                            checkCancelled,
                         )
                     ) {
                         return false
@@ -6998,8 +7001,15 @@ class DownloadOfflineFileManager(
             attemptedObservationText: String?,
             recordFile: IOFile,
             oldOperationProofText: String?,
+            checkCancelled: () -> Unit,
         ): Boolean {
             val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
+            // THE EXECUTING CONTEXT AFTER THE ENTRY READ (review-48 F3, the R3 principle):
+            // the canonical's presence read is this function's first look at durable state;
+            // every branch's first destructive effect is preceded by a fresh observation —
+            // this one covers the Damaged write-back, whose branch has no further blocking
+            // read. The check is NEVER inside a runCatching: a cancellation propagates.
+            checkCancelled()
             // THE CANONICAL'S PRESENCE AT THE BRANCH'S START (review-48 F2): a stale MOVED
             // reservation is released by THIS PASS's disposition only when the canonical was
             // present for the branch to dispose; when it was ALREADY absent, a missing MOVED
@@ -7008,7 +7018,7 @@ class DownloadOfflineFileManager(
             val branchResult = when (oldObservation) {
                 null, is OldObservationCapture.Absent ->
                     retiredOrQuarantinedCanonicalLadder(
-                        context, target, recordFile, failedPublicationId, attemptedObservationText,
+                        context, target, recordFile, failedPublicationId, attemptedObservationText, checkCancelled,
                     )
                 is OldObservationCapture.Legacy -> {
                     // THE CAPTURED EVIDENCE IS PRESERVED BEFORE ANYTHING ELSE (review-47
@@ -7026,9 +7036,9 @@ class DownloadOfflineFileManager(
                     // canonical name (the next relocation would capture it as
                     // id-bound-at-location and re-bind it again) — the canonical name
                     // ends honestly absent.
-                    preserveCapturedObservationEvidence(recordFile, target, oldObservation.text) &&
+                    preserveCapturedObservationEvidence(recordFile, target, oldObservation.text, checkCancelled) &&
                         retiredOrQuarantinedCanonicalLadder(
-                            context, target, recordFile, failedPublicationId, attemptedObservationText,
+                            context, target, recordFile, failedPublicationId, attemptedObservationText, checkCancelled,
                         )
                 }
                 is OldObservationCapture.Valid -> {
@@ -7058,7 +7068,7 @@ class DownloadOfflineFileManager(
                                     // moved to the owned recovery path, never left to
                                     // block or be promoted; a failed move RETAINS.
                                     ObservationRetirement.NotEligible ->
-                                        quarantineCanonicalObservation(context, target, recordFile)
+                                        quarantineCanonicalObservation(context, target, recordFile, checkCancelled)
                                     ObservationRetirement.Retired, ObservationRetirement.Absent -> true
                                 }
                             }
@@ -7095,18 +7105,28 @@ class DownloadOfflineFileManager(
                             // canonical mutation, the canonical takes the typed ladder,
                             // and the canonical name ends honestly absent — no rebind, no
                             // manufactured binding, no arbitrary-J rewrite.
-                            preserveCapturedObservationEvidence(recordFile, target, oldObservation.text) &&
+                            preserveCapturedObservationEvidence(recordFile, target, oldObservation.text, checkCancelled) &&
                                 retiredOrQuarantinedCanonicalLadder(
-                                    context, target, recordFile, failedPublicationId, attemptedObservationText,
+                                    context, target, recordFile, failedPublicationId, attemptedObservationText, checkCancelled,
                                 )
-                        } else when (removeObservationBoundTo(context, target, failedPublicationId)) {
-                            // THE FAILED ATTEMPT'S OBSERVATION IS RETIRED CONDITIONALLY
-                            // FIRST (review-47 E1): never overwritten as a side effect of
-                            // the rebind write; a Failed retirement retains.
-                            ObservationRetirement.Failed -> false
-                            ObservationRetirement.Retired, ObservationRetirement.Absent ->
-                                writeReboundRestorationObservation(context, target, capturedParsed, restorationPublicationId)
-                            ObservationRetirement.NotEligible -> {
+                        } else {
+                            // THE EXECUTING CONTEXT BEFORE THE FIRST CANONICAL DELETE
+                            // (review-48 F3): the failed-id rung reads and may delete the
+                            // canonical — the observation happens here, never inside a
+                            // runCatching.
+                            checkCancelled()
+                            when (removeObservationBoundTo(context, target, failedPublicationId)) {
+                                // THE FAILED ATTEMPT'S OBSERVATION IS RETIRED CONDITIONALLY
+                                // FIRST (review-47 E1): never overwritten as a side effect of
+                                // the rebind write; a Failed retirement retains.
+                                ObservationRetirement.Failed -> false
+                                ObservationRetirement.Retired, ObservationRetirement.Absent -> {
+                                    // THE EXECUTING CONTEXT AFTER THE RUNG'S BLOCKING
+                                    // READ/DELETE, BEFORE THE REBIND WRITE (review-48 F3).
+                                    checkCancelled()
+                                    writeReboundRestorationObservation(context, target, capturedParsed, restorationPublicationId)
+                                }
+                                ObservationRetirement.NotEligible -> {
                                 // THE CANONICAL HOLDS NON-FAILED-ID EVIDENCE — discriminated
                                 // by ONE exact read: the captured old text itself (the
                                 // rebind replaces it in place — the authorized
@@ -7120,6 +7140,9 @@ class DownloadOfflineFileManager(
                                 val canonicalText = runCatching {
                                     IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim()
                                 }.getOrNull() ?: return false
+                                // THE EXECUTING CONTEXT AFTER THE CANONICAL READ, BEFORE
+                                // THE FIRST REBIND WRITE (review-48 F3).
+                                checkCancelled()
                                 when {
                                     canonicalText == oldObservation.text ->
                                         writeReboundRestorationObservation(context, target, capturedParsed, restorationPublicationId)
@@ -7128,20 +7151,33 @@ class DownloadOfflineFileManager(
                                         removeObservationExactText(context, target, attemptedObservationText)
                                     ) {
                                         ObservationRetirement.Failed -> false
-                                        ObservationRetirement.Retired, ObservationRetirement.Absent ->
+                                        ObservationRetirement.Retired, ObservationRetirement.Absent -> {
+                                            // THE EXECUTING CONTEXT AFTER THE RUNG'S BLOCKING
+                                            // READ/DELETE, BEFORE THE REBIND WRITE
+                                            // (review-48 F3).
+                                            checkCancelled()
                                             writeReboundRestorationObservation(
                                                 context, target, capturedParsed, restorationPublicationId,
                                             )
-                                        ObservationRetirement.NotEligible ->
-                                            quarantineCanonicalObservation(context, target, recordFile) &&
+                                        }
+                                        ObservationRetirement.NotEligible -> {
+                                            // THE EXECUTING CONTEXT AFTER THE PRECEDING
+                                            // RUNG'S BLOCKING WORK, BEFORE THE QUARANTINE'S
+                                            // MOVE AND THE REBIND WRITE (review-48 F3); the
+                                            // quarantine observes its own context again
+                                            // internally before the rename.
+                                            checkCancelled()
+                                            quarantineCanonicalObservation(context, target, recordFile, checkCancelled) &&
                                                 writeReboundRestorationObservation(
                                                     context, target, capturedParsed, restorationPublicationId,
                                                 )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                }
                 }
                 is OldObservationCapture.Damaged -> {
                     // THE DAMAGED EVIDENCE IS RESTORED VERBATIM (review-44 N3): the exact
@@ -7179,6 +7215,7 @@ class DownloadOfflineFileManager(
                 (oldObservation as? OldObservationCapture.Legacy)?.text
                     ?: (oldObservation as? OldObservationCapture.Valid)?.text,
                 canonicalWasPresent,
+                checkCancelled,
             )
         }
 
@@ -7213,8 +7250,14 @@ class DownloadOfflineFileManager(
             recordFile: IOFile,
             failedPublicationId: Long?,
             attemptedObservationText: String?,
-        ): Boolean =
-            when (removeObservationBoundTo(context, target, failedPublicationId)) {
+            checkCancelled: () -> Unit,
+        ): Boolean {
+            // THE EXECUTING CONTEXT BEFORE THE FIRST CANONICAL DELETE (review-48 F3): the
+            // ladder's first rung reads and may delete the canonical — the observation
+            // happens here, after every preceding blocking read, never inside a
+            // runCatching.
+            checkCancelled()
+            return when (removeObservationBoundTo(context, target, failedPublicationId)) {
                 ObservationRetirement.Retired, ObservationRetirement.Absent ->
                     // The failed attempt's observation (or none) — the obligation is met.
                     true
@@ -7228,6 +7271,7 @@ class DownloadOfflineFileManager(
                     ObservationRetirement.Retired, ObservationRetirement.Absent -> true
                 }
             }
+        }
 
         /** THE CAPTURED EVIDENCE IS PRESERVED UNDER THE OWNED RECOVERY (review-47 E2, the
          * pending-write repair review-48 F1): the record's captured observation text is
@@ -7246,7 +7290,12 @@ class DownloadOfflineFileManager(
          * THE SAME RECORDED NAME (never a colliding suffix, never an invented entry). The
          * write is atomic + durably acknowledged + verified against the recorded identity. A
          * failed preservation RETAINS the whole restore. */
-        private fun preserveCapturedObservationEvidence(recordFile: IOFile, target: IOFile, capturedText: String): Boolean {
+        private fun preserveCapturedObservationEvidence(
+            recordFile: IOFile,
+            target: IOFile,
+            capturedText: String,
+            checkCancelled: () -> Unit,
+        ): Boolean {
             val payloadBytes = capturedText.toByteArray(Charsets.UTF_8)
             val payloadSha256 = sha256HexOfBytes(payloadBytes) ?: return false
             val manifest = when (val state = readQuarantineManifest(recordFile)) {
@@ -7264,6 +7313,10 @@ class DownloadOfflineFileManager(
                         !slotExistsExcludingSymlinks(IOFile(recordFile.parentFile, entry.slotName))
                 }
                 if (pending != null) {
+                    // THE EXECUTING CONTEXT BEFORE THE PENDING REPAIR WRITE (review-48 F3):
+                    // the manifest read and the slot probes can block — the observation
+                    // happens here, immediately before the first write.
+                    checkCancelled()
                     return writeSlotPayload(
                         recordFile,
                         IOFile(recordFile.parentFile, pending.slotName),
@@ -7283,6 +7336,10 @@ class DownloadOfflineFileManager(
             }
             val slotFile = allocateQuarantineSlot(recordFile, CAPTURED_SLOT_BASE, manifest)
             if (!upsertQuarantineManifestEntry(recordFile, target, slotFile.name, payloadSha256)) return false
+            // THE EXECUTING CONTEXT AFTER THE MANIFEST ACK, BEFORE THE SLOT WRITE
+            // (review-48 F3): the upsert's temp-write/fsync/rename/fsync chain blocks —
+            // the observation happens here, immediately before the first slot mutation.
+            checkCancelled()
             if (!atomicWriteText(slotFile, capturedText)) return false
             return slotMatchesManifest(slotFile, payloadSha256) &&
                 UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)
@@ -7643,6 +7700,7 @@ class DownloadOfflineFileManager(
             target: IOFile,
             capturedText: String?,
             canonicalWasPresent: Boolean,
+            checkCancelled: () -> Unit,
         ): Boolean {
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
             when (val state = readQuarantineManifest(recordFile)) {
@@ -7668,7 +7726,11 @@ class DownloadOfflineFileManager(
                             QuarantineSlotKind.CAPTURED -> {
                                 // THE PENDING CAPTURED WRITE IS FINISHED FROM THE RECORD
                                 // (review-48 F1): the payload must still be in the record
-                                // and hash to the recorded identity.
+                                // and hash to the recorded identity. THE EXECUTING CONTEXT
+                                // BEFORE THE REPAIR WRITE (review-48 F3): the manifest
+                                // read and the slot probes block — the observation happens
+                                // here, immediately before the first write.
+                                checkCancelled()
                                 val text = capturedText ?: return false
                                 val payloadSha = text.toByteArray(Charsets.UTF_8)
                                     .let { sha256HexOfBytes(it) } ?: return false
@@ -7677,6 +7739,9 @@ class DownloadOfflineFileManager(
                             }
                             QuarantineSlotKind.MOVED -> {
                                 if (!canonicalWasPresent) return false
+                                // THE EXECUTING CONTEXT BEFORE THE RELEASE REWRITE
+                                // (review-48 F3).
+                                checkCancelled()
                                 val released = releaseStaleMovedReservations(recordFile, current) ?: return false
                                 current = released
                             }
@@ -7710,7 +7775,12 @@ class DownloadOfflineFileManager(
          * or reconciled — their disposition belongs to the operator, at the
          * manifest-recorded names.
          */
-        private fun quarantineCanonicalObservation(context: Context, target: IOFile, recordFile: IOFile): Boolean {
+        private fun quarantineCanonicalObservation(
+            context: Context,
+            target: IOFile,
+            recordFile: IOFile,
+            checkCancelled: () -> Unit,
+        ): Boolean {
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
             // NOFOLLOW (review-48 F4): a symlink at the canonical name is unknown — never
             // read through, never moved.
@@ -7746,6 +7816,11 @@ class DownloadOfflineFileManager(
             // THE MANIFEST IS DURABLE BEFORE THE MOVE (review-47 E4): the entry records the
             // slot name and the payload's byte identity first.
             if (!upsertQuarantineManifestEntry(recordFile, target, slotFile.name, payloadSha256)) return false
+            // THE EXECUTING CONTEXT AFTER THE MANIFEST ACK, BEFORE THE RENAME (review-48
+            // F3): the manifest write and the reservation release block — the observation
+            // happens here, immediately before the move (the sequence's first destructive
+            // effect).
+            checkCancelled()
             val moved = runCatching { observationFile.renameTo(slotFile) }.getOrDefault(false)
             if (!moved || !slotFile.exists() || observationFile.exists()) return false
             // BOTH DIRECTORY ACKNOWLEDGMENTS: the source parent's entry (the removal) and,
@@ -8040,6 +8115,7 @@ class DownloadOfflineFileManager(
                         attemptedObservationText,
                         recordFile,
                         oldRecordText,
+                        checkCancelled,
                     )
                 ) {
                     return@runCatching false
