@@ -5823,6 +5823,16 @@ class DownloadOfflineFileManager(
             // propagates; the untouched target keeps its bytes and proof, and the sweep
             // reconciles the (never-mutated) recovery state.
             checkCancelled()
+            // THE PAYLOAD'S CONTENTS ARE DURABLE BEFORE PUBLICATION (review-39 #4): the
+            // network writers (worker, preview, dialog, SAF) close their output streams
+            // without synchronizing them — this shared boundary establishes the staged
+            // payload's data (after its final content and timestamp changes) BEFORE the
+            // replacement and before any old-backup disposal; hashing/readback and the
+            // later directory synchronization prove nothing about payload-data durability.
+            if (!UploadFile.synchronizeFileContents(staged)) {
+                runCatching { staged.delete() }
+                return PublicationOutcome.FAILED
+            }
             // THE DESTINATION HIERARCHY IS DURABLY CREATED (review-39 #2): every newly
             // created ancestor's entry is synchronized in creation order BEFORE the
             // replacement — the rename publishes into a hierarchy whose durability is
@@ -6120,6 +6130,15 @@ class DownloadOfflineFileManager(
                 }
                 runCatching {
                     staged.setLastModified(file.getLastModifiedInMilliSecond())
+                    // THE PAYLOAD'S CONTENTS ARE DURABLE AFTER THEIR FINAL TIMESTAMP
+                    // (review-39 #4): the staged copy's data was synchronized at staging,
+                    // but the timestamp write above is part of the published payload — the
+                    // shared requirement is established here, after the final content and
+                    // timestamp changes, before the replacement and any old-backup
+                    // disposal.
+                    if (!UploadFile.synchronizeFileContents(staged)) {
+                        return@runCatching PublicationOutcome.FAILED
+                    }
                     // PREPARE the staged record BEFORE the bytes are replaced (issue:
                     // round 18 #2): the registry directories are created and verified
                     // and the staged record reads back — a missing staged record is
