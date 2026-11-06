@@ -7137,8 +7137,10 @@ class DownloadOfflineFileManager(
                                 // failed attempt's own exact residue (a legacy-format
                                 // attempt the failed-id rung cannot identity-check), or the
                                 // unrelated leftover (the manifest-durable quarantine).
+                                val canonicalReadFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+                                if (isSymbolicLinkPath(canonicalReadFile)) return false
                                 val canonicalText = runCatching {
-                                    IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim()
+                                    canonicalReadFile.readText().trim()
                                 }.getOrNull() ?: return false
                                 // THE EXECUTING CONTEXT AFTER THE CANONICAL READ, BEFORE
                                 // THE FIRST REBIND WRITE (review-48 F3).
@@ -7186,6 +7188,9 @@ class DownloadOfflineFileManager(
                     // fail-closed for any later capture), never dropped and never read
                     // as absence.
                     val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+                    // A SYMLINK AT THE CANONICAL NAME IS UNKNOWN (review-48 F4): the
+                    // damaged restoration never replaces one.
+                    if (isSymbolicLinkPath(observationFile)) return false
                     // THE WRITE'S BOOLEAN ACK (review-44 compile fix): File.writeBytes
                     // returns Unit — its Result's Boolean acknowledgment is isSuccess
                     // (no exception = the write happened); the durability chain below
@@ -7376,6 +7381,9 @@ class DownloadOfflineFileManager(
                 return false
             }
             val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
+            // A SYMLINK AT THE CANONICAL NAME IS UNKNOWN (review-48 F4): the rebind never
+            // replaces one (the rename in atomicWriteText would swap the link entry).
+            if (isSymbolicLinkPath(targetObs)) return false
             if (!atomicWriteText(targetObs, reboundText)) return false
             val readBack = runCatching { targetObs.readText().trim() }.getOrNull() ?: return false
             val readParsed = parseObservationBinding(readBack) ?: return false
@@ -7549,10 +7557,13 @@ class DownloadOfflineFileManager(
             QuarantineManifestState.Present(QuarantineManifest(targetPath, recordName, entries)) as QuarantineManifestState
         }.getOrDefault(QuarantineManifestState.Unreadable)
 
-        /** THE MANIFEST WRITE: atomic + durably acknowledged + verified by readback (the
-         * atomicWriteText chain — temp write, contents fsync, rename, directory fsync).
-         * Always OBSQ2: a V1 manifest read is upgraded by the next write with its entries'
-         * identities carried verbatim and their states made explicit. */
+        /** THE MANIFEST WRITE: atomic + durably acknowledged (the atomicWriteText chain —
+         * temp write, contents fsync, rename, directory fsync) and VERIFIED BY READBACK:
+         * the written bytes are re-parsed under the strict grammar and must equal the
+         * intended manifest exactly — a write whose readback differs is a failure (the
+         * caller retains), never a silent divergence. Always OBSQ2: a V1 manifest read is
+         * upgraded by the next write with its entries' identities carried verbatim and
+         * their states made explicit. */
         private fun writeQuarantineManifest(recordFile: IOFile, manifest: QuarantineManifest): Boolean {
             val text = buildList {
                 add(QUARANTINE_MANIFEST_HEADER_V2)
@@ -7562,7 +7573,12 @@ class DownloadOfflineFileManager(
                     add("${it.slotName}|${if (it.active) "A" else "S"}|${it.sha256Hex}")
                 }
             }.joinToString("\n")
-            return atomicWriteText(quarantineManifestFile(recordFile), text)
+            if (!atomicWriteText(quarantineManifestFile(recordFile), text)) return false
+            return when (val readBack = readQuarantineManifest(recordFile)) {
+                is QuarantineManifestState.Present ->
+                    readBack.manifest == QuarantineManifest(manifest.targetPath, recordFile.name, manifest.entries)
+                else -> false
+            }
         }
 
         /** THE MANIFEST-FIRST UPSERT (review-47 E4): the entry is durable BEFORE the
@@ -7863,6 +7879,10 @@ class DownloadOfflineFileManager(
          * read/delete/fsync/verification of eligible (or unclassifiable) evidence. */
         private fun removeObservationBoundTo(context: Context, target: IOFile, boundPublicationId: Long?): ObservationRetirement {
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            // A SYMLINK AT THE CANONICAL NAME IS UNKNOWN (review-48 F4): dangling or not,
+            // its content is not this target's evidence — never read through it, never
+            // delete it; the caller retains.
+            if (isSymbolicLinkPath(observationFile)) return ObservationRetirement.Failed
             // ABSENCE ESTABLISHES THE ACK (review-46 D1): a prior successful delete whose
             // directory synchronization failed leaves the file absent — the retry reports
             // absence only AFTER the unlink's durable acknowledgment is established here.
@@ -7911,6 +7931,9 @@ class DownloadOfflineFileManager(
         private fun removeObservationExactText(context: Context, target: IOFile, expectedText: String?): ObservationRetirement {
             if (expectedText == null) return ObservationRetirement.NotEligible
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            // A SYMLINK AT THE CANONICAL NAME IS UNKNOWN (review-48 F4) — never read
+            // through, never deleted; the caller retains.
+            if (isSymbolicLinkPath(observationFile)) return ObservationRetirement.Failed
             if (!observationFile.exists()) {
                 return if (UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) {
                     ObservationRetirement.Absent
