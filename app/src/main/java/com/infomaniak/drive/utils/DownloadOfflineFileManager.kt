@@ -9668,7 +9668,20 @@ class DownloadOfflineFileManager(
             // the OLD location, so the transfer defers and the retry re-fetches the new
             // location first. A rejected adoption defers the whole publication — the
             // bytes are ours to discard and the retry converges.
-            if (established != null) {
+            //
+            // NEVER IN VERIFICATION MODE (the historical-preservation ordering, round 27
+            // #2/#3 and round 28 #2/#3): here the transfer's in-memory identity IS the
+            // fresh destination (the boundary deferred the metadata and kept the OLD
+            // row), so the location guard below passes and this adoption would commit
+            // the fresh B metadata BEFORE the historical-byte comparison can reject the
+            // transfer — a conflicting comparison (SKIPPED_CONFLICT below) would then
+            // strand the retained historical bytes at the old location with no owning
+            // row (exclusive ownership derives from the CURRENT names/paths). In
+            // verification mode the row's advancement is owned EXCLUSIVELY by the
+            // post-publication conditional advance, which classifies and preserves the
+            // old source BEFORE any identity movement and runs only on PUBLISHED
+            // outcomes — the comparison's rejection keeps its full authority here.
+            if (established != null && verificationBasis == null) {
                 val fresh = established.fresh
                 if (fresh.parentId != file.parentId || fresh.name != file.name) {
                     runCatching { staged.delete() }
