@@ -6923,43 +6923,72 @@ class DownloadOfflineFileManager(
             val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
             return when (oldObservation) {
                 null, is OldObservationCapture.Absent -> {
-                    if (removeObservationBoundTo(context, target, failedPublicationId)) {
-                        // The failed attempt's observation (or none) — the obligation is met.
-                        true
-                    } else {
-                        // THE EXACT OPERATION OBLIGATION (review-45 R4): an UNCAPTURED old
-                        // state (null/"U") and an EXPLICIT captured absence are not the same
-                        // permission. Beyond the failed-id removal above, the ONLY evidence
-                        // this operation may retire is the observation whose EXACT text
-                        // equals the record's captured ATTEMPT observation (its own attempt
-                        // evidence — a legacy-format failed attempt's residue, removable by
-                        // exact-text identity, never by parseability). The retirement is
-                        // ATTEMPTED here; a leftover that matches neither identity — another
-                        // publication's, a LEGACY sidecar, an unparseable payload — is NOT
-                        // this operation's evidence to retire: parsing alone is never
-                        // permission and the restoration proof's existence is never
-                        // permission either. It is PRESERVED UNTOUCHED while the coherent
-                        // rollback completes — its disposition belongs to the operation that
-                        // owns it; no absence is fabricated and the unknown propagates as
-                        // the preserved state itself (a later capture on such a path fails
-                        // closed — the honest consequence of evidence this operation cannot
-                        // classify). The branch completes in every case: its obligation is
-                        // met exactly as far as the operation can know, and never by
-                        // dropping what it cannot.
-                        removeObservationExactText(context, target, attemptedObservationText)
-                        true
+                    // THE TYPED LADDER (review-45 R4, review-46 D1): the failed-id
+                    // retirement first; on a NotEligible leftover, the exact ATTEMPT-text
+                    // retirement. A Failed at either rung — the eligible (or
+                    // unclassifiable) evidence's read/delete/fsync/verification failed —
+                    // RETAINS: the retry owner is preserved, never collapsed into a
+                    // reported success. A NotEligible leftover is the preserved unrelated
+                    // evidence (the R4 policy below) and the branch completes.
+                    when (removeObservationBoundTo(context, target, failedPublicationId)) {
+                        ObservationRetirement.Retired, ObservationRetirement.Absent ->
+                            // The failed attempt's observation (or none) — the obligation is met.
+                            true
+                        ObservationRetirement.Failed -> false
+                        ObservationRetirement.NotEligible -> when (
+                            removeObservationExactText(context, target, attemptedObservationText)
+                        ) {
+                            // THE EXACT OPERATION OBLIGATION (review-45 R4): an UNCAPTURED
+                            // old state (null/"U") and an EXPLICIT captured absence are not
+                            // the same permission. The ONLY evidence this operation may
+                            // retire beyond the failed-id binding is the observation whose
+                            // EXACT text equals the record's captured ATTEMPT observation
+                            // (its own attempt evidence — a legacy-format failed attempt's
+                            // residue, removable by exact-text identity, never by
+                            // parseability). A leftover that matches neither identity —
+                            // another publication's, a LEGACY sidecar, an unparseable
+                            // payload — is NOT this operation's evidence to retire: parsing
+                            // alone is never permission and the restoration proof's
+                            // existence is never permission either. It is PRESERVED
+                            // UNTOUCHED while the coherent rollback completes — its
+                            // disposition belongs to the operation that owns it; no absence
+                            // is fabricated and the unknown propagates as the preserved
+                            // state itself (a later capture on such a path fails closed —
+                            // the honest consequence of evidence this operation cannot
+                            // classify). The branch completes only through the typed
+                            // outcomes: retired, acknowledged-absent, or preserved-unknown.
+                            ObservationRetirement.Failed -> false
+                            ObservationRetirement.Retired, ObservationRetirement.Absent, ObservationRetirement.NotEligible -> true
+                        }
                     }
                 }
                 is OldObservationCapture.Valid -> {
                     if (restorationPublicationId != null) {
                         establishRecoveredObservation(context, target, oldObservation.text, restorationPublicationId)
                     } else {
-                        // THE CAPTURE'S OWN AUTHORITY (review-45 R4): the unproven
-                        // restoration retires the observation it CAPTURED — exact-text
-                        // identity, never parseability; a current text that no longer
-                        // equals the captured one is not the captured evidence and
-                        // retains the whole restore.
-                        removeObservationExactText(context, target, oldObservation.text)
+                        // THE UNPROVEN LADDER (review-46 D6): the ACTUAL failed attempt's
+                        // observation is retired FIRST (the failed-id conditional — a
+                        // failed attempt that installed its own observation left a
+                        // differing text and previously stranded the restore), THEN the
+                        // captured old evidence where authorized (the exact captured text
+                        // — the capture, not parseability, is its authority), THEN the
+                        // record's captured ATTEMPT text (a LEGACY-format failed attempt's
+                        // residue, exact-text identity). A Failed at any rung RETAINS; a
+                        // NotEligible leftover advances the ladder or is preserved —
+                        // unrelated evidence is never retired and no default
+                        // false→complete exists.
+                        when (removeObservationBoundTo(context, target, failedPublicationId)) {
+                            ObservationRetirement.Failed -> false
+                            else -> when (removeObservationExactText(context, target, oldObservation.text)) {
+                                ObservationRetirement.Failed -> false
+                                else -> when (
+                                    removeObservationExactText(context, target, attemptedObservationText)
+                                ) {
+                                    ObservationRetirement.Failed -> false
+                                    ObservationRetirement.Retired, ObservationRetirement.Absent, ObservationRetirement.NotEligible -> true
+                                }
+                            }
+                        }
                     }
                 }
                 is OldObservationCapture.Damaged -> {
@@ -6984,37 +7013,91 @@ class DownloadOfflineFileManager(
             }
         }
 
-        /** Retires the target's observation ONLY when it is a parseable observation bound
-         * to [boundPublicationId] in the current format; absence succeeds, anything else
-         * retains. The retirement is durably acknowledged (review-43 #2 discipline). */
-        private fun removeObservationBoundTo(context: Context, target: IOFile, boundPublicationId: Long?): Boolean {
-            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
-            if (!observationFile.exists()) return true
-            if (boundPublicationId == null) return false
-            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
-                ?.let { parseObservationBinding(it) }
-                ?: return false
-            if (parsed.format != ObservationFormat.CURRENT || parsed.publicationId != boundPublicationId) return false
-            return runCatching { observationFile.delete() }.getOrDefault(false) &&
-                UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
-                !observationFile.exists()
+        /** THE TYPED OBSERVATION RETIREMENT OUTCOME (review-46 D1): the retirement's honest
+         * results are never collapsed. [Retired] = the eligible evidence was deleted and its
+         * unlink DURABLY ACKNOWLEDGED (absence verified). [Absent] = the target carries no
+         * observation — and a PRIOR unacknowledged unlink is acknowledged HERE before success
+         * is reported (a successful delete whose fsync failed reports exists=false on retry,
+         * which alone never proves the durable unlink). [NotEligible] = the present evidence
+         * is NOT this operation's to retire (a different identity, format or text) — it is
+         * preserved untouched. [Failed] = the evidence WAS eligible — or its eligibility is
+         * UNKNOWN (an unreadable payload is unknown, never "not mine") — but the
+         * read/delete/fsync/verification failed: the caller RETAINS and the retry owner is
+         * preserved. */
+        private sealed class ObservationRetirement {
+            object Retired : ObservationRetirement()
+            object Absent : ObservationRetirement()
+            object NotEligible : ObservationRetirement()
+            object Failed : ObservationRetirement()
         }
 
-        /** THE EXACT-TEXT RETIREMENT (review-45 R4): retires the target's observation ONLY
-         * when its exact current text equals the expected captured evidence — the
-         * operation's OWN captured attempt or old observation. Parsing alone is
-         * never permission; a current text that does not equal the expected one
-         * is not the captured evidence and retains. Durably acknowledged and
-         * absence-verified; absence succeeds. */
-        private fun removeObservationExactText(context: Context, target: IOFile, expectedText: String?): Boolean {
-            if (expectedText == null) return false
+        /** THE FAILED-PUBLICATION RETIREMENT (review-43 #2, typed review-46 D1): retires the
+         * target's observation ONLY when it is a parseable observation bound to
+         * [boundPublicationId] in the current format. The typed outcome distinguishes the
+         * durable success, the acknowledged absence, the unrelated evidence, and the failed
+         * read/delete/fsync/verification of eligible (or unclassifiable) evidence. */
+        private fun removeObservationBoundTo(context: Context, target: IOFile, boundPublicationId: Long?): ObservationRetirement {
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
-            if (!observationFile.exists()) return true
-            val current = runCatching { observationFile.readText().trim() }.getOrNull() ?: return false
-            if (current != expectedText) return false
-            return runCatching { observationFile.delete() }.getOrDefault(false) &&
+            // ABSENCE ESTABLISHES THE ACK (review-46 D1): a prior successful delete whose
+            // directory synchronization failed leaves the file absent — the retry reports
+            // absence only AFTER the unlink's durable acknowledgment is established here.
+            if (!observationFile.exists()) {
+                return if (UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) {
+                    ObservationRetirement.Absent
+                } else {
+                    ObservationRetirement.Failed
+                }
+            }
+            if (boundPublicationId == null) return ObservationRetirement.NotEligible
+            // A READ FAILURE IS UNKNOWN (review-46 D1): the evidence's eligibility cannot
+            // be classified — never "not mine"; the caller retains.
+            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
+                ?.let { parseObservationBinding(it) }
+                ?: return ObservationRetirement.Failed
+            if (parsed.format != ObservationFormat.CURRENT || parsed.publicationId != boundPublicationId) {
+                return ObservationRetirement.NotEligible
+            }
+            // THE DURABLE RETIREMENT (review-43 #2 discipline, typed review-46 D1): a
+            // failed delete, acknowledgment or absence verification of ELIGIBLE evidence
+            // is Failed — the retry owner is preserved.
+            return if (runCatching { observationFile.delete() }.getOrDefault(false) &&
                 UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
                 !observationFile.exists()
+            ) {
+                ObservationRetirement.Retired
+            } else {
+                ObservationRetirement.Failed
+            }
+        }
+
+        /** THE EXACT-TEXT RETIREMENT (review-45 R4, typed review-46 D1): retires the
+         * target's observation ONLY when its exact current text equals the expected captured
+         * evidence — the operation's OWN captured attempt or old observation. Parsing alone
+         * is never permission; a current text that does not equal the expected one is
+         * NotEligible (preserved untouched); a failed read/delete/fsync/verification of
+         * MATCHING text is Failed (the caller retains); the acknowledged absence of a prior
+         * unlink is established before success. */
+        private fun removeObservationExactText(context: Context, target: IOFile, expectedText: String?): ObservationRetirement {
+            if (expectedText == null) return ObservationRetirement.NotEligible
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!observationFile.exists()) {
+                return if (UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) {
+                    ObservationRetirement.Absent
+                } else {
+                    ObservationRetirement.Failed
+                }
+            }
+            val current = runCatching { observationFile.readText().trim() }.getOrNull()
+                ?: return ObservationRetirement.Failed
+            if (current != expectedText) return ObservationRetirement.NotEligible
+            return if (runCatching { observationFile.delete() }.getOrDefault(false) &&
+                UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
+                !observationFile.exists()
+            ) {
+                ObservationRetirement.Retired
+            } else {
+                ObservationRetirement.Failed
+            }
         }
 
         /** THE PERSISTED RESTORATION IDENTITY (review-44 N2): the restore's fresh
