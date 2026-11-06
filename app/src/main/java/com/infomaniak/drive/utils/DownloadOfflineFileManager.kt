@@ -2090,11 +2090,25 @@ class DownloadOfflineFileManager(
             // recursed to StackOverflowError on every disposal.
             val bodyDisposed = if (!recordFile.exists()) true else runCatching { recordFile.delete() }.getOrDefault(false)
             if (!bodyDisposed) return false
-            // THE SIDECAR ONLY AFTER CONFIRMED BODY DISPOSITION (issue: round 27 #1): the
-            // index never outlives its operation and never disappears before the body; an
-            // absent sidecar (a legacy record) is already disposed.
+            // THE UNLINK IS DURABLY ACKNOWLEDGED (review-44 #11): File.delete's Boolean
+            // says the syscall returned, not that the directory entry's removal
+            // persists — a crash can lose the unlink while a LATER deletion (the
+            // caller's backup) survives, resurrecting a record whose fallback is gone
+            // (the stranded "journal without backup" state the missing-backup arm
+            // cannot recognize), or losing the body's unlink while the scope index's
+            // deletion persisted (an unscoped body). The containing staging directory
+            // is synchronized after the BODY deletion — covering an already-absent
+            // body's earlier unacknowledged unlink too — and again after the SIDECAR's;
+            // a failed acknowledgment retains (the callers keep the disposal's false
+            // result and the backup).
+            if (!UploadFile.synchronizeDirectoryEntry(recordFile.parentFile)) return false
+            // THE SIDECAR ONLY AFTER THE CONFIRMED, ACKNOWLEDGED BODY DISPOSITION (issue:
+            // round 27 #1): the index never outlives its operation and never disappears
+            // before the body; an absent sidecar (a legacy record) is already disposed.
             val sidecar = IOFile(recordFile.path + ".scope")
-            return !sidecar.exists() || runCatching { sidecar.delete() }.getOrDefault(false)
+            val sidecarDisposed = !sidecar.exists() || runCatching { sidecar.delete() }.getOrDefault(false)
+            if (!sidecarDisposed) return false
+            return UploadFile.synchronizeDirectoryEntry(sidecar.parentFile)
         }
 
         /** THE TRI-STATE SIDECAR AUTHORITY (issue: round 28 #10): an ABSENT sidecar is
@@ -5573,15 +5587,18 @@ class DownloadOfflineFileManager(
                                                 // decoder's payload.
                                                 val retainedPublicationId =
                                                     publicationIdOfRecordText(parsed.proofText) ?: 0L
-                                                // THE EXECUTING CONTEXT AFTER THE BLOCKING VALIDATION
-                                                // (review-43 #9): the typed evidence read and the
-                                                // ownership query can block — a cancelled sweep is
-                                                // observed HERE, immediately before this arm's FIRST
+                                                // THE CERTIFYING HASH IS BLOCKING (review-44 #9): the
+                                                // round-43 check sat BEFORE it — the hash can outlast
+                                                // the cancellation. The last blocking validation is
+                                                // the certifiesBytes hash; the executing context is
+                                                // observed immediately AFTER it, before the FIRST
                                                 // destructive effect (the supersession's journal
                                                 // disposal or the retained proof write); the throw
                                                 // propagates and the durable journal is retained.
+                                                val currentProofCertifies =
+                                                    currentProof != null && currentProof.certifiesBytes(target)
                                                 checkCancelled()
-                                                if (currentProof != null && currentProof.certifiesBytes(target) &&
+                                                if (currentProof != null && currentProofCertifies &&
                                                     currentProof.publicationId != retainedPublicationId
                                                 ) {
                                                     // THE SUPERSESSION'S BARRIER (review-41 #3): the
@@ -5947,6 +5964,12 @@ class DownloadOfflineFileManager(
                 // synchronization prerequisite is retried here, and a matching hash never
                 // substitutes for the acknowledgment.
                 if (!payloadDurabilityEstablished(target)) return false
+                // THE EXECUTING CONTEXT AFTER THE BLOCKING PREPARATION (review-44 #9):
+                // the target hash, the certifying read and the barrier can block — a
+                // cancelled sweep is observed HERE, immediately before the arm's FIRST
+                // destructive effect (the disposal); the throw propagates and the
+                // durable state is retained.
+                checkCancelled()
                 // THE DISPOSAL IS ACKNOWLEDGED BEFORE ANY FALLBACK LEAVES (review-43
                 // #11, all arms): the record's disposal result is honored — a stop
                 // between an ignored backup-first deletion and the record deletion left
@@ -5969,6 +5992,12 @@ class DownloadOfflineFileManager(
                     UserDrive(userId = record.userId, driveId = record.driveId, sharedWithMe = capturedShared),
                 )
             ) {
+                // THE EXECUTING CONTEXT AFTER THE BLOCKING VALIDATION (review-44 #9):
+                // the certifying hash and the identity read can block — a cancelled
+                // sweep is observed HERE, immediately before the arm's FIRST destructive
+                // effect (the observation establishment or the disposal); the throw
+                // propagates and the durable state is retained.
+                checkCancelled()
                 // THE OBSERVATION JOINS THE SELF-CERTIFYING DISPOSAL (issue: round 30 #7):
                 // the crash window this arm closed the proof of — rename and destination
                 // record written, observation not yet moved — previously disposed the
@@ -6102,6 +6131,12 @@ class DownloadOfflineFileManager(
                         return false
                     }
                 }
+                // THE EXECUTING CONTEXT AFTER THE BLOCKING VALIDATION (review-44 #9):
+                // the target hash, the typed evidence read and the ownership lookup can
+                // block — a cancelled sweep is observed HERE, immediately before the
+                // arm's FIRST destructive effect (the expected proof write); the throw
+                // propagates and the durable state is retained.
+                checkCancelled()
                 if (record.expectedPublicationRecordText != null) {
                     if (!atomicWriteText(provenanceFileFor(context, target), record.expectedPublicationRecordText)) return false
                     // THE ESTABLISHED PROOF IS READ BACK AS TYPED EVIDENCE (review-42 #5):
@@ -6208,6 +6243,13 @@ class DownloadOfflineFileManager(
                 ) {
                     return false
                 }
+                // THE EXECUTING CONTEXT AFTER THE BLOCKING VALIDATION (review-44 #9):
+                // the current-target hash and the ownership lookup can block — a
+                // cancelled sweep is observed HERE, immediately before the arm's FIRST
+                // destructive effect (the restoration proof rewrite or the failed
+                // evidence removal); the throw propagates and the durable state is
+                // retained.
+                checkCancelled()
                 if (record.oldRecordText != null) {
                     // THE TYPED AUTHORITY BEFORE THE REWRITE (review-43 #5): the target's
                     // current record is read ONCE as typed evidence — an UNREADABLE record
@@ -6358,6 +6400,12 @@ class DownloadOfflineFileManager(
                     }
                 }.getOrDefault(false)
                 if (!newerThanBackedUp || !rowOwnsTarget) return false
+                // THE EXECUTING CONTEXT AFTER THE BLOCKING VALIDATION (review-44 #9):
+                // the prefix comparison and the row ownership query can block — a
+                // cancelled sweep is observed HERE, immediately before the branch's
+                // FIRST destructive effect (the dirty-snapshot registration); the throw
+                // propagates and the durable state is retained.
+                checkCancelled()
                 val preserved = OfflineFolderController.registerDirtySnapshot(
                     context = context,
                     file = FileController.getRealmInstance(armScope).use { realm ->
