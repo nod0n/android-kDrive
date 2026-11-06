@@ -19,7 +19,6 @@ package com.infomaniak.drive.utils
 
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.ObservationFormat
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.ObservedHashBasis
-import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.ProvenanceProofFields
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.decodeObservedHashBasis
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.decodeProvenanceProofFields
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.encodeObservedHashBasis
