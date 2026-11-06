@@ -7767,6 +7767,50 @@ class DownloadOfflineFileManager(
             }
         }
 
+        /** THE VERIFIED-CARRIER PROMOTION (review-51 J2): advances an existing entry's
+         * phase to COMMITTED — the durability commitment the canonical delete rests on —
+         * ONLY after the helper itself (never trusting the caller) has re-verified the
+         * slot's ACTUAL bytes: the NOFOLLOW existence check, the sha re-hash against the
+         * SAME recorded identity, and the slot's directory acknowledgment. NEVER an
+         * unconditional weak→M transition: the verification IS the condition, and the
+         * transition applies only at the SAME recorded sha, the SAME owned slot name, and
+         * the manifest's own validated scope binding (read + bound here). The manifest
+         * rewrite passes its readback; a failure leaves the entry's old state untouched
+         * (the caller retains — no M downgrade, no lost ambiguity). An already-COMMITTED
+         * entry is the idempotent success. A missing or unverifiable slot returns false —
+         * a phase is never promoted on metadata alone. */
+        private fun promoteVerifiedCarrier(
+            recordFile: IOFile,
+            target: IOFile,
+            scope: QuarantineScope,
+            slotName: String,
+            sha256Hex: String,
+        ): Boolean {
+            val slotFile = IOFile(recordFile.parentFile, slotName)
+            if (!slotExistsExcludingSymlinks(slotFile)) return false
+            if (!slotMatchesManifest(slotFile, sha256Hex)) return false
+            if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
+            return when (val state0 = readQuarantineManifest(recordFile)) {
+                is QuarantineManifestState.Unreadable -> false
+                is QuarantineManifestState.Absent -> false
+                is QuarantineManifestState.Present -> {
+                    val manifest = state0.manifest
+                    if (!manifestBindsToOperation(manifest, target, recordFile, scope)) return false
+                    val existing = manifest.entries.firstOrNull { it.slotName == slotName } ?: return false
+                    if (existing.sha256Hex != sha256Hex) return false
+                    if (existing.state == QuarantineEntryState.COMMITTED) return true
+                    writeQuarantineManifest(
+                        recordFile,
+                        manifest.copy(
+                            entries = manifest.entries.map {
+                                if (it.slotName == slotName) it.copy(state = QuarantineEntryState.COMMITTED) else it
+                            },
+                        ),
+                    )
+                }
+            }
+        }
+
         private fun sha256HexOfBytes(bytes: ByteArray): String? = runCatching {
             java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
                 .joinToString("") { "%02x".format(it) }
@@ -7964,15 +8008,18 @@ class DownloadOfflineFileManager(
                             if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
                             // A PRESENT SLOT WITH A MATCHING SHA IS VERIFIED EVIDENCE (the
                             // mismatch retained above): a PENDING entry is promoted (the
-                            // copy completed, the phase write did not), and a LEGACY-
-                            // provenance entry — a rename-era A/S or an upgraded L — is
-                            // CLEARED TO COMMITTED: the bytes exist durably, the strongest
-                            // possible state (review-50 H1: a matching legacy slot commits).
-                            // A new-protocol SUPERSEDED/LEGACY_AMBIGUOUS entry keeps its
-                            // state (its release semantics stand; the bytes are verified at
-                            // the gate regardless).
+                            // copy completed, the phase write did not), and ANY
+                            // weak-or-ambiguous phase — a rename-era A/S, an upgraded L,
+                            // or an inherited/protocol S under any header — is CLEARED TO
+                            // COMMITTED: the bytes exist durably, the strongest possible
+                            // state (review-50 H1; review-51 J2 — a stale weak phase is
+                            // never left where it could later be used as a retire
+                            // carrier). A RELEASED_PROVEN entry keeps its release marker
+                            // (its provenance is the state itself; the present slot is
+                            // out-of-band but verified at the gate).
                             if (entry.state == QuarantineEntryState.PENDING ||
-                                (bound.legacy && entry.state != QuarantineEntryState.COMMITTED)
+                                entry.state == QuarantineEntryState.SUPERSEDED ||
+                                entry.state == QuarantineEntryState.LEGACY_AMBIGUOUS
                             ) {
                                 changed = true
                                 updatedEntries.add(entry.copy(state = QuarantineEntryState.COMMITTED))
@@ -8255,24 +8302,30 @@ class DownloadOfflineFileManager(
                     !slotExistsExcludingSymlinks(IOFile(recordFile.parentFile, it.slotName))
             }
             if (reused == null) {
-                // THE VERIFIED-SLOT REUSE (review-50 H2): an existing entry of THIS
-                // operation recording THIS payload's identity whose slot is PRESENT and
-                // VERIFIED (NOFOLLOW + the sha re-checked) means the preservation already
-                // exists durably — the reserve/copy/commit steps are SKIPPED entirely (no
-                // new allocation, no repeat copy, NO replay growth: N passes with a
-                // persistent fresh-read/delete/fsync failure produce exactly one slot and
-                // one entry). The required directories are re-acknowledged and the phase
-                // is made durably COMMITTED (a promotable PENDING via the upsert's one
-                // allowed transition) BEFORE the final fresh-read identity check, the
-                // cancellation observation, and the conditional delete — a changed
+                // THE VERIFIED-SLOT REUSE (review-50 H2, the carrier discipline review-51
+                // J2): an existing entry of THIS operation recording THIS payload's
+                // identity whose slot is PRESENT and VERIFIED (NOFOLLOW + the sha
+                // re-checked) means the preservation already exists durably — the
+                // reserve/copy/commit steps are SKIPPED entirely (no new allocation, no
+                // repeat copy, NO replay growth: N passes with a persistent fresh-read/
+                // delete/fsync failure produce exactly one slot and one entry). A
+                // COMMITTED carrier is PREFERRED over a weak-phase duplicate; the carrier
+                // actually used is then made DURABLY COMMITTED — whatever its prior state
+                // (PENDING/S/L/R) — by promoteVerifiedCarrier's own bytes/NOFOLLOW/ACK/
+                // readback verification, BEFORE the final fresh-read identity check, the
+                // cancellation observation, and the conditional delete: the delete's
+                // justification is always a real M, so a later slot loss reads as
+                // M-missing real loss (retain), never a skipped release. A changed
                 // canonical is never deleted (unchanged). Existing multiple slots are
                 // never silently forgotten: the gate verifies every present slot.
-                val verified = existingManifest?.entries?.firstOrNull {
+                val verifiedCandidates = existingManifest?.entries?.filter {
                     it.sha256Hex == payloadSha256 && run {
                         val candidate = IOFile(recordFile.parentFile, it.slotName)
                         slotExistsExcludingSymlinks(candidate) && slotMatchesManifest(candidate, payloadSha256)
                     }
-                }
+                }.orEmpty()
+                val verified = verifiedCandidates.firstOrNull { it.state == QuarantineEntryState.COMMITTED }
+                    ?: verifiedCandidates.firstOrNull()
                 if (verified != null) {
                     // THE EXECUTING CONTEXT BEFORE THE FIRST BLOCKING ACK (the review-48
                     // F3 / review-49 G4 discipline).
@@ -8282,11 +8335,11 @@ class DownloadOfflineFileManager(
                     // acknowledgment covers the evidence's and the phase's durability
                     // before anything is retired.
                     if (!UploadFile.synchronizeDirectoryEntry(recordFile.parentFile)) return false
-                    if (verified.state == QuarantineEntryState.PENDING &&
-                        !upsertQuarantineManifestEntry(
-                            recordFile, target, scope, verified.slotName,
-                            QuarantineEntryState.COMMITTED, payloadSha256,
-                        )
+                    // THE CARRIER'S PHASE IS MADE DURABLY COMMITTED (review-51 J2) — for
+                    // EVERY non-COMMITTED state, never only a PENDING one — before the
+                    // retire; a promotion failure retains with the old state untouched.
+                    if (verified.state != QuarantineEntryState.COMMITTED &&
+                        !promoteVerifiedCarrier(recordFile, target, scope, verified.slotName, payloadSha256)
                     ) {
                         return false
                     }
