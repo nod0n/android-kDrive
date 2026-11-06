@@ -90,7 +90,7 @@ object OfflineFolderUtils {
             // its destructive absent-child cleanup) compare against THIS stamp, so changes
             // that happen while the walk is in flight are newer work's business, not this
             // walk's to complete or clear.
-            val intentGeneration = OfflineFolderController.rootIntentGeneration(rootFolderId)
+            val intentGeneration = OfflineFolderController.rootIntentGeneration(userDrive, rootFolderId)
 
             // REQUEST-TIME SUBTREE TOKENS (issue: round 22 #11): the absent-subtree
             // traversal collects its candidates from the CURRENT realm after HTTP — a
@@ -281,7 +281,7 @@ object OfflineFolderUtils {
         // listing request — the absent-child cleanup's freshness horizon is the REQUEST's,
         // not the cleanup's; a root removed and revived (or a newer walk started) while the
         // response was in flight predates this stamp.
-        val requestGeneration = OfflineFolderController.rootIntentGeneration(rootFolderId)
+        val requestGeneration = OfflineFolderController.rootIntentGeneration(userDrive, rootFolderId)
 
         // COMPLETE PRE-REQUEST OBSERVATIONS (issues: round 16 #16, round 19 #25): the
         // folder's children as they stood before the FIRST listing request — detached at
@@ -723,10 +723,14 @@ object OfflineFolderUtils {
      * them); a root created or revived after the traversal collected this child is a newly
      * authoritative owner the collection checks never saw — it stops this decision.
      */
-    private fun listingAbsentClearable(expectedParentId: Int, traversalStartedGeneration: Long): (Realm, File) -> Boolean =
+    private fun listingAbsentClearable(
+        userDrive: UserDrive,
+        expectedParentId: Int,
+        traversalStartedGeneration: Long,
+    ): (Realm, File) -> Boolean =
         { currentRealm, candidate ->
             listingClearable(expectedParentId)(currentRealm, candidate) &&
-                !OfflineFolderController.hasActiveRootCoveringSince(candidate.id, currentRealm, traversalStartedGeneration)
+                !OfflineFolderController.hasActiveRootCoveringSince(userDrive, candidate.id, currentRealm, traversalStartedGeneration)
         }
 
     /**
@@ -887,7 +891,7 @@ object OfflineFolderUtils {
             // transaction is still seen here, so the generation stamp alone never decides.
             !OfflineFolderController.hasActiveOfflineRoot(boundaryFolderId, customRealm = currentRealm) &&
             !OfflineFolderController.hasActiveOfflineRoot(candidate.id, customRealm = currentRealm) &&
-            !OfflineFolderController.hasActiveRootCoveringSince(candidate.id, currentRealm, traversalStartedGeneration)
+            !OfflineFolderController.hasActiveRootCoveringSince(predicateUserDrive, candidate.id, currentRealm, traversalStartedGeneration)
     }
 
     private fun cleanupConfirmedAbsentChildren(
@@ -987,7 +991,7 @@ object OfflineFolderUtils {
                     isInOfflineFolder = child.isInOfflineFolder,
                 )
             ) {
-                val fileClearable = listingAbsentClearable(folderId, traversalStartedGeneration)
+                val fileClearable = listingAbsentClearable(userDrive, folderId, traversalStartedGeneration)
                 OfflineFolderController.clearFileCoverage(
                     context = context,
                     realm = realm,
@@ -1224,7 +1228,7 @@ object OfflineFolderUtils {
         // about. The removal runs under the intent monitor, and only while the root's
         // generation is still the request's.
         synchronized(OfflineFileCoordination.rootIntentMonitor) {
-            if (OfflineFolderController.rootIntentChangedSince(rootFolderId, requestGeneration)) {
+            if (OfflineFolderController.rootIntentChangedSince(userDrive, rootFolderId, requestGeneration)) {
                 SentryLog.i(
                     TAG,
                     "Root $rootFolderId intent changed while the listing was in flight; removal deferred to the newer authority",

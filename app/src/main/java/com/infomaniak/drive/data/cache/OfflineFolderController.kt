@@ -59,12 +59,28 @@ object OfflineFolderController {
     // empty and pre-existing roots are conservatively treated as predating any traversal,
     // preserving the listing-maintenance semantics; every intra-process race the freshness
     // horizon exists for is covered.
-    private val rootIntentGenerations = ConcurrentHashMap<Int, Long>()
+    private val rootIntentGenerations = ConcurrentHashMap<RootIntentScopeKey, Long>()
     private val rootIntentGenerationClock = AtomicLong()
 
-    /** Records a root state change for [folderId]; callers invoke it at every record mutation. */
-    internal fun noteRootIntentChange(folderId: Int) {
-        rootIntentGenerations.merge(folderId, rootIntentGenerationClock.incrementAndGet()) { current, next -> maxOf(current, next) }
+    /**
+     * The generation scope: folder ids are server-assigned PER DRIVE, so the same numeric
+     * id recurs across drives and accounts — a root-intent change in one scope must never
+     * defer another scope's walk (an unrelated same-id root's add/remove previously
+     * bumped the shared key and produced spurious "intent changed" deferrals;
+     * conservative-direction only — the merge keeps the max, so this keying change cannot
+     * introduce a false negative: a same-scope change still bumps the same key).
+     */
+    private data class RootIntentScopeKey(val userId: Int, val driveId: Int, val folderId: Int)
+
+    private fun rootIntentScopeKey(userDrive: UserDrive, folderId: Int) =
+        RootIntentScopeKey(userDrive.userId, userDrive.driveId, folderId)
+
+    /** Records a root state change for [folderId] in [userDrive]'s scope; callers invoke it at every record mutation. */
+    internal fun noteRootIntentChange(userDrive: UserDrive, folderId: Int) {
+        rootIntentGenerations.merge(
+            rootIntentScopeKey(userDrive, folderId),
+            rootIntentGenerationClock.incrementAndGet(),
+        ) { current, next -> maxOf(current, next) }
     }
 
     /** The generation stamp a cleanup traversal takes BEFORE its collection checks. */
@@ -75,10 +91,11 @@ object OfflineFolderController {
      * captures it BEFORE its first request so its completion can be compared against it —
      * an old batch must not complete newly revived intent.
      */
-    internal fun rootIntentGeneration(folderId: Int): Long = rootIntentGenerations[folderId] ?: 0L
+    internal fun rootIntentGeneration(userDrive: UserDrive, folderId: Int): Long =
+        rootIntentGenerations[rootIntentScopeKey(userDrive, folderId)] ?: 0L
 
-    internal fun rootIntentChangedSince(folderId: Int, sinceGeneration: Long): Boolean =
-        (rootIntentGenerations[folderId] ?: 0L) > sinceGeneration
+    internal fun rootIntentChangedSince(userDrive: UserDrive, folderId: Int, sinceGeneration: Long): Boolean =
+        (rootIntentGenerations[rootIntentScopeKey(userDrive, folderId)] ?: 0L) > sinceGeneration
 
     data class RemovalResult(
         var rootExisted: Boolean = false,
@@ -138,7 +155,7 @@ object OfflineFolderController {
                     // The generation is recorded ONLY for a committed state change (issue:
                     // round 13 #7): an "already active" answer must not masquerade as a
                     // revival, and a false return here is now a reliable fresh answer.
-                    if (stateChanged) noteRootIntentChange(folder.id)
+                    if (stateChanged) noteRootIntentChange(userDrive, folder.id)
                     stateChanged
                 }
             }
@@ -181,14 +198,14 @@ object OfflineFolderController {
 
                     if (isCoveredByAncestorRoot) {
                         realm.executeTransaction { if (root.isValid) root.deleteFromRealm() }
-                        noteRootIntentChange(folderId)
+                        noteRootIntentChange(userDrive, folderId)
                         RemovalResult(rootExisted = true)
                     } else {
                         // Persist the deferred-cleanup intent BEFORE any cleanup runs: the record is
                         // the durable owner and must exist while protected copies remain (issue:
                         // round 3 #8).
                         realm.executeTransaction { if (root.isValid) root.isPendingRemoval = true }
-                        noteRootIntentChange(folderId)
+                        noteRootIntentChange(userDrive, folderId)
 
                         val result = clearCoverageRecursively(context, realm, folderId, userDrive) {
                             // Abort as soon as the record is gone (completed elsewhere) or revived.
@@ -213,7 +230,7 @@ object OfflineFolderController {
                                     ?.takeIf { it.isValid && it.isPendingRemoval }
                                     ?.deleteFromRealm()
                             }
-                            noteRootIntentChange(folderId)
+                            noteRootIntentChange(userDrive, folderId)
                         }
                         result
                     }
@@ -267,12 +284,12 @@ object OfflineFolderController {
      * destructive decisions is a newly authoritative owner whose state those checks never
      * saw — it stops those decisions.
      */
-    internal fun hasActiveRootCoveringSince(folderId: Int, realm: Realm, sinceGeneration: Long): Boolean {
+    internal fun hasActiveRootCoveringSince(userDrive: UserDrive, folderId: Int, realm: Realm, sinceGeneration: Long): Boolean {
         getOfflineRoot(folderId, customRealm = realm)?.let { ownRoot ->
-            if (ownRoot.isValid && !ownRoot.isPendingRemoval && rootIntentChangedSince(folderId, sinceGeneration)) return true
+            if (ownRoot.isValid && !ownRoot.isPendingRemoval && rootIntentChangedSince(userDrive, folderId, sinceGeneration)) return true
         }
         return walkAncestryForRoot(realm, folderId) { root ->
-            root.isValid && !root.isPendingRemoval && rootIntentChangedSince(root.folderId, sinceGeneration)
+            root.isValid && !root.isPendingRemoval && rootIntentChangedSince(userDrive, root.folderId, sinceGeneration)
         }
     }
 
@@ -491,7 +508,7 @@ object OfflineFolderController {
                         ?.takeIf { it.isValid && it.isPendingRemoval }
                         ?.deleteFromRealm()
                 }
-                noteRootIntentChange(root.folderId)
+                noteRootIntentChange(userDrive, root.folderId)
             }
         }
     }

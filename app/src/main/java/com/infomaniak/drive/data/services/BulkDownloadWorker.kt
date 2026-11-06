@@ -159,7 +159,7 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                     OfflineFileCoordination.withFileLock(userDrive, folderId) {
                         FileController.getRealmInstance(userDrive).use { realm ->
                             runCatching { realm.refresh() }
-                            if (!OfflineFolderController.rootIntentChangedSince(folderId, intentGeneration)) {
+                            if (!OfflineFolderController.rootIntentChangedSince(userDrive, folderId, intentGeneration)) {
                                 realm.executeTransaction {
                                     val root = FileController.getFileById(realm, folderId)
                                     if (root != null && root.isValid) {
