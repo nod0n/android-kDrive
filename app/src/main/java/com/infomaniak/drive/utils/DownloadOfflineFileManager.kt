@@ -607,6 +607,12 @@ class DownloadOfflineFileManager(
         // (publishStagedOfflineFile) re-acquires the SAME monitor and locks in the SAME
         // order and revalidates identity, ownership, intent and protection before its
         // rename, so no outcome check is lost.
+        // THE PROMOTION'S EVIDENCE IS CAPTURED INSIDE THE STAGING SECTION (review-54 F2):
+        // the source record and the persisted live row are read under the SAME
+        // monitor+lock that copied the cache bytes, so a concurrent cache publication
+        // (G2's record over G1's staged bytes) can never be combined with the earlier
+        // validation — the post-lock verification reads ONLY this immutable capture.
+        var promotionEvidence: CapturedPromotionEvidence? = null
         val staged = synchronized(OfflineFileCoordination.rootIntentMonitor) {
             OfflineFileCoordination.withFileLock(userDrive, file.id) {
                 // EXACT current generation provenance (issues: round 14 #14, round 15 #9,
@@ -631,6 +637,7 @@ class DownloadOfflineFileManager(
                             UploadFile.synchronizeDirectoryEntry(candidate.parentFile)
                     }.getOrDefault(false)
                     if (copied) {
+                        promotionEvidence = capturePromotionEvidence(context, file.id, cacheFile, userDrive)
                         candidate
                     } else {
                         runCatching { if (candidate.exists()) candidate.delete() }
@@ -641,16 +648,20 @@ class DownloadOfflineFileManager(
         } ?: return@withContext CachePromotionOutcome.FAILED
 
         try {
+            // THE EXECUTING CONTEXT IS CAPTURED FOR THE NON-SUSPEND HASH HOOK (issue:
+            // round 42 #9's rule): the blocking XXH3 stage below cannot read the suspend
+            // coroutineContext from its lambda.
+            val promotionContext = coroutineContext
             val published = runCatching {
-                // THE PROMOTION'S VERIFICATION TIER (review-53 §4, stage 5): a verified
-                // source cache record (a strict-valid server hash equal to the live
-                // row's stored hash) promotes to a VERIFIED publication — the content
-                // identity and the root chain are preserved. A metadata-tier source
-                // publishes EXPLICITLY UNRESOLVED — never a silent upgrade of a v2
-                // record; the intent consumption and the completion claims stay
-                // verified-only.
-                val promotionEstablishment =
-                    verifiedPromotionEstablishment(context, file, cacheFile, staged, userDrive)
+                // THE PROMOTION'S VERIFICATION TIER (review-53 §4 stage 5; review-54 F2):
+                // the CAPTURED evidence alone decides — a verified source record whose
+                // server hash the staged bytes reproduce promotes to a VERIFIED
+                // publication; anything else publishes EXPLICITLY UNRESOLVED, preserving
+                // the stage and the source evidence. Never a fabricated Established.
+                val promotionEstablishment = verifiedPromotionEstablishment(
+                    promotionEvidence, file, staged, userDrive,
+                    onHashCheck = { promotionContext.ensureActive() },
+                )
                 publishStagedOfflineFile(
                     context, file, offlineFile, staged,
                     explicitUnresolvedGeneration = promotionEstablishment == null,
@@ -4084,35 +4095,82 @@ class DownloadOfflineFileManager(
         }
 
         /**
-         * THE PROMOTION'S VERIFIED TIER (review-53 §4, stage 5): a promoted copy may
-         * publish as content-verified only when the SOURCE record carries a strict-valid
-         * server hash that equals the LIVE row's stored server hash — the staged bytes
-         * were re-staged from exactly that verified source, and the publication then
-         * preserves the content identity and the root chain. Null = the metadata tier:
-         * the caller publishes with an explicitly UNRESOLVED proof — never a silent
-         * upgrade of a v2 record, and the completion claims stay verified-only.
+         * THE PROMOTION'S CAPTURED EVIDENCE (review-54 F2): the source record and the
+         * persisted live row, read INSIDE the same root-intent-monitor/file-lock staging
+         * section that copied the cache bytes — the cache writers hold the same file
+         * lock, so neither can change between the validation, the staged copy and this
+         * capture. Immutable after the locks; the post-lock verification reads ONLY this
+         * capture, never a re-read of the (racy) cache sidecar.
+         */
+        private class CapturedPromotionEvidence(
+            val sourceRecord: PublishedProvenance,
+            val liveRow: File,
+        )
+
+        /**
+         * THE STAGING-SECTION CAPTURE (review-54 F2): reads the source record and a
+         * detached copy of the persisted live row (whose [File.serverContentHash] is the
+         * authorized ingestion's value) while the caller holds the monitor and the file
+         * lock. Runs only after the staged copy succeeded, so the evidence describes
+         * exactly the bytes that were staged.
+         */
+        private fun capturePromotionEvidence(
+            context: Context,
+            fileId: Int,
+            sourceFile: IOFile,
+            userDrive: UserDrive,
+        ): CapturedPromotionEvidence? {
+            val sourceRecord = readPublishedProvenance(context, sourceFile) ?: return null
+            val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
+                FileController.getFileById(realm, fileId)?.let { realm.copyFromRealm(it, 1) }
+            } ?: return null
+            return CapturedPromotionEvidence(sourceRecord, liveRow)
+        }
+
+        /**
+         * THE PROMOTION'S VERIFIED TIER (review-53 §4 stage 5; review-54 F2's trust
+         * binding): a promoted copy publishes as content-verified ONLY when the
+         * CAPTURED source record carries a strict-valid server hash that equals the
+         * CAPTURED persisted row's stored hash, the captured row's generation tuple
+         * matches the authoritative details identity exactly (the staged bytes inherit
+         * no hash across a changed tuple), AND the staged bytes themselves are bound to
+         * that evidence: the local SHA-256 receipt must equal the record's contentHash
+         * and the streaming XXH3 over the SAME staged bytes must equal the captured
+         * server hash — neither check is inherited from an earlier validation of the
+         * cache copy. [onHashCheck] runs before the blocking hash, after every chunk and
+         * after it (the caller's cancellation hook). Null = the metadata tier: the
+         * caller publishes with an explicitly UNRESOLVED proof, preserving the stage and
+         * the source evidence — never a fabricated Established over unverified bytes.
          */
         private fun verifiedPromotionEstablishment(
-            context: Context,
-            file: File,
-            sourceFile: IOFile,
+            evidence: CapturedPromotionEvidence?,
+            authoritativeFile: File,
             staged: IOFile,
             userDrive: UserDrive,
+            onHashCheck: () -> Unit,
         ): GenerationEstablishment.Established? {
-            val sourceRecord = readPublishedProvenance(context, sourceFile) ?: return null
-            val serverHash = sourceRecord.serverHash
+            val captured = evidence ?: return null
+            val serverHash = captured.sourceRecord.serverHash
                 ?.takeIf { ServerContentHash.SUPPORTED_FORMAT.matches(it) }
                 ?: return null
-            // THE LIVE ROW'S STORED VALUE (the authorized ingestion's): the in-memory
-            // authoritative row deserialized from a hash-less details response carries
-            // null — the comparison must read the PERSISTED row.
-            val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
-                FileController.getFileById(realm, file.id)
-            } ?: return null
-            if (liveRow.serverContentHash != serverHash) return null
-            val localReceipt = UploadFile.sha256OrNull(staged) ?: return null
+            // THE SOURCE IDENTITY/TUPLE BINDING (review-54 F2): the captured persisted
+            // row carries the verified hash and names exactly the generation the
+            // authoritative details row describes.
+            if (captured.liveRow.serverContentHash != serverHash) return null
+            if (!captured.liveRow.serverGenerationTupleMatches(authoritativeFile)) return null
+            // THE ACTUAL-BYTES BINDING (review-54 F2): the staged bytes ARE the source
+            // record's certified bytes.
+            val localReceipt = UploadFile.sha256OrNull(staged)
+            if (localReceipt == null || localReceipt != captured.sourceRecord.contentHash) return null
+            // THE SERVER-ALGORITHM BINDING OVER THE SAME BYTES (review-54 F2): the
+            // staging XXH3 must reproduce the captured server hash — the strongest
+            // available check that the hash is over exactly these bytes.
+            onHashCheck()
+            val computed = ServerContentHash.hashStreaming(staged.inputStream().buffered(), onCheck = onHashCheck)
+            onHashCheck()
+            if (computed != serverHash) return null
             return GenerationEstablishment.Established(
-                fresh = file,
+                fresh = captured.liveRow,
                 serverHash = serverHash,
                 localSha256 = localReceipt,
             )
@@ -10100,6 +10158,11 @@ class DownloadOfflineFileManager(
             // writer that replaces the cache after the section (certifying different bytes
             // under the same captured row metadata) can no longer satisfy the cleanup.
             var capturedPromotionToken: CachePublicationToken? = null
+            // THE PROMOTION'S EVIDENCE IS CAPTURED INSIDE THE STAGING SECTION (review-54
+            // F2), as in the worker's promotion: the source record and the persisted live
+            // row are read under the SAME monitor+lock that copied the cache bytes; the
+            // post-lock verification reads ONLY this immutable capture.
+            var promotionEvidence: CapturedPromotionEvidence? = null
             val stagedOk = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 OfflineFileCoordination.withFileLock(userDrive, file.id) {
                     // EXPLICIT Boolean success AFTER the actual copy (round-16 compile fix
@@ -10113,6 +10176,8 @@ class DownloadOfflineFileManager(
                         UploadFile.synchronizeFileContents(staged) &&
                             UploadFile.synchronizeDirectoryEntry(staged.parentFile) && run {
                             capturedPromotionToken = capturedCachePublicationToken(context, cacheFile)
+                            promotionEvidence =
+                                capturePromotionEvidence(context, file.id, cacheFile, userDrive)
                             true
                         }
                     }.getOrDefault(false)
@@ -10122,15 +10187,17 @@ class DownloadOfflineFileManager(
                 SentryLog.i(TAG, "Cache promotion refused for ${offlineFile.path}: unproven generation")
                 return PublicationOutcome.FAILED
             }
+            // THE EXECUTING CONTEXT IS CAPTURED FOR THE NON-SUSPEND HASH HOOK (issue:
+            // round 42 #9's rule), as in the worker's promotion.
+            val promotionContext = coroutineContext
             val outcome = runCatching {
-                // THE PROMOTION'S VERIFICATION TIER (review-53 §4, stage 5), as in the
-                // worker's promotion: a verified source cache record promotes to a
-                // VERIFIED publication (the content identity and the root chain are
-                // preserved); a metadata-tier source publishes EXPLICITLY UNRESOLVED —
-                // never a silent upgrade of a v2 record (the UI already refuses a pin
-                // confirmation over unproven content).
+                // THE PROMOTION'S VERIFICATION TIER (review-53 §4 stage 5; review-54 F2),
+                // as in the worker's promotion: the CAPTURED evidence alone decides; a
+                // metadata-tier source publishes EXPLICITLY UNRESOLVED (the UI already
+                // refuses a pin confirmation over unproven content).
                 val promotionEstablishment = verifiedPromotionEstablishment(
-                    context, authoritativeFile, cacheFile, staged, userDrive,
+                    promotionEvidence, authoritativeFile, staged, userDrive,
+                    onHashCheck = { promotionContext.ensureActive() },
                 )
                 publishStagedOfflineFile(
                     userDrive,
