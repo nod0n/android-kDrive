@@ -7957,37 +7957,43 @@ class DownloadOfflineFileManager(
          *     not);
          *   - a COMMITTED entry with a MISSING slot is REAL LOSS (the slot was once
          *     durable) → the restore RETAINS — never superseded, never waived;
-         *   - a PENDING MOVED entry with a missing slot: under the copy-then-retire
+         *   - a PENDING MOVED entry with a missing slot (a NEW-PROTOCOL reservation — a
+         *     rename-era A takes the legacy rule below): under the copy-then-retire
          *     protocol the canonical was NEVER removed by this operation, so nothing is
          *     lost — it is KEPT for the same-identity reuse when the canonical still
-         *     hashes to the recorded identity, and RELEASED (superseded, the sha kept)
-         *     when the canonical's current identity differs (the reservation is stale);
-         *     with the canonical ABSENT it is POTENTIAL LOSS (the addendum's row 3) →
-         *     retain;
+         *     hashes to the recorded identity, and RELEASED as RELEASED_PROVEN (review-51
+         *     J1 — the ONLY trusted release state, written only here; the sha kept) when
+         *     the canonical's current identity differs (the reservation is stale); with
+         *     the canonical ABSENT it is POTENTIAL LOSS (the addendum's row 3) → retain;
          *   - a PENDING CAPTURED entry with a missing slot stays PENDING — its payload is
          *     record-carried and the repair is independent of the move protocol;
-         *   - THE LEGACY/INHERITED MISSING-SLOT RULE (review-50 H1 — the round-49
-         *     L-then-skip was the old unsafe inference renamed and is GONE): a MISSING
-         *     slot on a rename-era entry (a legacy PENDING/SUPERSEDED MOVED slot) or on
-         *     an ALREADY-UPGRADED LEGACY_AMBIGUOUS entry (whatever the current header)
-         *     has exactly TWO safe exits — the canonical still hashes to the RECORDED
-         *     identity, in which case the verified exact bytes are preserved DURABLY in
-         *     the OWNED RECORDED slot (the canonical untouched) and the entry is cleared
-         *     to COMMITTED ([recoverLegacyAmbiguousSlot]; never routed through PENDING —
-         *     a legacy missing slot never reads as the new protocol's never-executed
-         *     proof) — or the restore RETAINS, PERMANENTLY (no operator disposition is
-         *     invented; the recorded sha stays). A legacy SUPERSEDED CAPTURED entry with
-         *     a missing slot is normalized to PENDING (its payload's carrier is the
-         *     record, available now — the record-carried repair applies).
-         *   - a PRESENT slot with a matching sha on a LEGACY-provenance entry (A/S/L) is
-         *     CLEARED TO COMMITTED (the bytes exist durably — the strongest evidence); a
-         *     mismatch retains. A new-protocol SUPERSEDED/LEGACY_AMBIGUOUS entry with a
-         *     present verified slot keeps its state (verified at the gate).
-         * The new-protocol PENDING/SUPERSEDED rules (the keep/supersede/retain above and
-         * the gate's skip) are UNCHANGED — the copy-then-retire proof stands for entries
-         * this protocol created (review-50: closed). The rewrite (any state change or the
-         * format upgrade) is atomic + readback-verified; the cancellation is observed
-         * before the first rewrite and before each recovery copy.
+         *   - THE LEGACY/INHERITED MISSING-SLOT RULE (review-50 H1, the state-based
+         *     provenance review-51 J1 — a header alone never proves an old entry's
+         *     origin): a MISSING slot on a rename-era PENDING MOVED slot, on ANY
+         *     SUPERSEDED entry (an inherited S is ambiguous from EVERY header — a
+         *     round-49 build could carry a V2 S into an OBSQ3 manifest with no marker),
+         *     or on an ALREADY-UPGRADED LEGACY_AMBIGUOUS entry, has exactly TWO safe
+         *     exits — the canonical still hashes to the RECORDED identity, in which case
+         *     the verified exact bytes are preserved DURABLY in the OWNED RECORDED slot
+         *     (the canonical untouched) and the entry is cleared to COMMITTED
+         *     ([recoverLegacyAmbiguousSlot]; never routed through PENDING — a legacy
+         *     missing slot never reads as the new protocol's never-executed proof) — or
+         *     the restore RETAINS, PERMANENTLY (no operator disposition is invented; the
+         *     recorded sha stays). A SUPERSEDED CAPTURED entry with a missing slot is
+         *     normalized to PENDING (its payload's carrier is the record, available now —
+         *     the record-carried repair applies).
+         *   - a PRESENT slot with a matching sha on ANY PENDING, SUPERSEDED, or
+         *     LEGACY_AMBIGUOUS entry (any header) is CLEARED TO COMMITTED (the bytes
+         *     exist durably — the strongest evidence; review-51 J2 — a stale weak phase
+         *     is never left where it could be used as a retire carrier); a mismatch
+         *     retains. A RELEASED_PROVEN entry keeps its release marker (verified at the
+         *     gate).
+         * The new-protocol PENDING/RELEASED_PROVEN rules (the keep/release/retain above
+         * and the gate's skip) are UNCHANGED — the copy-then-retire proof stands for
+         * entries this protocol created (review-50: closed). The rewrite (any state
+         * change or the format upgrade) is atomic + readback-verified; the cancellation
+         * is observed before the first rewrite, before each recovery copy, and after
+         * every canonical-read validation.
          */
         private fun reconcileQuarantineManifest(
             context: Context,
