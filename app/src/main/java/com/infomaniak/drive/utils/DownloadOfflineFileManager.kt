@@ -6518,6 +6518,9 @@ class DownloadOfflineFileManager(
                             checkCancelled = checkCancelled,
                             // THE CAPTURED OLD OBSERVATION STATE (review-43 #4).
                             oldObservation = record.capturedOldObservation(),
+                            // THE CAPTURED ATTEMPT OBSERVATION TEXT (review-45 R4): the
+                            // exact-text retirement's expected identity.
+                            attemptedObservationText = record.attemptedObservationText,
                         )
                     }
                 }
@@ -6613,6 +6616,7 @@ class DownloadOfflineFileManager(
                                 record.capturedOldObservation(),
                                 record.restorationPublicationId,
                                 record.expectedPublicationRecordText,
+                                record.attemptedObservationText,
                             )
                         ) {
                             return false
@@ -6635,6 +6639,7 @@ class DownloadOfflineFileManager(
                                 record.capturedOldObservation(),
                                 restorationId,
                                 record.expectedPublicationRecordText,
+                                record.attemptedObservationText,
                             )
                         ) {
                             return false
@@ -6660,6 +6665,7 @@ class DownloadOfflineFileManager(
                             record.capturedOldObservation(),
                             null,
                             record.expectedPublicationRecordText,
+                            record.attemptedObservationText,
                         )
                     ) {
                         return false
@@ -6978,6 +6984,22 @@ class DownloadOfflineFileManager(
             }
         }
 
+        /** Retires the target's observation ONLY when it is a parseable observation bound
+         * to [boundPublicationId] in the current format; absence succeeds, anything else
+         * retains. The retirement is durably acknowledged (review-43 #2 discipline). */
+        private fun removeObservationBoundTo(context: Context, target: IOFile, boundPublicationId: Long?): Boolean {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!observationFile.exists()) return true
+            if (boundPublicationId == null) return false
+            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
+                ?.let { parseObservationBinding(it) }
+                ?: return false
+            if (parsed.format != ObservationFormat.CURRENT || parsed.publicationId != boundPublicationId) return false
+            return runCatching { observationFile.delete() }.getOrDefault(false) &&
+                UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
+                !observationFile.exists()
+        }
+
         /** THE EXACT-TEXT RETIREMENT (review-45 R4): retires the target's observation ONLY
          * when its exact current text equals the expected captured evidence — the
          * operation's OWN captured attempt or old observation. Parsing alone is
@@ -7058,6 +7080,7 @@ class DownloadOfflineFileManager(
             failedOperationProofText: String?,
             checkCancelled: () -> Unit,
             oldObservation: OldObservationCapture?,
+            attemptedObservationText: String?,
         ): Boolean = runCatching {
             // BACKUP INTEGRITY BEFORE ANY TARGET MUTATION (issue: round 24 #2): the backup
             // must still hash to the record's immutable hash (a corrupted backup never
@@ -7169,7 +7192,15 @@ class DownloadOfflineFileManager(
                 // observation (or the old publication's dead-id observation) over the
                 // restored generation blocks every later capture; the captured state is
                 // restored explicitly and verified BEFORE any fallback disposal.
-                if (!restoreOldObservationState(context, target, oldObservation, restorationPublicationId, failedOperationProofText)) {
+                if (!restoreOldObservationState(
+                        context,
+                        target,
+                        oldObservation,
+                        restorationPublicationId,
+                        failedOperationProofText,
+                        attemptedObservationText,
+                    )
+                ) {
                     return@runCatching false
                 }
                 // THE ROLLBACK DISPOSES THE RELOCATION STATE ITSELF (issue: round 25 #5):
