@@ -1589,7 +1589,13 @@ object OfflineFolderController {
                     val intentRevoked = isAborted() ||
                         (isStillClearable != null && (normalized == null || isStillClearable(realm, normalized) == false))
                     if (!intentRevoked) {
-                        deleteOfflineCopy(context, liveRow, offlineFile, userDrive, result)
+                        val deleted = deleteOfflineCopy(context, liveRow, offlineFile, userDrive, result)
+                        if (!deleted) {
+                            result.keptOfflineFilesCount++
+                            // The reviving authority owns the row when the abort fires; only a
+                            // still-valid removal restores the coverage its bytes remain under.
+                            if (!isAborted()) restoreClearedCoverage(realm, file.id, preCommitMarker)
+                        }
                     } else {
                         result.keptOfflineFilesCount++
                     }
@@ -1962,15 +1968,48 @@ object OfflineFolderController {
         offlineFile: IOFile,
         userDrive: UserDrive,
         result: RemovalResult,
-    ) {
+    ): Boolean {
         // The published generation's provenance sidecar dies with the bytes (issue: round
-        // 16 #12): an orphaned sidecar must never lend its generation to later bytes.
+        // 16 #12): an orphaned sidecar must never lend its generation to later bytes. The
+        // sidecar-BEFORE-bytes order is the established crash-safe direction (the same
+        // order as File.deleteCaches): a crash between the two leaves sidecar-less bytes —
+        // the conservative unproven state — never an orphaned sidecar.
         DownloadOfflineFileManager.deletePublishedProvenance(context, offlineFile)
-        runCatching { offlineFile.delete() }.onFailure { exception ->
-            SentryLog.e(TAG, "Failed to delete offline file ${offlineFile.path}", exception)
-        }.onSuccess {
-            if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
-            result.removedOfflineFilesCount++
+        // A FAILED DELETION IS NOT A DISPOSAL (issue: round 25 #7 — the same contract as
+        // File.deleteCaches): java.io.File.delete() reports failure by returning FALSE
+        // (it throws only SecurityException), so the Boolean is checked — runCatching
+        // alone would treat a retained file as removed and lie in the counters while the
+        // bytes stay with no sidecar and no revisiting machinery.
+        val deleted = runCatching { offlineFile.delete() }
+            .onFailure { exception ->
+                SentryLog.e(TAG, "Failed to delete offline file ${offlineFile.path}", exception)
+            }.getOrDefault(false)
+        if (!deleted) {
+            SentryLog.e(TAG, "Offline file deletion reported failure; bytes retained: ${offlineFile.path}")
+            return false
+        }
+        if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
+        result.removedOfflineFilesCount++
+        return true
+    }
+
+    /**
+     * A retained file must not stay under cleared coverage flags (the failed-deletion
+     * arm of [deleteOfflineCopy]'s round-25-#7 contract): the committing transaction
+     * already cleared the flags, so on a failed byte deletion they are restored here —
+     * INSIDE the same coordination section (the intent monitor and the file lock still
+     * held, the abort predicate respected, the live pin state re-checked) — so the row
+     * again claims the coverage whose bytes remain and the established cleanup machinery
+     * re-attempts the removal on later passes. The intent-stamp bump is deliberately NOT
+     * rewound: the retained copy re-verifies conservatively instead of being trusted
+     * (its published provenance was already released by the sidecar-before-bytes order).
+     */
+    private fun restoreClearedCoverage(realm: Realm, fileId: Int, preCommitMarker: Boolean) {
+        realm.executeTransaction {
+            val retainedRow = FileController.getFileById(realm, fileId) ?: return@executeTransaction
+            if (retainedRow.isOffline) return@executeTransaction
+            retainedRow.isInOfflineFolder = true
+            retainedRow.isMarkedAsOffline = preCommitMarker
         }
     }
 
