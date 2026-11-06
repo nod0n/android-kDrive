@@ -4639,70 +4639,187 @@ class DownloadOfflineFileManager(
                                                         sharedWithMe = moveScopeShared,
                                                         storageKind = moveScopeKind,
                                                     )
-                                                    // THE SOURCE'S PROOF IS DURABLY RESTORED AND
-                                                    // VERIFIED (review-40 #10, gated review-41 #7):
-                                                    // the captured source-bound payload is written
-                                                    // back through the atomic writer ONLY after the
-                                                    // full validation, and read back against the
-                                                    // bytes and the publication id — the retained
-                                                    // bytes are never left as bare unproven content,
-                                                    // and a differing-identity payload never replaces
-                                                    // source provenance.
-                                                    val sourceProofRestored = fullyValidated && run {
-                                                        val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
-                                                        sourceRecordFile != null &&
-                                                            atomicWriteText(sourceRecordFile, sourceProofText) &&
-                                                            readPublishedProvenance(context, sourceFile)?.let { restored ->
-                                                                restored.certifiesBytes(sourceFile) &&
-                                                                    restored.publicationId == sourceProof.publicationId
-                                                            } == true
-                                                    }
-                                                    // THE CARRIED OBSERVATION IS RESTORED WITH ITS
-                                                    // PROOF (review-40 #10, full binding review-41
-                                                    // #7): a carried observation is re-bound to the
-                                                    // recorded source verbatim and its read-back is
-                                                    // verified against the FULL binding — location AND
-                                                    // (current format) the restored proof's publication
-                                                    // id — never the location alone; an explicit
-                                                    // absence is the operation's own contract and
-                                                    // restores nothing.
-                                                    val observationRestored = !sourceProofRestored ||
-                                                        parsed.observationText == null || run {
-                                                            val sourceObs = IOFile(provenanceFileFor(context, sourceFile).path + ".obs")
-                                                            atomicWriteText(sourceObs, parsed.observationText) &&
-                                                                parseObservationBinding(
-                                                                    sourceObs.readText().trim(),
-                                                                )?.let { bound ->
-                                                                    bound.location == sourceFile.absolutePath &&
-                                                                        (bound.format != ObservationFormat.CURRENT ||
-                                                                            bound.publicationId == sourceProof.publicationId)
-                                                                } != null
+                                                    // THE TWO VALIDATED RESOLUTION ROUTES (review-41
+                                                    // #9): with the complete operation validated, the
+                                                    // destination's fresh row state decides the route —
+                                                    // a destination whose row already names the target
+                                                    // (the shared graph committed before the copy)
+                                                    // with no later publication COMPLETES the verified
+                                                    // transfer; a destination whose row does not claim
+                                                    // the target takes the VALIDATED ROLLBACK. A
+                                                    // destination row that names the target while a
+                                                    // later publication's record sits at the path is a
+                                                    // conflict that retains. Until one route resolves,
+                                                    // the source and the operation are retained — no
+                                                    // evidence is disposed while bytes, metadata and
+                                                    // intent disagree under the captured owners.
+                                                    when {
+                                                        // ROUTE C — THE VERIFIED COMPLETION (review-41 #9):
+                                                        // the operation's own captured identity finishes
+                                                        // what its armed phase began.
+                                                        fullyValidated && destinationRowNamesTarget &&
+                                                            (
+                                                                parsed.observationText == null ||
+                                                                    IOFile(
+                                                                        provenanceFileFor(context, sourceFile).path + ".obs",
+                                                                    ).exists()
+                                                                ) &&
+                                                            run {
+                                                                val destinationRecord = readPublishedProvenance(context, target)
+                                                                destinationRecord == null ||
+                                                                    destinationRecord.publicationId == targetProof.publicationId
+                                                            }
+                                                        -> {
+                                                            if (target.exists()) return@runCatching false
+                                                            // THE VALIDATED SOURCE BYTES ARE COPIED TO THE
+                                                            // CAPTURED DESTINATION and verified against the
+                                                            // captured generation's hash before anything
+                                                            // else.
+                                                            val copyVerified = runCatching {
+                                                                sourceFile.copyTo(target, overwrite = false)
+                                                            }.isSuccess &&
+                                                                target.exists() &&
+                                                                target.length() == sourceFile.length() &&
+                                                                UploadFile.sha256OrNull(target) == targetProof.contentHash
+                                                            if (!copyVerified) {
+                                                                // OUR OWN PARTIAL OUTPUT at a path that was
+                                                                // absent is removed; the operation retains.
+                                                                runCatching { target.delete() }
+                                                                return@runCatching false
+                                                            }
+                                                            // THE CAPTURED GENERATION'S TIMESTAMP (review-41
+                                                            // #10 doctrine): the setter's result is required
+                                                            // and the resulting mtime is validated at the
+                                                            // precision the stored-copy reader uses — an
+                                                            // unacknowledged or imprecise timestamp would
+                                                            // publish bytes the reader classifies
+                                                            // ABSENT_OR_STALE.
+                                                            if (!target.setLastModified(targetProof.lastModifiedAt * 1_000L) ||
+                                                                target.lastModified() / 1_000L != targetProof.lastModifiedAt
+                                                            ) {
+                                                                runCatching { target.delete() }
+                                                                return@runCatching false
+                                                            }
+                                                            // THE PAYLOAD'S DURABILITY BARRIER (review-41
+                                                            // #3): contents, filename entry and the whole
+                                                            // ancestor chain, after the final timestamp
+                                                            // mutation; a still-failing barrier retains the
+                                                            // journal (the next sweep finds the target
+                                                            // existing and resolves through the
+                                                            // target-present arms).
+                                                            if (!payloadDurabilityEstablished(target)) {
+                                                                return@runCatching false
+                                                            }
+                                                            // THE DESTINATION PROOF IS ESTABLISHED FROM THE
+                                                            // JOURNAL'S OWN CAPTURED TEXT and verified
+                                                            // against the bytes and the publication id —
+                                                            // never a location-only read-back.
+                                                            val recordTarget = verifiedProvenanceFileFor(context, target)
+                                                            val proofEstablished = recordTarget != null &&
+                                                                atomicWriteText(recordTarget, parsed.proofText) &&
+                                                                readPublishedProvenance(context, target)?.let { established ->
+                                                                    established.certifiesBytes(target) &&
+                                                                        established.publicationId == targetProof.publicationId
+                                                                } == true
+                                                            if (!proofEstablished) return@runCatching false
+                                                            // THE COMPLETION PROTOCOL (review-39 #9): the
+                                                            // operation's own observation move (re-bound and
+                                                            // verified), the durable M phase, and the source
+                                                            // evidence deletion — the same order the live
+                                                            // completion uses. A journal without an
+                                                            // authoritative phase has none to transition: its
+                                                            // completion moves the observation evidence,
+                                                            // retires the source proof and disposes the
+                                                            // journal directly.
+                                                            if (parsed.phaseAuthoritative) {
+                                                                completePreparedProofMove(context, sourceFile, target)
+                                                            } else {
+                                                                val sourceObs = IOFile(provenanceFileFor(context, sourceFile).path + ".obs")
+                                                                val observationMoved = !sourceObs.exists() || run {
+                                                                    val liveText = runCatching { sourceObs.readText().trim() }.getOrNull()
+                                                                    establishRecoveredObservation(
+                                                                        context,
+                                                                        target,
+                                                                        liveText,
+                                                                        targetProof.publicationId,
+                                                                    ) && runCatching { sourceObs.delete() }.getOrDefault(false)
+                                                                }
+                                                                observationMoved &&
+                                                                    runCatching { deletePublishedProvenance(context, sourceFile) }
+                                                                        .getOrDefault(false) &&
+                                                                    runCatching { disposeRecoveryRecord(recordFile) }.getOrDefault(false)
+                                                            }
                                                         }
-                                                    // THE RETAINED AUTHORITY IS DURABLE BEFORE THE
-                                                    // JOURNAL LEAVES (review-39 #5): the restored
-                                                    // source is the coherent authority for this
-                                                    // generation.
-                                                    val sourceCoherent = sourceProofRestored && observationRestored &&
-                                                        UploadFile.synchronizeFileContents(sourceFile) &&
-                                                        UploadFile.synchronizeDirectoryEntry(sourceFile.parentFile)
-                                                    // THE VALIDATED ROLLBACK (review-41 #7/#8): the
-                                                    // source is coherent and the destination row does
-                                                    // not claim the target — the destination (byteless
-                                                    // in this arm) has only its record to resolve: the
-                                                    // captured prior evidence is restored, the
-                                                    // operation's own prepared record is removed, a
-                                                    // LATER publication's record is left intact, and
-                                                    // DAMAGED evidence retains the journal (uncertainty
-                                                    // is never disposed). A readable prepared proof
-                                                    // alone is never permission to dispose.
-                                                    sourceCoherent && !destinationRowNamesTarget &&
-                                                        resolveAbortedDestinationRecord(
-                                                            context,
-                                                            target,
-                                                            publicationIdOfRecordText(parsed.proofText),
-                                                            parsed.previousDestinationRecordText,
-                                                            phaseProvenOperationOwned = false,
-                                                        )
+                                                        // ROUTE R — THE VALIDATED ROLLBACK (review-41
+                                                        // #7/#8): the source is coherent and the
+                                                        // destination row does not claim the target — the
+                                                        // destination (byteless in this arm) has only its
+                                                        // record to resolve: the captured prior evidence
+                                                        // is restored, the operation's own prepared
+                                                        // record is removed, a LATER publication's record
+                                                        // is left intact, and DAMAGED evidence retains the
+                                                        // journal (uncertainty is never disposed). A
+                                                        // readable prepared proof alone is never
+                                                        // permission to dispose.
+                                                        fullyValidated && !destinationRowNamesTarget -> {
+                                                            // THE SOURCE'S PROOF IS DURABLY RESTORED AND
+                                                            // VERIFIED (review-40 #10, gated review-41 #7):
+                                                            // the captured source-bound payload is written
+                                                            // back through the atomic writer ONLY after the
+                                                            // full validation, and read back against the
+                                                            // bytes and the publication id.
+                                                            val sourceProofRestored = run {
+                                                                val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
+                                                                sourceRecordFile != null &&
+                                                                    atomicWriteText(sourceRecordFile, sourceProofText) &&
+                                                                    readPublishedProvenance(context, sourceFile)?.let { restored ->
+                                                                        restored.certifiesBytes(sourceFile) &&
+                                                                            restored.publicationId == sourceProof.publicationId
+                                                                    } == true
+                                                            }
+                                                            // THE CARRIED OBSERVATION IS RESTORED WITH ITS
+                                                            // PROOF (review-40 #10, full binding review-41
+                                                            // #7): a carried observation is re-bound to the
+                                                            // recorded source verbatim and its read-back is
+                                                            // verified against the FULL binding — location
+                                                            // AND (current format) the restored proof's
+                                                            // publication id — never the location alone; an
+                                                            // explicit absence is the operation's own
+                                                            // contract and restores nothing.
+                                                            val observationRestored = !sourceProofRestored ||
+                                                                parsed.observationText == null || run {
+                                                                    val sourceObs = IOFile(provenanceFileFor(context, sourceFile).path + ".obs")
+                                                                    atomicWriteText(sourceObs, parsed.observationText) &&
+                                                                        parseObservationBinding(
+                                                                            sourceObs.readText().trim(),
+                                                                        )?.let { bound ->
+                                                                            bound.location == sourceFile.absolutePath &&
+                                                                                (bound.format != ObservationFormat.CURRENT ||
+                                                                                    bound.publicationId == sourceProof.publicationId)
+                                                                        } != null
+                                                                }
+                                                            // THE RETAINED AUTHORITY IS DURABLE BEFORE THE
+                                                            // JOURNAL LEAVES (review-39 #5): the restored
+                                                            // source is the coherent authority for this
+                                                            // generation.
+                                                            val sourceCoherent = sourceProofRestored && observationRestored &&
+                                                                UploadFile.synchronizeFileContents(sourceFile) &&
+                                                                UploadFile.synchronizeDirectoryEntry(sourceFile.parentFile)
+                                                            sourceCoherent &&
+                                                                resolveAbortedDestinationRecord(
+                                                                    context,
+                                                                    target,
+                                                                    publicationIdOfRecordText(parsed.proofText),
+                                                                    parsed.previousDestinationRecordText,
+                                                                    phaseProvenOperationOwned = false,
+                                                                )
+                                                        }
+                                                        // THE CONFLICTING DESTINATION STATE (the row
+                                                        // names the target while a later publication's
+                                                        // record sits at the path) and every
+                                                        // unvalidated state retain.
+                                                        else -> false
+                                                    }
                                                 }.getOrDefault(false)
                                                 // THE EXPLICIT DISPATCH (review-41 #8): three
                                                 // disjoint routes. A resolved post-copy state
