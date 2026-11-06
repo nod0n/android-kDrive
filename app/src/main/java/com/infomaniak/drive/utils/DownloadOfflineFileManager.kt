@@ -6960,14 +6960,15 @@ class DownloadOfflineFileManager(
          * the VALIDATED TRANSITION. Over an UNPROVEN restoration (no publication at all)
          * a stale carried observation's own publication is provably gone: it is retired
          * and its absence verified, never re-bound to an invented identity and never kept
-         * to block every later capture. THE COHERENT QUARANTINE (review-46 D2): a LEGACY
-         * old observation is never re-bound (its location-only binding cannot be
-         * established for a new publication id without MANUFACTURING evidence) and no
-         * unclassifiable leftover is left at the canonical name (a dead-id CURRENT
-         * observation there fails every later capture) — both are MOVED verbatim to the
-         * operation-owned recovery path ([quarantineObservation]); the canonical name is
-         * left honestly absent. [recordFile] is this operation's own recovery record —
-         * the quarantine base is derived from it. */
+         * to block every later capture. THE COHERENT QUARANTINE (review-46 D2, manifest-
+         * durable per review-47 E2/E4): a LEGACY old observation's CAPTURED TEXT is first
+         * durably preserved under the operation-owned captured slot (the record is disposed
+         * on success and is not its carrier anymore), and no unclassifiable leftover is left
+         * at the canonical name (a dead-id CURRENT observation there fails every later
+         * capture) — leftovers are MOVED verbatim into the manifest-indexed owned slots
+         * ([quarantineCanonicalObservation]); the canonical name is left honestly absent.
+         * [recordFile] is this operation's own recovery record — the manifest and the slots
+         * are derived from it. */
         private fun restoreOldObservationState(
             context: Context,
             target: IOFile,
@@ -6978,69 +6979,45 @@ class DownloadOfflineFileManager(
             recordFile: IOFile,
         ): Boolean {
             val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
+            // THE REPLAYED QUARANTINE IS VERIFIED BEFORE ANYTHING PROCEEDS (review-47 E4):
+            // when the canonical observation is already absent, every manifest-recorded
+            // slot must exist with its recorded byte identity and BOTH sides' directories
+            // (the canonical's registry dir and the slots' staging dir) must be
+            // acknowledged BEFORE this restore completes toward the journal/backup
+            // disposal — a prior run's crash after the rename but before its
+            // acknowledgments lands HERE (the ladder's absent arm alone would never
+            // re-reach the quarantine's verification). A missing or byte-mismatched slot
+            // is the honest loss signal: the restore retains.
+            if (!IOFile(provenanceFileFor(context, target).path + ".obs").exists() &&
+                !verifyReplayedQuarantine(context, recordFile, target)
+            ) {
+                return false
+            }
             return when (oldObservation) {
-                null, is OldObservationCapture.Absent -> {
-                    // THE TYPED LADDER (review-45 R4, review-46 D1): the failed-id
-                    // retirement first; on a NotEligible leftover, the exact ATTEMPT-text
-                    // retirement. A Failed at either rung — the eligible (or
-                    // unclassifiable) evidence's read/delete/fsync/verification failed —
-                    // RETAINS: the retry owner is preserved, never collapsed into a
-                    // reported success. A NotEligible leftover advances to the next rung
-                    // or takes the coherent quarantine (the D2 policy below).
-                    when (removeObservationBoundTo(context, target, failedPublicationId)) {
-                        ObservationRetirement.Retired, ObservationRetirement.Absent ->
-                            // The failed attempt's observation (or none) — the obligation is met.
-                            true
-                        ObservationRetirement.Failed -> false
-                        ObservationRetirement.NotEligible -> when (
-                            removeObservationExactText(context, target, attemptedObservationText)
-                        ) {
-                            // THE EXACT OPERATION OBLIGATION (review-45 R4): an UNCAPTURED
-                            // old state (null/"U") and an EXPLICIT captured absence are not
-                            // the same permission. The ONLY evidence this operation may
-                            // retire beyond the failed-id binding is the observation whose
-                            // EXACT text equals the record's captured ATTEMPT observation
-                            // (its own attempt evidence — a legacy-format failed attempt's
-                            // residue, removable by exact-text identity, never by
-                            // parseability). A leftover that matches neither identity —
-                            // another publication's, a LEGACY sidecar, an unparseable
-                            // payload — is NOT this operation's evidence to retire:
-                            // parsing alone is never permission and the restoration
-                            // proof's existence is never permission either. THE COHERENT
-                            // QUARANTINE (review-46 D2) is its disposition: it is MOVED
-                            // verbatim to the operation-owned recovery path — never
-                            // deleted (no arbitrary delete), never left at the canonical
-                            // name (a dead-id CURRENT observation there fails every later
-                            // capture forever — the original #4 stuck state; a LEGACY
-                            // sidecar there is promoted to evidence it never carried) —
-                            // and the canonical name is left honestly absent. A failed
-                            // move RETAINS. The branch completes only through the typed
-                            // outcomes: retired, acknowledged-absent, or quarantined.
-                            ObservationRetirement.Failed -> false
-                            // THE EXACT OPERATION OBLIGATION (review-45 R4) meets THE
-                            // COHERENT QUARANTINE (review-46 D2): a leftover matching
-                            // neither identity is no longer left at the canonical name —
-                            // a dead-id CURRENT observation there fails every later
-                            // capture forever (the original #4 stuck state), and a LEGACY
-                            // sidecar is promoted to evidence it never carried. It is
-                            // MOVED to the operation-owned recovery path (bytes preserved,
-                            // the canonical name honestly absent); a failed move RETAINS.
-                            ObservationRetirement.NotEligible ->
-                                quarantineObservation(context, target, recordFile)
-                            ObservationRetirement.Retired, ObservationRetirement.Absent -> true
-                        }
-                    }
-                }
+                null, is OldObservationCapture.Absent ->
+                    retiredOrQuarantinedCanonicalLadder(
+                        context, target, recordFile, failedPublicationId, attemptedObservationText,
+                    )
                 is OldObservationCapture.Legacy -> {
-                    // THE LEGACY QUARANTINE (review-46 D2): a LEGACY observation's
-                    // binding is location-only — re-binding it to the restoration's
-                    // publication id would MANUFACTURE evidence it never carried, and
-                    // leaving it at the canonical name makes the next relocation capture
-                    // it as Valid (LEGACY = id-bound-at-location) and re-bind it again.
-                    // The captured text is moved VERBATIM to the operation-owned recovery
-                    // path (never deleted, never re-bound, never read as absence); the
-                    // canonical name is left honestly absent. A failed move RETAINS.
-                    quarantineObservation(context, target, recordFile)
+                    // THE CAPTURED EVIDENCE IS PRESERVED BEFORE ANYTHING ELSE (review-47
+                    // E2): the record carrying this text is disposed on success, so the
+                    // EXACT captured text is first written into the operation-owned,
+                    // manifest-indexed captured slot (a bare suffix was not enough — the
+                    // manifest records the byte identity and survives the disposal). Only
+                    // then the canonical is retired through the shared typed ladder: the
+                    // failed attempt's own observation (the failed-id binding), its own
+                    // exact attempt text (a legacy-format attempt's residue), and only
+                    // then the unrelated leftover's quarantine — the captured slot is
+                    // never overwritten and the unknown is never lost. A LEGACY
+                    // observation's binding is location-only: it is never re-bound (that
+                    // would manufacture evidence it never carried) and never left at the
+                    // canonical name (the next relocation would capture it as
+                    // id-bound-at-location and re-bind it again) — the canonical name
+                    // ends honestly absent.
+                    preserveCapturedObservationEvidence(recordFile, target, oldObservation.text) &&
+                        retiredOrQuarantinedCanonicalLadder(
+                            context, target, recordFile, failedPublicationId, attemptedObservationText,
+                        )
                 }
                 is OldObservationCapture.Valid -> {
                     if (restorationPublicationId != null) {
@@ -7071,7 +7048,7 @@ class DownloadOfflineFileManager(
                                     // moved to the owned recovery path, never left to
                                     // block or be promoted; a failed move RETAINS.
                                     ObservationRetirement.NotEligible ->
-                                        quarantineObservation(context, target, recordFile)
+                                        quarantineCanonicalObservation(context, target, recordFile)
                                     ObservationRetirement.Retired, ObservationRetirement.Absent -> true
                                 }
                             }
@@ -7100,66 +7077,318 @@ class DownloadOfflineFileManager(
             }
         }
 
-        /**
-         * THE COHERENT QUARANTINE (review-46 D2): an observation that cannot bind
-         * coherently to the restored generation — a LEGACY sidecar (location-only
-         * binding: re-binding it to the restoration's publication id would MANUFACTURE
-         * evidence it never carried), a dead-id CURRENT observation (every later capture
-         * fails closed on it — the original #4 stuck state), or an unparseable payload —
-         * is MOVED out of the canonical name to a deterministic OPERATION-OWNED path
-         * derived from this operation's recovery record. THE BYTES ARE PRESERVED
-         * VERBATIM (a rename, never a deletion — no arbitrary delete), the canonical
-         * `.obs` name is left HONESTLY ABSENT (a later capture sees absence, not a
-         * promotion or a permanent block), and the quarantined evidence remains
-         * recoverable under the owned recovery state. The move is atomic (the registry
-         * and the staging container are siblings under the offline storage's parent —
-         * the same filesystem by construction), durably acknowledged in BOTH parents,
-         * and verified both ways. A failed move RETAINS (the caller keeps the recovery
-         * state and the sweep replays). An absent canonical name first establishes its
-         * directory acknowledgment (the D1 doctrine: exists() is never the
-         * acknowledgment) and is already the honest restored state.
-         * HONEST LIMITS: quarantined files are inert to every sweep enumeration (which
-         * keys on exact `.recovery`/`.scope` suffixes) and are never automatically
-         * restored or reconciled — their disposition belongs to the operator, at the
-         * recorded operation-owned name; a per-target journal record name means
-         * sequential quarantines for the same target allocate increasing numeric
-         * suffixes so earlier preserved evidence is never clobbered.
-         */
-        private fun quarantineObservation(context: Context, target: IOFile, recordFile: IOFile): Boolean {
-            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
-            if (!observationFile.exists()) {
-                return UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)
+        /** THE SHARED CANONICAL LADDER (review-45 R4, review-46 D1/D2, review-47 E2/E3):
+         * retires the canonical observation through the operation's own identities and
+         * quarantines only the unclassifiable leftover. THE FAILED-ID RUNG (review-45 R4,
+         * review-46 D1): the failed attempt's own observation, retired conditionally and
+         * durably — a Failed at either rung (an eligible or unreadable payload's read/
+         * delete/fsync/verification failed) RETAINS: the retry owner is preserved, never
+         * collapsed into a reported success. THE EXACT OPERATION OBLIGATION (review-45
+         * R4): an UNCAPTURED old state (null/"U") and an EXPLICIT captured absence are not
+         * the same permission. The ONLY evidence this operation may retire beyond the
+         * failed-id binding is the observation whose EXACT text equals the record's
+         * captured ATTEMPT observation (its own attempt evidence — a legacy-format failed
+         * attempt's residue, removable by exact-text identity, never by parseability; a
+         * readable-but-unclassifiable payload is NotEligible here, review-47 E3, and can
+         * still be tested textually). A leftover matching neither identity — another
+         * publication's, a LEGACY sidecar, an unparseable payload — is NOT this
+         * operation's evidence to retire: parsing alone is never permission and the
+         * restoration proof's existence is never permission either. THE COHERENT
+         * QUARANTINE (review-46 D2, manifest-durable review-47 E4) is its disposition: it
+         * is MOVED verbatim into the manifest-indexed owned slot — never deleted (no
+         * arbitrary delete), never left at the canonical name (a dead-id CURRENT
+         * observation there fails every later capture forever — the original #4 stuck
+         * state; a LEGACY sidecar there is promoted to evidence it never carried) — and
+         * the canonical name is left honestly absent. A failed move RETAINS. The ladder
+         * completes only through the typed outcomes: retired, acknowledged-absent, or
+         * quarantined. */
+        private fun retiredOrQuarantinedCanonicalLadder(
+            context: Context,
+            target: IOFile,
+            recordFile: IOFile,
+            failedPublicationId: Long?,
+            attemptedObservationText: String?,
+        ): Boolean =
+            when (removeObservationBoundTo(context, target, failedPublicationId)) {
+                ObservationRetirement.Retired, ObservationRetirement.Absent ->
+                    // The failed attempt's observation (or none) — the obligation is met.
+                    true
+                ObservationRetirement.Failed -> false
+                ObservationRetirement.NotEligible -> when (
+                    removeObservationExactText(context, target, attemptedObservationText)
+                ) {
+                    ObservationRetirement.Failed -> false
+                    ObservationRetirement.NotEligible ->
+                        quarantineCanonicalObservation(context, target, recordFile)
+                    ObservationRetirement.Retired, ObservationRetirement.Absent -> true
+                }
             }
-            // THE COLLISION-FREE OWNED NAME: the record-derived base never overwrites a
-            // prior quarantine — the first free numbered suffix is allocated, so earlier
-            // quarantined evidence is preserved, never clobbered.
-            var quarantineFile = IOFile(recordFile.path + ".obs.q")
+
+        /** THE CAPTURED EVIDENCE IS PRESERVED UNDER THE OWNED RECOVERY (review-47 E2):
+         * the record's captured observation text is written EXACTLY (no trailing newline,
+         * no re-encoding) into the operation-owned captured slot BEFORE anything else —
+         * the record is disposed on success and is then no longer the text's carrier, and
+         * moving only the canonical previously lost the captured evidence when a failed
+         * attempt had replaced the canonical content. The manifest entry (the slot's byte
+         * identity) is durable BEFORE the slot write; the slot is never overwritten (a
+         * fresh name is allocated, and a manifest-recorded slot holding the same byte
+         * identity makes the replay idempotent — no accumulating duplicates); the write is
+         * atomic + durably acknowledged + verified against the recorded identity. A failed
+         * preservation RETAINS the whole restore. */
+        private fun preserveCapturedObservationEvidence(recordFile: IOFile, target: IOFile, capturedText: String): Boolean {
+            val payloadBytes = capturedText.toByteArray(Charsets.UTF_8)
+            val payloadSha256 = sha256HexOfBytes(payloadBytes) ?: return false
+            // THE REPLAY IS IDEMPOTENT (review-47 E4): a manifest entry whose recorded
+            // slot already holds this byte identity means the evidence is already durably
+            // preserved — no duplicate slot is allocated.
+            when (val state = readQuarantineManifest(recordFile)) {
+                is QuarantineManifestState.Unreadable -> return false
+                is QuarantineManifestState.Present -> {
+                    if (state.manifest.targetPath != target.absolutePath) return false
+                    val alreadyPreserved = state.manifest.entries.any { entry ->
+                        val slotFile = IOFile(recordFile.parentFile, entry.slotName)
+                        slotExistsExcludingSymlinks(slotFile) && slotMatchesManifest(slotFile, payloadSha256)
+                    }
+                    if (alreadyPreserved) return true
+                }
+                is QuarantineManifestState.Absent -> Unit
+            }
+            val slotFile = allocateQuarantineSlot(recordFile, CAPTURED_SLOT_BASE)
+            if (!upsertQuarantineManifestEntry(recordFile, target.absolutePath, slotFile.name, payloadSha256)) return false
+            if (!atomicWriteText(slotFile, capturedText)) return false
+            return slotMatchesManifest(slotFile, payloadSha256)
+        }
+
+        /**
+         * THE DURABLE QUARANTINE MANIFEST (review-47 E4): the operation-owned index of the
+         * evidence preserved out of the canonical observation name. A file suffix alone is
+         * not a recoverable manifest, and the recovery record (the only other carrier) is
+         * disposed on success — this sidecar is INDEPENDENT of the record and SURVIVES its
+         * disposal ([disposeRecoveryRecord] touches only the record body and the scope
+         * sidecar), because the operator is the preserved evidence's only owner and the
+         * pointer metadata must outlive the operation. STRICT LINE GRAMMAR: line 1 the
+         * header "OBSQ1", line 2 the bound target path, then one
+         * "<slotFileName>|<64-lowercase-hex sha256>" per preserved slot. A manifest that
+         * does not parse is UNREADABLE — the caller retains (never a blind rebuild, which
+         * could unrecord a live slot); the same strictness the record decoders apply.
+         */
+        private const val QUARANTINE_MANIFEST_HEADER = "OBSQ1"
+        private const val CAPTURED_SLOT_BASE = "obs.q.captured"
+        private const val CANONICAL_SLOT_BASE = "obs.q.canonical"
+
+        private class QuarantineManifestEntry(val slotName: String, val sha256Hex: String)
+
+        private class QuarantineManifest(val targetPath: String, val entries: List<QuarantineManifestEntry>)
+
+        private sealed class QuarantineManifestState {
+            object Absent : QuarantineManifestState()
+            class Present(val manifest: QuarantineManifest) : QuarantineManifestState()
+            object Unreadable : QuarantineManifestState()
+        }
+
+        private fun quarantineManifestFile(recordFile: IOFile): IOFile =
+            IOFile(recordFile.path + ".obs.manifest")
+
+        /** THE TYPED MANIFEST READ: [Absent] = no manifest file (a fresh operation — the
+         * caller may create it); [Unreadable] = the file exists but does not parse (the
+         * caller RETAINS — never a blind rebuild over a possibly-recorded state);
+         * [Present] = the parsed index. */
+        private fun readQuarantineManifest(recordFile: IOFile): QuarantineManifestState = runCatching {
+            val manifestFile = quarantineManifestFile(recordFile)
+            if (!manifestFile.exists()) return@runCatching QuarantineManifestState.Absent as QuarantineManifestState
+            val lines = manifestFile.readText().split("\n")
+            if (lines.size < 2 || lines[0] != QUARANTINE_MANIFEST_HEADER || lines[1].isEmpty()) {
+                return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+            }
+            val entries = lines.drop(2).map { line ->
+                val parts = line.split("|")
+                val name = parts.getOrNull(0) ?: ""
+                val hex = parts.getOrNull(1) ?: ""
+                if (parts.size != 2 || name.isEmpty() || hex.length != 64 ||
+                    hex.any { !it.isDigit() && it !in 'a'..'f' }
+                ) {
+                    return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+                }
+                QuarantineManifestEntry(name, hex)
+            }
+            QuarantineManifestState.Present(QuarantineManifest(lines[1], entries)) as QuarantineManifestState
+        }.getOrDefault(QuarantineManifestState.Unreadable)
+
+        /** THE MANIFEST WRITE: atomic + durably acknowledged + verified by readback (the
+         * atomicWriteText chain — temp write, contents fsync, rename, directory fsync). */
+        private fun writeQuarantineManifest(
+            recordFile: IOFile,
+            targetPath: String,
+            entries: List<QuarantineManifestEntry>,
+        ): Boolean {
+            val text = buildList {
+                add(QUARANTINE_MANIFEST_HEADER)
+                add(targetPath)
+                entries.forEach { add("${it.slotName}|${it.sha256Hex}") }
+            }.joinToString("\n")
+            return atomicWriteText(quarantineManifestFile(recordFile), text)
+        }
+
+        /** THE MANIFEST-FIRST UPSERT (review-47 E4): the entry is durable BEFORE the
+         * corresponding slot mutation, recording the slot's byte identity. A manifest bound
+         * to another target is never mutated; a slot name recorded with a DIFFERENT
+         * identity is an unknown state (retain); an identical existing entry is the
+         * idempotent replay (no write). */
+        private fun upsertQuarantineManifestEntry(
+            recordFile: IOFile,
+            targetPath: String,
+            slotName: String,
+            sha256Hex: String,
+        ): Boolean {
+            return when (val state = readQuarantineManifest(recordFile)) {
+                is QuarantineManifestState.Unreadable -> false
+                is QuarantineManifestState.Absent ->
+                    writeQuarantineManifest(recordFile, targetPath, listOf(QuarantineManifestEntry(slotName, sha256Hex)))
+                is QuarantineManifestState.Present -> {
+                    val manifest = state.manifest
+                    if (manifest.targetPath != targetPath) return false
+                    val existing = manifest.entries.firstOrNull { it.slotName == slotName }
+                    val entries = when {
+                        existing != null && existing.sha256Hex == sha256Hex -> manifest.entries
+                        existing != null -> return false
+                        else -> manifest.entries + QuarantineManifestEntry(slotName, sha256Hex)
+                    }
+                    writeQuarantineManifest(recordFile, targetPath, entries)
+                }
+            }
+        }
+
+        private fun sha256HexOfBytes(bytes: ByteArray): String? = runCatching {
+            java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+                .joinToString("") { "%02x".format(it) }
+        }.getOrNull()
+
+        /** THE SLOT EXISTENCE CHECK EXCLUDES SYMLINKS (review-47 E4): a symlink at a slot
+         * name is UNKNOWN content — never overwritten (renameTo would replace the link
+         * entry); the check's own failure is treated as existing (the conservative side). */
+        private fun slotExistsExcludingSymlinks(file: IOFile): Boolean = runCatching {
+            java.nio.file.Files.exists(
+                java.nio.file.Paths.get(file.absolutePath),
+                java.nio.file.LinkOption.NOFOLLOW_LINKS,
+            )
+        }.getOrDefault(true)
+
+        private fun slotMatchesManifest(slotFile: IOFile, expectedSha256Hex: String): Boolean = runCatching {
+            sha256HexOfBytes(slotFile.readBytes()) == expectedSha256Hex
+        }.getOrDefault(false)
+
+        /** THE DETERMINISTIC REPLAY-STABLE SLOT NAME: the record-derived base is reused by
+         * every replay (the manifest is the index, so the recorded name is authoritative);
+         * a slot that already exists with unknown byte identity — a real collision, never
+         * a replay — takes the next numbered suffix, bounded by the collisions
+         * themselves. */
+        private fun allocateQuarantineSlot(recordFile: IOFile, baseName: String): IOFile {
+            var candidate = IOFile(recordFile.parentFile, recordFile.name + "." + baseName)
             var suffix = 2
-            while (quarantineFile.exists()) {
-                quarantineFile = IOFile(recordFile.path + ".obs.q" + suffix)
+            while (slotExistsExcludingSymlinks(candidate)) {
+                candidate = IOFile(recordFile.parentFile, recordFile.name + "." + baseName + "." + suffix)
                 suffix++
             }
-            val moved = runCatching { observationFile.renameTo(quarantineFile) }.getOrDefault(false)
-            if (!moved || !quarantineFile.exists() || observationFile.exists()) return false
-            // THE DIRECTORY ACKNOWLEDGMENTS: the source parent's entry (the removal) and,
+            return candidate
+        }
+
+        /** THE REPLAYED QUARANTINE IS VERIFIED, NOT ASSUMED (review-47 E4): the canonical's
+         * absence alone is never success. Every recorded slot must exist with its recorded
+         * BYTE IDENTITY, and BOTH directories are acknowledged — the canonical's registry
+         * directory (the removal side) and each slot's staging directory (the appearance
+         * side) — BEFORE the caller proceeds to the journal/backup disposal. A manifest
+         * entry whose slot is missing or byte-mismatched is the honest loss signal: the
+         * caller retains. A crash after the source fsync but before the destination fsync
+         * lands HERE on the replay: the evidence is verified and both sides acknowledged,
+         * so no durable evidence and no retry owner is lost. */
+        private fun verifyReplayedQuarantine(context: Context, recordFile: IOFile, target: IOFile): Boolean {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            return when (val state = readQuarantineManifest(recordFile)) {
+                is QuarantineManifestState.Unreadable -> false
+                is QuarantineManifestState.Absent ->
+                    // No manifest and no canonical: nothing was ever preserved — the honest
+                    // absence; the registry directory's acknowledgment is established (the
+                    // D1 doctrine: exists() is never the acknowledgment).
+                    UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)
+                is QuarantineManifestState.Present -> {
+                    val manifest = state.manifest
+                    if (manifest.targetPath != target.absolutePath) return false
+                    if (!UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) return false
+                    for (entry in manifest.entries) {
+                        val slotFile = IOFile(recordFile.parentFile, entry.slotName)
+                        if (!slotExistsExcludingSymlinks(slotFile)) return false
+                        if (!slotMatchesManifest(slotFile, entry.sha256Hex)) return false
+                        if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
+                    }
+                    true
+                }
+            }
+        }
+
+        /**
+         * THE COHERENT QUARANTINE, MANIFEST-DURABLE (review-46 D2, reworked review-47
+         * E2/E4): an observation that cannot bind coherently to the restored generation —
+         * a LEGACY sidecar (location-only binding: re-binding it to the restoration's
+         * publication id would MANUFACTURE evidence it never carried), a dead-id CURRENT
+         * observation (every later capture fails closed on it — the original #4 stuck
+         * state), or an unclassifiable payload — is MOVED out of the canonical name into
+         * the operation-owned manifest-indexed slot. THE BYTES ARE PRESERVED VERBATIM (a
+         * rename on the same filesystem — the registry and the staging container are
+         * siblings under the offline storage's parent by construction — never a deletion),
+         * the canonical .obs name is left HONESTLY ABSENT, and the manifest (which survives
+         * the record disposal) records the slot's byte identity BEFORE the move. The move
+         * runs ONLY inside the validated arms — the recovery record's scope validation and
+         * the proof gates precede it, so a newer valid J's observation is never moved while
+         * its proof is live (no authority broadened). A failed move/mutation RETAINS (the
+         * caller keeps the recovery state and the sweep replays). An absent canonical name
+         * takes the replay verification (both directories acknowledged, every recorded
+         * slot's bytes verified). HONEST LIMITS: quarantined slots and their manifest are
+         * inert to every sweep enumeration (which keys on exact `.recovery`/`.scope`
+         * suffixes) and are never automatically restored or reconciled — their disposition
+         * belongs to the operator, at the manifest-recorded names.
+         */
+        private fun quarantineCanonicalObservation(context: Context, target: IOFile, recordFile: IOFile): Boolean {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!observationFile.exists()) {
+                return verifyReplayedQuarantine(context, recordFile, target)
+            }
+            // THE PRE-MUTATION IDENTITY: the exact bytes are read once and hashed BEFORE
+            // the manifest is written, so every later crash window is verifiable against
+            // the recorded identity.
+            val payloadBytes = runCatching { observationFile.readBytes() }.getOrNull() ?: return false
+            val payloadSha256 = sha256HexOfBytes(payloadBytes) ?: return false
+            val slotFile = allocateQuarantineSlot(recordFile, CANONICAL_SLOT_BASE)
+            // THE MANIFEST IS DURABLE BEFORE THE MOVE (review-47 E4): the entry records the
+            // slot name and the payload's byte identity first.
+            if (!upsertQuarantineManifestEntry(recordFile, target.absolutePath, slotFile.name, payloadSha256)) return false
+            val moved = runCatching { observationFile.renameTo(slotFile) }.getOrDefault(false)
+            if (!moved || !slotFile.exists() || observationFile.exists()) return false
+            // BOTH DIRECTORY ACKNOWLEDGMENTS: the source parent's entry (the removal) and,
             // when distinct, the destination parent's entry (the appearance) are both
             // established before the move is reported.
             if (!UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) return false
-            return quarantineFile.parentFile == observationFile.parentFile ||
-                UploadFile.synchronizeDirectoryEntry(quarantineFile.parentFile)
+            if (slotFile.parentFile != observationFile.parentFile &&
+                !UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)
+            ) {
+                return false
+            }
+            // THE BYTE IDENTITY IS VERIFIED AFTER THE MOVE: the moved bytes are hashed and
+            // compared against the manifest-recorded identity.
+            return slotMatchesManifest(slotFile, payloadSha256)
         }
 
-        /** THE TYPED OBSERVATION RETIREMENT OUTCOME (review-46 D1): the retirement's honest
-         * results are never collapsed. [Retired] = the eligible evidence was deleted and its
-         * unlink DURABLY ACKNOWLEDGED (absence verified). [Absent] = the target carries no
-         * observation — and a PRIOR unacknowledged unlink is acknowledged HERE before success
-         * is reported (a successful delete whose fsync failed reports exists=false on retry,
-         * which alone never proves the durable unlink). [NotEligible] = the present evidence
-         * is NOT this operation's to retire (a different identity, format or text) — it is
-         * preserved untouched. [Failed] = the evidence WAS eligible — or its eligibility is
-         * UNKNOWN (an unreadable payload is unknown, never "not mine") — but the
-         * read/delete/fsync/verification failed: the caller RETAINS and the retry owner is
-         * preserved. */
+        /** THE TYPED OBSERVATION RETIREMENT OUTCOME (review-46 D1, refined review-47 E3): the
+         * retirement's honest results are never collapsed. [Retired] = the eligible evidence was
+         * deleted and its unlink DURABLY ACKNOWLEDGED (absence verified). [Absent] = the target
+         * carries no observation — and a PRIOR unacknowledged unlink is acknowledged HERE before
+         * success is reported (a successful delete whose fsync failed reports exists=false on
+         * retry, which alone never proves the durable unlink). [NotEligible] = the present
+         * evidence is NOT this operation's to retire (a different identity, format or text) — or
+         * it READS but cannot be classified (a parse-invalid payload is unknown-shaped, not an
+         * eligible-evidence failure: the ladder reaches it by exact text and the quarantine
+         * preserves it). [Failed] = the evidence WAS eligible and its read/delete/fsync/
+         * verification failed, or the payload is UNREADABLE (a read exception is unknown — never
+         * "not mine"): the caller RETAINS and the retry owner is preserved. */
         private sealed class ObservationRetirement {
             object Retired : ObservationRetirement()
             object Absent : ObservationRetirement()
@@ -7187,9 +7416,15 @@ class DownloadOfflineFileManager(
             if (boundPublicationId == null) return ObservationRetirement.NotEligible
             // A READ FAILURE IS UNKNOWN (review-46 D1): the evidence's eligibility cannot
             // be classified — never "not mine"; the caller retains.
-            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
-                ?.let { parseObservationBinding(it) }
+            val canonicalText = runCatching { observationFile.readText().trim() }.getOrNull()
                 ?: return ObservationRetirement.Failed
+            // READABLE BUT UNCLASSIFIABLE IS NOT A FAILED RETIREMENT (review-47 E3): a
+            // payload that reads but does not parse is not an eligible-evidence failure —
+            // the ladder must reach it (the exact-text rung can test it textually; the
+            // quarantine preserves it under the owned recovery). Only an unreadable payload
+            // is unknown.
+            val parsed = parseObservationBinding(canonicalText)
+                ?: return ObservationRetirement.NotEligible
             if (parsed.format != ObservationFormat.CURRENT || parsed.publicationId != boundPublicationId) {
                 return ObservationRetirement.NotEligible
             }
