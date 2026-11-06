@@ -1470,6 +1470,13 @@ class DownloadOfflineFileManager(
             /** Fresh per-publication value (0 = a pre-nonce record): the request-time
              * publication/restoration token's distinguishing field (issue: round 24 #11). */
             val publicationId: Long = 0,
+            /** THE SERVER CONTENT IDENTITY (review-53 D3; the server-content-verification
+             * establishment route is its only producer): the server's own content hash in
+             * the canonical "xxh3:…" form, taken from the SAME fresh details response that
+             * anchors the record's metadata — never the local SHA-256 receipt
+             * ([contentHash]), never an etag. Null on every v2/legacy record: absence is
+             * the metadata tier, never a verified claim. */
+            val serverHash: String? = null,
             val absolutePath: String,
         ) {
             /** STRICT owner identity (issue: round 20 #11): the record must name THIS row,
@@ -1502,20 +1509,110 @@ class DownloadOfflineFileManager(
         }
 
         /**
-         * EXPLICIT VERSIONED FRAMING (issue: round 25 #12): every NEW record starts with the
-         * literal "v2|" marker, so the format is never inferred from the total number of
-         * '|'-split components — a legacy nine-field record whose final path contains '|'
-         * splits into ten-plus components and must still parse as LEGACY (its location is
-         * the re-joined remainder after the known prefix fields). The body after the marker
-         * is: version|lastModifiedAt|revisedAt|updatedAt|userId|driveId|fileId|contentHash|
-         * publicationId|location(re-joined).
+         * EXPLICIT VERSIONED FRAMING (issue: round 25 #12, review-53 D3): every NEW record
+         * starts with a literal frame marker, so the format is never inferred from the
+         * total number of '|'-split components — a legacy nine-field record whose final
+         * path contains '|' splits into ten-plus components and must still parse as
+         * LEGACY (its location is the re-joined remainder after the known prefix fields).
+         * The body after the marker is:
+         *  v2| version|lastModifiedAt|revisedAt|updatedAt|userId|driveId|fileId|contentHash|
+         *      publicationId|location(re-joined)
+         *  v3| version|lastModifiedAt|revisedAt|updatedAt|userId|driveId|fileId|contentHash|
+         *      serverHash|publicationId|location(re-joined)
+         * The v3 server hash sits BEFORE the location because the location is the LAST
+         * field and re-joins any '|' inside it — a trailing field would be absorbed into
+         * the path. The server hash is the SERVER's canonical content identity only;
+         * there is deliberately no etag (opaque, unused for any decision) and no
+         * verification timestamp (grants no authority). An OLDER build reading a v3
+         * record fails closed: the "v3|" prefix is not stripped as "v2|", the legacy
+         * grammar re-parses the body from "v3" — which is not an integer — and the parse
+         * throws; the record stays retained and invalid, never positive authority (a
+         * downgrade is unrecoverable by design).
          */
         private const val PROVENANCE_FRAME = "v2|"
+        private const val PROVENANCE_FRAME_V3 = "v3|"
         private const val SIDECAR_FRAME = "s2|"
         private val KNOWN_STORAGE_KINDS = setOf("offline", "cache", "converted")
 
-        private fun PublishedProvenance.recordText(target: IOFile): String =
-            PROVENANCE_FRAME + "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${contentHash ?: ""}|$publicationId|${target.absolutePath}"
+        /** THE SUPPORTED SERVER HASH FORMAT (review-53 D3): exactly the documented shape —
+         * the "xxh3:" prefix plus sixteen lowercase hex digits, the canonical unsigned
+         * 64-bit XXH3 digest. Any other value (another algorithm, uppercase, wrong
+         * length) is UNSUPPORTED: it never round-trips as v3 and never authorizes a
+         * content-verified claim. No MD5/SHA-1/SHA-256 guessing — XXH3-64 is
+         * non-cryptographic and certifies accidental-corruption/staleness integrity only.
+         */
+        private val SERVER_HASH_FORMAT = Regex("xxh3:[0-9a-f]{16}")
+
+        /**
+         * THE SHARED PROOF-FIELD DECODER (review-53 D3): ONE exact-grammar decoder for
+         * every reader of a proof text's pipe fields — parseProvenanceText, the
+         * proof-move journal's field reads, and the publication-id extraction. No reader
+         * splits a proof text itself or strips the "v2|" prefix blindly, so the v3
+         * frame's extra server-hash field can never shift another reader's indexes.
+         *
+         * A framed text is decoded STRICTLY: v2 = exactly ten body fields (the location
+         * last, re-joined), v3 = exactly eleven with the server hash strictly validated;
+         * anything else (a truncated frame, a malformed or unsupported hash) is
+         * UNDECODABLE — null, never reparsed as a legacy grammar, never positive
+         * authority. A legacy UNFRAMED proof (the pre-v2 writers) is decoded leniently
+         * exactly as the historical blind splits did: version first, user/drive/file at
+         * 4/5/6, hash at 7, the publication id (when the grammar has one) at 8, no
+         * server hash, no count requirement.
+         */
+        private class ProvenanceProofFields private constructor(
+            /** 2 or 3 for the framed formats; null for a legacy unframed proof. */
+            val frameVersion: Int?,
+            /** The frame-stripped body fields; for a framed proof the LAST element is
+             * the re-joined location. For a legacy proof the raw split, unchanged. */
+            val body: List<String>,
+        ) {
+            val userId: String? get() = body.getOrNull(4)
+            val driveId: String? get() = body.getOrNull(5)
+            val fileId: String? get() = body.getOrNull(6)
+            val contentHash: String? get() = body.getOrNull(7)
+
+            /** The SERVER content hash — carried by framed v3 only, null on every older
+             * format. Never the local SHA-256 receipt ([contentHash]). */
+            val serverHash: String? get() = body.getOrNull(8)?.takeIf { frameVersion == 3 }
+
+            /** The publication id: v3 body index 9 (after the server hash), v2/legacy
+             * index 8. Guaranteed non-null for a complete framed grammar. */
+            val publicationId: String? get() = body.getOrNull(if (frameVersion == 3) 9 else 8)
+
+            companion object {
+                fun of(text: String): ProvenanceProofFields? = when {
+                    text.startsWith(PROVENANCE_FRAME) -> {
+                        val body = text.removePrefix(PROVENANCE_FRAME).split("|", limit = 10)
+                        if (body.size == 10) ProvenanceProofFields(2, body) else null
+                    }
+                    text.startsWith(PROVENANCE_FRAME_V3) -> {
+                        val body = text.removePrefix(PROVENANCE_FRAME_V3).split("|", limit = 11)
+                        val serverHash = body.getOrNull(8)
+                        if (body.size == 11 && serverHash != null && SERVER_HASH_FORMAT.matches(serverHash)) {
+                            ProvenanceProofFields(3, body)
+                        } else {
+                            null
+                        }
+                    }
+                    else -> ProvenanceProofFields(null, text.split("|"))
+                }
+            }
+        }
+
+        private fun decodeProvenanceProofFields(text: String?): ProvenanceProofFields? =
+            text?.let(ProvenanceProofFields::of)
+
+        private fun PublishedProvenance.recordText(target: IOFile): String {
+            // THE V3 EMISSION (review-53 D3): a record carrying a verified server content
+            // hash serializes in the distinct v3 grammar, the hash BEFORE the location.
+            // The strict format check keeps a malformed value off the wire as v3; without
+            // a server hash the emission is byte-identical to the historical v2 writer.
+            val serverHashField = serverHash?.takeIf { SERVER_HASH_FORMAT.matches(it) }
+            if (serverHashField == null) {
+                return PROVENANCE_FRAME + "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${contentHash ?: ""}|$publicationId|${target.absolutePath}"
+            }
+            return PROVENANCE_FRAME_V3 + "$version|$lastModifiedAt|$revisedAt|$updatedAt|$userId|$driveId|$fileId|${contentHash ?: ""}|$serverHashField|$publicationId|${target.absolutePath}"
+        }
 
         /** A fresh per-publication identity (issue: round 24 #11): 64 random bits — two
          * publications colliding is negligible, and a re-publication of the SAME generation
@@ -1786,8 +1883,12 @@ class DownloadOfflineFileManager(
 
         /**
          * Parses one provenance record text (issues: round 20 #3, round 24 #11, round 25
-         * #12, round 26 #15): an explicit "v2|" frame selects the framed format (the
-         * publication identity at a KNOWN body index). Anything else is LEGACY, and the
+         * #12, round 26 #15, review-53 D3): an explicit "v2|" or "v3|" frame selects the
+         * framed format, decoded by the SHARED proof-field decoder (the publication
+         * identity at a KNOWN body index — 8 for v2/legacy, 9 for v3). A framed text the
+         * decoder rejects fails the parse here (fail-closed; an older build fails the
+         * same way on "v3", which is not an integer, so a downgrade is unrecoverable by
+         * design). Anything else is LEGACY, and the
          * format is NEVER inferred from the total split count — a path containing '|'
          * changes the count under every grammar. The three actual legacy grammars are the
          * eight-field hashless record, the nine-field hash record, and the unframed
@@ -1799,10 +1900,14 @@ class DownloadOfflineFileManager(
          * specific grammar wins; the caller's location check still guards.
          */
         private fun parseProvenanceText(text: String, expectedPath: String? = null): PublishedProvenance {
-            val framed = text.startsWith(PROVENANCE_FRAME)
-            val parts = text.removePrefix(PROVENANCE_FRAME).split("|")
-            if (framed) {
-                require(parts.size >= 10)
+            // THE SHARED DECODER (review-53 D3): framed texts are decoded by the ONE
+            // exact-grammar decoder every other proof-field reader uses. A framed text
+            // the decoder rejects (a truncated frame; a v3 hash that is missing,
+            // malformed, or from an unsupported algorithm) fails HERE — it is never
+            // reparsed as a legacy grammar and never read as positive authority.
+            if (text.startsWith(PROVENANCE_FRAME) || text.startsWith(PROVENANCE_FRAME_V3)) {
+                val decoded = requireNotNull(decodeProvenanceProofFields(text))
+                val parts = decoded.body
                 return PublishedProvenance(
                     version = parts[0].trim().toInt(),
                     lastModifiedAt = parts[1].trim().toLong(),
@@ -1812,11 +1917,14 @@ class DownloadOfflineFileManager(
                     driveId = parts[5].trim().toInt(),
                     fileId = parts[6].trim().toInt(),
                     contentHash = parts[7].trim().takeIf { it.isNotEmpty() },
-                    publicationId = parts[8].trim().toLongOrNull() ?: 0L,
+                    serverHash = decoded.serverHash,
+                    // The decoder's complete-frame contract guarantees the publication id.
+                    publicationId = decoded.publicationId!!.trim().toLongOrNull() ?: 0L,
                     // The location is the LAST field and re-joins any '|' inside it.
-                    absolutePath = parts.drop(9).joinToString("|"),
+                    absolutePath = parts.last(),
                 )
             }
+            val parts = text.split("|")
             require(parts.size >= 8)
             val candidates = buildList {
                 if (parts.size >= 10) {
@@ -2537,12 +2645,17 @@ class DownloadOfflineFileManager(
             // record is still scoped (identities demonstrably outside it progress), and it
             // names the destination's actual Realm flavor (the proofmove target is always
             // an offline-path publication).
-            val proofFields = proofText.removePrefix(PROVENANCE_FRAME).split("|")
+            // THE SHARED DECODER (review-53 D3): the journal's embedded proof is decoded
+            // by the one exact-grammar decoder — a v3 proof's extra server-hash field
+            // never shifts these indexes, and an undecodable proof yields NO identities
+            // (the sidecar scopes 0/0/0 and the destination reads fail the write below;
+            // both conservative).
+            val proofFields = decodeProvenanceProofFields(proofText)
             val sidecarWritten = writeScopeSidecar(
                 recordFile,
-                userId = proofFields.getOrNull(4)?.trim()?.toIntOrNull() ?: 0,
-                driveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull() ?: 0,
-                fileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull() ?: 0,
+                userId = proofFields?.userId?.trim()?.toIntOrNull() ?: 0,
+                driveId = proofFields?.driveId?.trim()?.toIntOrNull() ?: 0,
+                fileId = proofFields?.fileId?.trim()?.toIntOrNull() ?: 0,
                 targetPath = target.absolutePath,
                 sharedWithMe = sharedWithMe,
                 storageKind = storageKind,
@@ -2562,9 +2675,9 @@ class DownloadOfflineFileManager(
             // capture is required, never guessed (a stale capture could only ever force
             // the conservative superseded route, but an honest failure aborts
             // preparation instead).
-            val destinationUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull() ?: return@runCatching false
-            val destinationDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull() ?: return@runCatching false
-            val destinationFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull() ?: return@runCatching false
+            val destinationUserId = proofFields?.userId?.trim()?.toIntOrNull() ?: return@runCatching false
+            val destinationDriveId = proofFields?.driveId?.trim()?.toIntOrNull() ?: return@runCatching false
+            val destinationFileId = proofFields?.fileId?.trim()?.toIntOrNull() ?: return@runCatching false
             val capturedDestinationGeneration = FileController.getRealmInstance(
                 UserDrive(userId = destinationUserId, driveId = destinationDriveId, sharedWithMe = sharedWithMe),
             ).use { realm ->
@@ -2804,7 +2917,10 @@ class DownloadOfflineFileManager(
             // version requires still rejects through its own size/newline checks, and a
             // journal damaged by extra lines is retained — never decoded.
             val parts = recordFile.readText().split("\n", limit = 11)
-            fun fields(proofText: String): List<String> = proofText.removePrefix(PROVENANCE_FRAME).split("|")
+            // THE SHARED DECODER (review-53 D3): every embedded proof's field reads go
+            // through the one exact-grammar decoder — a v3 proof's extra server-hash
+            // field never shifts the user/drive/file indexes, and an undecodable proof
+            // yields ABSENT identities (conservative), never shifted garbage.
             // THE COMPLETE PROOF DECODE (review-34 #9): the embedded location is parsed
             // loose (any grammar) and strict (the operation's target expected) — the strict
             // result decides [proofLocationValid], the loose one names the independently
@@ -2817,17 +2933,17 @@ class DownloadOfflineFileManager(
             when (parts.getOrNull(0)?.trim()) {
                 "1" -> {
                     if (parts.size != 3 && parts.size != 4) return@runCatching null
-                    val proofFields = fields(parts[2])
+                    val proofFields = decodeProvenanceProofFields(parts[2])
                     val observationField = parts.getOrNull(3)
                     val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
                     ParsedProofMoveRecord(
                         version = 1,
                         targetPath = parts[1],
                         proofText = parts[2],
-                        proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
-                        proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
-                        proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
-                        proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
+                        proofUserId = proofFields?.userId?.trim()?.toIntOrNull(),
+                        proofDriveId = proofFields?.driveId?.trim()?.toIntOrNull(),
+                        proofFileId = proofFields?.fileId?.trim()?.toIntOrNull(),
+                        proofContentHash = proofFields?.contentHash?.trim()?.takeIf { it.isNotEmpty() },
                         observationText = observationField?.takeIf { it.isNotEmpty() && it != "A" },
                         observationFieldDamaged = false,
                         // RETRACTION + RESTORED AMBIGUITY (review-37 #3), THE EXPLICIT ABSENCE
@@ -2853,17 +2969,17 @@ class DownloadOfflineFileManager(
                     if (parts.size != 5) return@runCatching null
                     val sourceField = parts[4]
                     if (sourceField.contains('\n')) return@runCatching null
-                    val proofFields = fields(parts[2])
+                    val proofFields = decodeProvenanceProofFields(parts[2])
                     val observationField = parts[3]
                     val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
                     ParsedProofMoveRecord(
                         version = 2,
                         targetPath = parts[1],
                         proofText = parts[2],
-                        proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
-                        proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
-                        proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
-                        proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
+                        proofUserId = proofFields?.userId?.trim()?.toIntOrNull(),
+                        proofDriveId = proofFields?.driveId?.trim()?.toIntOrNull(),
+                        proofFileId = proofFields?.fileId?.trim()?.toIntOrNull(),
+                        proofContentHash = proofFields?.contentHash?.trim()?.takeIf { it.isNotEmpty() },
                         observationText = when {
                             observationField == "A" -> null
                             observationField.isNotEmpty() -> observationField
@@ -2896,17 +3012,17 @@ class DownloadOfflineFileManager(
                     ) {
                         return@runCatching null
                     }
-                    val proofFields = fields(parts[2])
+                    val proofFields = decodeProvenanceProofFields(parts[2])
                     val observationField = parts[3]
                     val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
                     ParsedProofMoveRecord(
                         version = 3,
                         targetPath = parts[1],
                         proofText = parts[2],
-                        proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
-                        proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
-                        proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
-                        proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
+                        proofUserId = proofFields?.userId?.trim()?.toIntOrNull(),
+                        proofDriveId = proofFields?.driveId?.trim()?.toIntOrNull(),
+                        proofFileId = proofFields?.fileId?.trim()?.toIntOrNull(),
+                        proofContentHash = proofFields?.contentHash?.trim()?.takeIf { it.isNotEmpty() },
                         observationText = when {
                             observationField == "A" -> null
                             observationField.isNotEmpty() -> observationField
@@ -3003,17 +3119,17 @@ class DownloadOfflineFileManager(
                     // v5, v6 AND v7 carry the authoritative write-ahead contract (v6/v7
                     // only add the captured generations).
                     val phaseAuthoritative = recordVersion == "5" || recordVersion == "6" || recordVersion == "7"
-                    val proofFields = fields(parts[2])
+                    val proofFields = decodeProvenanceProofFields(parts[2])
                     val observationField = parts[3]
                     val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
                     ParsedProofMoveRecord(
                         version = parts[0].trim().toInt(),
                         targetPath = parts[1],
                         proofText = parts[2],
-                        proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
-                        proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
-                        proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
-                        proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
+                        proofUserId = proofFields?.userId?.trim()?.toIntOrNull(),
+                        proofDriveId = proofFields?.driveId?.trim()?.toIntOrNull(),
+                        proofFileId = proofFields?.fileId?.trim()?.toIntOrNull(),
+                        proofContentHash = proofFields?.contentHash?.trim()?.takeIf { it.isNotEmpty() },
                         observationText = when {
                             observationField == "A" -> null
                             observationField.isNotEmpty() -> observationField
@@ -4140,12 +4256,13 @@ class DownloadOfflineFileManager(
             else -> true
         }
 
-        /** THE EXPECTED PUBLICATION IDENTITY (issue: round 32 #5): the operation's own
-         * publication id, parsed from its persisted expected proof text (v2-frame body
-         * index 8). */
+        /** THE EXPECTED PUBLICATION IDENTITY (issue: round 32 #5, review-53 D3): the
+         * operation's own publication id, parsed from its persisted expected proof text
+         * through the SHARED decoder — v3 body index 9, v2/legacy index 8; the frame
+         * version decides, never a blind offset. */
         private fun publicationIdOfRecordText(text: String?): Long? {
             if (text == null) return null
-            return text.removePrefix(PROVENANCE_FRAME).split("|").getOrNull(8)?.trim()?.toLongOrNull()
+            return decodeProvenanceProofFields(text)?.publicationId?.trim()?.toLongOrNull()
         }
 
         private fun writeRecoveryRecord(
