@@ -1680,6 +1680,20 @@ class DownloadOfflineFileManager(
             }.getOrDefault(false)
         }
 
+        /** THE PROOF'S DURABLE RE-ACKNOWLEDGMENT (review-40 #6): the exact current proof is
+         * re-written through the crash-consistent writer — its possibly-failed directory
+         * synchronization is the prerequisite being retried — and the destination
+         * hierarchy's ancestor chain is acknowledged, with the result verified by
+         * read-back. A readable matching proof after a rename whose acknowledgment failed
+         * is never sufficient; false retains the caller's owned retry. */
+        internal fun reestablishDurableProvenance(context: Context, target: IOFile): Boolean = runCatching {
+            val provenance = readPublishedProvenance(context, target) ?: return@runCatching false
+            val recordFile = verifiedProvenanceFileFor(context, target) ?: return@runCatching false
+            ensureDurableDestinationHierarchy(target) &&
+                atomicWriteText(recordFile, provenance.recordText(target)) &&
+                readPublishedProvenance(context, target)?.recordText(target) == provenance.recordText(target)
+        }.getOrDefault(false)
+
         /** THE WRITER'S OBSERVATION RETIREMENT (review-33 #8, idempotent review-34 #7): a
          * freshly written proof is a NEW publication — every pre-existing observation
          * predates it and is retired. A failed deletion returns false so the caller

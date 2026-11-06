@@ -604,6 +604,24 @@ open class UploadFile(
                         if (existingProof?.certifiesBytes(original) == true &&
                             liveRow.effectivePublishedBaseline >= uploadedBaselineSeconds
                         ) {
+                            // COMPLETE SUCCESS REQUIRES THE DURABLE ACKNOWLEDGMENT FIRST
+                            // (review-40 #6): the visible proof may be a rename that
+                            // succeeded while its directory synchronization failed — the
+                            // writer deferred on that failure, and this early-success retry
+                            // (matching bytes, same-second baseline) must re-establish the
+                            // durable exact proof and its directory chain before concluding.
+                            // No observation, snapshot or record disposal happens until the
+                            // acknowledgment holds; a failed re-acknowledgment defers with
+                            // the upload ownership retained.
+                            val proofDurablyAcknowledged = provenanceContext != null &&
+                                DownloadOfflineFileManager.reestablishDurableProvenance(
+                                    provenanceContext,
+                                    original,
+                                )
+                            if (!proofDurablyAcknowledged) {
+                                deferred = true
+                                return@withFileLock
+                            }
                             // COMPLETE SUCCESS REQUIRES THE OBSERVATION STATE TOO (review-34
                             // #7): a previous pass that wrote the proof but FAILED its
                             // observation retirement left a stale observation bound to the
