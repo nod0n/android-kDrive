@@ -5018,10 +5018,17 @@ class DownloadOfflineFileManager(
                 // id (its persisted expected proof) and the CURRENT target proof's id —
                 // never a raw carried-observation id alone.
                 val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
+                // THE DISPOSAL AUTHORIZATION (review-40 #7): the observation arms decide
+                // whether the self-certifying disposal may proceed — an unconverged
+                // AMBIGUOUS legacy evidence does NOT return here: it falls through to the
+                // backup's verified rollback authority instead of leaving an available
+                // verified rollback permanently unreachable.
+                var selfCertifyingDisposalAuthorized: Boolean
                 when {
                     // DAMAGED CARRIED EVIDENCE NEVER AUTHORIZES DISPOSAL (issues: round 31
                     // #4, round 32 #5): an unparseable carried observation retains the
-                    // operation state.
+                    // operation state — the recovery defers entirely (a present-but-
+                    // unbindable observation is never spent by a rollback).
                     record.attemptedObservationText != null -> {
                         parseObservationBinding(record.attemptedObservationText) ?: return false
                         when {
@@ -5037,35 +5044,44 @@ class DownloadOfflineFileManager(
                             // operation: its observation evidence is spent and is
                             // deliberately not rewritten.
                         }
+                        selfCertifyingDisposalAuthorized = true
                     }
                     // AMBIGUOUS LEGACY EVIDENCE (review-34 #8, review-37 #3): emptiness, line
                     // count and version prove nothing — an ambiguous absence converges ONLY
-                    // through independent evidence (the validated target evidence, or the
-                    // upload authority over the record's own row) and otherwise retains; a
-                    // SUPERSEDED target spends the evidence either way.
+                    // through the independently validated target evidence; a SUPERSEDED
+                    // target spends the evidence either way.
                     record.attemptedObservationAmbiguous -> {
                         when {
                             expectedPublicationId == null -> return false
-                            targetProof.publicationId != expectedPublicationId -> Unit
+                            targetProof.publicationId != expectedPublicationId -> selfCertifyingDisposalAuthorized = true
                             // THE COMPLETED-UPLOAD CONVERGENCE IS RETRACTED (review-39 #7), as
                             // in the observation resolver: equal bytes bind no operation — the
                             // ambiguous evidence converges only through the validated target
-                            // evidence and otherwise retains.
-                            else -> if (!targetObservationEvidenceComplete(context, target, expectedPublicationId)) {
-                                return false
-                            }
+                            // evidence and otherwise falls through.
+                            else -> selfCertifyingDisposalAuthorized =
+                                targetObservationEvidenceComplete(context, target, expectedPublicationId)
                         }
                     }
                     // An explicit absence (the "A" marker / a pre-observation format) is
                     // legitimate: nothing to establish.
+                    else -> selfCertifyingDisposalAuthorized = true
                 }
-                // THE DURABILITY BARRIER BEFORE DISPOSAL (review-39 #5), as in the
-                // missing-backup arm: the self-certified bytes' contents and directory
-                // entry are synchronized before the backup and journal are retired.
-                if (!payloadDurabilityEstablished(target)) return false
-                runCatching { recoveryFile.delete() }
-                disposeRecoveryRecord(record.recordFile)
-                return true
+                if (selfCertifyingDisposalAuthorized) {
+                    // THE DURABILITY BARRIER BEFORE DISPOSAL (review-39 #5), as in the
+                    // missing-backup arm: the self-certified bytes' contents and directory
+                    // entry are synchronized before the backup and journal are retired.
+                    if (!payloadDurabilityEstablished(target)) return false
+                    runCatching { recoveryFile.delete() }
+                    disposeRecoveryRecord(record.recordFile)
+                    return true
+                }
+                // THE VALIDATED ROLLBACK REMAINS REACHABLE (review-40 #7): an ambiguous
+                // legacy evidence that the target evidence cannot converge does not end the
+                // recovery — the record's intact VERIFIED backup and its captured expected
+                // publication route through the owner-checked rollback below, which
+                // restores the backed-up generation under the captured coordination.
+                // Ambiguity is never absence, no equal-bytes upload authority participates,
+                // and a permanent exclusion is never claimed as convergence.
             }
             // The backup's IMMUTABLE verification basis (issue: round 23 #2): the record's
             // hash when carried; a legacy record's backup is hashed NOW (the backup file
