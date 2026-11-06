@@ -1551,7 +1551,10 @@ class DownloadOfflineFileManager(
             return digest.joinToString("") { "%02x".format(it) }
         }
 
-        private fun provenanceFileFor(context: Context, publishedFile: IOFile): IOFile {
+        // TEST-VISIBLE (the round-58 pattern): a pure path derivation — the instrumentation
+        // fixture uses THE PRODUCTION derivation (never a mirrored copy) to locate its own
+        // seeded record for attempt-evidence assertions and exact own-record cleanup.
+        internal fun provenanceFileFor(context: Context, publishedFile: IOFile): IOFile {
             val hex = provenanceKeyHex(publishedFile)
             return IOFile(IOFile(provenanceRoot(context), hex.substring(0, 2)), "$hex.gen")
         }
@@ -1772,7 +1775,12 @@ class DownloadOfflineFileManager(
          * record without a computable byte identity is not written — it could authorize
          * nothing.
          */
-        private fun writePublishedProvenance(
+        // TEST-VISIBLE (the round-58 pattern): the PRODUCTION record writer — the
+        // instrumentation fixture seeds its synthetic proof through THIS writer (a
+        // structurally valid record computed over the actual seeded bytes), never a
+        // hand-mirrored registry file, so the sidecar-release assertions exercise real
+        // state. No behavior change for production callers.
+        internal fun writePublishedProvenance(
             context: Context,
             target: IOFile,
             file: File,
