@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import java.util.Date
@@ -118,7 +119,8 @@ class FileMigration16to17Test {
     }
 
     @Test
-    fun `migration 16 to 17 adds a nullable empty serverContentHash and preserves every row`() {
+    @DisplayName("migration 16 to 17 adds a nullable empty serverContentHash and preserves every row")
+    fun migration16to17AddsNullableEmptyServerContentHashAndPreservesEveryRow() {
         // ---- PHASE A: a disposable typed realm at the full current module shape, stamped 16.
         Realm.getInstance(configAt16).use { realm ->
             realm.executeTransaction { transactionRealm ->
