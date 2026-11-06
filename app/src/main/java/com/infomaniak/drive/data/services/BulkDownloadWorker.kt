@@ -18,6 +18,7 @@
 package com.infomaniak.drive.data.services
 
 import android.content.Context
+import android.util.Log
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.infomaniak.core.sentry.SentryLog
@@ -232,12 +233,16 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
                     // 9 #8): its pending marker belongs to the newer transfer, so it is
                     // excluded from completion, and the batch must not report the root
                     // synchronized while that replacement runs.
+                    // THE RESULT-GATE BREADCRUMB (the post-chain triage, 2026-11-06): the
+                    // retained incompleteness is named per file — stage/status only.
+                    Log.i(TAG, "stage: file ${file.id} retained the root's incompleteness (unresolved/superseded outcome)")
                     allFilesSucceeded = false
                 }
                 // Ordinary success (including a protected-copy skip whose own marker the
                 // publication cleared under the locks — issue: round 18 #20): the transfer
                 // consumed its own marker; the batch records nothing.
             } else {
+                Log.i(TAG, "stage: file ${file.id} transfer returned failure")
                 allFilesSucceeded = false
             }
         }

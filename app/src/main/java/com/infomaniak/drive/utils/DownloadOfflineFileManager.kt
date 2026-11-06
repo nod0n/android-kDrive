@@ -1182,6 +1182,25 @@ class DownloadOfflineFileManager(
                 okHttpClient = okHttpClient,
                 staged = staged,
             )
+            // THE STAGE BREADCRUMB (the post-chain triage, 2026-11-06): the establishment's
+            // outcome class and the server hash KIND/LENGTH only — never a hash value, a
+            // header or a raw response. The coarse-vs-supported arm decides whether the
+            // steady state is the designed bounded skip or a ladder-format question.
+            val seenServerHash = (generation as? GenerationEstablishment.CoarseUnresolved)?.seenServerHash
+            val hashKind = when {
+                generation is GenerationEstablishment.Established -> "supported"
+                seenServerHash.isNullOrEmpty() -> "absent"
+                else -> "unsupported"
+            }
+            val hashPrefix = seenServerHash
+                ?.substringBefore(':')
+                ?.takeIf { prefix -> prefix.isNotEmpty() && prefix.length <= 16 && prefix.all { it.isLetter() } }
+                ?: "none"
+            Log.i(
+                downloadWorker.workerTag(),
+                "stage: establishment ${generation::class.java.simpleName}, server hash kind=$hashKind " +
+                    "prefix=$hashPrefix length=${seenServerHash?.length ?: 0} for file ${file.id}",
+            )
             if (remoteDataHasBeenSaved && staged.exists() && sizeIsValidated && generation is GenerationEstablishment.Failed) {
                 runCatching { staged.delete() }
                 // TYPED UNRESOLVED, RETRYABLE (issue: round 24 #20): a discarded
@@ -1216,6 +1235,10 @@ class DownloadOfflineFileManager(
                     explicitUnresolvedGeneration = generation !is GenerationEstablishment.Established,
                     establishment = generation,
                 )
+                // THE STAGE BREADCRUMB (the post-chain triage, 2026-11-06): the publication
+                // outcome per file — the outcome name only, never secrets. The silent
+                // unresolved/skip arms are the loop's classification point.
+                Log.i(downloadWorker.workerTag(), "stage: publication outcome $outcome for file ${file.id}")
                 // Public superseded/conflict status for the bulk caller (issues: round 9 #8,
                 // round 14 #13).
                 lastTransferSuperseded = outcome in UNRESOLVED_PUBLICATION_OUTCOMES
@@ -10840,6 +10863,13 @@ class DownloadOfflineFileManager(
          * the state). This gate NEVER reports a verified completion — it only prevents the
          * identical-bytes transfer spin.
          */
+        // THE DENIAL-REASON BREADCRUMB (the post-chain triage, 2026-11-06): every silent
+        // denial of the no-spin gate names its leg — stage/status only, never a secret.
+        private fun suppressionGateDenial(reason: String): Boolean {
+            Log.i(TAG, "stage: no-spin gate denied: $reason")
+            return false
+        }
+
         internal suspend fun unresolvedPublicationAlreadyCoversCurrentGeneration(
             context: Context,
             file: File,
@@ -10847,10 +10877,13 @@ class DownloadOfflineFileManager(
             userDrive: UserDrive,
             okHttpClient: OkHttpClient,
         ): Boolean = runCatching {
-            val proof = readPublishedProvenance(context, target) ?: return@runCatching false
-            if (proof.version != 0) return@runCatching false // a PROVEN record is not the spin state
+            val proof = readPublishedProvenance(context, target)
+                ?: return@runCatching suppressionGateDenial("no-record")
+            if (proof.version != 0) {
+                return@runCatching suppressionGateDenial("proven-record") // a PROVEN record is not the spin state
+            }
             if (!(proof.identifies(file, userDrive) && proof.certifiesBytes(target))) {
-                return@runCatching false
+                return@runCatching suppressionGateDenial("identity-or-certification")
             }
             // THE FRESH DETAILS CARRY THE HASH STATE (review-53 §5, stage 6): the gate
             // fetches the with-hash expansion on the cache-less view of the captured
@@ -10863,7 +10896,7 @@ class DownloadOfflineFileManager(
                 okHttpClient = okHttpClient,
             )
             val row = fresh.data?.takeIf { fresh.isSuccess() && it.id == file.id }
-                ?: return@runCatching false // indeterminate: allow the re-drive
+                ?: return@runCatching suppressionGateDenial("fresh-details-indeterminate") // indeterminate: allow the re-drive
             // THE PERSISTED ATTEMPTED OBSERVATION DECIDES (issue: round 28 #13): the
             // complete durable remote observation — version, NULLABLE size, and the three
             // timestamps — is read from the observation sidecar written beside the record
@@ -10881,31 +10914,41 @@ class DownloadOfflineFileManager(
             val observation = runCatching {
                 IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim()
             }.getOrNull()?.let { parseObservationBinding(it) }
-                ?: return@runCatching false
+                ?: return@runCatching suppressionGateDenial("observation-sidecar-missing-or-unparseable")
             // THE OBSERVATION'S LOCATION MUST BE THIS DESTINATION (issue: round 28 #13
             // follow-up): a sidecar re-keyed by a relocation or a record at a reused path
             // is not this destination's attempt evidence. The COMPLETE location tail
             // (pipes safe) is the parser's own field.
-            if (observation.location != target.absolutePath) return@runCatching false
+            if (observation.location != target.absolutePath) {
+                return@runCatching suppressionGateDenial("observation-location-mismatch")
+            }
             // THE ATTEMPT IDENTITY BINDING (issue: round 29 #6): the observation belongs
             // to the SPECIFIC publication/attempt whose record now sits at the target — a
             // restoration or re-publication writes a FRESH publication id and thereby ends
             // the old attempt's binding (its suppression evidence is spent). A LEGACY
             // observation's publication id is null — never equal, and its second field
             // (a version) is never compared as an id.
-            if (proof.publicationId != observation.publicationId) return@runCatching false
-            val attemptedVersion = observation.prefix[2].toIntOrNull() ?: return@runCatching false
+            if (proof.publicationId != observation.publicationId) {
+                return@runCatching suppressionGateDenial("publication-id-mismatch")
+            }
+            val attemptedVersion = observation.prefix[2].toIntOrNull()
+                ?: return@runCatching suppressionGateDenial("observation-frame-fields")
             val attemptedSize = observation.prefix[3].toLongOrNull()
-            val attemptedRevisedAt = observation.prefix[4].toLongOrNull() ?: return@runCatching false
-            val attemptedLastModifiedAt = observation.prefix[5].toLongOrNull() ?: return@runCatching false
-            val attemptedUpdatedAt = observation.prefix[6].toLongOrNull() ?: return@runCatching false
+            val attemptedRevisedAt = observation.prefix[4].toLongOrNull()
+                ?: return@runCatching suppressionGateDenial("observation-frame-fields")
+            val attemptedLastModifiedAt = observation.prefix[5].toLongOrNull()
+                ?: return@runCatching suppressionGateDenial("observation-frame-fields")
+            val attemptedUpdatedAt = observation.prefix[6].toLongOrNull()
+                ?: return@runCatching suppressionGateDenial("observation-frame-fields")
             val metadataIdentityHolds =
                 row.revisedAt == attemptedRevisedAt &&
                     row.lastModifiedAt == attemptedLastModifiedAt &&
                     row.updatedAt == attemptedUpdatedAt &&
                     row.size == attemptedSize &&
                     (row.version?.number ?: 0) == attemptedVersion
-            if (!metadataIdentityHolds) return@runCatching false
+            if (!metadataIdentityHolds) {
+                return@runCatching suppressionGateDenial("attempted-metadata-mismatch")
+            }
             // THE FRAME-1 OBSERVATION CARRIES NO HASH EVIDENCE (review-53 §5 stage 6):
             // the metadata-identity match alone decides (today's behavior). Only the v2
             // frame adds the basis leg — its prefix[7] is already validated as the exact
@@ -10920,11 +10963,16 @@ class DownloadOfflineFileManager(
             if (observation.format == ObservationFormat.CURRENT) return@runCatching true
             val freshHash = row.serverContentHash
             when (val decodedBasis = decodeObservedHashBasis(observation.prefix[7])) {
-                null -> false
-                ObservedHashBasis.Absent -> freshHash.isNullOrEmpty()
+                null -> suppressionGateDenial("basis-undecodable")
+                ObservedHashBasis.Absent ->
+                    if (freshHash.isNullOrEmpty()) true
+                    else suppressionGateDenial("absent-basis-with-fresh-hash")
                 is ObservedHashBasis.Seen -> when {
-                    ServerContentHash.SUPPORTED_FORMAT.matches(decodedBasis.token) -> false
-                    else -> decodedBasis.token == freshHash
+                    ServerContentHash.SUPPORTED_FORMAT.matches(decodedBasis.token) ->
+                        suppressionGateDenial("seen-supported-basis")
+                    else ->
+                        if (decodedBasis.token == freshHash) true
+                        else suppressionGateDenial("seen-basis-changed")
                 }
             }
         }
@@ -10933,7 +10981,10 @@ class DownloadOfflineFileManager(
             // read as "no covering publication" — the caller would then start a NEW
             // blocking transfer the cancellation cannot reach. The exception is rethrown
             // to the caller's own cancellation boundary.
-            .onFailure { if (it is CancellationException) throw it }
+            .onFailure {
+                if (it is CancellationException) throw it
+                Log.i(TAG, "stage: no-spin gate denied by exception: ${it::class.java.simpleName}")
+            }
             .getOrDefault(false)
 
         /**
