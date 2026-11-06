@@ -6658,6 +6658,7 @@ class DownloadOfflineFileManager(
                                 record.expectedPublicationRecordText,
                                 record.attemptedObservationText,
                                 record.recordFile,
+                                record.oldRecordText,
                             )
                         ) {
                             return false
@@ -6682,6 +6683,7 @@ class DownloadOfflineFileManager(
                                 record.expectedPublicationRecordText,
                                 record.attemptedObservationText,
                                 record.recordFile,
+                                record.oldRecordText,
                             )
                         ) {
                             return false
@@ -6709,6 +6711,7 @@ class DownloadOfflineFileManager(
                             record.expectedPublicationRecordText,
                             record.attemptedObservationText,
                             record.recordFile,
+                            record.oldRecordText,
                         )
                     ) {
                         return false
@@ -6967,8 +6970,15 @@ class DownloadOfflineFileManager(
          * at the canonical name (a dead-id CURRENT observation there fails every later
          * capture) — leftovers are MOVED verbatim into the manifest-indexed owned slots
          * ([quarantineCanonicalObservation]); the canonical name is left honestly absent.
-         * [recordFile] is this operation's own recovery record — the manifest and the slots
-         * are derived from it. */
+         * THE EXPLICIT SOURCE-BOUND ID REBIND (review-47 E1): a captured CURRENT old
+         * observation carries the OLD publication's id while the restoration proof carries
+         * the fresh persisted id R — the captured text is verified against the operation's
+         * ACTUAL captured OLD proof ([oldOperationProofText], threaded from every restore
+         * call site) and re-established bound to R with every other field verbatim and a
+         * verified readback; an incoherent capture is a KNOWN state (preserved + laddered,
+         * the canonical ending honestly absent), never an unknown and never an arbitrary-J
+         * rebind. [recordFile] is this operation's own recovery record — the manifest and
+         * the slots are derived from it. */
         private fun restoreOldObservationState(
             context: Context,
             target: IOFile,
@@ -6977,6 +6987,7 @@ class DownloadOfflineFileManager(
             failedOperationProofText: String?,
             attemptedObservationText: String?,
             recordFile: IOFile,
+            oldOperationProofText: String?,
         ): Boolean {
             val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
             // THE REPLAYED QUARANTINE IS VERIFIED BEFORE ANYTHING PROCEEDS (review-47 E4):
@@ -7020,9 +7031,7 @@ class DownloadOfflineFileManager(
                         )
                 }
                 is OldObservationCapture.Valid -> {
-                    if (restorationPublicationId != null) {
-                        establishRecoveredObservation(context, target, oldObservation.text, restorationPublicationId)
-                    } else {
+                    if (restorationPublicationId == null) {
                         // THE UNPROVEN LADDER (review-46 D6): the ACTUAL failed attempt's
                         // observation is retired FIRST (the failed-id conditional — a
                         // failed attempt that installed its own observation left a
@@ -7050,6 +7059,84 @@ class DownloadOfflineFileManager(
                                     ObservationRetirement.NotEligible ->
                                         quarantineCanonicalObservation(context, target, recordFile)
                                     ObservationRetirement.Retired, ObservationRetirement.Absent -> true
+                                }
+                            }
+                        }
+                    } else {
+                        // THE EXPLICIT SOURCE-BOUND ID REBIND (review-47 E1): a captured
+                        // CURRENT old observation carries the OLD publication's id O, and
+                        // the restoration proof carries the fresh persisted id R (the
+                        // same-bytes ABA guard) — the generic establishment's
+                        // id-equality check could therefore never accept it, and every
+                        // restore of such a target retained forever. The rebind is
+                        // EXPLICIT and SOURCE-BOUND: the captured text must parse CURRENT,
+                        // carry the operation's ACTUAL captured OLD proof's own
+                        // publication id (from the record's retained old proof — threaded
+                        // to every restore call site; never the failed proof, never a
+                        // default id, never the live row's metadata), and bind to this
+                        // exact target location; only then is the id field rewritten to
+                        // the persisted R with every other field verbatim and a verified
+                        // durable readback ([writeReboundRestorationObservation]). The
+                        // generic target-binding check is NOT weakened and an arbitrary J
+                        // is never rebound.
+                        val oldPublicationId = oldOperationProofText?.let { publicationIdOfRecordText(it) }
+                        val capturedParsed = parseObservationBinding(oldObservation.text)
+                        if (capturedParsed == null || oldPublicationId == null ||
+                            capturedParsed.format != ObservationFormat.CURRENT ||
+                            capturedParsed.publicationId != oldPublicationId ||
+                            capturedParsed.location != target.absolutePath
+                        ) {
+                            // THE KNOWN INCOHERENCE (review-47 E1): the captured CURRENT
+                            // evidence does not bind to the record's own old proof — a
+                            // KNOWN state (the old proof authority is present in the
+                            // record; it is never called unknown). The captured text is
+                            // durably preserved under the owned captured slot before any
+                            // canonical mutation, the canonical takes the typed ladder,
+                            // and the canonical name ends honestly absent — no rebind, no
+                            // manufactured binding, no arbitrary-J rewrite.
+                            preserveCapturedObservationEvidence(recordFile, target, oldObservation.text) &&
+                                retiredOrQuarantinedCanonicalLadder(
+                                    context, target, recordFile, failedPublicationId, attemptedObservationText,
+                                )
+                        } else when (removeObservationBoundTo(context, target, failedPublicationId)) {
+                            // THE FAILED ATTEMPT'S OBSERVATION IS RETIRED CONDITIONALLY
+                            // FIRST (review-47 E1): never overwritten as a side effect of
+                            // the rebind write; a Failed retirement retains.
+                            ObservationRetirement.Failed -> false
+                            ObservationRetirement.Retired, ObservationRetirement.Absent ->
+                                writeReboundRestorationObservation(context, target, capturedParsed, restorationPublicationId)
+                            ObservationRetirement.NotEligible -> {
+                                // THE CANONICAL HOLDS NON-FAILED-ID EVIDENCE — discriminated
+                                // by ONE exact read: the captured old text itself (the
+                                // rebind replaces it in place — the authorized
+                                // transformation; the captured text stays in the record
+                                // until disposal), the already-rebounded text (the replay
+                                // recognizes the persisted R and the same text — done; no
+                                // fresh id is regenerated on an already-restored path), the
+                                // failed attempt's own exact residue (a legacy-format
+                                // attempt the failed-id rung cannot identity-check), or the
+                                // unrelated leftover (the manifest-durable quarantine).
+                                val canonicalText = runCatching {
+                                    IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim()
+                                }.getOrNull() ?: return false
+                                when {
+                                    canonicalText == oldObservation.text ->
+                                        writeReboundRestorationObservation(context, target, capturedParsed, restorationPublicationId)
+                                    isRestorationReboundText(canonicalText, target, restorationPublicationId) -> true
+                                    else -> when (
+                                        removeObservationExactText(context, target, attemptedObservationText)
+                                    ) {
+                                        ObservationRetirement.Failed -> false
+                                        ObservationRetirement.Retired, ObservationRetirement.Absent ->
+                                            writeReboundRestorationObservation(
+                                                context, target, capturedParsed, restorationPublicationId,
+                                            )
+                                        ObservationRetirement.NotEligible ->
+                                            quarantineCanonicalObservation(context, target, recordFile) &&
+                                                writeReboundRestorationObservation(
+                                                    context, target, capturedParsed, restorationPublicationId,
+                                                )
+                                    }
                                 }
                             }
                         }
@@ -7157,6 +7244,57 @@ class DownloadOfflineFileManager(
             if (!upsertQuarantineManifestEntry(recordFile, target.absolutePath, slotFile.name, payloadSha256)) return false
             if (!atomicWriteText(slotFile, capturedText)) return false
             return slotMatchesManifest(slotFile, payloadSha256)
+        }
+
+        /** THE EXPLICIT SOURCE-BOUND ID REBIND WRITE (review-47 E1): the caller has verified
+         * that [capturedParsed] parses CURRENT, carries the operation's captured OLD proof's
+         * own publication id, and binds to this exact target. The id field (prefix[1] — the
+         * CURRENT grammar's id slot, verified against parseObservationBinding) is rewritten
+         * to the PERSISTED restoration id; every other prefix field (the receipt/version/
+         * size/timestamp fields) and the whole location tail are preserved verbatim. The
+         * write is atomic + durably acknowledged (the atomicWriteText chain) and VERIFIED by
+         * readback: the written text is exact, parses CURRENT, carries R, and binds to the
+         * target. The generic establishRecoveredObservation check is NOT weakened and an
+         * arbitrary J is never rebound — this write runs only behind the caller's
+         * exact-source check against the record's old proof. The id is the one already
+         * persisted into the recovery record: a replay recognizes the same R and the same
+         * rebound text and never regenerates a fresh id on an already-restored path. */
+        private fun writeReboundRestorationObservation(
+            context: Context,
+            target: IOFile,
+            capturedParsed: ParsedObservation,
+            restorationPublicationId: Long,
+        ): Boolean {
+            if (capturedParsed.prefix.size < 2) return false
+            val reboundPrefix = capturedParsed.prefix.toMutableList()
+            reboundPrefix[1] = restorationPublicationId.toString()
+            val reboundText = (reboundPrefix + target.absolutePath).joinToString("|")
+            val rebound = parseObservationBinding(reboundText) ?: return false
+            if (rebound.format != ObservationFormat.CURRENT ||
+                rebound.publicationId != restorationPublicationId ||
+                rebound.location != target.absolutePath
+            ) {
+                return false
+            }
+            val targetObs = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!atomicWriteText(targetObs, reboundText)) return false
+            val readBack = runCatching { targetObs.readText().trim() }.getOrNull() ?: return false
+            val readParsed = parseObservationBinding(readBack) ?: return false
+            return readBack == reboundText &&
+                readParsed.format == ObservationFormat.CURRENT &&
+                readParsed.publicationId == restorationPublicationId &&
+                readParsed.location == target.absolutePath
+        }
+
+        /** THE REPLAY RECOGNITION (review-47 E1): the canonical text is THIS restoration's
+         * own re-established observation — CURRENT format, bound to the persisted
+         * restoration id at this exact target. An arbitrary J bound elsewhere never
+         * matches. */
+        private fun isRestorationReboundText(text: String, target: IOFile, restorationPublicationId: Long): Boolean {
+            val parsed = parseObservationBinding(text) ?: return false
+            return parsed.format == ObservationFormat.CURRENT &&
+                parsed.publicationId == restorationPublicationId &&
+                parsed.location == target.absolutePath
         }
 
         /**
@@ -7654,6 +7792,7 @@ class DownloadOfflineFileManager(
                         failedOperationProofText,
                         attemptedObservationText,
                         recordFile,
+                        oldRecordText,
                     )
                 ) {
                     return@runCatching false
