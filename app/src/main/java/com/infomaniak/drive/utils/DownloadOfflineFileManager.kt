@@ -4506,10 +4506,28 @@ class DownloadOfflineFileManager(
                                                     )
                                                 if (supersededByVerified) {
                                                     // THE DURABILITY BARRIER BEFORE RETIREMENT (review-39
-                                                    // #5): the superseding publication's bytes and
-                                                    // directory entry are synchronized before this journal
-                                                    // is retired over them.
-                                                    payloadDurabilityEstablished(target)
+                                                    // #5), AND THE DISPOSAL IT GATES (review-40 #5): the
+                                                    // superseding publication's bytes and directory entry
+                                                    // are synchronized, and only on the acknowledged
+                                                    // barrier is THIS EXACT current journal disposed — the
+                                                    // governing record is re-decoded and compared inside
+                                                    // the held coordination before removal, and the
+                                                    // disposal result is propagated (a failed disposal
+                                                    // retains; no resolution is ever claimed while the
+                                                    // record remains).
+                                                    payloadDurabilityEstablished(target) && run {
+                                                        val currentJournal = parseProofMoveRecord(recordFile)
+                                                        currentJournal != null &&
+                                                            currentJournal.version == parsed.version &&
+                                                            currentJournal.targetPath == parsed.targetPath &&
+                                                            currentJournal.proofText == parsed.proofText &&
+                                                            currentJournal.observationText == parsed.observationText &&
+                                                            currentJournal.recordedSourcePath == parsed.recordedSourcePath &&
+                                                            currentJournal.recordedSourceProofText == parsed.recordedSourceProofText &&
+                                                            currentJournal.previousDestinationRecordText == parsed.previousDestinationRecordText &&
+                                                            currentJournal.recordedPhase == parsed.recordedPhase &&
+                                                            disposeRecoveryRecord(recordFile)
+                                                    }
                                                 } else false
                                             }
                                             else -> {
