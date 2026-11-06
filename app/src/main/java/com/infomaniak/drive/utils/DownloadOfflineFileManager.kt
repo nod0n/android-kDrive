@@ -3421,28 +3421,39 @@ class DownloadOfflineFileManager(
             }
 
         /**
-         * THE ORDERED DURABLE DESTINATION HIERARCHY (review-39 #2, reworked review-40 #3):
-         * EVERY ancestor's entry in ITS OWN parent is acknowledged, from the target's
-         * immediate parent up to an established durable root (the app-owned offline
-         * storage root or the staging directory) — a directory that merely EXISTS may have
-         * been created by getOfflineFile's mkdirs or by a prior attempt whose
-         * synchronization failed, and synchronizing its contents never acknowledged its
-         * own entry in its parent. Newly created ancestors are made ONE LEVEL at a time,
-         * each acknowledged in its then-existing parent. exists() is never the
-         * acknowledgment. Returns false when any creation or synchronization fails; the
-         * caller retains instead of publishing.
+         * THE ORDERED DURABLE DESTINATION HIERARCHY (review-39 #2, reworked review-40 #3,
+         * review-41 #2): EVERY ancestor's entry in ITS OWN parent is acknowledged, from the
+         * target's immediate parent up to the ESTABLISHED DURABLE BASE OF THE TARGET'S
+         * STORAGE KIND — the app-owned offline storage root, the staging directory, or the
+         * app-owned cache root (plain cache and converted-PDF destinations live under it,
+         * outside both other roots) — a directory that merely EXISTS may have been created
+         * by getOfflineFile's mkdirs or by a prior attempt whose synchronization failed,
+         * and synchronizing its contents never acknowledged its own entry in its parent.
+         * Newly created ancestors are made ONE LEVEL at a time, each acknowledged in its
+         * then-existing parent. The walk NEVER leaves the established app-owned bases: a
+         * destination under none of them is an unknown storage location and is rejected
+         * BEFORE any synchronization (the previous walk continued to the filesystem root,
+         * whose parentless entry deterministically failed — plain-cache and converted
+         * publications and their recovery acknowledgments could never succeed). exists()
+         * is never the acknowledgment. Returns false when the base is not established or
+         * any creation or synchronization fails; the caller retains instead of publishing.
          */
         internal fun ensureDurableDestinationHierarchy(target: IOFile): Boolean {
             val context = Realm.getApplicationContext() ?: return false
             val offlineRoot = File.getOfflineFolder(context)
             val stagingRoot = IOFile(offlineRoot.parentFile, STAGING_FOLDER)
+            val cacheRoot = context.cacheDir
             val chain = ArrayDeque<IOFile>()
             var ancestor: IOFile? = target.parentFile
             while (ancestor != null) {
                 chain.addFirst(ancestor)
-                if (ancestor == offlineRoot || ancestor == stagingRoot) break
+                if (ancestor == offlineRoot || ancestor == stagingRoot || ancestor == cacheRoot) break
                 ancestor = ancestor.parentFile
             }
+            // THE VALIDATED BASE (review-41 #2): the walk must have reached an established
+            // app-owned durable base. A destination under none of them never touches the
+            // filesystem — the chain is rejected whole, never walked to "/".
+            if (ancestor == null) return false
             for (directory in chain) {
                 if (!directory.exists() && !directory.mkdir()) return false
                 if (!UploadFile.synchronizeDirectoryEntry(directory.parentFile ?: return false)) return false
