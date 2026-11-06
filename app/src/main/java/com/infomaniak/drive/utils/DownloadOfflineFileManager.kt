@@ -4699,14 +4699,16 @@ class DownloadOfflineFileManager(
                                                     when {
                                                         // ROUTE C — THE VERIFIED COMPLETION (review-41 #9):
                                                         // the operation's own captured identity finishes
-                                                        // what its armed phase began.
+                                                        // what its armed phase began. The observation
+                                                        // state is NOT gated on the source-side
+                                                        // artifact (review-42 #11): normal completion
+                                                        // moves the observation to the destination and
+                                                        // retires the source file before recording M —
+                                                        // an M journal replaying after a failed
+                                                        // disposal carries its evidence in the journal
+                                                        // text and the destination observation, never
+                                                        // again at the source.
                                                         fullyValidated && destinationRowNamesTarget &&
-                                                            (
-                                                                parsed.observationText == null ||
-                                                                    IOFile(
-                                                                        provenanceFileFor(context, sourceFile).path + ".obs",
-                                                                    ).exists()
-                                                                ) &&
                                                             // THE DESTINATION'S TYPED EVIDENCE (review-42 #5):
                                                             // a VALID record must carry this operation's own
                                                             // publication id; an INVALID (unreadable)
@@ -4773,15 +4775,49 @@ class DownloadOfflineFileManager(
                                                                         established.publicationId == validatedTargetProof.publicationId
                                                                 } == true
                                                             if (!proofEstablished) return@runCatching false
+                                                            // THE OBSERVATION STATE FROM THE OPERATION'S OWN
+                                                            // EVIDENCE (review-42 #11): the state is
+                                                            // established from an INDEPENDENTLY VALIDATED
+                                                            // DESTINATION OBSERVATION bound to this
+                                                            // operation's publication id (normal completion
+                                                            // moved it there and retired the source
+                                                            // artifact) or from the VALIDATED
+                                                            // journal-carried text re-established at the
+                                                            // destination; an explicit absence (the
+                                                            // operation's own contract) succeeds; an
+                                                            // AMBIGUOUS field is unknown and never a
+                                                            // fabricated "A". The retired source artifact
+                                                            // is never required.
+                                                            val observationStateEstablished = run {
+                                                                val destinationObs = IOFile(provenanceFileFor(context, target).path + ".obs")
+                                                                val destinationBinding = runCatching { destinationObs.readText().trim() }
+                                                                    .getOrNull()?.let { parseObservationBinding(it) }
+                                                                when {
+                                                                    destinationBinding?.location == target.absolutePath &&
+                                                                        (destinationBinding.format != ObservationFormat.CURRENT ||
+                                                                            destinationBinding.publicationId == validatedTargetProof.publicationId) -> true
+                                                                    parsed.observationText != null ->
+                                                                        establishRecoveredObservation(
+                                                                            context,
+                                                                            target,
+                                                                            parsed.observationText,
+                                                                            validatedTargetProof.publicationId,
+                                                                        )
+                                                                    !parsed.observationAmbiguous -> true
+                                                                    else -> false
+                                                                }
+                                                            }
+                                                            if (!observationStateEstablished) return@runCatching false
                                                             // THE COMPLETION PROTOCOL (review-39 #9): the
-                                                            // operation's own observation move (re-bound and
-                                                            // verified), the durable M phase, and the source
-                                                            // evidence deletion — the same order the live
-                                                            // completion uses. A journal without an
-                                                            // authoritative phase has none to transition: its
-                                                            // completion moves the observation evidence,
-                                                            // retires the source proof and disposes the
-                                                            // journal directly.
+                                                            // operation's own observation move (idempotent
+                                                            // — the state above may already be established),
+                                                            // the durable M phase, and the source evidence
+                                                            // deletion — the same order the live completion
+                                                            // uses, so the replay is idempotent after an M
+                                                            // transition or disposal failure. A journal
+                                                            // without an authoritative phase has none to
+                                                            // transition: its completion retires the source
+                                                            // proof and disposes the journal directly.
                                                             if (parsed.phaseAuthoritative) {
                                                                 completePreparedProofMove(context, sourceFile, target)
                                                             } else {
@@ -4855,12 +4891,17 @@ class DownloadOfflineFileManager(
                                                                             } == true
                                                                 }
                                                             // THE RETAINED AUTHORITY IS DURABLE BEFORE THE
-                                                            // JOURNAL LEAVES (review-39 #5): the restored
-                                                            // source is the coherent authority for this
-                                                            // generation.
+                                                            // JOURNAL LEAVES (review-39 #5, full barrier
+                                                            // review-42 #10): the restored source is the
+                                                            // coherent authority for this generation — its
+                                                            // CONTENTS, its own FILENAME ENTRY and the
+                                                            // WHOLE ancestor-entry chain are
+                                                            // acknowledged (the immediate parent sync
+                                                            // alone left ancestors left unacknowledged by
+                                                            // an earlier failed creation/restoration); a
+                                                            // failed acknowledgment retains the journal.
                                                             val sourceCoherent = sourceProofRestored && observationRestored &&
-                                                                UploadFile.synchronizeFileContents(sourceFile) &&
-                                                                UploadFile.synchronizeDirectoryEntry(sourceFile.parentFile)
+                                                                payloadDurabilityEstablished(sourceFile)
                                                             sourceCoherent &&
                                                                 resolveAbortedDestinationRecord(
                                                                     context,
@@ -4890,8 +4931,12 @@ class DownloadOfflineFileManager(
                                                 // whose phase-proven repair authority covers exactly
                                                 // the states it was built for.
                                                 if (postCopyResolved) {
+                                                    // THE EXACT DISPOSAL RESULT IS PROPAGATED
+                                                    // (review-42 #10): a failed journal disposal is a
+                                                    // failed resolution — the next sweep re-runs it —
+                                                    // never a reported success while the record
+                                                    // remains.
                                                     disposeRecoveryRecord(recordFile)
-                                                    true
                                                 } else if (postCopyAttempt) {
                                                     false
                                                 } else if (!resolveAbortedDestinationRecord(
@@ -5455,8 +5500,12 @@ class DownloadOfflineFileManager(
                 // equality is content evidence only — the recorded owner must still
                 // exclusively hold the canonical path, and the target's current record must
                 // not be a DIFFERENT later publication's proof (completing the interrupted
-                // operation over it would regress a newer publication token).
-                val currentRecord = readPublishedProvenance(context, target)
+                // operation over it would regress a newer publication token). The record is
+                // read ONCE as typed evidence (review-42 #5): an INVALID (unreadable)
+                // record retains before ANY mutation.
+                val currentEvidence = readPublishedProvenanceEvidence(context, target)
+                if (currentEvidence is PublishedProvenanceEvidence.Invalid) return false
+                val currentRecord = (currentEvidence as? PublishedProvenanceEvidence.Valid)?.record
                 if (!currentOwnerHolds(
                         context, recordScope, record.fileId, target,
                         sharedWithMe = capturedShared,
@@ -5466,9 +5515,29 @@ class DownloadOfflineFileManager(
                     return false
                 }
                 if (currentRecord != null && currentRecord.contentHash != record.expectedPublicationHash) return false
+                // THE PRE-WRITE PUBLICATION AUTHORITY (review-42 #6): the ORIGINAL target
+                // record's owner, publication and operation identity are validated BEFORE
+                // the expected proof is written — a same-bytes proof of another identity or
+                // another publication at the contested path is never overwritten, and the
+                // conflicting record's destruction can never precede this check. The
+                // precondition governs BOTH the completion write and the rollback below.
+                val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
+                if (currentRecord != null) {
+                    if (expectedPublicationId == null) return false
+                    if (currentRecord.publicationId != expectedPublicationId) return false
+                    if (!currentRecord.identifies(
+                            File(id = record.fileId, driveId = record.driveId),
+                            UserDrive(userId = record.userId, driveId = record.driveId, sharedWithMe = capturedShared),
+                        )
+                    ) {
+                        return false
+                    }
+                }
                 if (record.expectedPublicationRecordText != null) {
                     if (!atomicWriteText(provenanceFileFor(context, target), record.expectedPublicationRecordText)) return false
-                    val establishedProof = readPublishedProvenance(context, target) ?: return false
+                    // THE ESTABLISHED PROOF IS READ BACK AS TYPED EVIDENCE (review-42 #5):
+                    // only a VALID read-back confirms the write.
+                    if (readPublishedProvenanceEvidence(context, target) !is PublishedProvenanceEvidence.Valid) return false
                     // THE OBSERVATION IS ESTABLISHED WITH ITS PROOF (issues: round 30
                     // #7, round 32 #5): the interrupted publication's replay no longer
                     // reconstructs a self-certifying destination proof while the attempt's
@@ -5483,7 +5552,6 @@ class DownloadOfflineFileManager(
                     // evidence or the upload authority) and otherwise routes to the validated
                     // rollback below; an explicit absence succeeds. No emptiness, line count
                     // or version participates.
-                    val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
                     if (!observationEvidenceComplete(
                             context,
                             target,
@@ -5506,19 +5574,16 @@ class DownloadOfflineFileManager(
                         // remained reachable only for an absent target. The explicit
                         // validated rollback transition runs when the operation's own
                         // output is established at the target: the recorded owner
-                        // exclusively holds the path (checked above), the target's bytes
-                        // are exactly the expected publication's, and the target's
-                        // PRE-WRITE record was absent or THIS operation's own publication
-                        // — a later publication's token is never regressed, so any
-                        // intervening revision is preserved by refusing the rollback. A
-                        // failed CARRIED-text establishment is never routed here — damaged
-                        // carried evidence defers entirely and is never spent by a
-                        // rollback.
+                        // exclusively holds the path and the original record's owner,
+                        // publication and operation identity were validated BEFORE the
+                        // write (review-42 #6) — a later publication's token is never
+                        // regressed, so any intervening revision is preserved by refusing
+                        // the rollback. A failed CARRIED-text establishment is never
+                        // routed here — damaged carried evidence defers entirely and is
+                        // never spent by a rollback.
                         if (record.attemptedObservationText != null || !record.attemptedObservationAmbiguous) {
                             return false
                         }
-                        if (expectedPublicationId == null) return false
-                        if (currentRecord != null && currentRecord.publicationId != expectedPublicationId) return false
                         // THE BACKUP'S INTEGRITY IS RE-VERIFIED BEFORE THE RESTORE: the
                         // verified backup is the rollback authority — a damaged backup
                         // retains the whole state.
