@@ -24,6 +24,7 @@ import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.decodePro
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.encodeObservedHashBasis
 import com.infomaniak.drive.utils.DownloadOfflineFileManager.Companion.parseObservationBinding
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -68,10 +69,22 @@ class ObservationProofGrammarTest {
     }
 
     @Test
-    fun `current frame is damaged by a malformed typed field`() {
-        assertNull(parseObservationBinding("1|x|7|123|100|200|300|/f"))
-        assertNull(parseObservationBinding("1|42|7|123|100|200|x|/f"))
-        assertNull(parseObservationBinding("1|42|7|123|100|200")) // no location component
+    fun `current frame is damaged by a malformed typed field invalid in BOTH grammars`() {
+        // GENUINELY invalid in both readings: fields[1] exceeds the LEGACY version's Int
+        // range (so the legacy grammar cannot re-read it as a version) AND fields[2] is
+        // not an Int (so the CURRENT grammar cannot parse it either) — unparseable, null.
+        assertNull(parseObservationBinding("1|2147483648|x|1|2|3|4|/f"))
+        // The head-1 ambiguity is EXPLICIT and accepted (the first-run finding): a string
+        // that fails the CURRENT grammar but whose remaining fields satisfy the LEGACY
+        // grammar IS a legacy observation — "42" reads as the version, "x|/f" is the
+        // location tail. The accepted legacy behavior is pinned here, never broken to
+        // satisfy a new test.
+        val fallback = parseObservationBinding("1|42|7|123|100|200|x|/f")
+        assertEquals(ObservationFormat.LEGACY, fallback?.format)
+        assertNull(fallback?.publicationId)
+        assertEquals("x|/f", fallback?.location)
+        // No location component at all: six fields satisfy neither grammar.
+        assertNull(parseObservationBinding("1|42|7|123|100|200"))
     }
 
     @Test
@@ -132,23 +145,35 @@ class ObservationProofGrammarTest {
         assertEquals(ObservedHashBasis.Absent, decodeObservedHashBasis("a"))
     }
 
+    /** THE VALUE-EXACT SEEN ASSERTION: [ObservedHashBasis.Seen] is an ordinary class (its
+     * identity is never compared), so the decoded value is asserted by SUBTYPE + TOKEN —
+     * the first-run lesson (the reference-equality test error), fixed in the TEST only:
+     * the production type is never changed to satisfy a test. */
+    private fun assertSeen(decoded: ObservedHashBasis?, expectedToken: String) {
+        assertInstanceOf(ObservedHashBasis.Seen::class.java, decoded)
+        assertEquals(expectedToken, (decoded as ObservedHashBasis.Seen).token)
+    }
+
     @Test
     fun `present tokens decode to the verbatim value`() {
-        assertEquals(ObservedHashBasis.Seen("-"), decodeObservedHashBasis("x2d"))
-        assertEquals(ObservedHashBasis.Seen("abc"), decodeObservedHashBasis("x616263"))
-        assertEquals(
-            ObservedHashBasis.Seen("xxh3:deadbeefdeadbeef"),
-            decodeObservedHashBasis("x7878683364656164626565666465616462656566"),
+        assertSeen(decodeObservedHashBasis("x2d"), "-")
+        assertSeen(decodeObservedHashBasis("x616263"), "abc")
+        // "xxh3:deadbeefdeadbeef" byte-exact: 78 78 68 33 3a 64 65 61 64 62 65 65 66
+        // 64 65 61 64 62 65 65 66 — the first run's literal omitted the 0x3a colon byte
+        // (masked by the reference-equality error); corrected from the source bytes.
+        assertSeen(
+            decodeObservedHashBasis("x787868333a64656164626565666465616462656566"),
+            "xxh3:deadbeefdeadbeef",
         )
         // Multi-byte UTF-8 rides losslessly.
-        assertEquals(ObservedHashBasis.Seen("é★"), decodeObservedHashBasis("xc3a9e29885"))
+        assertSeen(decodeObservedHashBasis("xc3a9e29885"), "é★")
     }
 
     @Test
     fun `encode is total and collides with nothing — decode inverts it exactly`() {
         listOf("-", "abc", "xxh3:deadbeefdeadbeef", "with|pipe", "with\nnewline", "é★", " ")
             .forEach { token ->
-                assertEquals(ObservedHashBasis.Seen(token), decodeObservedHashBasis(encodeObservedHashBasis(token)))
+                assertSeen(decodeObservedHashBasis(encodeObservedHashBasis(token)), token)
             }
         assertEquals(ObservedHashBasis.Absent, decodeObservedHashBasis(encodeObservedHashBasis(null)))
         assertEquals(ObservedHashBasis.Absent, decodeObservedHashBasis(encodeObservedHashBasis("")))
@@ -225,7 +250,10 @@ class ObservationProofGrammarTest {
         listOf(
             "1|42|7|123|100|200|300",
             "2|42|7|123|100|200|300|a",
-            "2|42|7||100|200|300|x787868336162",
+            // The basis decodes to "xxh3:ab" (78 78 68 33 3a 61 62) — the literal's
+            // decoded content is irrelevant to this test (only the verbatim preservation
+            // is asserted), but the transcription is kept byte-honest.
+            "2|42|7||100|200|300|x787868333a6162",
         ).forEach { prefix ->
             val parsed = parseObservationBinding("$prefix|/old/dest") ?: error("fixture must parse")
             // The relocation's own reconstruction shape (parsed.prefix + the new location).
