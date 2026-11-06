@@ -7272,7 +7272,7 @@ class DownloadOfflineFileManager(
                 ) {
                     ObservationRetirement.Failed -> false
                     ObservationRetirement.NotEligible ->
-                        quarantineCanonicalObservation(context, target, recordFile)
+                        quarantineCanonicalObservation(context, target, recordFile, checkCancelled)
                     ObservationRetirement.Retired, ObservationRetirement.Absent -> true
                 }
             }
