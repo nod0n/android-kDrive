@@ -7439,20 +7439,32 @@ class DownloadOfflineFileManager(
          * INDEPENDENT of the record and SURVIVES its disposal ([disposeRecoveryRecord]
          * touches only the record body and the scope sidecar), because the operator is the
          * preserved evidence's only owner and the pointer metadata must outlive the
-         * operation. STRICT GRAMMAR (OBSQ3, review-49): line 1 the header, line 2 the bound
-         * target path, line 3 THE RECORD FILE'S OWN NAME (the operation identity), line 4
-         * THE VALIDATED SCOPE "u:<userId>|d:<driveId>|f:<fileId>" (written from the
-         * record's own decoded identity — never name-parsed — and compared before any slot
-         * IO), then one "<slotFileName>|<state>|<64-lowercase-ASCII-hex sha256>" per slot,
-         * state "A" pending / "M" committed / "S" superseded / "L" legacy-ambiguous. A V1/V2
-         * manifest (round-47/48, never shipped) is accepted as LEGACY with the target/record
-         * binding only — no phase or evidence is invented for it (review-49 G3: the
-         * rename-era phases prove nothing); the reconciliation upgrades it to OBSQ3 with
-         * THIS record's validated scope. A manifest that does not parse — a wrong
-         * header, a malformed or unknown-name entry, a NON-ASCII hex digit, a duplicate
-         * slot name — is UNREADABLE: the caller RETAINS, never a blind rebuild that could
-         * forget a recorded slot.
+         * operation. STRICT GRAMMAR (OBSQ4, review-51 — the additive bump that carries
+         * RELEASE PROVENANCE IN THE STATE, since a header alone never retroactively proves
+         * an old entry's origin): line 1 the header, line 2 the bound target path, line 3
+         * THE RECORD FILE'S OWN NAME (the operation identity), line 4 THE VALIDATED SCOPE
+         * "u:<userId>|d:<driveId>|f:<fileId>" (written from the record's own decoded
+         * identity — never name-parsed — and compared before any slot IO), then one
+         * "<slotFileName>|<state>|<64-lowercase-ASCII-hex sha256>" per slot, state "A"
+         * pending / "M" committed / "R" released-proven (ONLY the copy-then-retire
+         * reconciliation's own supersession — the only missing-slot state the final gate
+         * skips) / "S" superseded-AMBIGUOUS / "L" legacy-ambiguous. BACKWARD COMPATIBILITY:
+         * the reader accepts OBSQ4 and every older format (OBSQ3/V2/V1, parsed without the
+         * R letter — an R under a non-OBSQ4 header is UNREADABLE, fail-closed); the writer
+         * emits OBSQ4 only; an OLDER build reading an OBSQ4 manifest fails the R parse →
+         * UNREADABLE → retain — also fail-closed. An S read from ANY header is AMBIGUOUS
+         * (review-51 J1 — an inherited rename-era S that an OBSQ3-era build carried into an
+         * OBSQ3 manifest is indistinguishable from a protocol release BY THE LETTER ALONE,
+         * so the state's meaning is conservative everywhere and only R is trusted). A V1/V2
+         * manifest (round-47/48, never shipped) is accepted as LEGACY with the
+         * target/record binding only — no phase or evidence is invented for it (review-49
+         * G3: the rename-era phases prove nothing); the reconciliation upgrades it to
+         * OBSQ4 with THIS record's validated scope. A manifest that does not parse — a
+         * wrong header, a malformed or unknown-name entry, a NON-ASCII hex digit, a
+         * duplicate slot name — is UNREADABLE: the caller RETAINS, never a blind rebuild
+         * that could forget a recorded slot.
          */
+        private const val QUARANTINE_MANIFEST_HEADER_V4 = "OBSQ4"
         private const val QUARANTINE_MANIFEST_HEADER_V3 = "OBSQ3"
         private const val QUARANTINE_MANIFEST_HEADER_V2 = "OBSQ2"
         private const val QUARANTINE_MANIFEST_HEADER_V1 = "OBSQ1"
@@ -7461,15 +7473,26 @@ class DownloadOfflineFileManager(
 
         private enum class QuarantineSlotKind { CAPTURED, MOVED }
 
-        /** THE ENTRY PHASE (review-49 G3): [PENDING] = reserved, the copy not yet durably
-         * recorded; [COMMITTED] = the slot's bytes verified and durably acknowledged (the
-         * canonical may now be retired); [SUPERSEDED] = a pending reservation released —
-         * under the copy-then-retire protocol a released pending entry is PROVABLY
-         * never-executed (the canonical is only removed after COMMITTED), so nothing was
-         * lost; [LEGACY_AMBIGUOUS] = an entry carried over from the rename-based protocol,
-         * whose phases prove nothing about an execution — honestly OPEN, never claimed
-         * proven, its recorded sha kept for the operator. */
-        private enum class QuarantineEntryState { PENDING, COMMITTED, SUPERSEDED, LEGACY_AMBIGUOUS }
+        /** THE ENTRY PHASE (review-49 G3, the provenance review-51 J1): [PENDING] =
+         * reserved, the copy not yet durably recorded; [COMMITTED] = the slot's bytes
+         * verified and durably acknowledged (the canonical may now be retired);
+         * [RELEASED_PROVEN] = a pending reservation released BY THIS reconciliation's
+         * copy-then-retire decision (the canonical's current identity differs from the
+         * recorded one — provably never-executed, since the canonical is only removed
+         * after COMMITTED). This is the ONLY trusted release state, and the ONLY
+         * missing-slot state the final gate skips: a header alone never retroactively
+         * proves an old entry's origin, so provenance lives HERE, written by exactly one
+         * site; [SUPERSEDED] = a release whose provenance CANNOT be proven — read as
+         * AMBIGUOUS from every header (an inherited rename-era S that an OBSQ3-era build
+         * carried through an upgrade is letter-identical to a protocol release, so the
+         * conservative meaning wins and a legitimate old release retains: the safe side
+         * of an unprovable state, no never-shipped waiver); [LEGACY_AMBIGUOUS] = an entry
+         * carried over from the rename-based protocol, whose phases prove nothing about
+         * an execution — honestly OPEN, never claimed proven, its recorded sha kept for
+         * the operator. */
+        private enum class QuarantineEntryState {
+            PENDING, COMMITTED, RELEASED_PROVEN, SUPERSEDED, LEGACY_AMBIGUOUS,
+        }
 
         private data class QuarantineManifestEntry(
             val slotName: String,
@@ -7567,7 +7590,8 @@ class DownloadOfflineFileManager(
             val lines = manifestFile.readText().split("\n")
             val header = lines.getOrNull(0)
             val targetPath = lines.getOrNull(1) ?: ""
-            if ((header != QUARANTINE_MANIFEST_HEADER_V3 && header != QUARANTINE_MANIFEST_HEADER_V2 && header != QUARANTINE_MANIFEST_HEADER_V1) ||
+            if ((header != QUARANTINE_MANIFEST_HEADER_V4 && header != QUARANTINE_MANIFEST_HEADER_V3 &&
+                    header != QUARANTINE_MANIFEST_HEADER_V2 && header != QUARANTINE_MANIFEST_HEADER_V1) ||
                 targetPath.isEmpty()
             ) {
                 return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
@@ -7575,7 +7599,7 @@ class DownloadOfflineFileManager(
             var recordName: String? = null
             var scope: QuarantineScope? = null
             var entryStart = 2
-            if (header == QUARANTINE_MANIFEST_HEADER_V3) {
+            if (header == QUARANTINE_MANIFEST_HEADER_V4 || header == QUARANTINE_MANIFEST_HEADER_V3) {
                 recordName = lines.getOrNull(2) ?: ""
                 if (recordName.isEmpty()) {
                     return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
@@ -7605,9 +7629,22 @@ class DownloadOfflineFileManager(
                 val parts = line.split("|")
                 val entry = when (parts.size) {
                     3 -> {
+                        // THE STRICT OLD/NEW PARSERS (review-51 J1): the R letter
+                        // (released-proven) is parsed ONLY under the OBSQ4 header — an R
+                        // under an older header is UNREADABLE (the older writers never
+                        // emitted it; encountering one is out-of-band → retain). An S is
+                        // parsed as SUPERSEDED from EVERY header, and its meaning is
+                        // ambiguous everywhere (the state carries the provenance, never the
+                        // header).
                         val state = when (parts[1]) {
                             "A" -> QuarantineEntryState.PENDING
                             "M" -> QuarantineEntryState.COMMITTED
+                            "R" ->
+                                if (header == QUARANTINE_MANIFEST_HEADER_V4) {
+                                    QuarantineEntryState.RELEASED_PROVEN
+                                } else {
+                                    return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+                                }
                             "S" -> QuarantineEntryState.SUPERSEDED
                             "L" -> QuarantineEntryState.LEGACY_AMBIGUOUS
                             else -> return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
@@ -7639,7 +7676,10 @@ class DownloadOfflineFileManager(
                     scope,
                     // THE LEGACY FORMATS (V1/V2) were written by the RENAME-based protocol:
                     // their entry phases prove nothing about an execution (review-49 G3).
-                    header != QUARANTINE_MANIFEST_HEADER_V3,
+                    // OBSQ3 is the copy-then-retire era WITHOUT the release provenance
+                    // (review-51 J1): its A/M entries keep the new-protocol semantics, and
+                    // its S entries are ambiguous by the STATE rule, not by this flag.
+                    header != QUARANTINE_MANIFEST_HEADER_V3 && header != QUARANTINE_MANIFEST_HEADER_V4,
                     entries,
                 ),
             ) as QuarantineManifestState
@@ -7649,19 +7689,25 @@ class DownloadOfflineFileManager(
          * temp write, contents fsync, rename, directory fsync) and VERIFIED BY READBACK:
          * the written bytes are re-parsed under the strict grammar and must equal the
          * intended manifest exactly — a write whose readback differs is a failure (the
-         * caller retains), never a silent divergence. Always OBSQ3: a legacy manifest read
+         * caller retains), never a silent divergence. Always OBSQ4: a legacy manifest read
          * is upgraded by the next write with its entries' identities carried verbatim and
-         * their states made explicit. */
+         * their states made explicit (an inherited S stays S — ambiguous on every future
+         * read; the trusted R is written only by the reconciliation's own supersession). */
         private fun writeQuarantineManifest(recordFile: IOFile, manifest: QuarantineManifest): Boolean {
             val text = buildList {
-                add(QUARANTINE_MANIFEST_HEADER_V3)
+                add(QUARANTINE_MANIFEST_HEADER_V4)
                 add(manifest.targetPath)
                 add(recordFile.name)
                 add("u:${manifest.scope?.userId}|d:${manifest.scope?.driveId}|f:${manifest.scope?.fileId}")
                 manifest.entries.forEach {
+                    // NO LAUNDERING (review-51 J1): an inherited SUPERSEDED entry is carried
+                    // verbatim as "S" — ambiguous on every future read; the trusted
+                    // RELEASED_PROVEN state is written ONLY where the reconciliation's own
+                    // supersession decision produced it, never by a rewrite.
                     val state = when (it.state) {
                         QuarantineEntryState.PENDING -> "A"
                         QuarantineEntryState.COMMITTED -> "M"
+                        QuarantineEntryState.RELEASED_PROVEN -> "R"
                         QuarantineEntryState.SUPERSEDED -> "S"
                         QuarantineEntryState.LEGACY_AMBIGUOUS -> "L"
                     }
@@ -7957,7 +8003,12 @@ class DownloadOfflineFileManager(
                                         updatedEntries.add(recovered)
                                     } else {
                                         // THE NEW PROTOCOL: the canonical was never removed
-                                        // by this operation while the entry is PENDING.
+                                        // by this operation while the entry is PENDING. The
+                                        // canonical-changed release is written as
+                                        // RELEASED_PROVEN — the ONLY trusted release state,
+                                        // produced ONLY by this decision (review-51 J1: a
+                                        // header alone never proves an old entry's origin,
+                                        // so the provenance lives in the state).
                                         val currentBytes = runCatching { observationFile.readBytes() }.getOrNull()
                                         val currentSha = currentBytes?.let { sha256HexOfBytes(it) }
                                         when {
@@ -7965,44 +8016,52 @@ class DownloadOfflineFileManager(
                                             currentSha == entry.sha256Hex -> updatedEntries.add(entry)
                                             else -> {
                                                 changed = true
-                                                updatedEntries.add(entry.copy(state = QuarantineEntryState.SUPERSEDED))
+                                                updatedEntries.add(entry.copy(state = QuarantineEntryState.RELEASED_PROVEN))
                                             }
                                         }
                                     }
                                 }
                                 null -> return false
                             }
-                            QuarantineEntryState.SUPERSEDED -> when (quarantinedSlotKind(recordFile, entry.slotName)) {
-                                QuarantineSlotKind.CAPTURED -> {
-                                    if (bound.legacy) {
-                                        // A legacy S on a CAPTURED slot is the same
-                                        // inference-era release (review-50 H1): the payload's
-                                        // carrier is the RECORD, available now — normalized
-                                        // to PENDING so the record-carried repair applies.
+                            QuarantineEntryState.SUPERSEDED ->
+                                // THE S AMBIGUITY IS STATE-BASED, NOT HEADER-BASED
+                                // (review-51 J1): an S read from ANY header — a rename-era
+                                // release, or an inherited S an OBSQ3-era build carried
+                                // through an upgrade — has NO provable origin, so it is
+                                // exactly as open as an L entry. A legitimate copy-then-
+                                // retire release written by an OBSQ3-era build therefore
+                                // conservatively RETAINS when its canonical differs (the
+                                // prompt: indistinguishable, no never-shipped waiver); this
+                                // reconciliation's own releases are written as
+                                // RELEASED_PROVEN and never re-enter this branch.
+                                when (quarantinedSlotKind(recordFile, entry.slotName)) {
+                                    QuarantineSlotKind.CAPTURED -> {
+                                        // The payload's carrier is the RECORD, available
+                                        // now — normalized to PENDING so the record-carried
+                                        // repair applies.
                                         changed = true
                                         updatedEntries.add(entry.copy(state = QuarantineEntryState.PENDING))
-                                    } else {
-                                        updatedEntries.add(entry)
                                     }
-                                }
-                                QuarantineSlotKind.MOVED -> {
-                                    if (bound.legacy) {
-                                        // A V2 S MOVED entry is the old presence inference
-                                        // treated as a proven release (review-50 H1) — the
-                                        // SAME conservative rule as the legacy A above:
-                                        // recover-or-retain, never a release.
+                                    QuarantineSlotKind.MOVED -> {
+                                        // Recover-or-retain, never a release.
                                         val recovered = recoverLegacyAmbiguousSlot(
                                             observationFile, recordFile, entry, checkCancelled,
                                         )
                                         if (recovered == null) return false
                                         changed = true
                                         updatedEntries.add(recovered)
-                                    } else {
-                                        updatedEntries.add(entry)
                                     }
+                                    null -> return false
                                 }
-                                null -> return false
-                            }
+                            QuarantineEntryState.RELEASED_PROVEN ->
+                                // THE TRUSTED RELEASE (review-51 J1): this reconciliation's
+                                // own supersession decision — the canonical's identity
+                                // differed from the reservation's, and under copy-then-
+                                // retire a pending entry provably never executed. Its
+                                // missing slot is the ONLY missing-slot state the final
+                                // gate skips; its recorded sha stays for the operator. A
+                                // present slot (out-of-band) is verified at the gate.
+                                updatedEntries.add(entry)
                             QuarantineEntryState.LEGACY_AMBIGUOUS -> {
                                 // THE ALREADY-UPGRADED AMBIGUITY (review-50 H1): an L entry
                                 // — whatever the current header says — with a missing slot
@@ -8042,15 +8101,16 @@ class DownloadOfflineFileManager(
          *   - a PRESENT slot: the recorded sha must match whatever the state (a mismatch
          *     retains — the recorded identity and the existing bytes are never waived) +
          *     the slot's directory acknowledgment;
-         *   - a MISSING slot on a SUPERSEDED entry: skipped for loss detection (review-49
-         *     G2 — a released reservation is never loss; NEW-PROTOCOL only: the
-         *     reconciliation normalizes every legacy/inherited S before the gate, so an S
-         *     here is the copy-then-retire release of a provably never-executed
-         *     reservation);
-         *   - a MISSING slot on a LEGACY_AMBIGUOUS entry: RETAIN (review-50 H1 — the
-         *     ambiguity is never a release; the reconciliation recovers or retains every
-         *     such entry before the gate, so reaching this branch is out-of-band and the
-         *     honest response is the permanent retain — no L-then-skip at the disposal);
+         *   - a MISSING slot on a RELEASED_PROVEN entry: skipped for loss detection
+         *     (review-49 G2 / review-51 J1 — the ONLY trusted release: the state is written
+         *     exclusively by the reconciliation's own copy-then-retire supersession, so its
+         *     provenance is sound and the header plays no part; the gate INDEPENDENTLY
+         *     enforces this before any record/backup disposal);
+         *   - a MISSING slot on a SUPERSEDED or LEGACY_AMBIGUOUS entry: RETAIN (review-50
+         *     H1 / review-51 J1 — the ambiguity is never a release, from ANY header; the
+         *     reconciliation recovers or retains every such entry before the gate, so
+         *     reaching this branch is out-of-band and the honest response is the permanent
+         *     retain — no S/L-then-skip at the disposal);
          *   - a MISSING slot on a COMMITTED entry: REAL LOSS → retain (never waived);
          *   - a MISSING slot on a PENDING CAPTURED entry: the pending write is finished
          *     FROM THE RECORD (the payload must hash to the recorded identity; the slot is
@@ -8089,11 +8149,17 @@ class DownloadOfflineFileManager(
                             continue
                         }
                         when (entry.state) {
-                            QuarantineEntryState.SUPERSEDED -> continue
-                            // A MISSING LEGACY-AMBIGUOUS SLOT IS NEVER A RELEASE
-                            // (review-50 H1): the reconciliation recovers or retains every
-                            // such entry before this gate; reaching it here means the
-                            // ambiguity was never resolved — the restore retains.
+                            // THE ONLY SKIPPED MISSING-SLOT STATE (review-51 J1): the
+                            // provenance is the STATE itself — written only by this
+                            // reconciliation's copy-then-retire supersession — never the
+                            // header.
+                            QuarantineEntryState.RELEASED_PROVEN -> continue
+                            // A MISSING SUPERSEDED OR LEGACY-AMBIGUOUS SLOT IS NEVER A
+                            // RELEASE (review-50 H1, review-51 J1): the reconciliation
+                            // recovers or retains every such entry before this gate;
+                            // reaching it here means the ambiguity was never resolved —
+                            // the restore retains.
+                            QuarantineEntryState.SUPERSEDED -> return false
                             QuarantineEntryState.LEGACY_AMBIGUOUS -> return false
                             QuarantineEntryState.COMMITTED -> return false
                             QuarantineEntryState.PENDING -> when (quarantinedSlotKind(recordFile, entry.slotName)) {
