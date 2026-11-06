@@ -4583,6 +4583,12 @@ class DownloadOfflineFileManager(
                                                         sourceProof.revisedAt == targetProof.revisedAt &&
                                                         sourceProof.updatedAt == targetProof.updatedAt &&
                                                         sourceProof.publicationId == targetProof.publicationId
+                                                    // EXPLICIT NON-NULL CAPTURES (review-41 #7): the
+                                                    // validated operation's payloads — every route
+                                                    // below reads them without relying on data-flow
+                                                    // inference through boolean vals.
+                                                    val validatedSourceProof = sourceProof ?: return@runCatching false
+                                                    val validatedTargetProof = targetProof ?: return@runCatching false
                                                     // THE SOURCE'S OWNERSHIP (recorded scope) AND ITS
                                                     // BYTES' IDENTITY.
                                                     val sourceAuthoritative = sourceFile.exists() &&
@@ -4609,7 +4615,7 @@ class DownloadOfflineFileManager(
                                                     val sourcePublicationAuthoritative =
                                                         currentSourceRecord == null ||
                                                             (currentSourceRecord.certifiesBytes(sourceFile) &&
-                                                                currentSourceRecord.publicationId == sourceProof.publicationId)
+                                                                currentSourceRecord.publicationId == validatedSourceProof.publicationId)
                                                     // THE FULL CARRIED-OBSERVATION BINDING (review-41
                                                     // #7), validated BEFORE any registry write: the
                                                     // carried observation is the operation's captured
@@ -4623,7 +4629,7 @@ class DownloadOfflineFileManager(
                                                         parseObservationBinding(parsed.observationText)?.let { bound ->
                                                             bound.location == sourceFile.absolutePath &&
                                                                 (bound.format != ObservationFormat.CURRENT ||
-                                                                    bound.publicationId == sourceProof.publicationId)
+                                                                    bound.publicationId == validatedSourceProof.publicationId)
                                                         } == true
                                                     val fullyValidated = tupleEqual && targetProof != null &&
                                                         sourceAuthoritative && sourcePublicationAuthoritative &&
@@ -4667,7 +4673,7 @@ class DownloadOfflineFileManager(
                                                             run {
                                                                 val destinationRecord = readPublishedProvenance(context, target)
                                                                 destinationRecord == null ||
-                                                                    destinationRecord.publicationId == targetProof.publicationId
+                                                                    destinationRecord.publicationId == validatedTargetProof.publicationId
                                                             }
                                                         -> {
                                                             if (target.exists()) return@runCatching false
@@ -4680,7 +4686,7 @@ class DownloadOfflineFileManager(
                                                             }.isSuccess &&
                                                                 target.exists() &&
                                                                 target.length() == sourceFile.length() &&
-                                                                UploadFile.sha256OrNull(target) == targetProof.contentHash
+                                                                UploadFile.sha256OrNull(target) == validatedTargetProof.contentHash
                                                             if (!copyVerified) {
                                                                 // OUR OWN PARTIAL OUTPUT at a path that was
                                                                 // absent is removed; the operation retains.
@@ -4694,8 +4700,8 @@ class DownloadOfflineFileManager(
                                                             // unacknowledged or imprecise timestamp would
                                                             // publish bytes the reader classifies
                                                             // ABSENT_OR_STALE.
-                                                            if (!target.setLastModified(targetProof.lastModifiedAt * 1_000L) ||
-                                                                target.lastModified() / 1_000L != targetProof.lastModifiedAt
+                                                            if (!target.setLastModified(validatedTargetProof.lastModifiedAt * 1_000L) ||
+                                                                target.lastModified() / 1_000L != validatedTargetProof.lastModifiedAt
                                                             ) {
                                                                 runCatching { target.delete() }
                                                                 return@runCatching false
@@ -4719,7 +4725,7 @@ class DownloadOfflineFileManager(
                                                                 atomicWriteText(recordTarget, parsed.proofText) &&
                                                                 readPublishedProvenance(context, target)?.let { established ->
                                                                     established.certifiesBytes(target) &&
-                                                                        established.publicationId == targetProof.publicationId
+                                                                        established.publicationId == validatedTargetProof.publicationId
                                                                 } == true
                                                             if (!proofEstablished) return@runCatching false
                                                             // THE COMPLETION PROTOCOL (review-39 #9): the
@@ -4741,12 +4747,12 @@ class DownloadOfflineFileManager(
                                                                         context,
                                                                         target,
                                                                         liveText,
-                                                                        targetProof.publicationId,
+                                                                        validatedTargetProof.publicationId,
                                                                     ) && runCatching { sourceObs.delete() }.getOrDefault(false)
                                                                 }
                                                                 observationMoved &&
                                                                     runCatching { deletePublishedProvenance(context, sourceFile) }
-                                                                        .getOrDefault(false) &&
+                                                                        .isSuccess &&
                                                                     runCatching { disposeRecoveryRecord(recordFile) }.getOrDefault(false)
                                                             }
                                                         }
@@ -4774,7 +4780,7 @@ class DownloadOfflineFileManager(
                                                                     atomicWriteText(sourceRecordFile, sourceProofText) &&
                                                                     readPublishedProvenance(context, sourceFile)?.let { restored ->
                                                                         restored.certifiesBytes(sourceFile) &&
-                                                                            restored.publicationId == sourceProof.publicationId
+                                                                            restored.publicationId == validatedSourceProof.publicationId
                                                                     } == true
                                                             }
                                                             // THE CARRIED OBSERVATION IS RESTORED WITH ITS
@@ -4795,7 +4801,7 @@ class DownloadOfflineFileManager(
                                                                         )?.let { bound ->
                                                                             bound.location == sourceFile.absolutePath &&
                                                                                 (bound.format != ObservationFormat.CURRENT ||
-                                                                                    bound.publicationId == sourceProof.publicationId)
+                                                                                    bound.publicationId == validatedSourceProof.publicationId)
                                                                         } != null
                                                                 }
                                                             // THE RETAINED AUTHORITY IS DURABLE BEFORE THE
