@@ -4437,8 +4437,15 @@ class DownloadOfflineFileManager(
          *    back and read) disposes the state.
          * Returns true only when every record is resolved; the caller threads the
          * per-file pending set as the durable exclusion (round 22 #3).
+         * THE EXECUTING JOB'S CANCELLATION (review-42 #9): [checkCancelled] is the
+         * CALLER'S ACTUAL EXECUTING job's check (never GlobalScope or a stale job) — it is
+         * re-checked AFTER waiting for the intent monitor and file lock and after blocking
+         * preparation, immediately before any destructive publication step, and a
+         * CancellationException propagates through the replay's broad runCatching paths
+         * instead of being consumed into an unresolved default; the durable operation
+         * state is retained and the next sweep re-drives it.
          */
-        internal fun reconcileInterruptedRecoveries(context: Context): Boolean {
+        internal fun reconcileInterruptedRecoveries(context: Context, checkCancelled: () -> Unit): Boolean {
             val records = runCatching {
                 stagingDirectory(context)?.listFiles { f -> f.name.endsWith(".recovery") }?.toList() ?: emptyList()
             }.getOrDefault(emptyList())
@@ -4493,6 +4500,10 @@ class DownloadOfflineFileManager(
                                 // persisted capture could describe a superseded graph.
                                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                                     OfflineFileCoordination.withFileLock(scope, proofFileId) {
+                                    // THE EXECUTING CONTEXT AFTER THE LOCK ACQUISITION (review-42
+                                    // #9): a cancelled sweep that waited here must not start the
+                                    // replay's publication work.
+                                    checkCancelled()
                                     // THE JOURNAL IS REREAD INSIDE THE COORDINATION (review-37 #8):
                                     // the filename is deterministic per destination — after waiting
                                     // for the locks, operation I may have completed and operation J
@@ -4636,7 +4647,7 @@ class DownloadOfflineFileManager(
                                                     val phaseRecordedPrepared = parsed.phaseAuthoritative &&
                                                         parsed.recordedPhase == "P"
                                                     tupleEqual && sourceOwnership && phaseRecordedPrepared
-                                                }.getOrDefault(false)
+                                                }.getOrRethrowCancellation(false)
                                                 // THE EXPLICIT POST-COPY RECONCILIATION (review-39
                                                 // #9, reworked review-40 #10, review-41 #7/#8): a
                                                 // journal with recorded source authority whose
@@ -4926,6 +4937,14 @@ class DownloadOfflineFileManager(
                                                                 ) {
                                                                     return@runCatching false
                                                                 }
+                                                                // THE EXECUTING CONTEXT AFTER THE BLOCKING
+                                                                // PREPARATION (review-42 #9): the stage copy,
+                                                                // hashing and synchronizations can block — a
+                                                                // cancelled sweep is observed HERE, immediately
+                                                                // before the destructive rename; the throw
+                                                                // propagates, the finally cleans the stage, and
+                                                                // the durable journal is retained.
+                                                                checkCancelled()
                                                                 // THE CONDITIONAL ATOMIC RENAME publishes the
                                                                 // verified stage: the final path was absent
                                                                 // under the held locks; if it appeared, the
@@ -5122,7 +5141,7 @@ class DownloadOfflineFileManager(
                                                         // unvalidated state retain.
                                                         else -> false
                                                     }
-                                                }.getOrDefault(false)
+                                                }.getOrRethrowCancellation(false)
                                                 // THE EXPLICIT DISPATCH (review-41 #8): three
                                                 // disjoint routes. A resolved post-copy state
                                                 // disposes its journal; a FAILED post-copy repair —
@@ -5447,7 +5466,7 @@ class DownloadOfflineFileManager(
                                 resolved
                             }
                         }
-                    }.getOrDefault(false)
+                    }.getOrRethrowCancellation(false)
                     if (!proofMoveResolved) allResolved = false
                     continue
                 }
@@ -5472,7 +5491,13 @@ class DownloadOfflineFileManager(
                 val recordScope = UserDrive(userId = record.userId, driveId = record.driveId)
                 val resolved = synchronized(OfflineFileCoordination.rootIntentMonitor) {
                     OfflineFileCoordination.withFileLock(recordScope, record.fileId) {
-                        runCatching { reconcileOneRecovery(context, record, recordScope, recoveryFile, target) }.getOrDefault(false)
+                        // THE EXECUTING CONTEXT AFTER THE LOCK ACQUISITION (review-42 #9), and
+                        // the cancellation PROPAGATES out of the wrapper instead of being
+                        // consumed into an unresolved default.
+                        checkCancelled()
+                        runCatching {
+                            reconcileOneRecovery(context, record, recordScope, recoveryFile, target, checkCancelled)
+                        }.getOrRethrowCancellation(false)
                     }
                 }
                 if (!resolved) allResolved = false
@@ -5507,6 +5532,7 @@ class DownloadOfflineFileManager(
             recordScope: UserDrive,
             recoveryFile: IOFile,
             target: IOFile,
+            checkCancelled: () -> Unit,
         ): Boolean {
             // THE CAPTURED REALM FLAVOR AND DESTINATION KIND (issue: round 26 #5), for
             // every ownership validation in this arm set: the scope sidecar written before
@@ -5805,6 +5831,7 @@ class DownloadOfflineFileManager(
                             // the conditional evidence removal checks the restored state
                             // against.
                             failedOperationProofText = record.expectedPublicationRecordText,
+                            checkCancelled = checkCancelled,
                         )
                     }
                 }
@@ -5973,6 +6000,7 @@ class DownloadOfflineFileManager(
                     // THE FAILED OPERATION'S OWN PROOF (review-42 #2), as in the
                     // expected-publication rollback.
                     failedOperationProofText = record.expectedPublicationRecordText,
+                    checkCancelled = checkCancelled,
                 )
             } else {
                 // An UNREADABLE CHANGED target (issue: round 23 #2): never overwritten —
@@ -6044,6 +6072,7 @@ class DownloadOfflineFileManager(
             oldTargetMtimeMillis: Long,
             expectedBackupHash: String? = null,
             failedOperationProofText: String?,
+            checkCancelled: () -> Unit,
         ): Boolean = runCatching {
             // BACKUP INTEGRITY BEFORE ANY TARGET MUTATION (issue: round 24 #2): the backup
             // must still hash to the record's immutable hash (a corrupted backup never
@@ -6086,6 +6115,11 @@ class DownloadOfflineFileManager(
                 // after it, before the rename publishes the restore; the network
                 // publication's finalization order applies to every stage kind.
                 if (!UploadFile.synchronizeFileContents(stage)) return@runCatching false
+                // THE EXECUTING CONTEXT AFTER THE BLOCKING PREPARATION (review-42 #9): the
+                // stage copy, hashing and synchronizations can block — a cancelled sweep is
+                // observed HERE, immediately before the destructive rename, and the durable
+                // recovery state is retained (no disposal has run).
+                checkCancelled()
                 // ATOMIC PUBLICATION of the verified stage: the rename replaces the target
                 // in one step; a failed rename leaves the target exactly as it was.
                 if (!stage.renameTo(target)) return@runCatching false
@@ -6131,7 +6165,7 @@ class DownloadOfflineFileManager(
                 runCatching { if (stage.exists()) stage.delete() }
                 runCatching { deletePublishedProvenance(context, stage) }
             }
-        }.getOrDefault(false)
+        }.getOrRethrowCancellation(false)
 
         /** THE SHARED OLD-SOURCE DISPOSITION (issues: round 29 #1 and masked flow A): the
          * retirement and the no-spin resume both validate the old source's authority BEFORE
@@ -6899,6 +6933,9 @@ class DownloadOfflineFileManager(
                                 // staged publication's captured record text identifies the
                                 // proof the conditional removal may clear.
                                 failedOperationProofText = expectedPublicationRecordText,
+                                // THE EXECUTING JOB'S CANCELLATION (review-42 #9): the
+                                // publication core's own check.
+                                checkCancelled = checkCancelled,
                             )
                         } == true
                     if (restored) {
@@ -7124,6 +7161,11 @@ class DownloadOfflineFileManager(
             staged: IOFile,
             generationResolved: Boolean = true,
         ): PublicationOutcome = try {
+            // THE EXECUTING CONTEXT CAPTURED FOR THE CALLBACK (review-42 #9): a non-suspend
+            // lambda cannot read the suspend coroutineContext — the ACTUAL executing
+            // context is captured once here and its ensureActive drives the threaded
+            // cancellation checks (never GlobalScope, never a stale job).
+            val executingContext = coroutineContext
             // THE MONITOR PRECEDES THE FILE LOCK (issue: round 28 #11): this writer
             // creates and disposes scope-indexed operation records (sidecar BEFORE body),
             // so its (sidecar, body) publication pair must be atomic relative to the
@@ -7337,6 +7379,10 @@ class DownloadOfflineFileManager(
                                                 // THE FAILED PUBLICATION'S OWN PROOF (review-42
                                                 // #2), as in the coordinated publication.
                                                 failedOperationProofText = expectedPublicationRecordText,
+                                                // THE EXECUTING JOB'S CANCELLATION (review-42 #9):
+                                                // the suspend caller's context captured once — a
+                                                // non-suspend lambda cannot read coroutineContext.
+                                                checkCancelled = { executingContext.ensureActive() },
                                             )
                                         } == true
                                     if (restored) {

@@ -256,7 +256,15 @@ object SyncOfflineUtils {
             // the still-PENDING file ids become a per-file durable exclusion — partial
             // bytes from an interrupted restore are never classified as an edit,
             // registered, or replaced; unrelated files progress independently.
-            DownloadOfflineFileManager.reconcileInterruptedRecoveries(context)
+            DownloadOfflineFileManager.reconcileInterruptedRecoveries(
+                context,
+                // THE ACTUAL EXECUTING JOB'S CANCELLATION (review-42 #9): the recovery work
+                // is driven by THIS coroutine — a cancelled sync must not start the
+                // recovery's destructive publication after waiting for the coordination
+                // locks; the check re-runs after lock acquisition and blocking preparation,
+                // and a CancellationException propagates through the replay wrappers.
+                checkCancelled = { coroutineScope.ensureActive() },
+            )
             // FAIL-CLOSED SELECTION (issue: round 23 #3): an enumeration failure never
             // means "no pending recovery" — the whole pass defers (the next sync retries)
             // rather than classifying possibly-recovery-managed bytes.
