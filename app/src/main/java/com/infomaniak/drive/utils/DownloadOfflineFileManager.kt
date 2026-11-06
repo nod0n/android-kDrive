@@ -6984,7 +6984,11 @@ class DownloadOfflineFileManager(
          * verified readback; an incoherent capture is a KNOWN state (preserved + laddered,
          * the canonical ending honestly absent), never an unknown and never an arbitrary-J
          * rebind. [recordFile] is this operation's own recovery record — the manifest and
-         * the slots are derived from it. */
+         * the slots are derived from it. THE FINAL EVIDENCE GATE (review-48 F1/F2): every
+         * TRUE branch result crosses [finalizeQuarantineEvidence] before this function
+         * returns — a pending captured slot is repaired from the record, a stale moved
+         * reservation is released by this pass's own disposition, and no journal/backup
+         * disposal ever runs over unverified manifest state. */
         private fun restoreOldObservationState(
             context: Context,
             target: IOFile,
@@ -6996,21 +7000,12 @@ class DownloadOfflineFileManager(
             oldOperationProofText: String?,
         ): Boolean {
             val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
-            // THE REPLAYED QUARANTINE IS VERIFIED BEFORE ANYTHING PROCEEDS (review-47 E4):
-            // when the canonical observation is already absent, every manifest-recorded
-            // slot must exist with its recorded byte identity and BOTH sides' directories
-            // (the canonical's registry dir and the slots' staging dir) must be
-            // acknowledged BEFORE this restore completes toward the journal/backup
-            // disposal — a prior run's crash after the rename but before its
-            // acknowledgments lands HERE (the ladder's absent arm alone would never
-            // re-reach the quarantine's verification). A missing or byte-mismatched slot
-            // is the honest loss signal: the restore retains.
-            if (!IOFile(provenanceFileFor(context, target).path + ".obs").exists() &&
-                !verifyReplayedQuarantine(context, recordFile, target)
-            ) {
-                return false
-            }
-            return when (oldObservation) {
+            // THE CANONICAL'S PRESENCE AT THE BRANCH'S START (review-48 F2): a stale MOVED
+            // reservation is released by THIS PASS's disposition only when the canonical was
+            // present for the branch to dispose; when it was ALREADY absent, a missing MOVED
+            // slot at the final gate is the genuine loss signal.
+            val canonicalWasPresent = IOFile(provenanceFileFor(context, target).path + ".obs").exists()
+            val branchResult = when (oldObservation) {
                 null, is OldObservationCapture.Absent ->
                     retiredOrQuarantinedCanonicalLadder(
                         context, target, recordFile, failedPublicationId, attemptedObservationText,
@@ -7168,6 +7163,23 @@ class DownloadOfflineFileManager(
                 }
                 OldObservationCapture.Unreadable -> false
             }
+            if (!branchResult) return false
+            // THE FINAL QUARANTINE EVIDENCE GATE (review-48 F1/F2): no completion path —
+            // the ladders, the rebind write, the replay-recognition early return, the
+            // Damaged write-back — reaches the journal/backup disposal without every
+            // ACTIVE manifest entry being verified (or its pending captured write repaired
+            // from the record, or its stale moved reservation released), with both sides'
+            // directories acknowledged. This is the single choke point the review-47 entry
+            // gate tried to be, now covering a PRESENT canonical too (the rebind's replay
+            // recognition).
+            return finalizeQuarantineEvidence(
+                context,
+                recordFile,
+                target,
+                (oldObservation as? OldObservationCapture.Legacy)?.text
+                    ?: (oldObservation as? OldObservationCapture.Valid)?.text,
+                canonicalWasPresent,
+            )
         }
 
         /** THE SHARED CANONICAL LADDER (review-45 R4, review-46 D1/D2, review-47 E2/E3):
@@ -7217,39 +7229,63 @@ class DownloadOfflineFileManager(
                 }
             }
 
-        /** THE CAPTURED EVIDENCE IS PRESERVED UNDER THE OWNED RECOVERY (review-47 E2):
-         * the record's captured observation text is written EXACTLY (no trailing newline,
-         * no re-encoding) into the operation-owned captured slot BEFORE anything else —
-         * the record is disposed on success and is then no longer the text's carrier, and
-         * moving only the canonical previously lost the captured evidence when a failed
-         * attempt had replaced the canonical content. The manifest entry (the slot's byte
-         * identity) is durable BEFORE the slot write; the slot is never overwritten (a
-         * fresh name is allocated, and a manifest-recorded slot holding the same byte
-         * identity makes the replay idempotent — no accumulating duplicates); the write is
-         * atomic + durably acknowledged + verified against the recorded identity. A failed
-         * preservation RETAINS the whole restore. */
+        /** THE CAPTURED EVIDENCE IS PRESERVED UNDER THE OWNED RECOVERY (review-47 E2, the
+         * pending-write repair review-48 F1): the record's captured observation text is
+         * written into the operation-owned captured slot BEFORE anything else — the record
+         * is disposed on success and is then no longer the text's carrier, and moving only
+         * the canonical previously lost the captured evidence when a failed attempt had
+         * replaced the canonical content. HONEST BYTES (review-48 F5): the slot holds the
+         * EVIDENCE-EQUIVALENT TRIMMED DECODED TEXT — the original file's raw bytes are NOT
+         * preserved for a parseable capture (a trailing newline of the original is not
+         * carried), and the manifest records the sha of the WRITTEN bytes; only the DAMAGED
+         * capture carries exact raw bytes. The manifest entry is durable BEFORE the slot
+         * write; a replay with the slot already holding this byte identity is idempotent
+         * (no accumulating duplicates); a replay whose ACTIVE entry records this identity
+         * but whose slot is MISSING is the crash window between the upsert and the write —
+         * the payload is provably still in the record, so the pending write is FINISHED AT
+         * THE SAME RECORDED NAME (never a colliding suffix, never an invented entry). The
+         * write is atomic + durably acknowledged + verified against the recorded identity. A
+         * failed preservation RETAINS the whole restore. */
         private fun preserveCapturedObservationEvidence(recordFile: IOFile, target: IOFile, capturedText: String): Boolean {
             val payloadBytes = capturedText.toByteArray(Charsets.UTF_8)
             val payloadSha256 = sha256HexOfBytes(payloadBytes) ?: return false
-            // THE REPLAY IS IDEMPOTENT (review-47 E4): a manifest entry whose recorded
-            // slot already holds this byte identity means the evidence is already durably
-            // preserved — no duplicate slot is allocated.
-            when (val state = readQuarantineManifest(recordFile)) {
+            val manifest = when (val state = readQuarantineManifest(recordFile)) {
                 is QuarantineManifestState.Unreadable -> return false
+                is QuarantineManifestState.Absent -> null
                 is QuarantineManifestState.Present -> {
-                    if (state.manifest.targetPath != target.absolutePath) return false
-                    val alreadyPreserved = state.manifest.entries.any { entry ->
+                    if (!manifestBindsToOperation(state.manifest, target, recordFile)) return false
+                    state.manifest
+                }
+            }
+            if (manifest != null) {
+                // THE PENDING CAPTURED WRITE IS FINISHED IN PLACE (review-48 F1).
+                val pending = manifest.entries.firstOrNull { entry ->
+                    entry.active && entry.sha256Hex == payloadSha256 &&
+                        !slotExistsExcludingSymlinks(IOFile(recordFile.parentFile, entry.slotName))
+                }
+                if (pending != null) {
+                    return writeSlotPayload(
+                        recordFile,
+                        IOFile(recordFile.parentFile, pending.slotName),
+                        capturedText,
+                        payloadSha256,
+                    )
+                }
+                // THE IDEMPOTENT REPLAY (review-47 E4): an ACTIVE entry whose recorded slot
+                // already holds this byte identity — already durably preserved.
+                val alreadyPreserved = manifest.entries.any { entry ->
+                    entry.active && entry.sha256Hex == payloadSha256 && run {
                         val slotFile = IOFile(recordFile.parentFile, entry.slotName)
                         slotExistsExcludingSymlinks(slotFile) && slotMatchesManifest(slotFile, payloadSha256)
                     }
-                    if (alreadyPreserved) return true
                 }
-                is QuarantineManifestState.Absent -> Unit
+                if (alreadyPreserved) return true
             }
-            val slotFile = allocateQuarantineSlot(recordFile, CAPTURED_SLOT_BASE)
-            if (!upsertQuarantineManifestEntry(recordFile, target.absolutePath, slotFile.name, payloadSha256)) return false
+            val slotFile = allocateQuarantineSlot(recordFile, CAPTURED_SLOT_BASE, manifest)
+            if (!upsertQuarantineManifestEntry(recordFile, target, slotFile.name, payloadSha256)) return false
             if (!atomicWriteText(slotFile, capturedText)) return false
-            return slotMatchesManifest(slotFile, payloadSha256)
+            return slotMatchesManifest(slotFile, payloadSha256) &&
+                UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)
         }
 
         /** THE EXPLICIT SOURCE-BOUND ID REBIND WRITE (review-47 E1): the caller has verified
@@ -7304,25 +7340,44 @@ class DownloadOfflineFileManager(
         }
 
         /**
-         * THE DURABLE QUARANTINE MANIFEST (review-47 E4): the operation-owned index of the
-         * evidence preserved out of the canonical observation name. A file suffix alone is
-         * not a recoverable manifest, and the recovery record (the only other carrier) is
-         * disposed on success — this sidecar is INDEPENDENT of the record and SURVIVES its
-         * disposal ([disposeRecoveryRecord] touches only the record body and the scope
-         * sidecar), because the operator is the preserved evidence's only owner and the
-         * pointer metadata must outlive the operation. STRICT LINE GRAMMAR: line 1 the
-         * header "OBSQ1", line 2 the bound target path, then one
-         * "<slotFileName>|<64-lowercase-hex sha256>" per preserved slot. A manifest that
-         * does not parse is UNREADABLE — the caller retains (never a blind rebuild, which
-         * could unrecord a live slot); the same strictness the record decoders apply.
+         * THE DURABLE QUARANTINE MANIFEST (review-47 E4, the state machine review-48 F1/F2):
+         * the operation-owned index of the evidence preserved out of the canonical
+         * observation name. A file suffix alone is not a recoverable manifest, and the
+         * recovery record (the only other carrier) is disposed on success — this sidecar is
+         * INDEPENDENT of the record and SURVIVES its disposal ([disposeRecoveryRecord]
+         * touches only the record body and the scope sidecar), because the operator is the
+         * preserved evidence's only owner and the pointer metadata must outlive the
+         * operation. STRICT GRAMMAR (OBSQ2): line 1 the header, line 2 the bound target
+         * path, line 3 THE RECORD FILE'S OWN NAME (the operation identity — the
+         * recovery-file name embeds the file/drive scope), then one
+         * "<slotFileName>|<state>|<64-lowercase-ASCII-hex sha256>" per slot, state "A"
+         * active / "S" superseded. A V1 manifest (round-47, never shipped) is accepted with
+         * all entries ACTIVE and the target-only binding — no phase or evidence is invented
+         * for it; the writer emits OBSQ2 only. A manifest that does not parse — a wrong
+         * header, a malformed or unknown-name entry, a NON-ASCII hex digit, a duplicate
+         * slot name — is UNREADABLE: the caller RETAINS, never a blind rebuild that could
+         * forget a recorded slot.
          */
-        private const val QUARANTINE_MANIFEST_HEADER = "OBSQ1"
+        private const val QUARANTINE_MANIFEST_HEADER_V2 = "OBSQ2"
+        private const val QUARANTINE_MANIFEST_HEADER_V1 = "OBSQ1"
         private const val CAPTURED_SLOT_BASE = "obs.q.captured"
         private const val CANONICAL_SLOT_BASE = "obs.q.canonical"
 
-        private class QuarantineManifestEntry(val slotName: String, val sha256Hex: String)
+        private enum class QuarantineSlotKind { CAPTURED, MOVED }
 
-        private class QuarantineManifest(val targetPath: String, val entries: List<QuarantineManifestEntry>)
+        private data class QuarantineManifestEntry(
+            val slotName: String,
+            val active: Boolean,
+            val sha256Hex: String,
+        )
+
+        private data class QuarantineManifest(
+            val targetPath: String,
+            /** The record file's own name (the operation identity); null only for a V1
+             * manifest, whose binding is the target path alone. */
+            val recordName: String?,
+            val entries: List<QuarantineManifestEntry>,
+        )
 
         private sealed class QuarantineManifestState {
             object Absent : QuarantineManifestState()
@@ -7333,71 +7388,154 @@ class DownloadOfflineFileManager(
         private fun quarantineManifestFile(recordFile: IOFile): IOFile =
             IOFile(recordFile.path + ".obs.manifest")
 
+        /** THE STRICT SLOT-NAME VALIDATION AND KIND DERIVATION (review-48 F4): a slot name
+         * must be exactly this record's owned prefix — recordFile.name + ".obs.q." +
+         * "captured"/"canonical" — with an empty or purely-decimal numbered tail. Anything
+         * else (a separator, "..", an absolute form, another operation's prefix, an unknown
+         * shape) is UNREADABLE manifest data: the caller retains, never infers from
+         * unvalidated names. The validated name IS the kind carrier. */
+        private fun quarantinedSlotKind(recordFile: IOFile, slotName: String): QuarantineSlotKind? {
+            val capturedPrefix = recordFile.name + "." + CAPTURED_SLOT_BASE
+            val canonicalPrefix = recordFile.name + "." + CANONICAL_SLOT_BASE
+            val capturedTail = slotNameTailAfter(slotName, capturedPrefix)
+            val canonicalTail = slotNameTailAfter(slotName, canonicalPrefix)
+            val tail = capturedTail ?: canonicalTail ?: return null
+            if (tail.isNotEmpty() && !tail.all { it in '0'..'9' }) return null
+            return if (capturedTail != null) QuarantineSlotKind.CAPTURED else QuarantineSlotKind.MOVED
+        }
+
+        private fun slotNameTailAfter(slotName: String, prefix: String): String? = when {
+            slotName == prefix -> ""
+            slotName.startsWith(prefix + ".") -> slotName.substring(prefix.length + 1)
+            else -> null
+        }
+
+        /** THE OPERATION BINDING (review-48 F4): before ANY slot read/write, the manifest
+         * must bind to THIS target and THIS operation's record (V1 binds by the target
+         * alone). */
+        private fun manifestBindsToOperation(manifest: QuarantineManifest, target: IOFile, recordFile: IOFile): Boolean =
+            manifest.targetPath == target.absolutePath &&
+                (manifest.recordName == null || manifest.recordName == recordFile.name)
+
+        /** NOFOLLOW SYMBOLIC-LINK CHECK (review-48 F4): a symlink — dangling or not — at a
+         * manifest/canonical/slot name is UNKNOWN content; the caller retains, never reads
+         * through it and never replaces it. The check's own failure is treated as symbolic
+         * (the conservative side). */
+        private fun isSymbolicLinkPath(file: IOFile): Boolean = runCatching {
+            java.nio.file.Files.isSymbolicLink(java.nio.file.Paths.get(file.absolutePath))
+        }.getOrDefault(true)
+
         /** THE TYPED MANIFEST READ: [Absent] = no manifest file (a fresh operation — the
-         * caller may create it); [Unreadable] = the file exists but does not parse (the
-         * caller RETAINS — never a blind rebuild over a possibly-recorded state);
-         * [Present] = the parsed index. */
+         * caller may create it); [Unreadable] = the file exists but does not parse, is a
+         * symlink, or carries an unvalidated name (the caller RETAINS — never a blind
+         * rebuild over a possibly-recorded state); [Present] = the parsed index. The read
+         * itself is NOFOLLOW-guarded. */
         private fun readQuarantineManifest(recordFile: IOFile): QuarantineManifestState = runCatching {
             val manifestFile = quarantineManifestFile(recordFile)
-            if (!manifestFile.exists()) return@runCatching QuarantineManifestState.Absent as QuarantineManifestState
-            val lines = manifestFile.readText().split("\n")
-            if (lines.size < 2 || lines[0] != QUARANTINE_MANIFEST_HEADER || lines[1].isEmpty()) {
+            if (isSymbolicLinkPath(manifestFile)) {
                 return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
             }
-            val entries = lines.drop(2).map { line ->
+            if (!slotExistsExcludingSymlinks(manifestFile)) {
+                return@runCatching QuarantineManifestState.Absent as QuarantineManifestState
+            }
+            val lines = manifestFile.readText().split("\n")
+            val header = lines.getOrNull(0)
+            val targetPath = lines.getOrNull(1) ?: ""
+            if ((header != QUARANTINE_MANIFEST_HEADER_V2 && header != QUARANTINE_MANIFEST_HEADER_V1) ||
+                targetPath.isEmpty()
+            ) {
+                return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+            }
+            val recordName: String?
+            val entryLines: List<String>
+            if (header == QUARANTINE_MANIFEST_HEADER_V2) {
+                val name = lines.getOrNull(2) ?: ""
+                if (name.isEmpty()) {
+                    return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+                }
+                recordName = name
+                entryLines = lines.drop(3)
+            } else {
+                recordName = null
+                entryLines = lines.drop(2)
+            }
+            val entries = mutableListOf<QuarantineManifestEntry>()
+            val seenNames = mutableSetOf<String>()
+            for (line in entryLines) {
                 val parts = line.split("|")
-                val name = parts.getOrNull(0) ?: ""
-                val hex = parts.getOrNull(1) ?: ""
-                if (parts.size != 2 || name.isEmpty() || hex.length != 64 ||
-                    hex.any { !it.isDigit() && it !in 'a'..'f' }
+                val entry = when (parts.size) {
+                    3 -> {
+                        val state = parts[1]
+                        if (state != "A" && state != "S") {
+                            return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+                        }
+                        QuarantineManifestEntry(parts[0], state == "A", parts[2])
+                    }
+                    // A V1 entry carries no state column: every V1 entry is ACTIVE — the
+                    // round-47 semantics, never an invented phase.
+                    2 -> QuarantineManifestEntry(parts[0], true, parts[1])
+                    else -> return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+                }
+                if (entry.sha256Hex.length != 64 ||
+                    entry.sha256Hex.any { it !in '0'..'9' && it !in 'a'..'f' }
                 ) {
                     return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
                 }
-                QuarantineManifestEntry(name, hex)
+                if (quarantinedSlotKind(recordFile, entry.slotName) == null) {
+                    return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+                }
+                if (!seenNames.add(entry.slotName)) {
+                    return@runCatching QuarantineManifestState.Unreadable as QuarantineManifestState
+                }
+                entries.add(entry)
             }
-            QuarantineManifestState.Present(QuarantineManifest(lines[1], entries)) as QuarantineManifestState
+            QuarantineManifestState.Present(QuarantineManifest(targetPath, recordName, entries)) as QuarantineManifestState
         }.getOrDefault(QuarantineManifestState.Unreadable)
 
         /** THE MANIFEST WRITE: atomic + durably acknowledged + verified by readback (the
-         * atomicWriteText chain — temp write, contents fsync, rename, directory fsync). */
-        private fun writeQuarantineManifest(
-            recordFile: IOFile,
-            targetPath: String,
-            entries: List<QuarantineManifestEntry>,
-        ): Boolean {
+         * atomicWriteText chain — temp write, contents fsync, rename, directory fsync).
+         * Always OBSQ2: a V1 manifest read is upgraded by the next write with its entries'
+         * identities carried verbatim and their states made explicit. */
+        private fun writeQuarantineManifest(recordFile: IOFile, manifest: QuarantineManifest): Boolean {
             val text = buildList {
-                add(QUARANTINE_MANIFEST_HEADER)
-                add(targetPath)
-                entries.forEach { add("${it.slotName}|${it.sha256Hex}") }
+                add(QUARANTINE_MANIFEST_HEADER_V2)
+                add(manifest.targetPath)
+                add(recordFile.name)
+                manifest.entries.forEach {
+                    add("${it.slotName}|${if (it.active) "A" else "S"}|${it.sha256Hex}")
+                }
             }.joinToString("\n")
             return atomicWriteText(quarantineManifestFile(recordFile), text)
         }
 
         /** THE MANIFEST-FIRST UPSERT (review-47 E4): the entry is durable BEFORE the
-         * corresponding slot mutation, recording the slot's byte identity. A manifest bound
-         * to another target is never mutated; a slot name recorded with a DIFFERENT
-         * identity is an unknown state (retain); an identical existing entry is the
-         * idempotent replay (no write). */
+         * corresponding slot mutation, recording the slot's byte identity. A manifest not
+         * bound to this target/operation is never mutated; a slot name recorded with a
+         * DIFFERENT identity is an unknown state (retain); an identical existing entry is
+         * the idempotent replay (no write). */
         private fun upsertQuarantineManifestEntry(
             recordFile: IOFile,
-            targetPath: String,
+            target: IOFile,
             slotName: String,
             sha256Hex: String,
         ): Boolean {
             return when (val state = readQuarantineManifest(recordFile)) {
                 is QuarantineManifestState.Unreadable -> false
                 is QuarantineManifestState.Absent ->
-                    writeQuarantineManifest(recordFile, targetPath, listOf(QuarantineManifestEntry(slotName, sha256Hex)))
+                    writeQuarantineManifest(
+                        recordFile,
+                        QuarantineManifest(target.absolutePath, recordFile.name, listOf(QuarantineManifestEntry(slotName, true, sha256Hex))),
+                    )
                 is QuarantineManifestState.Present -> {
                     val manifest = state.manifest
-                    if (manifest.targetPath != targetPath) return false
+                    if (!manifestBindsToOperation(manifest, target, recordFile)) return false
                     val existing = manifest.entries.firstOrNull { it.slotName == slotName }
                     val entries = when {
-                        existing != null && existing.sha256Hex == sha256Hex -> manifest.entries
+                        existing != null && existing.active && existing.sha256Hex == sha256Hex -> manifest.entries
                         existing != null -> return false
-                        else -> manifest.entries + QuarantineManifestEntry(slotName, sha256Hex)
+                        else -> manifest.entries + QuarantineManifestEntry(slotName, true, sha256Hex)
                     }
-                    writeQuarantineManifest(recordFile, targetPath, entries)
+                    writeQuarantineManifest(recordFile, manifest.copy(entries = entries))
                 }
             }
         }
@@ -7407,9 +7545,10 @@ class DownloadOfflineFileManager(
                 .joinToString("") { "%02x".format(it) }
         }.getOrNull()
 
-        /** THE SLOT EXISTENCE CHECK EXCLUDES SYMLINKS (review-47 E4): a symlink at a slot
-         * name is UNKNOWN content — never overwritten (renameTo would replace the link
-         * entry); the check's own failure is treated as existing (the conservative side). */
+        /** THE SLOT EXISTENCE CHECK EXCLUDES SYMLINKS (review-47 E4, review-48 F4): a
+         * symlink at a slot name is UNKNOWN content — never overwritten (renameTo would
+         * replace the link entry); the check's own failure is treated as existing (the
+         * conservative side). */
         private fun slotExistsExcludingSymlinks(file: IOFile): Boolean = runCatching {
             java.nio.file.Files.exists(
                 java.nio.file.Paths.get(file.absolutePath),
@@ -7418,93 +7557,195 @@ class DownloadOfflineFileManager(
         }.getOrDefault(true)
 
         private fun slotMatchesManifest(slotFile: IOFile, expectedSha256Hex: String): Boolean = runCatching {
+            if (isSymbolicLinkPath(slotFile)) return@runCatching false
             sha256HexOfBytes(slotFile.readBytes()) == expectedSha256Hex
         }.getOrDefault(false)
 
-        /** THE DETERMINISTIC REPLAY-STABLE SLOT NAME: the record-derived base is reused by
-         * every replay (the manifest is the index, so the recorded name is authoritative);
-         * a slot that already exists with unknown byte identity — a real collision, never
-         * a replay — takes the next numbered suffix, bounded by the collisions
-         * themselves. */
-        private fun allocateQuarantineSlot(recordFile: IOFile, baseName: String): IOFile {
+        /** THE MANIFEST-AWARE REPLAY-STABLE SLOT ALLOCATION (review-48 F2): a candidate name
+         * is skipped when a FILE exists there (NOFOLLOW — a symlink is unknown) OR when ANY
+         * manifest entry (active or superseded) already records it — a pending reservation
+         * whose payload later changed can therefore never collide with its own recorded
+         * name, and a superseded name is never reused (the manifest could never carry two
+         * entries for one name). Bounded by real collisions and reservations, never by
+         * replay. */
+        private fun allocateQuarantineSlot(recordFile: IOFile, baseName: String, manifest: QuarantineManifest?): IOFile {
+            val reservedNames = manifest?.entries?.map { it.slotName }?.toSet() ?: emptySet()
             var candidate = IOFile(recordFile.parentFile, recordFile.name + "." + baseName)
             var suffix = 2
-            while (slotExistsExcludingSymlinks(candidate)) {
+            while (slotExistsExcludingSymlinks(candidate) || candidate.name in reservedNames) {
                 candidate = IOFile(recordFile.parentFile, recordFile.name + "." + baseName + "." + suffix)
                 suffix++
             }
             return candidate
         }
 
-        /** THE REPLAYED QUARANTINE IS VERIFIED, NOT ASSUMED (review-47 E4): the canonical's
-         * absence alone is never success. Every recorded slot must exist with its recorded
-         * BYTE IDENTITY, and BOTH directories are acknowledged — the canonical's registry
-         * directory (the removal side) and each slot's staging directory (the appearance
-         * side) — BEFORE the caller proceeds to the journal/backup disposal. A manifest
-         * entry whose slot is missing or byte-mismatched is the honest loss signal: the
-         * caller retains. A crash after the source fsync but before the destination fsync
-         * lands HERE on the replay: the evidence is verified and both sides acknowledged,
-         * so no durable evidence and no retry owner is lost. */
-        private fun verifyReplayedQuarantine(context: Context, recordFile: IOFile, target: IOFile): Boolean {
+        /** A PENDING SLOT IS FINISHED AT ITS RECORDED NAME (review-48 F1): the name must be
+         * free (NOFOLLOW-checked — a symlink is unknown and refuses), the text is written
+         * atomically + durably (the atomicWriteText chain), and the result is verified
+         * against the recorded identity before the caller may proceed. */
+        private fun writeSlotPayload(recordFile: IOFile, slotFile: IOFile, capturedText: String, sha256Hex: String): Boolean {
+            if (slotExistsExcludingSymlinks(slotFile)) return false
+            if (!atomicWriteText(slotFile, capturedText)) return false
+            return slotMatchesManifest(slotFile, sha256Hex) &&
+                UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)
+        }
+
+        /** THE STALE-RESERVATION RELEASE (review-48 F2): a MOVED-kind ACTIVE entry whose
+         * slot file is missing is PROVABLY NEVER EXECUTED while the canonical observation is
+         * PRESENT — a completed move is a rename that leaves the canonical ABSENT and the
+         * slot PRESENT, and the canonical's presence contradicts completion. Such a
+         * reservation is released (marked superseded, its recorded sha KEPT — never
+         * silently forgotten) before the current canonical is re-disposed under the
+         * ladder's own authority: its bytes are subsumed by that disposition (identity-
+         * checked retirement, the record-carried rebind source, or a fresh entry with the
+         * recorded identity) or honestly recorded as lost to an out-of-band change. The
+         * release is a durable manifest rewrite; a failed release retains. */
+        private fun releaseStaleMovedReservations(recordFile: IOFile, manifest: QuarantineManifest): QuarantineManifest? {
+            fun isStale(entry: QuarantineManifestEntry): Boolean =
+                entry.active &&
+                    quarantinedSlotKind(recordFile, entry.slotName) == QuarantineSlotKind.MOVED &&
+                    !slotExistsExcludingSymlinks(IOFile(recordFile.parentFile, entry.slotName))
+            if (manifest.entries.none { isStale(it) }) return manifest
+            val updated = manifest.entries.map { if (isStale(it)) it.copy(active = false) else it }
+            return if (writeQuarantineManifest(recordFile, manifest.copy(entries = updated))) {
+                manifest.copy(entries = updated)
+            } else {
+                null
+            }
+        }
+
+        /**
+         * THE FINAL QUARANTINE EVIDENCE GATE (review-48 F1/F2, replacing review-47's entry
+         * gate): runs after the restore's branch computed a TRUE result and BEFORE the
+         * restore may return toward the journal/backup disposal. EVERY completion path
+         * crosses it — the ladders, the rebind write, the replay-recognition early return,
+         * the Damaged write-back — so NO disposal ever runs over unverified manifest state,
+         * and a canonical that is PRESENT at the gate (the rebind's replay recognition)
+         * still ACKs every recorded entry. For every ACTIVE entry:
+         *   - the slot exists → the recorded sha must match (a mismatch retains) + the
+         *     slot's directory acknowledgment;
+         *   - the slot is missing + CAPTURED kind → the pending write is FINISHED FROM THE
+         *     RECORD: the record's own captured payload (this branch's decoded capture)
+         *     must hash to the recorded identity, then the slot is written at the SAME
+         *     recorded name, verified, ACKed — a repair, never an invention; a captured
+         *     entry with no reconstructible record payload is record corruption → retain;
+         *   - the slot is missing + MOVED kind → THE CANONICAL-WAS-PRESENT RULE: when THIS
+         *     PASS's branch disposed a canonical that was present at its start, the stale
+         *     reservation is provably never executed and is released (marked superseded,
+         *     the sha kept); when the canonical was ALREADY ABSENT, the moved bytes are
+         *     genuinely lost — the only known copy is gone — and the restore RETAINS.
+         * The registry directory is acknowledged in every case. A repair or release that
+         * cannot be made durably retains.
+         */
+        private fun finalizeQuarantineEvidence(
+            context: Context,
+            recordFile: IOFile,
+            target: IOFile,
+            capturedText: String?,
+            canonicalWasPresent: Boolean,
+        ): Boolean {
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
-            return when (val state = readQuarantineManifest(recordFile)) {
-                is QuarantineManifestState.Unreadable -> false
+            when (val state = readQuarantineManifest(recordFile)) {
+                is QuarantineManifestState.Unreadable -> return false
                 is QuarantineManifestState.Absent ->
-                    // No manifest and no canonical: nothing was ever preserved — the honest
-                    // absence; the registry directory's acknowledgment is established (the
-                    // D1 doctrine: exists() is never the acknowledgment).
-                    UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)
+                    // Nothing was ever preserved — the honest state; the registry
+                    // directory's acknowledgment is established (the D1 doctrine:
+                    // exists() is never the acknowledgment).
+                    return UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)
                 is QuarantineManifestState.Present -> {
-                    val manifest = state.manifest
-                    if (manifest.targetPath != target.absolutePath) return false
+                    val bound = state.manifest
+                    if (!manifestBindsToOperation(bound, target, recordFile)) return false
                     if (!UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)) return false
-                    for (entry in manifest.entries) {
+                    var current = bound
+                    for (entry in bound.entries.toList()) {
                         val slotFile = IOFile(recordFile.parentFile, entry.slotName)
-                        if (!slotExistsExcludingSymlinks(slotFile)) return false
-                        if (!slotMatchesManifest(slotFile, entry.sha256Hex)) return false
-                        if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
+                        if (slotExistsExcludingSymlinks(slotFile)) {
+                            if (!slotMatchesManifest(slotFile, entry.sha256Hex)) return false
+                            if (!UploadFile.synchronizeDirectoryEntry(slotFile.parentFile)) return false
+                            continue
+                        }
+                        when (quarantinedSlotKind(recordFile, entry.slotName)) {
+                            QuarantineSlotKind.CAPTURED -> {
+                                // THE PENDING CAPTURED WRITE IS FINISHED FROM THE RECORD
+                                // (review-48 F1): the payload must still be in the record
+                                // and hash to the recorded identity.
+                                val text = capturedText ?: return false
+                                val payloadSha = text.toByteArray(Charsets.UTF_8)
+                                    .let { sha256HexOfBytes(it) } ?: return false
+                                if (payloadSha != entry.sha256Hex) return false
+                                if (!writeSlotPayload(recordFile, slotFile, text, entry.sha256Hex)) return false
+                            }
+                            QuarantineSlotKind.MOVED -> {
+                                if (!canonicalWasPresent) return false
+                                val released = releaseStaleMovedReservations(recordFile, current) ?: return false
+                                current = released
+                            }
+                            null -> return false
+                        }
                     }
-                    true
+                    return true
                 }
             }
         }
 
         /**
-         * THE COHERENT QUARANTINE, MANIFEST-DURABLE (review-46 D2, reworked review-47
-         * E2/E4): an observation that cannot bind coherently to the restored generation —
-         * a LEGACY sidecar (location-only binding: re-binding it to the restoration's
-         * publication id would MANUFACTURE evidence it never carried), a dead-id CURRENT
-         * observation (every later capture fails closed on it — the original #4 stuck
-         * state), or an unclassifiable payload — is MOVED out of the canonical name into
-         * the operation-owned manifest-indexed slot. THE BYTES ARE PRESERVED VERBATIM (a
-         * rename on the same filesystem — the registry and the staging container are
-         * siblings under the offline storage's parent by construction — never a deletion),
-         * the canonical .obs name is left HONESTLY ABSENT, and the manifest (which survives
-         * the record disposal) records the slot's byte identity BEFORE the move. The move
-         * runs ONLY inside the validated arms — the recovery record's scope validation and
-         * the proof gates precede it, so a newer valid J's observation is never moved while
-         * its proof is live (no authority broadened). A failed move/mutation RETAINS (the
-         * caller keeps the recovery state and the sweep replays). An absent canonical name
-         * takes the replay verification (both directories acknowledged, every recorded
-         * slot's bytes verified). HONEST LIMITS: quarantined slots and their manifest are
-         * inert to every sweep enumeration (which keys on exact `.recovery`/`.scope`
-         * suffixes) and are never automatically restored or reconciled — their disposition
-         * belongs to the operator, at the manifest-recorded names.
+         * THE COHERENT QUARANTINE, MANIFEST-DURABLE (review-46 D2, review-47 E2/E4, the
+         * reservation discipline review-48 F2): an observation that cannot bind coherently
+         * to the restored generation — a LEGACY sidecar (location-only binding: re-binding
+         * it to the restoration's publication id would MANUFACTURE evidence it never
+         * carried), a dead-id CURRENT observation (every later capture fails closed on it —
+         * the original #4 stuck state), or an unclassifiable payload — is MOVED out of the
+         * canonical name into the operation-owned manifest-indexed slot. THE BYTES ARE
+         * PRESERVED VERBATIM (a rename on the same filesystem — the registry and the
+         * staging container are siblings under the offline storage's parent by
+         * construction — never a deletion), the canonical .obs name is left HONESTLY
+         * ABSENT, and the manifest (which survives the record disposal) records the slot's
+         * byte identity BEFORE the move. Stale MOVED reservations are released first (the
+         * canonical's presence proves they never executed). The move runs ONLY inside the
+         * validated arms — the recovery record's scope validation and the proof gates
+         * precede it, so a newer valid J's observation is never moved while its proof is
+         * live (no authority broadened). A failed move/mutation RETAINS. HONEST LIMITS:
+         * quarantined slots and their manifest are inert to every sweep enumeration (which
+         * keys on exact `.recovery`/`.scope` suffixes) and are never automatically restored
+         * or reconciled — their disposition belongs to the operator, at the
+         * manifest-recorded names.
          */
         private fun quarantineCanonicalObservation(context: Context, target: IOFile, recordFile: IOFile): Boolean {
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            // NOFOLLOW (review-48 F4): a symlink at the canonical name is unknown — never
+            // read through, never moved.
+            if (isSymbolicLinkPath(observationFile)) return false
             if (!observationFile.exists()) {
-                return verifyReplayedQuarantine(context, recordFile, target)
+                // The ladder calls this only for a present canonical; an absent one has
+                // nothing to move — its directory acknowledgment is established and the
+                // final gate verifies the recorded state.
+                return UploadFile.synchronizeDirectoryEntry(observationFile.parentFile)
             }
             // THE PRE-MUTATION IDENTITY: the exact bytes are read once and hashed BEFORE
             // the manifest is written, so every later crash window is verifiable against
             // the recorded identity.
             val payloadBytes = runCatching { observationFile.readBytes() }.getOrNull() ?: return false
             val payloadSha256 = sha256HexOfBytes(payloadBytes) ?: return false
-            val slotFile = allocateQuarantineSlot(recordFile, CANONICAL_SLOT_BASE)
+            val existingManifest = when (val state = readQuarantineManifest(recordFile)) {
+                is QuarantineManifestState.Unreadable -> return false
+                is QuarantineManifestState.Absent -> null
+                is QuarantineManifestState.Present -> {
+                    if (!manifestBindsToOperation(state.manifest, target, recordFile)) return false
+                    state.manifest
+                }
+            }
+            // THE STALE RESERVATIONS ARE RELEASED BEFORE THE NEW UPSERT (review-48 F2):
+            // the canonical's presence proves any MOVED reservation without a slot was
+            // never executed.
+            val releasedManifest = if (existingManifest == null) {
+                null
+            } else {
+                releaseStaleMovedReservations(recordFile, existingManifest) ?: return false
+            }
+            val slotFile = allocateQuarantineSlot(recordFile, CANONICAL_SLOT_BASE, releasedManifest)
             // THE MANIFEST IS DURABLE BEFORE THE MOVE (review-47 E4): the entry records the
             // slot name and the payload's byte identity first.
-            if (!upsertQuarantineManifestEntry(recordFile, target.absolutePath, slotFile.name, payloadSha256)) return false
+            if (!upsertQuarantineManifestEntry(recordFile, target, slotFile.name, payloadSha256)) return false
             val moved = runCatching { observationFile.renameTo(slotFile) }.getOrDefault(false)
             if (!moved || !slotFile.exists() || observationFile.exists()) return false
             // BOTH DIRECTORY ACKNOWLEDGMENTS: the source parent's entry (the removal) and,
