@@ -135,8 +135,14 @@ sealed class GenerationEstablishment {
 
     /** The metadata-equal coarse tier: no usable server hash (missing or an
      * unsupported algorithm) and the coarse metadata comparison did not refute the
-     * transfer. Publishes unresolved (version-0 record); never a verified claim. */
-    object CoarseUnresolved : GenerationEstablishment()
+     * transfer. Publishes unresolved (version-0 record); never a verified claim.
+     * [seenServerHash] is the EXACT server hash value the details response carried —
+     * null when the field was absent/empty, the verbatim token otherwise (an
+     * unsupported algorithm included) — the durable retry-eligibility evidence stage 6
+     * records in the attempt observation. The public-share routes (no establishment
+     * ran) use the default null only through the legacy observation frame — never as a
+     * claimed absence. */
+    class CoarseUnresolved(val seenServerHash: String? = null) : GenerationEstablishment()
 
     /** The bytes' generation is unknowable or refuted: discard the bytes, retain the
      * durable intent (the pending marker stays for the re-drive). */
@@ -648,7 +654,7 @@ class DownloadOfflineFileManager(
                 publishStagedOfflineFile(
                     context, file, offlineFile, staged,
                     explicitUnresolvedGeneration = promotionEstablishment == null,
-                    established = promotionEstablishment,
+                    establishment = promotionEstablishment,
                 )
             }.onFailure { exception ->
                 // CANCELLATION IS NEVER A FAILED PROMOTION (issue: round 31 #6): the
@@ -735,7 +741,7 @@ class DownloadOfflineFileManager(
         staged: IOFile,
         verificationBasis: File? = null,
         explicitUnresolvedGeneration: Boolean = false,
-        established: GenerationEstablishment.Established? = null,
+        establishment: GenerationEstablishment? = null,
     ): PublicationOutcome = publishStagedOfflineFile(
         userDrive = userDrive,
         isInheritedDownload = isInheritedDownload,
@@ -749,11 +755,15 @@ class DownloadOfflineFileManager(
             // what was actually published, never the stale capture. The location guard
             // in the core guarantees fresh.name == file.name, so every identity use is
             // unchanged.
-            completePublishedFileLocked(context, established?.fresh ?: file, target)
+            completePublishedFileLocked(
+                context,
+                (establishment as? GenerationEstablishment.Established)?.fresh ?: file,
+                target,
+            )
         },
         verificationBasis = verificationBasis,
         explicitUnresolvedGeneration = explicitUnresolvedGeneration,
-        established = established,
+        establishment = establishment,
         // THE COMPARISON-TIME BASIS HASH (issue: round 27 #3) rides this transfer's own
         // instance state — the companion core cannot hold it, so the wrapper binds the
         // callback; the retirement below reads exactly the hash its publication verified.
@@ -908,9 +918,16 @@ class DownloadOfflineFileManager(
                             val attemptObservation = runCatching {
                                 IOFile(provenanceFileFor(context, offlineFile).path + ".obs")
                                     .readText().trim().split("|")
-                            }.getOrNull()?.takeIf { it.size >= 8 && it[0] == "1" }
+                            }.getOrNull()?.takeIf {
+                                (it.size >= 8 && it[0] == "1") || (it.size >= 9 && it[0] == "2")
+                            }
                             val attemptIdentityHolds = attemptObservation != null &&
-                                attemptObservation.drop(7).joinToString("|") == offlineFile.absolutePath &&
+                                // THE FRAME DECIDES THE LOCATION INDEX (review-53 §5,
+                                // stage 6): the v2 observation inserts the seen hash basis
+                                // before the location; the identity fields 1-6 are shared.
+                                attemptObservation.drop(
+                                    if (attemptObservation[0] == "1") 7 else 8
+                                ).joinToString("|") == offlineFile.absolutePath &&
                                 attemptObservation[1].toLongOrNull() == bindingProof.publicationId &&
                                 attemptObservation[2].toIntOrNull() == (freshForAdvance.version?.number ?: 0) &&
                                 attemptObservation[3].toLongOrNull() == freshForAdvance.size &&
@@ -1134,7 +1151,7 @@ class DownloadOfflineFileManager(
                     staged = staged,
                     verificationBasis = verificationBasis,
                     explicitUnresolvedGeneration = generation !is GenerationEstablishment.Established,
-                    established = generation as? GenerationEstablishment.Established,
+                    establishment = generation,
                 )
                 // Public superseded/conflict status for the bulk caller (issues: round 9 #8,
                 // round 14 #13).
@@ -1752,6 +1769,7 @@ class DownloadOfflineFileManager(
             destination: IOFile = staged,
             serverHash: String? = null,
             contentHashOverride: String? = null,
+            seenServerHashBasis: String? = null,
         ): Boolean {
             // THE OBSERVATION BINDS THE ACTUAL PUBLICATION DESTINATION AND THE ATTEMPT'S
             // IDENTITY (issues: round 29 #6/#7): the previous writer recorded the STAGING
@@ -1773,17 +1791,45 @@ class DownloadOfflineFileManager(
             if (unresolvedRecord) {
                 val attemptId = readPublishedProvenance(context, staged)?.publicationId
                     ?: return false
-                val observationText = (
-                    listOf(
-                        "1",
-                        attemptId.toString(),
-                        (file.version?.number ?: 0).toString(),
-                        file.size?.toString() ?: "",
-                        file.revisedAt.toString(),
-                        file.lastModifiedAt.toString(),
-                        file.updatedAt.toString(),
-                    ) + destination.absolutePath
-                    ).joinToString("|")
+                // THE RETRY-ELIGIBILITY BASIS (review-53 §5, stage 6): an establishment
+                // that RAN records the seen server-hash basis in the observation's v2
+                // frame — "-" for an absent hash field, the verbatim token otherwise (an
+                // unsupported algorithm included). No establishment (the public-share
+                // routes, the promotions) records the LEGACY frame: no hash evidence, so
+                // the reader allows another transfer (fail-closed, today's behavior).
+                // The basis lets the no-spin gate skip the BODY re-download while the
+                // fresh details are still checked every pass: a server that later offers
+                // a usable hash changes the observed basis and re-justifies the transfer.
+                val observationText = if (seenServerHashBasis == null) {
+                    (
+                        listOf(
+                            "1",
+                            attemptId.toString(),
+                            (file.version?.number ?: 0).toString(),
+                            file.size?.toString() ?: "",
+                            file.revisedAt.toString(),
+                            file.lastModifiedAt.toString(),
+                            file.updatedAt.toString(),
+                        ) + destination.absolutePath
+                        ).joinToString("|")
+                } else {
+                    // A basis that cannot ride a single field (a '|' or newline inside a
+                    // pathological server token) FAILS THE WRITE — never a corrupted
+                    // frame, never a falsified absence.
+                    if (seenServerHashBasis.any { it == '|' || it == '\n' }) return false
+                    (
+                        listOf(
+                            "2",
+                            attemptId.toString(),
+                            (file.version?.number ?: 0).toString(),
+                            file.size?.toString() ?: "",
+                            file.revisedAt.toString(),
+                            file.lastModifiedAt.toString(),
+                            file.updatedAt.toString(),
+                            seenServerHashBasis,
+                        ) + destination.absolutePath
+                        ).joinToString("|")
+                }
                 // ATOMIC WRITE AND READ-BACK (issue: round 29 #7): a failed or interrupted
                 // observation preparation FAILS the publication preparation (the staged
                 // state is cleaned by the caller) — no publication proceeds whose retry
@@ -9178,7 +9224,7 @@ class DownloadOfflineFileManager(
             onPublishedLocked: (() -> Unit)? = null,
             verificationBasis: File? = null,
             explicitUnresolvedGeneration: Boolean = false,
-            established: GenerationEstablishment.Established? = null,
+            establishment: GenerationEstablishment? = null,
             onVerifiedBasisHash: ((String?) -> Unit)? = null,
         ): PublicationOutcome = withContext(Dispatchers.IO) {
             try {
@@ -9220,7 +9266,7 @@ class DownloadOfflineFileManager(
                             lockedOwnerId = lockedOwnerId,
                             verificationBasis = verificationBasis,
                             explicitUnresolvedGeneration = explicitUnresolvedGeneration,
-                            established = established,
+                            establishment = establishment,
                             checkCancelled = { coroutineContext.ensureActive() },
                             onVerifiedBasisHash = onVerifiedBasisHash,
                         )
@@ -9260,7 +9306,7 @@ class DownloadOfflineFileManager(
             checkCancelled: () -> Unit,
             verificationBasis: File? = null,
             explicitUnresolvedGeneration: Boolean = false,
-            established: GenerationEstablishment.Established? = null,
+            establishment: GenerationEstablishment? = null,
             onVerifiedBasisHash: ((String?) -> Unit)? = null,
         ): PublicationOutcome {
             checkCancelled()
@@ -9280,6 +9326,13 @@ class DownloadOfflineFileManager(
             // identity, never from the captured tuple (old metadata + new hash is the
             // exact defect the adoption exists to prevent). The CAS basis, the intent
             // checks and the location authority keep the captured transfer's basis.
+            val established = establishment as? GenerationEstablishment.Established
+            // THE RETRY-ELIGIBILITY BASIS (review-53 §5, stage 6): an unresolved
+            // publication records the seen server-hash basis in its attempt observation —
+            // "-" for an absent hash, the verbatim token otherwise. An establishment that
+            // did not run records no basis (the legacy frame — no skip eligibility).
+            val seenServerHashBasis = (establishment as? GenerationEstablishment.CoarseUnresolved)
+                ?.let { it.seenServerHash ?: "-" }
             val payloadIdentity = established?.fresh ?: file
             // Live intent: an inherited download requires a current pin or durable root
             // ancestry (a materialized inherited flag alone never authorizes retention); a
@@ -9701,6 +9754,7 @@ class DownloadOfflineFileManager(
                     destination = target,
                     serverHash = established?.serverHash,
                     contentHashOverride = established?.localSha256,
+                    seenServerHashBasis = seenServerHashBasis,
                 )
             ) {
                 runCatching { staged.delete() }
@@ -10071,7 +10125,7 @@ class DownloadOfflineFileManager(
                     offlineFile,
                     staged,
                     explicitUnresolvedGeneration = promotionEstablishment == null,
-                    established = promotionEstablishment,
+                    establishment = promotionEstablishment,
                     onPublishedLocked = {
                         // EXACT-GENERATION cache cleanup INSIDE the publication's locks
                         // (issues: round 17 #6, round 18 #11): the promoted cache goes only
@@ -10131,7 +10185,7 @@ class DownloadOfflineFileManager(
             userDrive: UserDrive,
             staged: IOFile,
             generationResolved: Boolean = true,
-            established: GenerationEstablishment.Established? = null,
+            establishment: GenerationEstablishment? = null,
         ): PublicationOutcome = try {
             // THE EXECUTING CONTEXT CAPTURED FOR THE CALLBACK (review-42 #9): a non-suspend
             // lambda cannot read the suspend coroutineContext — the ACTUAL executing
@@ -10173,6 +10227,7 @@ class DownloadOfflineFileManager(
                 // conditionally advanced to the fresh identity under the held locks (the
                 // acceptance gate refuses a newer or conflicting live row; a location
                 // difference is not adoptable — the transfer defers).
+                val established = establishment as? GenerationEstablishment.Established
                 val payloadIdentity = established?.fresh ?: file
                 if (established != null) {
                     val fresh = established.fresh
@@ -10229,6 +10284,8 @@ class DownloadOfflineFileManager(
                             destination = target,
                             serverHash = established?.serverHash,
                             contentHashOverride = established?.localSha256,
+                            seenServerHashBasis = (establishment as? GenerationEstablishment.CoarseUnresolved)
+                                ?.let { it.seenServerHash ?: "-" },
                         )
                     ) {
                         PublicationOutcome.FAILED
@@ -10486,7 +10543,13 @@ class DownloadOfflineFileManager(
             if (!(proof.identifies(file, userDrive) && proof.certifiesBytes(target))) {
                 return@runCatching false
             }
-            val fresh = ApiRepository.getFileDetailsSuspend(
+            // THE FRESH DETAILS CARRY THE HASH STATE (review-53 §5, stage 6): the gate
+            // fetches the with-hash expansion on the cache-less view of the captured
+            // client — the same freshness the establishment uses — so the recorded hash
+            // basis can be compared against what the server offers NOW. A server that
+            // later offers a usable hash changes the observed basis and re-justifies the
+            // transfer even when every metadata field is unchanged.
+            val fresh = ApiRepository.getFileDetailsWithHashNoCacheSuspend(
                 file = File(id = file.id, driveId = userDrive.driveId),
                 okHttpClient = okHttpClient,
             )
@@ -10503,12 +10566,13 @@ class DownloadOfflineFileManager(
             // never a byte-generation proof.
             val observation = runCatching {
                 IOFile(provenanceFileFor(context, target).path + ".obs").readText().trim().split("|")
-            }.getOrNull()?.takeIf { it.size >= 7 && it[0] == "1" }
+            }.getOrNull()?.takeIf { (it.size >= 7 && it[0] == "1") || (it.size >= 9 && it[0] == "2") }
                 ?: return@runCatching false
             // THE OBSERVATION'S LOCATION MUST BE THIS DESTINATION (issue: round 28 #13
             // follow-up): a sidecar re-keyed by a relocation or a record at a reused path
-            // is not this destination's attempt evidence.
-            val attemptedLocation = observation.drop(7).joinToString("|")
+            // is not this destination's attempt evidence. The frame decides the location
+            // index: the v2 observation inserts the seen hash basis before the location.
+            val attemptedLocation = observation.drop(if (observation[0] == "1") 7 else 8).joinToString("|")
             if (attemptedLocation != target.absolutePath) return@runCatching false
             // THE ATTEMPT IDENTITY BINDING (issue: round 29 #6): the observation belongs
             // to the SPECIFIC publication/attempt whose record now sits at the target — a
@@ -10520,11 +10584,30 @@ class DownloadOfflineFileManager(
             val attemptedRevisedAt = observation[4].toLongOrNull() ?: return@runCatching false
             val attemptedLastModifiedAt = observation[5].toLongOrNull() ?: return@runCatching false
             val attemptedUpdatedAt = observation[6].toLongOrNull() ?: return@runCatching false
-            row.revisedAt == attemptedRevisedAt &&
-                row.lastModifiedAt == attemptedLastModifiedAt &&
-                row.updatedAt == attemptedUpdatedAt &&
-                row.size == attemptedSize &&
-                (row.version?.number ?: 0) == attemptedVersion
+            val metadataIdentityHolds =
+                row.revisedAt == attemptedRevisedAt &&
+                    row.lastModifiedAt == attemptedLastModifiedAt &&
+                    row.updatedAt == attemptedUpdatedAt &&
+                    row.size == attemptedSize &&
+                    (row.version?.number ?: 0) == attemptedVersion
+            if (!metadataIdentityHolds) return@runCatching false
+            // THE SEEN HASH BASIS (review-53 §5, stage 6): the legacy frame carries no
+            // hash evidence — the metadata-identity match alone decides (today's
+            // behavior). The v2 frame adds the basis leg: the skip fires only when the
+            // server's CURRENT hash state is EXACTLY what the failed attempt faced —
+            // "-" matches an absent/empty fresh hash; a recorded verbatim token must
+            // equal the fresh hash verbatim AND be an UNSUPPORTED value, because a
+            // supported basis can always gain from another attempt (the re-drive is the
+            // only route to the verified tier). A changed basis — the server added,
+            // removed, or switched algorithms — re-justifies the transfer.
+            if (observation[0] == "1") return@runCatching true
+            val attemptedHashBasis = observation[7]
+            val freshHash = row.serverContentHash
+            when {
+                attemptedHashBasis == "-" -> freshHash.isNullOrEmpty()
+                ServerContentHash.SUPPORTED_FORMAT.matches(attemptedHashBasis) -> false
+                else -> attemptedHashBasis == freshHash
+            }
         }
             // CANCELLATION IS NEVER A SUPPRESSION MISS (issue: round 30 #8): a cancelled
             // caller (the SAF bridge job, a stopped worker, a cancelled dialog) must not
@@ -10584,7 +10667,9 @@ class DownloadOfflineFileManager(
                 is ServerContentHash.Parsed.Supported -> {
                     val stagedFile = staged
                     if (stagedFile == null || !stagedFile.exists()) {
-                        return@runCatching GenerationEstablishment.CoarseUnresolved
+                        // The basis is SUPPORTED — the re-drive must proceed (it can
+                        // establish): the recorded basis never authorizes a skip.
+                        return@runCatching GenerationEstablishment.CoarseUnresolved(serverHash.canonical)
                     }
                     // THE FRESH IDENTITY'S OWN SIZE GATE (review-53 D1): the size check
                     // is based on the CORRECT fresh identity, never the stale capture —
@@ -10596,9 +10681,11 @@ class DownloadOfflineFileManager(
                     // THE LOCAL RECEIPT IS REQUIRED for an established record (the
                     // content-verified tier carries both identities); unhashable local
                     // bytes degrade to the coarse tier — the bytes still publish
-                    // unresolved, never discarded over a tooling failure.
+                    // unresolved, never discarded over a tooling failure. The supported
+                    // basis is recorded verbatim: a supported basis never authorizes a
+                    // skip (the re-drive is the only route to verified).
                     val localSha256 = UploadFile.sha256OrNull(stagedFile)
-                        ?: return@runCatching GenerationEstablishment.CoarseUnresolved
+                        ?: return@runCatching GenerationEstablishment.CoarseUnresolved(serverHash.canonical)
                     // THE HASH ITSELF: the streaming hook re-checks cancellation after
                     // every chunk; the final check below runs after the hash and before
                     // the caller's publication CAS. THE EXECUTING CONTEXT IS CAPTURED
@@ -10647,14 +10734,14 @@ class DownloadOfflineFileManager(
             return when {
                 freshVersion > 0 && claimedVersion > 0 &&
                     freshVersion == claimedVersion && fresh.revisedAt == file.revisedAt ->
-                    GenerationEstablishment.CoarseUnresolved
+                    GenerationEstablishment.CoarseUnresolved(seenServerHash = fresh.serverContentHash)
                 freshVersion <= 0 && claimedVersion <= 0 &&
                     fresh.revisedAt == file.revisedAt &&
                     fresh.lastModifiedAt == file.lastModifiedAt &&
                     fresh.size == file.size ->
                     // Both sides version-less: the coarse tie is the only evidence —
                     // published, but with an explicitly UNRESOLVED (version-0) proof.
-                    GenerationEstablishment.CoarseUnresolved
+                    GenerationEstablishment.CoarseUnresolved(seenServerHash = fresh.serverContentHash)
                 // KNOWN CLAIMED, UNKNOWN FRESH (issue: round 23 #22): a versioned
                 // claim meeting a version-less details response establishes nothing.
                 else -> GenerationEstablishment.Failed
@@ -10720,8 +10807,12 @@ class DownloadOfflineFileManager(
                     // outcome; Failed discards the staged bytes and fails the transfer —
                     // nothing is published, no intent/marker is consumed, and no
                     // known-version proof is issued from an unbound response.
+                    // THE PUBLIC-SHARE ROUTES RECORD NO HASH BASIS (review-53 §5, stage 6):
+                    // no establishment runs here, so the publication carries NO
+                    // establishment outcome — its observation is the legacy frame (no
+                    // hash evidence, another transfer allowed), never a claimed absence.
                     val establishment = if (file.isPublicShared()) {
-                        GenerationEstablishment.CoarseUnresolved
+                        null
                     } else {
                         reestablishDownloadedGeneration(
                             file = file,
@@ -10730,12 +10821,12 @@ class DownloadOfflineFileManager(
                             staged = staged,
                         )
                     }
-                    when (establishment) {
-                        GenerationEstablishment.Failed -> PublicationOutcome.FAILED
+                    when {
+                        establishment is GenerationEstablishment.Failed -> PublicationOutcome.FAILED
                         else -> publishStagedCacheCopy(
                             context, file, target, userDrive, staged,
                             generationResolved = establishment is GenerationEstablishment.Established,
-                            established = establishment as? GenerationEstablishment.Established,
+                            establishment = establishment,
                         )
                     }
                 } finally {
@@ -10764,8 +10855,13 @@ class DownloadOfflineFileManager(
                         // publishes with an explicitly UNRESOLVED version-0 proof and an
                         // unresolved outcome; Established adopts the fresh identity
                         // (review-53 D1).
+                        // THE PUBLIC-SHARE ROUTES RECORD NO HASH BASIS (review-53 §5,
+                        // stage 6), as in the plain-cache branch: no establishment ran, so
+                        // the publication carries no establishment outcome (the legacy
+                        // observation frame), and the unresolved flag is derived from the
+                        // absence of an ESTABLISHED result.
                         val establishment = if (file.isPublicShared()) {
-                            GenerationEstablishment.CoarseUnresolved
+                            null
                         } else {
                             reestablishDownloadedGeneration(
                                 file = file,
@@ -10780,8 +10876,8 @@ class DownloadOfflineFileManager(
                             else -> publishStagedOfflineFile(
                                 userDrive, isInheritedDownload, file, target, staged,
                                 explicitUnresolvedGeneration =
-                                    establishment is GenerationEstablishment.CoarseUnresolved,
-                                established = establishment as? GenerationEstablishment.Established,
+                                    establishment !is GenerationEstablishment.Established,
+                                establishment = establishment,
                             )
                         }
                     }.onFailure { exception ->

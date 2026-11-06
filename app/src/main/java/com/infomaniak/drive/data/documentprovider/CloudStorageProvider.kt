@@ -1104,7 +1104,7 @@ class CloudStorageProvider : DocumentsProvider() {
                         DownloadOfflineFileManager.publishStagedCacheCopy(
                             context, file, cacheFile, userDrive, staged,
                             generationResolved = establishment is GenerationEstablishment.Established,
-                            established = establishment as? GenerationEstablishment.Established,
+                            establishment = establishment,
                         )
                     }
                     if (outcome == PublicationOutcome.PUBLISHED ||
