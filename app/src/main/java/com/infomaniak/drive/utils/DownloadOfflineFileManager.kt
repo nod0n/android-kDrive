@@ -9444,10 +9444,11 @@ class DownloadOfflineFileManager(
             // exact defect the adoption exists to prevent). The CAS basis, the intent
             // checks and the location authority keep the captured transfer's basis.
             val established = establishment as? GenerationEstablishment.Established
-            // THE RETRY-ELIGIBILITY BASIS (review-53 §5, stage 6): an unresolved
-            // publication records the seen server-hash basis in its attempt observation —
-            // "-" for an absent hash, the verbatim token otherwise. An establishment that
-            // did not run records no basis (the legacy frame — no skip eligibility).
+            // THE RETRY-ELIGIBILITY BASIS (review-53 §5 stage 6; review-54 F6): an
+            // unresolved publication records the seen server-hash basis in its attempt
+            // observation — the total encoded field ("a" absent, "x"+hex otherwise). An
+            // establishment that did not run records no basis (the legacy frame — no
+            // skip eligibility).
             val seenServerHashBasis = (establishment as? GenerationEstablishment.CoarseUnresolved)
                 ?.let { encodeObservedHashBasis(it.seenServerHash) }
             val payloadIdentity = established?.fresh ?: file
