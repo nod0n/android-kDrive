@@ -81,9 +81,9 @@ class FileMigration16to17Test {
         .directory(fixtureDir)
         .build()
 
-    /** THE ORDINARY ROW'S SYNTHETIC FIXTURE (no owner data — synthetic constants only). */
+    /** THE ORDINARY ROW'S SYNTHETIC FIXTURE (no owner data — synthetic constants only; the
+     * PK `uid` is bound ONCE by createObject's argument — a managed row's PK is immutable). */
     private fun seedOrdinary(file: File) = file.apply {
-        uid = "900001_701"
         id = 900001
         driveId = 701
         name = "fixture-ordinary.bin"
@@ -100,9 +100,9 @@ class FileMigration16to17Test {
     }
 
     /** THE SHARED-SHAPE ROW (the same schema — shared-with-me rows live in their own realm
-     * FILE; the migration is schema-level and treats every File row identically). */
+     * FILE; the migration is schema-level and treats every File row identically; the PK
+     * `uid` is likewise bound ONCE by createObject's argument). */
     private fun seedShared(file: File) = file.apply {
-        uid = "900002_701"
         id = 900002
         driveId = 701
         name = "fixture-shared.bin"
