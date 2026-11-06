@@ -1857,6 +1857,34 @@ class DownloadOfflineFileManager(
             }.getOrDefault(false)
         }
 
+        // THE SINGLE UNRESOLVED-OUTCOME DECISION (the established-versionless publication
+        // fix, 2026-11-06): extracted verbatim from publishLockedCore's inline expression
+        // as the finite test seam — the regression drives THIS production predicate, never
+        // a mirrored copy. THE BOTH-VERSIONS-UNKNOWN ARM (round 19 #14) no longer
+        // downgrades an ESTABLISHED publication: when the ladder has hash-verified the
+        // staged bytes against the server's canonical hash (and passed the fresh-identity
+        // size gate), the generation identity IS provable — by exact content, the v3
+        // frame's verified hash — so the missing OPTIONAL version number alone must not
+        // demote the outcome to PUBLISHED_UNRESOLVED (the structural re-download loop the
+        // device diagnostic pinned: the marker stayed, the batch failed, the bodies
+        // re-downloaded forever). NEVER INVENTS a version (the record keeps whatever the
+        // fresh row carries — 0 when unknown); NEVER lets coarse metadata alone verify
+        // (the arm fires IN FULL for null/CoarseUnresolved/Failed establishments —
+        // `!is Established` matches the original `established == null` semantics exactly);
+        // the CAS, freshness, supersession, intent, location, user/drive and size gates
+        // are untouched (they precede and stay independent).
+        internal fun publicationGenerationUnresolved(
+            explicitUnresolvedGeneration: Boolean,
+            establishment: GenerationEstablishment?,
+            liveRowExists: Boolean,
+            liveVersionNumber: Int?,
+            casBasisVersionNumber: Int?,
+        ): Boolean =
+            explicitUnresolvedGeneration ||
+                (establishment !is GenerationEstablishment.Established &&
+                    liveRowExists &&
+                    (liveVersionNumber ?: 0) <= 0 && (casBasisVersionNumber ?: 0) <= 0)
+
         /**
          * PREPARES the staged record and reads it back BEFORE any byte is replaced (issue:
          * round 18 #2): a publication proceeds only when its provenance is established and
@@ -9720,9 +9748,13 @@ class DownloadOfflineFileManager(
                 // prove, so they are skipped and a later details-resolved pass completes.
                 // The assignment precedes the conditional so the lambda's TAIL stays the
                 // Boolean the caller's `if (!intentOk)` needs (round-19 build fix).
-                unresolvedGeneration = explicitUnresolvedGeneration ||
-                    (live != null &&
-                        (live.version?.number ?: 0) <= 0 && (casBasis.version?.number ?: 0) <= 0)
+                unresolvedGeneration = publicationGenerationUnresolved(
+                    explicitUnresolvedGeneration = explicitUnresolvedGeneration,
+                    establishment = establishment,
+                    liveRowExists = live != null,
+                    liveVersionNumber = live?.version?.number,
+                    casBasisVersionNumber = casBasis.version?.number,
+                )
                 if (isInheritedDownload) {
                     pinned || ancestryCovers
                 } else {
