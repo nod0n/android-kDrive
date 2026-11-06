@@ -494,49 +494,66 @@ open class UploadFile(
          * source ownership, or a content identity that could not be read: record and snapshot
          * stay intact for [retryUnreconciledOriginals] (issue: round 17 #4).
          */
-        /** THE ORIGINAL ROW'S ACTUAL REALM FLAVOR (review-39 #8): the ordinary flavor first,
-         * then the shared one — the Realm files are per-drive and per-user respectively, so
-         * a row is located by opening each candidate and looking up the id. Null when the
-         * row exists in neither flavor (validated absence). */
-        private fun locateOriginalRowFlavor(record: UploadFile): UserDrive? {
-            val ordinary = UserDrive(userId = record.userId, driveId = record.driveId)
-            return listOf(ordinary, ordinary.copy(sharedWithMe = true)).firstOrNull { scope ->
-                runCatching {
-                    FileController.getRealmInstance(scope).use { realm ->
-                        runCatching { realm.refresh() }
-                        realm.where(File::class.java)
-                            .equalTo(File::id.name, record.originalFileId)
-                            .findFirst() != null
-                    }
-                }.getOrDefault(false)
-            }
-        }
-
         private fun reconcileOriginalCopyCleanBaseline(record: UploadFile): Boolean {
             val context = Realm.getApplicationContext() ?: return false
             // LEGACY rule (issue: round 18 #7): no trustworthy ownership/content proof —
             // conclude without advancing ANY row's baseline, and without selecting an
             // arbitrary name+parent match.
             if (record.originalFileId <= 0) return true
-            // THE ROW'S ACTUAL REALM FLAVOR (review-39 #8): the reconciliation previously
-            // opened the ORDINARY Realm for every record — a shared-only original's row
-            // lives in the shared Realm, the ordinary lookup found nothing, and the
-            // no-advance early return read as a CONCLUDED reconciliation, disposing the
-            // snapshot and the record before the shared recovery could ever use that
-            // evidence. The row is LOCATED first — ordinary flavor, then shared — and the
-            // whole reconciliation (lock, Realm, path derivation, ownership) runs in the
-            // row's actual flavor; absence in BOTH flavors is a validated no-advance, not
-            // a single-realm lookup's blind spot.
-            val userDrive = locateOriginalRowFlavor(record) ?: run {
-                // Absent in both flavors: there is no row whose baseline could advance —
-                // the legacy no-advance conclusion applies with the location actually
-                // validated (review-39 #8).
-                return true
-            }
             val candidateId = record.originalFileId
+            // THE FLAVOR DISCOVERY IS INSIDE THE CONTINUOUS COORDINATION (review-40 #8):
+            // the previous locate ran BEFORE the monitor and lock, ignored refresh
+            // failures, took the FIRST matching flavor as authority, and read a null as a
+            // concluded no-advance — a failed lookup became "absent in both", a row that
+            // moved between flavors before the lock was never re-examined, and a
+            // cross-Realm transfer's duplicate (both flavors holding F) reconciled the
+            // wrong revision. The discovery now runs inside the synchronized section with
+            // FRESH views of BOTH flavors and classifies explicitly: UNIQUE ownership,
+            // CONFIRMED absence (both fresh lookups succeeded and found nothing),
+            // AMBIGUITY (both flavors hold the row) and LOOKUP FAILURE — uncertainty
+            // DEFERS, never a blind no-advance cleanup. The file lock's key is
+            // flavor-agnostic (userId_driveId_fileId), so this single acquisition
+            // serializes the movers of both flavors for the row; the resolved scope then
+            // carries the whole reconciliation (Realm, path derivation, ownership).
+            val lockScope = UserDrive(userId = record.userId, driveId = record.driveId)
             synchronized(OfflineFileCoordination.rootIntentMonitor) {
                 var deferred = false
-                OfflineFileCoordination.withFileLock(userDrive, candidateId) {
+                OfflineFileCoordination.withFileLock(lockScope, candidateId) {
+                    var ordinaryRowFound = false
+                    var sharedRowFound = false
+                    var lookupFailed = false
+                    FileController.getRealmInstance(lockScope).use { realm ->
+                        if (runCatching { realm.refresh() }.isFailure) {
+                            lookupFailed = true
+                        } else {
+                            ordinaryRowFound = realm.where(File::class.java)
+                                .equalTo(File::id.name, candidateId).findFirst() != null
+                        }
+                    }
+                    FileController.getRealmInstance(lockScope.copy(sharedWithMe = true)).use { realm ->
+                        if (runCatching { realm.refresh() }.isFailure) {
+                            lookupFailed = true
+                        } else {
+                            sharedRowFound = realm.where(File::class.java)
+                                .equalTo(File::id.name, candidateId).findFirst() != null
+                        }
+                    }
+                    var discoveryDeferred = false
+                    val userDrive: UserDrive? = when {
+                        lookupFailed -> { discoveryDeferred = true; null }
+                        ordinaryRowFound && sharedRowFound -> { discoveryDeferred = true; null }
+                        ordinaryRowFound -> lockScope
+                        sharedRowFound -> lockScope.copy(sharedWithMe = true)
+                        else -> null
+                    }
+                    if (userDrive == null) {
+                        // CONFIRMED ABSENCE (both fresh lookups succeeded and found
+                        // nothing): no row exists whose baseline could advance — the
+                        // validated no-advance conclusion. A failed lookup or an ambiguous
+                        // duplicate deferred above, retaining the owned retry.
+                        if (discoveryDeferred) deferred = true
+                        return@withFileLock
+                    }
                     FileController.getRealmInstance(userDrive).use { realm ->
                         runCatching { realm.refresh() }
                         val liveRow = realm.where(File::class.java)
