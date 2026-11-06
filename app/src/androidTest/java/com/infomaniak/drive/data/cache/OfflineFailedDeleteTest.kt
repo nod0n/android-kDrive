@@ -61,10 +61,14 @@ import java.util.UUID
  *     BEFORE the byte deletion, so its disappearance after the run is DIRECT evidence the
  *     deletion was attempted (ruling out every protective-gate short-circuit — including
  *     any misclassification the seeded SYNC_OFFLINE record could have caused).
- *  3. existing state + release FAILS: the record's own registry directory is made
- *     unwritable, so the release fails over EXISTING state and the disposal defers
- *     ENTIRELY — the record is RETAINED alongside the bytes, and the coverage restoration
- *     still applies (a later pass retries sidecar and bytes together).
+ *  3. existing state + release FAILS: the seeded record at its EXACT production-derived
+ *     path is replaced by a non-empty directory — an unlink of a non-empty directory
+ *     deterministically fails on every POSIX filesystem — so the production release
+ *     genuinely fails over EXISTING registry state and the disposal defers ENTIRELY: the
+ *     record path is RETAINED alongside the bytes, and the coverage restoration still
+ *     applies (a later pass retries sidecar and bytes together). NO shared-directory
+ *     permission mutations anywhere: the obstruction lives only at this fixture's own
+ *     record path and its explicit cleanup restores that exact slot.
  *  4. successful deletion: the bytes go, the record is released, the counters tell the
  *     truth, the coverage stays cleared.
  *  5. abort between the failed deletion and the restoration: the flags stay cleared (the
@@ -84,14 +88,13 @@ import java.util.UUID
  * THE FIXTURE IS FULLY SYNTHETIC AND DISPOSABLE: a random realm in the instrumentation
  * target's cacheDir; the synthetic scope (user/drive/file ids) is RANDOMIZED PER CLASS LOAD
  * (a 50k-value space — no fixed scope collisions between fixture runs or parallel
- * residue); the seeded offline subtree, the seeded registry records (released and then
- * deleted by their EXACT production-derived paths) and the upload records (by URI) are the
- * ONLY state removed in cleanup — never other users' data. The registry prefix directory
- * in scenario 3 is shared by hash with same-prefix records: on a blank test app it holds
- * only this fixture's records; the lock is restored in `finally` even when the probe fails,
- * and the window's only possible side effect on a colliding residue is a deferred release
- * that retries later. No owner data, no account, no network. The coder executes nothing —
- * the orchestrator runs this on a device.
+ * residue); the seeded offline subtree, the seeded registry records (removed by their EXACT
+ * production-derived paths in cleanup — never a registry DIRECTORY, which is shared-by-hash
+ * infrastructure) and the upload records (by URI) are the ONLY state removed in cleanup —
+ * never other users' data, and NO shared-directory permission mutations anywhere (the
+ * owner installation may hold a real logged-in account, so nothing outside this fixture's
+ * own paths is ever touched). No owner data, no account, no network. The coder executes
+ * nothing — the orchestrator runs this on a device.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class OfflineFailedDeleteTest {
@@ -108,6 +111,7 @@ class OfflineFailedDeleteTest {
         private val DRIVE_ID = scopeBase + 2
         private val FILE_ID = scopeBase + 3
         private val PARENT_ID = scopeBase + 4
+        private val userDrive = UserDrive(userId = USER_ID, driveId = DRIVE_ID)
         private const val FILE_NAME = "fixture-failed-delete.bin"
         private const val ROW_PATH = "/fixture/failed-delete/"
         private const val PAYLOAD = "fixture offline copy payload — synthetic bytes"
@@ -199,34 +203,31 @@ class OfflineFailedDeleteTest {
             FileController.getFileById(realm, FILE_ID) ?: error("the fixture row must exist")
 
         /**
-         * THE ENVIRONMENT-REFUSAL PROBE: the sacrificial file is created while the
-         * directory is still writable, the directory is locked, and the sacrificial unlink
-         * must then FAIL (the file must persist). `setWritable`'s return is only the
-         * prerequisite — a chmod-ignoring FUSE layer surfaces HERE as an explicit
-         * environment-limitation failure, never as a vacuous contract pass. Returns the
-         * sacrificial file (the caller removes it after unlocking).
+         * THE ENVIRONMENT-REFUSAL PROBE, fully covered by ONE finally: the sacrificial
+         * file is created while the directory is still writable, the directory is locked,
+         * the sacrificial unlink must then FAIL (the file must persist) — and the unlock
+         * runs in `finally` from the moment the lock is attempted, so ANY throw (the
+         * creation, the lock, the probe or the block) still restores the directory and
+         * removes the sacrificial file. `setWritable`'s return is only the prerequisite —
+         * a chmod-ignoring FUSE layer surfaces as an explicit environment-limitation
+         * failure, never as a vacuous contract pass.
          */
-        private fun proveUnlinkRefusal(dir: IOFile): IOFile {
+        private inline fun withProvenLockedDirectory(dir: IOFile, block: () -> Unit) {
             val sacrificial = IOFile(dir, "probe-${UUID.randomUUID()}.tmp")
             check(sacrificial.createNewFile()) { "the fixture must be able to create its probe file" }
-            check(dir.setWritable(false, false)) { "the fixture directory must be lockable" }
-            check(!sacrificial.delete() && sacrificial.exists()) {
-                dir.setWritable(true, false)
-                "ENVIRONMENT LIMITATION: unlinks still succeed after the directory was made " +
-                    "unwritable (external-media FUSE may ignore chmod) — the real failed-unlink " +
-                    "contract cannot be exercised on this filesystem; this is a reported " +
-                    "unsupported mechanism, NOT a contract pass"
-            }
-            return sacrificial
-        }
-
-        /** Runs [block] with the directory locked after a proven refusal; always unlocks. */
-        private inline fun withProvenLockedDirectory(dir: IOFile, block: () -> Unit) {
-            val sacrificial = proveUnlinkRefusal(dir)
+            val locked = runCatching { dir.setWritable(false, false) }.getOrDefault(false)
             try {
+                check(locked) { "the fixture directory must be lockable" }
+                val deleted = runCatching { sacrificial.delete() }.getOrDefault(true)
+                check(!deleted && sacrificial.exists()) {
+                    "ENVIRONMENT LIMITATION: unlinks still succeed after the directory was made " +
+                        "unwritable (external-media FUSE may ignore chmod) — the real failed-unlink " +
+                        "contract cannot be exercised on this filesystem; this is a reported " +
+                        "unsupported mechanism, NOT a contract pass"
+                }
                 block()
             } finally {
-                check(dir.setWritable(true, false)) { "the fixture directory must be releasable" }
+                if (locked) runCatching { dir.setWritable(true, false) }
                 runCatching { sacrificial.delete() }
             }
         }
@@ -317,7 +318,6 @@ class OfflineFailedDeleteTest {
         Realm.getInstance(fixtureConfig).use { realm ->
             val offlineFile = seedCoveredCopy(realm, seedProvenance = true)
             val recordFile = provenanceFileFor(context, offlineFile)
-            val recordDir = recordFile.parentFile!!
             assertTrue(
                 recordFile.exists(),
                 "scenario setup: the seeded record must exist at its production-derived path",
@@ -325,24 +325,31 @@ class OfflineFailedDeleteTest {
             val stampBefore = liveRow(realm).offlineIntentStamp
             val result = OfflineFolderController.RemovalResult()
 
-            // The RECORD's own registry directory is locked (a fixture-only path: the
-            // record was seeded for THIS fixture's offline file; the shared-by-hash prefix
-            // caveat is documented in the class KDoc).
-            withProvenLockedDirectory(recordDir) {
-                val detached = realm.copyFromRealm(liveRow(realm), 1)
-                OfflineFolderController.clearFileCoverage(
-                    context = context,
-                    realm = realm,
-                    file = detached,
-                    userDrive = userDrive,
-                    result = result,
-                    isFolder = false,
-                )
-            }
+            // THE FIXTURE-OWNED OBSTRUCTION (no shared-directory permission mutations): the
+            // seeded record file at its EXACT production-derived path is replaced by a
+            // NON-EMPTY directory — an unlink of a non-empty directory deterministically
+            // fails on every POSIX filesystem, so the production release genuinely fails
+            // over EXISTING registry state, with no chmod anywhere and no effect on any
+            // other record sharing the hash prefix. The obstruction is this fixture's own
+            // record path alone and is removed by its own cleanup.
+            check(recordFile.delete()) { "the seeded record must be replaceable by the obstruction" }
+            check(recordFile.mkdirs()) { "the obstruction directory must be creatable at the record path" }
+            val obstructionChild = IOFile(recordFile, "obstruction.bin")
+            check(obstructionChild.createNewFile()) { "the obstruction must be non-empty (an empty directory would unlink)" }
+
+            val detached = realm.copyFromRealm(liveRow(realm), 1)
+            OfflineFolderController.clearFileCoverage(
+                context = context,
+                realm = realm,
+                file = detached,
+                userDrive = userDrive,
+                result = result,
+                isFolder = false,
+            )
 
             assertTrue(
-                provenanceRecordFileExists(context, offlineFile) && recordFile.exists(),
-                "the failed release must RETAIN the record — the disposal deferred entirely",
+                recordFile.exists() && obstructionChild.exists(),
+                "the failed release must RETAIN the obstructed record path — the disposal deferred entirely",
             )
             assertTrue(offlineFile.exists(), "the bytes are never deleted when the release fails")
             assertEquals(1, result.keptOfflineFilesCount)
@@ -350,6 +357,17 @@ class OfflineFailedDeleteTest {
             val retained = liveRow(realm)
             assertTrue(retained.isInOfflineFolder, "the coverage restoration applies to the deferred disposal")
             assertNotEquals(stampBefore, retained.offlineIntentStamp)
+
+            // EXACT OWN-PATH CLEANUP (explicit, never broad): the obstruction's child, the
+            // obstruction directory itself, and then the record slot's residue via the
+            // production release — all at this fixture's own record path only.
+            check(obstructionChild.delete()) { "the obstruction child must be removable in cleanup" }
+            check(recordFile.delete()) { "the obstruction directory must be removable in cleanup" }
+            runCatching { deletePublishedProvenance(context, offlineFile) }
+            assertFalse(
+                provenanceRecordFileExists(context, offlineFile),
+                "the fixture's own record slot must be clean after its cleanup",
+            )
         }
     }
 
