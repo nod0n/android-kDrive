@@ -696,6 +696,12 @@ class MainViewModel(
                                                                                 oldCopy,
                                                                                 newCopy,
                                                                                 userDrive = sharedScope,
+                                                                                // THE SOURCE'S OWN AUTHORITY (review-38
+                                                                                // #6): the merge's relocations run
+                                                                                // inside the shared scope — the source
+                                                                                // copies live in the shared Realm.
+                                                                                sourceSharedWithMe = sharedScope.sharedWithMe,
+                                                                                sourceStorageKind = "offline",
                                                                             )
                                                                         }.getOrDefault(false)
                                                                         if (prepared) {
@@ -1161,6 +1167,14 @@ class MainViewModel(
                                                                             sourceBytes,
                                                                             destinationBytes,
                                                                             userDrive = sharedScope,
+                                                                            // THE SOURCE'S OWN AUTHORITY (review-38 #6):
+                                                                            // the staged transfer's original lives in
+                                                                            // the ordinary per-drive Realm while the
+                                                                            // destination graph is the shared one — the
+                                                                            // journal records the SOURCE's flavor so the
+                                                                            // replay validates its ownership there.
+                                                                            sourceSharedWithMe = userDrive.sharedWithMe,
+                                                                            sourceStorageKind = "offline",
                                                                         )
                                                                     }.getOrDefault(false)
                                                                     if (!relocationPrepared) return@runCatching false

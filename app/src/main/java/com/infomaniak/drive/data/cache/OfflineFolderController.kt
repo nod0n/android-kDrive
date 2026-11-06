@@ -795,6 +795,12 @@ object OfflineFolderController {
                                         // recorded old identity when the live row has not
                                         // advanced to the destination yet.
                                         recordedSourcePath = oldOfflineFile.absolutePath,
+                                        // THE SOURCE'S OWN AUTHORITY IS RECORDED (review-38 #6):
+                                        // a same-realm relocation's source lives in the caller's
+                                        // captured flavor — recorded explicitly so the replay
+                                        // validates the source ownership there.
+                                        sourceSharedWithMe = userDrive.sharedWithMe,
+                                        sourceStorageKind = "offline",
                                     )
                                 ) {
                                     return@runCatching false

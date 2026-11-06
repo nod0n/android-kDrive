@@ -2245,6 +2245,9 @@ class DownloadOfflineFileManager(
             recordedSourcePath: String = "",
             recordedSourceProofText: String = "",
             previousDestinationRecordText: String = "",
+            sourceSharedWithMe: Boolean = false,
+            sourceStorageKind: String = "offline",
+            flow: ProofRelocationFlow = ProofRelocationFlow.STAGED_PUBLICATION,
         ): Boolean = runCatching {
             // DAMAGED EVIDENCE IS NEVER PERSISTED AS ABSENCE (issue: round 31 #4), as in
             // the publication recovery record: a relocation whose source observation
@@ -2292,16 +2295,26 @@ class DownloadOfflineFileManager(
             // on read — retained and fail-closed — never decoded as legitimate absence;
             // only the legacy "1" records keep the conservative empty-means-absent
             // semantics, and the "2" records stay parseable as the pre-rollback format.
+            // RECORD v4 (review-38 #6): the EIGHTH line records the SOURCE's own Realm
+            // flavor and storage kind (distinct from the destination sidecar — the
+            // cross-Realm copy flow's source lives in another realm) and the DURABLE
+            // OPERATION PHASE: the staged flow's bytes ALREADY sit at the target ("M"),
+            // the published-source flow's bytes are still at the source ("P") until
+            // completePreparedProofMove advances them. The replay's repair authority
+            // follows the recorded phase — never a source-hash or destination-location
+            // inference.
+            val operationPhase = if (flow == ProofRelocationFlow.STAGED_PUBLICATION) "M" else "P"
             atomicWriteText(
                 recordFile,
                 listOf(
-                    "3",
+                    "4",
                     target.absolutePath,
                     proofText,
                     attemptedObservationText,
                     recordedSourcePath,
                     recordedSourceProofText,
                     previousDestinationRecordText,
+                    "${if (sourceSharedWithMe) 1 else 0}|$sourceStorageKind|$operationPhase",
                 ).joinToString("\n"),
             )
         }.getOrDefault(false)
@@ -2395,6 +2408,20 @@ class DownloadOfflineFileManager(
              * destination write; an abort restores it exactly (null = no restore
              * contract — v1/v2, or the destination carried no record). */
             val previousDestinationRecordText: String?,
+            /** THE RECORDED SOURCE AUTHORITY (review-38 #6): the SOURCE's own Realm
+             * flavor and storage kind — distinct from the destination sidecar's, which
+             * describes the DESTINATION. The cross-Realm copy flow's source lives in
+             * another realm, so its ownership must validate there. Null for v1–v3
+             * legacy records (neither authority was recorded). */
+            val recordedSourceSharedWithMe: Boolean? = null,
+            val recordedSourceStorageKind: String? = null,
+            /** THE DURABLE OPERATION PHASE (review-38 #6): "P" = prepared (the
+             * published-source flow's bytes are still at the source), "M" = moved (the
+             * bytes sit at the destination). Written at prepare, advanced by
+             * completePreparedProofMove; the replay's repair authority follows the
+             * recorded phase, never an inference from the source hash or the
+             * destination row's location. Null for v1–v3 legacy records. */
+            val recordedPhase: String? = null,
             /** COMPLETE PROOF VALIDATION (review-34 #9): the retained proof text parses
              * under the FULL provenance grammar WITH the operation's target as its
              * expected embedded location — validated before any registry mutation. */
@@ -2428,8 +2455,11 @@ class DownloadOfflineFileManager(
             // newly written v3 journal undecodable forever. A specified limit PRESERVES
             // trailing empty fields (a v3 record legitimately ends with an empty
             // previous-destination field); excess fields surface as a '\n' inside the last
-            // parts and are rejected explicitly by the per-version checks below.
-            val parts = recordFile.readText().split("\n", limit = 7)
+            // parts and are rejected explicitly by the per-version checks below. The limit
+            // covers the CURRENT version's line count (v4, review-38 #6); an older record
+            // with more lines than its version requires still rejects through its own
+            // size/newline checks.
+            val parts = recordFile.readText().split("\n", limit = 8)
             fun fields(proofText: String): List<String> = proofText.removePrefix(PROVENANCE_FRAME).split("|")
             // THE COMPLETE PROOF DECODE (review-34 #9): the embedded location is parsed
             // loose (any grammar) and strict (the operation's target expected) — the strict
@@ -2547,6 +2577,67 @@ class DownloadOfflineFileManager(
                         embeddedProofLocation = embeddedLocation,
                     )
                 }
+                "4" -> {
+                    // RECORD v4 (review-38 #6): the v3 structure PLUS the EIGHTH line —
+                    // the recorded SOURCE authority (the source's own Realm flavor and
+                    // storage kind, distinct from the destination sidecar's) and the
+                    // DURABLE OPERATION PHASE ("P" prepared / "M" moved). Every field of
+                    // the authority line is required and strictly validated: an
+                    // undecodable journal is retained, never guessed. v1–v3 stay readable
+                    // as legacy — their repair keeps the validated source/destination
+                    // transition (exclusive source ownership proven in the row's actual
+                    // realm), never a source-hash or destination-location inference.
+                    if (parts.size != 8) return@runCatching null
+                    val sourceField = parts[4]
+                    val previousDestinationField = parts[6]
+                    val sourceAuthorityField = parts[7]
+                    if (sourceField.contains('\n') || parts[5].contains('\n') ||
+                        previousDestinationField.contains('\n') || sourceAuthorityField.contains('\n')
+                    ) {
+                        return@runCatching null
+                    }
+                    val authorityParts = sourceAuthorityField.split("|")
+                    if (authorityParts.size != 3) return@runCatching null
+                    val recordedSourceShared = when (authorityParts[0].trim()) {
+                        "0" -> false
+                        "1" -> true
+                        else -> return@runCatching null
+                    }
+                    val recordedSourceKind = authorityParts[1].trim().takeIf { it.isNotEmpty() }
+                        ?: return@runCatching null
+                    val recordedPhase = when (authorityParts[2].trim()) {
+                        "P" -> "P"
+                        "M" -> "M"
+                        else -> return@runCatching null
+                    }
+                    val proofFields = fields(parts[2])
+                    val observationField = parts[3]
+                    val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
+                    ParsedProofMoveRecord(
+                        version = 4,
+                        targetPath = parts[1],
+                        proofText = parts[2],
+                        proofUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull(),
+                        proofDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull(),
+                        proofFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull(),
+                        proofContentHash = proofFields.getOrNull(7)?.trim()?.takeIf { it.isNotEmpty() },
+                        observationText = when {
+                            observationField == "A" -> null
+                            observationField.isNotEmpty() -> observationField
+                            else -> null
+                        },
+                        observationFieldDamaged = observationField.isEmpty(),
+                        observationAmbiguous = false,
+                        recordedSourcePath = sourceField.takeIf { it.isNotEmpty() },
+                        recordedSourceProofText = parts[5].takeIf { it.isNotEmpty() },
+                        previousDestinationRecordText = previousDestinationField.takeIf { it.isNotEmpty() },
+                        recordedSourceSharedWithMe = recordedSourceShared,
+                        recordedSourceStorageKind = recordedSourceKind,
+                        recordedPhase = recordedPhase,
+                        proofLocationValid = locationValid,
+                        embeddedProofLocation = embeddedLocation,
+                    )
+                }
                 else -> null
             }
         }.getOrNull()
@@ -2589,6 +2680,8 @@ class DownloadOfflineFileManager(
             storageKind: String = "offline",
             flow: ProofRelocationFlow = ProofRelocationFlow.STAGED_PUBLICATION,
             recordedSourcePath: String = "",
+            sourceSharedWithMe: Boolean = false,
+            sourceStorageKind: String = "offline",
         ): Boolean {
             val provenance = readPublishedProvenance(context, source)
             if (provenance == null) {
@@ -2637,6 +2730,13 @@ class DownloadOfflineFileManager(
                     provenance.recordText(source)
                 } else "",
                 previousDestinationRecordText = previousDestinationRecordText,
+                // THE SOURCE'S OWN AUTHORITY IS RECORDED (review-38 #6): the journal
+                // carries the source's Realm flavor and storage kind beside the
+                // destination sidecar's, so the replay validates the source ownership
+                // through its ACTUAL scope.
+                sourceSharedWithMe = sourceSharedWithMe,
+                sourceStorageKind = sourceStorageKind,
+                flow = flow,
             )
             if (!relocationStateWritten) {
                 // Without recoverable state the source proof is NOT destroyed: the old
@@ -2965,12 +3065,46 @@ class DownloadOfflineFileManager(
                 runCatching { sourceObs.delete() }
             }
             deletePublishedProvenance(context, source)
+            // THE DURABLE PHASE ADVANCE (review-38 #6): the byte effect is done — the
+            // journal's recorded phase moves from prepared to moved so the replay's
+            // repair authority follows the record, not an inference. A failed advance
+            // leaves the prepared phase durable: every downstream guard (source hash,
+            // source ownership, tuple) still fails closed over the moved state, so a
+            // stale phase retains — it never relaxes a check.
+            advanceRelocationPhase(context, target)
             // THE STATE OUTLIVES THE COMPLETION WHEN THE CALLER'S METADATA COMMIT IS STILL
             // PENDING (review-34 #3): the subtree relocation completes its children while
             // the rows still resolve to the old paths — disposal happens only after that
             // commit succeeds, so a failed merge retains every child's rollback authority.
             if (disposeOnSuccess) runCatching { proofRelocationRecordFile(context, target).delete() }
             return true
+        }
+
+        /** THE DURABLE PHASE ADVANCE (review-38 #6): rewrites a v4 journal's phase field
+         * from the prepared state ("P") to the moved state ("M") after the byte effect,
+         * atomically and only when the CURRENT journal still decodes as this exact
+         * prepared operation. Every other field round-trips verbatim from the decoded
+         * record; a failure or a concurrent change leaves the journal untouched. */
+        private fun advanceRelocationPhase(context: Context, target: IOFile) {
+            runCatching {
+                val recordFile = proofRelocationRecordFile(context, target)
+                val parsed = parseProofMoveRecord(recordFile) ?: return@runCatching
+                if (parsed.version < 4 || parsed.recordedPhase != "P") return@runCatching
+                atomicWriteText(
+                    recordFile,
+                    listOf(
+                        "4",
+                        parsed.targetPath,
+                        parsed.proofText,
+                        parsed.observationText ?: if (parsed.observationFieldDamaged) "" else "A",
+                        parsed.recordedSourcePath ?: "",
+                        parsed.recordedSourceProofText ?: "",
+                        parsed.previousDestinationRecordText ?: "",
+                        "${if (parsed.recordedSourceSharedWithMe == true) 1 else 0}|" +
+                            "${parsed.recordedSourceStorageKind ?: "offline"}|M",
+                    ).joinToString("\n"),
+                )
+            }
         }
 
         /** DISPOSES A COMPLETED RELOCATION'S STATE (review-34 #3): called after the
@@ -3026,6 +3160,8 @@ class DownloadOfflineFileManager(
                 sharedWithMe = sharedWithMe,
                 storageKind = storageKind,
                 flow = ProofRelocationFlow.STAGED_PUBLICATION,
+                sourceSharedWithMe = sharedWithMe,
+                sourceStorageKind = storageKind,
             ) && completePreparedProofMove(context, source, target)
 
         /**
@@ -3042,6 +3178,8 @@ class DownloadOfflineFileManager(
             source: IOFile,
             target: IOFile,
             userDrive: UserDrive,
+            sourceSharedWithMe: Boolean,
+            sourceStorageKind: String = "offline",
         ): Boolean {
             // THE COMMON DESTINATION BOUNDARY (review-36 #3): EVERY published-source caller —
             // the shared subtree merge and the cross-Realm transfer alike — validates the
@@ -3062,6 +3200,8 @@ class DownloadOfflineFileManager(
                 storageKind = "offline",
                 flow = ProofRelocationFlow.PUBLISHED_SOURCE_RELOCATION,
                 recordedSourcePath = source.absolutePath,
+                sourceSharedWithMe = sourceSharedWithMe,
+                sourceStorageKind = sourceStorageKind,
             )
         }
 
@@ -4057,6 +4197,9 @@ class DownloadOfflineFileManager(
                                         reread.recordedSourcePath != parsed.recordedSourcePath ||
                                         reread.recordedSourceProofText != parsed.recordedSourceProofText ||
                                         reread.previousDestinationRecordText != parsed.previousDestinationRecordText ||
+                                        reread.recordedSourceSharedWithMe != parsed.recordedSourceSharedWithMe ||
+                                        reread.recordedSourceStorageKind != parsed.recordedSourceStorageKind ||
+                                        reread.recordedPhase != parsed.recordedPhase ||
                                         reread.proofLocationValid != parsed.proofLocationValid ||
                                         reread.embeddedProofLocation != parsed.embeddedProofLocation
                                     ) {
@@ -4148,14 +4291,52 @@ class DownloadOfflineFileManager(
                                                     // source hash equality alone never proves the pre-byte
                                                     // phase. The live row must STILL exclusively resolve to
                                                     // the recorded source under the captured coordination.
+                                                    // THE SOURCE'S OWN AUTHORITY (review-38 #6): a v4
+                                                    // journal records the SOURCE's Realm flavor and
+                                                    // storage kind — the destination sidecar's scope
+                                                    // describes the DESTINATION, and the cross-Realm
+                                                    // copy flow's source lives in another realm (the
+                                                    // destination graph commits while the source row
+                                                    // still resolves to the recorded source in its
+                                                    // OWN realm). A legacy v2/v3 journal records
+                                                    // neither: the VALIDATED TRANSITION checks the
+                                                    // exclusive source ownership in BOTH candidate
+                                                    // flavors — the row's own realm must resolve the
+                                                    // recorded source exclusively — and NEVER the
+                                                    // source hash alone nor the destination row's
+                                                    // location.
                                                     val sourceOwnership = sourceHash != null &&
-                                                        sourceProof != null && sourceHash == sourceProof.contentHash &&
-                                                        currentOwnerHolds(
-                                                            context, scope, proofFileId, sourceFile,
-                                                            sharedWithMe = moveScopeShared,
-                                                            storageKind = moveScopeKind,
+                                                        sourceProof != null && sourceHash == sourceProof.contentHash && (
+                                                        if (parsed.version >= 4 && parsed.recordedSourceSharedWithMe != null) {
+                                                            currentOwnerHolds(
+                                                                context, scope, proofFileId, sourceFile,
+                                                                sharedWithMe = parsed.recordedSourceSharedWithMe,
+                                                                storageKind = parsed.recordedSourceStorageKind
+                                                                    ?: moveScopeKind,
+                                                            )
+                                                        } else {
+                                                            currentOwnerHolds(
+                                                                context, scope, proofFileId, sourceFile,
+                                                                sharedWithMe = moveScopeShared,
+                                                                storageKind = moveScopeKind,
+                                                            ) || currentOwnerHolds(
+                                                                context, scope, proofFileId, sourceFile,
+                                                                sharedWithMe = !moveScopeShared,
+                                                                storageKind = moveScopeKind,
+                                                            )
+                                                        }
                                                         )
-                                                    tupleEqual && sourceOwnership
+                                                    // THE DURABLE PHASE (review-38 #6): a v4 journal's
+                                                    // recorded phase gates the pre-byte repair — only a
+                                                    // PREPARED journal repairs from the captured prior
+                                                    // evidence (a moved journal's bytes sit at the
+                                                    // destination; the missing-target arm never
+                                                    // rewrites them). A legacy journal has no recorded
+                                                    // phase: the validated transition above remains its
+                                                    // phase authority.
+                                                    val phaseRecordedPrepared = parsed.version < 4 ||
+                                                        parsed.recordedPhase == "P"
+                                                    tupleEqual && sourceOwnership && phaseRecordedPrepared
                                                 }.getOrDefault(false)
                                                 if (!resolveAbortedDestinationRecord(
                                                         context,
