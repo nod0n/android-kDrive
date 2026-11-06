@@ -3208,15 +3208,20 @@ class DownloadOfflineFileManager(
         internal fun beginRelocationByteEffects(context: Context, target: IOFile): Boolean =
             transitionRelocationPhase(context, target, "B")
 
-        /** THE REPLAY DURABILITY BARRIER (review-39 #5, review-40 #3/#4): a matching hash
+        /** THE REPLAY DURABILITY BARRIER (review-39 #5, review-40 #3/#4, review-41 #3): a matching hash
          * and the durable registry record never substitute for the payload's own
-         * durability — the payload's CONTENTS and its WHOLE ancestor-entry chain are
-         * synchronized before any replay branch acknowledges publication/restoration or
-         * disposes its fallback evidence. A still-failing barrier retains the evidence
-         * for the next sweep. */
+         * durability — the payload's CONTENTS, its OWN FILENAME ENTRY in its containing
+         * directory, and the WHOLE ancestor-entry chain are synchronized before any replay
+         * branch acknowledges publication/restoration or disposes its fallback evidence.
+         * The hierarchy helper acknowledges every ANCESTOR directory's entry in its own
+         * parent — never the payload file's own entry — so a publication rename that
+         * succeeded while its parent-entry synchronization failed passed the barrier
+         * without the filename entry's acknowledgment. A still-failing barrier retains
+         * the evidence for the next sweep. */
         private fun payloadDurabilityEstablished(payload: IOFile): Boolean =
             payload.exists() &&
                 UploadFile.synchronizeFileContents(payload) &&
+                UploadFile.synchronizeDirectoryEntry(payload.parentFile) &&
                 ensureDurableDestinationHierarchy(payload)
 
         /** DISPOSES A COMPLETED RELOCATION'S STATE (review-34 #3): called after the
@@ -4665,7 +4670,15 @@ class DownloadOfflineFileManager(
                                                 if (currentProof != null && currentProof.certifiesBytes(target) &&
                                                     currentProof.publicationId != retainedPublicationId
                                                 ) {
-                                                    return@runCatching disposeRecoveryRecord(recordFile)
+                                                    // THE SUPERSESSION'S BARRIER (review-41 #3): the
+                                                    // superseding publication's payload durability —
+                                                    // contents, filename entry, ancestor chain — is
+                                                    // established before this journal's conditional
+                                                    // disposal; a still-failing barrier retains the
+                                                    // journal for the next sweep instead of disposing
+                                                    // over an unacknowledged state.
+                                                    return@runCatching payloadDurabilityEstablished(target) &&
+                                                        disposeRecoveryRecord(recordFile)
                                                 }
                                                 val recordTarget = verifiedProvenanceFileFor(context, target)
                                                 val proofEstablished = recordTarget != null && runCatching {
