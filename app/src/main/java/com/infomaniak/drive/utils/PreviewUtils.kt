@@ -255,6 +255,10 @@ internal suspend fun downloadFile(
     return DownloadOfflineFileManager.withDownloadResponse(
         fileUrl = downloadUrl,
         okHttpClient = okHttpClient,
+        // THE ESTABLISHMENT'S DOWNLOAD IS NO-CACHE (review-54 F3): the staged body
+        // feeds publishDownloadedCopy's generation establishment on both branches — a
+        // cached stale 200 would hash the old generation and loop the retry.
+        noCache = true,
         downloadInterceptor = downloadProgressInterceptor,
     ) { response ->
         if (!response.isSuccessful) {
