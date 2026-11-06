@@ -3917,13 +3917,29 @@ class DownloadOfflineFileManager(
             joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
 
         private fun String.hexToBytes(): ByteArray? {
+            // THE STRICT HEX GRAMMAR (review-45 R5): the canonical format is the WRITER's —
+            // lowercase hex pairs ONLY ("0"-"9", "a"-"f"; toHexString emits exactly that).
+            // A sign, an UPPERCASE digit, any non-hex character, an odd length or an
+            // embedded newline is a DAMAGED line: fail closed (undecodable, retained),
+            // never a wrong-byte decode. Integer.parseInt(…, 16) accepted signs and
+            // uppercase digits — both rejected here. An EMPTY line remains the legitimate
+            // encoding of an empty damaged capture.
             if (length % 2 != 0) return null
             val out = ByteArray(length / 2)
             for (i in out.indices) {
-                val digit = Integer.parseInt(substring(i * 2, i * 2 + 2), 16)
-                out[i] = digit.toByte()
+                val high = strictHexDigit(this[i * 2]) ?: return null
+                val low = strictHexDigit(this[i * 2 + 1]) ?: return null
+                out[i] = ((high shl 4) or low).toByte()
             }
             return out
+        }
+
+        /** The strict LOWERCASE-hex digit value, or null for anything else — uppercase
+         * included: the canonical format is the writer's lowercase output. */
+        private fun strictHexDigit(c: Char): Int? = when (c) {
+            in '0'..'9' -> c - '0'
+            in 'a'..'f' -> c - 'a' + 10
+            else -> null
         }
 
         private sealed class AttemptedObservationCapture {
@@ -6737,6 +6753,9 @@ class DownloadOfflineFileManager(
                     checkCancelled = checkCancelled,
                     // THE CAPTURED OLD OBSERVATION STATE (review-43 #4).
                     oldObservation = record.capturedOldObservation(),
+                    // THE CAPTURED ATTEMPT OBSERVATION TEXT (review-45 R4): the exact-text
+                    // retirement's expected identity.
+                    attemptedObservationText = record.attemptedObservationText,
                 )
             } else {
                 // An UNREADABLE CHANGED target (issue: round 23 #2): never overwritten —
@@ -6836,41 +6855,48 @@ class DownloadOfflineFileManager(
             oldObservation: OldObservationCapture?,
             restorationPublicationId: Long?,
             failedOperationProofText: String?,
+            attemptedObservationText: String?,
         ): Boolean {
             val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
             return when (oldObservation) {
                 null, is OldObservationCapture.Absent -> {
                     if (removeObservationBoundTo(context, target, failedPublicationId)) {
+                        // The failed attempt's observation (or none) — the obligation is met.
                         true
                     } else {
-                        // THE NOT-CAPTURED LEFTOVER'S VALIDATED TRANSITION (review-44 N3):
-                        // records predating the capture know only the FAILED id — a
-                        // leftover observation bound to an OLD DEAD publication id (neither
-                        // the failed nor the restoration id) made this removal return false
-                        // forever, permanently blocking a valid rollback. The restored
-                        // state's own identity decides: with the restoration proof
-                        // ESTABLISHED, a parseable leftover bound to a different id is
-                        // stale relative to the restored generation and is retired with
-                        // verification (the restoration's own observation is kept). Without
-                        // an established restoration the restored generation is UNPROVEN —
-                        // no observation can be current for it, so a parseable leftover's
-                        // own publication is provably gone and it is retired with
-                        // verification (the same discipline as a captured-carried state
-                        // over an unproven restoration). An UNPARSEABLE leftover cannot be
-                        // classified and ALWAYS retains — the honest non-convergent case,
-                        // never dropped and never read as absence.
-                        if (restorationPublicationId != null) {
-                            removeStaleObservation(context, target, restorationPublicationId)
-                        } else {
-                            removeAnyParsedObservation(context, target)
-                        }
+                        // THE EXACT OPERATION OBLIGATION (review-45 R4): an UNCAPTURED old
+                        // state (null/"U") and an EXPLICIT captured absence are not the same
+                        // permission. Beyond the failed-id removal above, the ONLY evidence
+                        // this operation may retire is the observation whose EXACT text
+                        // equals the record's captured ATTEMPT observation (its own attempt
+                        // evidence — a legacy-format failed attempt's residue, removable by
+                        // exact-text identity, never by parseability). The retirement is
+                        // ATTEMPTED here; a leftover that matches neither identity — another
+                        // publication's, a LEGACY sidecar, an unparseable payload — is NOT
+                        // this operation's evidence to retire: parsing alone is never
+                        // permission and the restoration proof's existence is never
+                        // permission either. It is PRESERVED UNTOUCHED while the coherent
+                        // rollback completes — its disposition belongs to the operation that
+                        // owns it; no absence is fabricated and the unknown propagates as
+                        // the preserved state itself (a later capture on such a path fails
+                        // closed — the honest consequence of evidence this operation cannot
+                        // classify). The branch completes in every case: its obligation is
+                        // met exactly as far as the operation can know, and never by
+                        // dropping what it cannot.
+                        removeObservationExactText(context, target, attemptedObservationText)
+                        true
                     }
                 }
                 is OldObservationCapture.Valid -> {
                     if (restorationPublicationId != null) {
                         establishRecoveredObservation(context, target, oldObservation.text, restorationPublicationId)
                     } else {
-                        removeAnyParsedObservation(context, target)
+                        // THE CAPTURE'S OWN AUTHORITY (review-45 R4): the unproven
+                        // restoration retires the observation it CAPTURED — exact-text
+                        // identity, never parseability; a current text that no longer
+                        // equals the captured one is not the captured evidence and
+                        // retains the whole restore.
+                        removeObservationExactText(context, target, oldObservation.text)
                     }
                 }
                 is OldObservationCapture.Damaged -> {
@@ -6895,50 +6921,18 @@ class DownloadOfflineFileManager(
             }
         }
 
-        /** THE STALE-RELATIVE RETIREMENT (review-44 N3): over an ESTABLISHED restoration,
-         * a parseable observation bound to a publication id other than the restoration's
-         * own is stale relative to the restored generation (its binding names a superseded
-         * publication) and is retired with verification; the restoration's own observation
-         * is kept; an unparseable observation cannot be classified and retains. */
-        private fun removeStaleObservation(context: Context, target: IOFile, restorationPublicationId: Long): Boolean {
+        /** THE EXACT-TEXT RETIREMENT (review-45 R4): retires the target's observation ONLY
+         * when its exact current text equals the expected captured evidence — the
+         * operation's OWN captured attempt or old observation. Parsing alone is
+         * never permission; a current text that does not equal the expected one
+         * is not the captured evidence and retains. Durably acknowledged and
+         * absence-verified; absence succeeds. */
+        private fun removeObservationExactText(context: Context, target: IOFile, expectedText: String?): Boolean {
+            if (expectedText == null) return false
             val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
             if (!observationFile.exists()) return true
-            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
-                ?.let { parseObservationBinding(it) }
-                ?: return false
-            if (parsed.format == ObservationFormat.CURRENT && parsed.publicationId == restorationPublicationId) {
-                return true
-            }
-            return runCatching { observationFile.delete() }.getOrDefault(false) &&
-                UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
-                !observationFile.exists()
-        }
-
-        /** Retires the target's observation ONLY when it is a parseable observation bound
-         * to [boundPublicationId] in the current format; absence succeeds, anything else
-         * retains. The retirement is durably acknowledged (review-43 #2 discipline). */
-        private fun removeObservationBoundTo(context: Context, target: IOFile, boundPublicationId: Long?): Boolean {
-            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
-            if (!observationFile.exists()) return true
-            if (boundPublicationId == null) return false
-            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
-                ?.let { parseObservationBinding(it) }
-                ?: return false
-            if (parsed.format != ObservationFormat.CURRENT || parsed.publicationId != boundPublicationId) return false
-            return runCatching { observationFile.delete() }.getOrDefault(false) &&
-                UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
-                !observationFile.exists()
-        }
-
-        /** Retires ANY parseable observation at the target (a stale carried observation
-         * over an unproven restoration — its publication is provably gone); an unparseable
-         * observation retains. Durably acknowledged and absence-verified. */
-        private fun removeAnyParsedObservation(context: Context, target: IOFile): Boolean {
-            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
-            if (!observationFile.exists()) return true
-            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
-                ?.let { parseObservationBinding(it) }
-                ?: return false
+            val current = runCatching { observationFile.readText().trim() }.getOrNull() ?: return false
+            if (current != expectedText) return false
             return runCatching { observationFile.delete() }.getOrDefault(false) &&
                 UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
                 !observationFile.exists()
@@ -7819,6 +7813,9 @@ class DownloadOfflineFileManager(
             // the target's pre-publication observation (explicit absence or carried text)
             // rides the record beside the old proof.
             val oldObservationCapture = captureOldTargetObservation(provenanceContext, target)
+            // THE HOISTED ATTEMPT TEXT (review-45 R4): the exact-text retirement's expected
+            // identity for the failure-path restore.
+            var attemptedObservationCaptureText: String? = null
             val recoveryRecorded = recoveryFile == null || (backupHash != null &&
                 writeRecoveryRecord(
                     provenanceContext,
@@ -7835,13 +7832,21 @@ class DownloadOfflineFileManager(
                     // #4): captured from the staged attempt BEFORE the replacement; a
                     // missing/unreadable/invalid observation of an unresolved attempt
                     // fails the record write instead of being persisted as absence.
-                    attemptedObservation = captureAttemptedObservation(
-                        provenanceContext,
-                        staged,
-                        // THE INTENDED DESTINATION BINDING (issue: round 32 #5).
-                        expectedObservationLocation = target.absolutePath,
-                        requireObservation = explicitUnresolvedGeneration,
-                    ),
+                    // THE ATTEMPT CAPTURE IS HOISTED (review-45 R4): the same captured
+                    // attempt feeds the recovery record AND the rollback's exact-text
+                    // retirement identity.
+                    attemptedObservation = run {
+                        val capturedAttempt = captureAttemptedObservation(
+                            provenanceContext,
+                            staged,
+                            // THE INTENDED DESTINATION BINDING (issue: round 32 #5).
+                            expectedObservationLocation = target.absolutePath,
+                            requireObservation = explicitUnresolvedGeneration,
+                        )
+                        attemptedObservationCaptureText =
+                            (capturedAttempt as? AttemptedObservationCapture.Valid)?.text
+                        capturedAttempt
+                    },
                     oldObservation = oldObservationCapture,
                 ))
             if (!recoveryOk || !recoveryRecorded) {
@@ -7933,6 +7938,9 @@ class DownloadOfflineFileManager(
                                 // restored evidence includes the target's pre-publication
                                 // observation state.
                                 oldObservation = oldObservationCapture,
+                                // THE CAPTURED ATTEMPT OBSERVATION TEXT (review-45 R4): the
+                                // exact-text retirement's expected identity.
+                                attemptedObservationText = attemptedObservationCaptureText,
                             )
                         } == true
                     if (restored) {
@@ -8274,6 +8282,9 @@ class DownloadOfflineFileManager(
                         // pre-publication observation state rides the record for the
                         // rollback's complete evidence restoration.
                         val oldObservationCapture = captureOldTargetObservation(context, target)
+                        // THE HOISTED ATTEMPT TEXT (review-45 R4): the exact-text
+                        // retirement's expected identity for the failure-path restore.
+                        var attemptedObservationCaptureText: String? = null
                         val recoveryRecorded = recoveryFile == null || (backupHash != null &&
                             writeRecoveryRecord(
                                 context,
@@ -8288,13 +8299,21 @@ class DownloadOfflineFileManager(
                                 expectedPublicationRecordText,
                                 // THE OBSERVATION RIDES THE RECOVERY (issues: round 30 #7,
                                 // round 31 #4), as in the coordinated arm.
-                                attemptedObservation = captureAttemptedObservation(
-                                    context,
-                                    staged,
-                                    // THE INTENDED DESTINATION BINDING (issue: round 32 #5).
-                                    expectedObservationLocation = target.absolutePath,
-                                    requireObservation = !generationResolved,
-                                ),
+                                // THE ATTEMPT CAPTURE IS HOISTED (review-45 R4), as in the
+                                // coordinated arm: the same captured attempt feeds the
+                                // recovery record AND the rollback's exact-text retirement.
+                                attemptedObservation = run {
+                                    val capturedAttempt = captureAttemptedObservation(
+                                        context,
+                                        staged,
+                                        // THE INTENDED DESTINATION BINDING (issue: round 32 #5).
+                                        expectedObservationLocation = target.absolutePath,
+                                        requireObservation = !generationResolved,
+                                    )
+                                    attemptedObservationCaptureText =
+                                        (capturedAttempt as? AttemptedObservationCapture.Valid)?.text
+                                    capturedAttempt
+                                },
                                 oldObservation = oldObservationCapture,
                             ))
                         if (!recoveryOk || !recoveryRecorded) {
@@ -8389,6 +8408,9 @@ class DownloadOfflineFileManager(
                                                 // THE CAPTURED OLD OBSERVATION STATE (review-43 #4),
                                                 // as in the coordinated publication.
                                                 oldObservation = oldObservationCapture,
+                                                // THE CAPTURED ATTEMPT OBSERVATION TEXT (review-45
+                                                // R4): the exact-text retirement's expected identity.
+                                                attemptedObservationText = attemptedObservationCaptureText,
                                             )
                                         } == true
                                     if (restored) {
