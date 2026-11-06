@@ -5380,7 +5380,10 @@ class DownloadOfflineFileManager(
                                                                 // the validated route disposes it) and
                                                                 // the destination's own durable intent
                                                                 // re-drives through the ordinary sync
-                                                                // path: churn that converges, never a
+                                                                // path — the rollback converges TO THE
+                                                                // REDRIVE only; the redrive's fresh-
+                                                                // download completion remains subject to
+                                                                // #1 (no all-resolved claim). Never a
                                                                 // wrong publish. The historical intent of
                                                                 // such journals is unprovable — the
                                                                 // residual is STRUCTURAL and explicitly
@@ -5420,8 +5423,11 @@ class DownloadOfflineFileManager(
                                                             // proof-based comparison is the FAIL-SAFE:
                                                             // a changed or never-matching row
                                                             // supersedes → the validated rollback +
-                                                            // the durable redrive — churn that
-                                                            // converges, never a wrong publish. THE
+                                                            // the durable redrive — the rollback
+                                                            // converges TO THE REDRIVE only (the
+                                                            // redrive's fresh-download completion
+                                                            // remains subject to #1; no all-resolved
+                                                            // claim), never a wrong publish. THE
                                                             // LIMITS ARE EXPLICITLY OPEN: the
                                                             // destination's at-capture generation is
                                                             // unprovable for pre-v7 journals (the
