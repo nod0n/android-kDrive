@@ -725,16 +725,25 @@ class MainViewModel(
                                                                         }
                                                                         false
                                                                     } else {
-                                                                        // THE PUBLISHED BYTES' DIRECTORY ENTRY IS
-                                                                        // DURABLE (review-38 #2): each relocation's
-                                                                        // rename is persisted BEFORE its completion runs;
-                                                                        // a rename-success/fsync-failure state defers the
-                                                                        // merge with the prepared journals retained for
-                                                                        // the sweep's replay.
-                                                                        val renamed = oldBytes.renameTo(newBytes) &&
-                                                                            UploadFile.synchronizeDirectoryEntry(newBytes.parentFile)
-                                                                        var relocationsComplete = renamed
-                                                                        if (renamed) {
+                                                                        // THE RENAME EFFECT AND ITS DURABILITY ARE
+                                                                        // SEPARATE SUCCESSES (review-39 #3): only an
+                                                                        // actual rename FAILURE (nothing moved)
+                                                                        // aborts the prepared children; a rename
+                                                                        // success whose directory synchronization
+                                                                        // failed has MOVED the byte tree — the
+                                                                        // synchronization is retried once, and on
+                                                                        // continued failure EVERY child journal is
+                                                                        // RETAINED (the merge defers) until the
+                                                                        // sweep's synchronized replay or a verified
+                                                                        // rollback resolves them — never disposed
+                                                                        // over moved bytes.
+                                                                        val renameSucceeded = oldBytes.renameTo(newBytes)
+                                                                        val renameDurable = renameSucceeded && (
+                                                                            UploadFile.synchronizeDirectoryEntry(newBytes.parentFile) ||
+                                                                                UploadFile.synchronizeDirectoryEntry(newBytes.parentFile)
+                                                                            )
+                                                                        var relocationsComplete = true
+                                                                        if (renameSucceeded && renameDurable) {
                                                                             preparedPairs.forEach { (oldCopy, newCopy) ->
                                                                                 val completed = runCatching {
                                                                                     DownloadOfflineFileManager.completePreparedProofMove(
@@ -763,7 +772,7 @@ class MainViewModel(
                                                                                     )
                                                                                 }
                                                                             }
-                                                                        } else {
+                                                                        } else if (!renameSucceeded) {
                                                                             preparedPairs.forEach { (_, newCopy) ->
                                                                                 runCatching {
                                                                                     DownloadOfflineFileManager.disposePreparedProofRelocation(
@@ -775,7 +784,7 @@ class MainViewModel(
                                                                         }
                                                                         // THE FAILURE IS PROPAGATED (review-33 #6): a
                                                                         // deferral, never a logged success.
-                                                                        renamed && relocationsComplete
+                                                                        renameSucceeded && renameDurable && relocationsComplete
                                                                     }
                                                                 }
                                                             }.getOrDefault(false)
