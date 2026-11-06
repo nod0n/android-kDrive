@@ -790,8 +790,17 @@ object SyncOfflineUtils {
                                     downloadOutcome = downloadOfflineFile(context, localFile, remoteFile, userDrive, realm, actionAt)
                                     downloadOutcome.handled
                                 }
+                                // THE COMPLETION TIER (review-53 §4, stage 5): consuming
+                                // the activity as "nothing to do" IS a completion claim —
+                                // it requires the content-verified tier, not the metadata
+                                // tier. A metadata-current (v2) copy falls through to the
+                                // marker/download arms: its re-drive either verifies it (a
+                                // supported server hash converges) or the worker's no-spin
+                                // gate and the attempt observation bound it.
                                 freshIoFile != null &&
-                                    liveRow.isOfflineAndProvenCurrent(context, freshIoFile, userDrive) -> true
+                                    DownloadOfflineFileManager.offlineCopyIsServerContentVerified(
+                                        context, liveRow, freshIoFile, userDrive,
+                                    ) -> true
                                 liveRow.isMarkedAsOffline -> {
                                     // MARKER ALONE IS NOT DURABLE WORK (issue: round 19 #22):
                                     // the marker's enqueue may have failed (the marker is its
@@ -1357,7 +1366,17 @@ object SyncOfflineUtils {
             if (liveRow.isMedia()) liveRow.deleteInMediaScan(context, userDrive)
         }
 
-        if (!liveRow.isMarkedAsOffline && (!remoteFile.isOfflineAndProvenCurrent(context, remoteOfflineFile, userDrive) || pathChanged)) {
+        // THE COMPLETION TIER (review-53 §4, stage 5): the download-need decision claims
+        // the copy equals the server's current content — the content-verified tier, not
+        // the metadata tier. A metadata-current (v2) copy is re-driven: its transfer
+        // either verifies it or the worker's no-spin gate bounds the re-drive.
+        if (!liveRow.isMarkedAsOffline &&
+            (
+                !DownloadOfflineFileManager.offlineCopyIsServerContentVerified(
+                    context, remoteFile, remoteOfflineFile, userDrive,
+                ) || pathChanged
+                )
+        ) {
             // Preservation against the OLD row baseline BEFORE the metadata replacement
             // (issue: round 8 #1): with baseline T1, an unregistered local edit T2 and a newer
             // remote revision T3 (T1 < T2 < T3), committing T3 metadata first would advance the
@@ -1425,7 +1444,15 @@ object SyncOfflineUtils {
             )
             return DownloadActionOutcome(handled = true, pendingOperation = operation)
         }
-        if (liveRow.isMarkedAsOffline && !remoteFile.isOfflineAndProvenCurrent(context, remoteOfflineFile, userDrive)) {
+        // THE MARKER'S OWN COMPLETION TIER (review-53 §4, stage 5): the pending marker's
+        // work is done only at the content-verified tier — a metadata-current (v2) copy
+        // under a marker still owes its verification re-drive (idempotently enqueued
+        // here; the worker's no-spin gate bounds the body re-download).
+        if (liveRow.isMarkedAsOffline &&
+            !DownloadOfflineFileManager.offlineCopyIsServerContentVerified(
+                context, remoteFile, remoteOfflineFile, userDrive,
+            )
+        ) {
             // A pending marker alone does not prove that any worker owns the refresh (issue:
             // round 7 #16): it can outlive failed or cancelled work, and reporting this action
             // handled without durable work would advance the sync cursor past a missing or

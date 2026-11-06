@@ -606,7 +606,16 @@ object OfflineFolderUtils {
             val offlineFile = localFile.getOfflineFile(context, userDrive.userId)
             val hasPendingUpload = offlineFile != null &&
                     UploadFile.hasPendingUpload(uri = Uri.fromFile(offlineFile).toString())
-            val hasIntactOfflineCopy = offlineFile != null && localFile.isOfflineAndProvenCurrent(context, offlineFile, userDrive)
+            // THE COMPLETION-TIER COPY CHECK (review-53 §4, stage 5): the walk's skip
+            // decision claims the copy EQUALS THE SERVER'S CURRENT CONTENT — only the
+            // content-verified tier may skip a download. A metadata-current (v2) copy is
+            // re-queued: its transfer either verifies it (a supported server hash
+            // converges the copy to the verified tier) or the no-spin gate and the
+            // attempt observation bound the re-drive without a body re-download. The
+            // receipt-based edit/pending-upload protections below are unchanged — they
+            // classify locally, where the local receipt is the adequate authority.
+            val hasIntactOfflineCopy = offlineFile != null &&
+                DownloadOfflineFileManager.offlineCopyIsServerContentVerified(context, localFile, offlineFile, userDrive)
             val isLocallyModified = offlineFile != null && offlineFile.exists() && OfflineFolderPolicy.isLocallyModified(
                 offlineFileLastModifiedMillis = offlineFile.lastModified(),
                 // Edit detection judges against the PUBLISHED byte baseline, not accepted

@@ -480,7 +480,11 @@ class DownloadOfflineFileManager(
                 // The scoped current-copy proof (issues: round 21 #25, round 22 #8)
                 // re-established INSIDE the consuming section, against the transfer's
                 // captured account and the LIVE row's own location.
-                live.isOfflineAndProvenCurrent(context, liveOffline, userDrive)
+                // THE COMPLETION TIER (review-53 §4, stage 5): consuming the intent IS a
+                // completion claim — it requires the content-verified tier, not the
+                // metadata tier. A metadata-current copy stays pending: the no-spin gate
+                // and the attempt observation bound its re-drive.
+                offlineCopyIsServerContentVerified(context, live, liveOffline, userDrive)
             }
         ) {
             // We can have this case for example when we try to put a lot of files at once in offline mode
@@ -632,7 +636,20 @@ class DownloadOfflineFileManager(
 
         try {
             val published = runCatching {
-                publishStagedOfflineFile(context, file, offlineFile, staged)
+                // THE PROMOTION'S VERIFICATION TIER (review-53 §4, stage 5): a verified
+                // source cache record (a strict-valid server hash equal to the live
+                // row's stored hash) promotes to a VERIFIED publication — the content
+                // identity and the root chain are preserved. A metadata-tier source
+                // publishes EXPLICITLY UNRESOLVED — never a silent upgrade of a v2
+                // record; the intent consumption and the completion claims stay
+                // verified-only.
+                val promotionEstablishment =
+                    verifiedPromotionEstablishment(context, file, cacheFile, staged, userDrive)
+                publishStagedOfflineFile(
+                    context, file, offlineFile, staged,
+                    explicitUnresolvedGeneration = promotionEstablishment == null,
+                    established = promotionEstablishment,
+                )
             }.onFailure { exception ->
                 // CANCELLATION IS NEVER A FAILED PROMOTION (issue: round 31 #6): the
                 // enclosing catch must not consume the cancellation now rethrown by the
@@ -682,10 +699,16 @@ class DownloadOfflineFileManager(
                 // the pre-transfer suppression decided no transfer adds anything — the durable
                 // unresolved state stands, no marker clear, no completion.
                 PublicationOutcome.SKIPPED_READABLE_DEFERRED -> CachePromotionOutcome.DEFERRED
-                // UNRESOLVED generation (issue: round 20 #14): the bytes are published but the
-                // generation is unproven — the promotion is NOT fulfilled (the marker stays,
-                // the root's incompleteness is retained via the unresolved-outcome set).
-                PublicationOutcome.PUBLISHED_UNRESOLVED -> CachePromotionOutcome.DEFERRED
+                // UNRESOLVED generation (issue: round 20 #14; review-53 §4 stage 5): the
+                // bytes are published but the generation is unproven — the promotion is
+                // NOT fulfilled (the marker stays, the root's incompleteness is retained
+                // via the unresolved-outcome set). Mapped to FAILED — not DEFERRED — so
+                // the pass FALLS THROUGH to the fresh-download branch, whose no-spin gate
+                // defers the re-drive WITHOUT a body re-download and records the durable
+                // attempt observation (stage 6's retry-eligibility evidence) — a
+                // bounded, evidence-carrying steady state instead of an unobserved
+                // promotion loop.
+                PublicationOutcome.PUBLISHED_UNRESOLVED -> CachePromotionOutcome.FAILED
                 PublicationOutcome.FAILED -> CachePromotionOutcome.FAILED
             }
         } finally {
@@ -3958,6 +3981,81 @@ class DownloadOfflineFileManager(
                 // identity must match the current bytes.
                 provenance.certifiesBytes(cacheFile) &&
                 provenance.version == transferVersion && provenance.lastModifiedAt == file.lastModifiedAt
+        }
+
+        /**
+         * THE SERVER-CONTENT-VERIFIED TIER (review-53 §3/§4, stage 5): the retained copy
+         * is PROVEN to equal the SERVER's CURRENT content — strictly stronger than
+         * [File.storedOfflineCopyState]'s PROVEN_CURRENT metadata tier. Every metadata
+         * tier leg must already hold (strict owner identity, a known count matching the
+         * record, the timestamp equalities, the intact copy, the local SHA-256 receipt
+         * over the exact bytes); the verified tier adds the two SERVER hash legs: the
+         * record is a v3 frame (it CARRIES a strict-valid server hash) and that hash
+         * equals the ROW's stored [File.serverContentHash] — the value only the
+         * authorized details-with-hash ingestion writes, preserved only while the
+         * generation tuple holds. A v2 record — however complete — is never
+         * content-verified (no retroactive upgrade), and a v3 record whose row hash was
+         * cleared by the ingestion rules degrades to the metadata tier until a fresh
+         * establishment re-verifies. XXH3-64 is non-cryptographic: this tier certifies
+         * accidental-corruption/staleness integrity against the server's own claim, not
+         * adversarial integrity.
+         *
+         * COMPLETION-CLASS CONSUMERS ONLY (review-53 §4): the walk's download
+         * decisions, the intent-consuming early success and the publication outcomes
+         * that clear a pending marker or report completion must require THIS tier. The
+         * protection/cleanup classification keeps the receipt-based and metadata tiers
+         * — uncertain bytes are conservatively retained, and known-clean local bytes
+         * are still classified by the local receipt where that is the adequate
+         * authority.
+         */
+        internal fun offlineCopyIsServerContentVerified(
+            context: Context,
+            row: File,
+            offlineFile: IOFile,
+            userDrive: UserDrive,
+        ): Boolean {
+            if (row.storedOfflineCopyState(context, offlineFile, userDrive) !=
+                com.infomaniak.drive.data.models.StoredOfflineCopyState.PROVEN_CURRENT
+            ) {
+                return false
+            }
+            val proof = readPublishedProvenance(context, offlineFile) ?: return false
+            return proof.serverHash != null && proof.serverHash == row.serverContentHash
+        }
+
+        /**
+         * THE PROMOTION'S VERIFIED TIER (review-53 §4, stage 5): a promoted copy may
+         * publish as content-verified only when the SOURCE record carries a strict-valid
+         * server hash that equals the LIVE row's stored server hash — the staged bytes
+         * were re-staged from exactly that verified source, and the publication then
+         * preserves the content identity and the root chain. Null = the metadata tier:
+         * the caller publishes with an explicitly UNRESOLVED proof — never a silent
+         * upgrade of a v2 record, and the completion claims stay verified-only.
+         */
+        private fun verifiedPromotionEstablishment(
+            context: Context,
+            file: File,
+            sourceFile: IOFile,
+            staged: IOFile,
+            userDrive: UserDrive,
+        ): GenerationEstablishment.Established? {
+            val sourceRecord = readPublishedProvenance(context, sourceFile) ?: return null
+            val serverHash = sourceRecord.serverHash
+                ?.takeIf { ServerContentHash.SUPPORTED_FORMAT.matches(it) }
+                ?: return null
+            // THE LIVE ROW'S STORED VALUE (the authorized ingestion's): the in-memory
+            // authoritative row deserialized from a hash-less details response carries
+            // null — the comparison must read the PERSISTED row.
+            val liveRow = FileController.getRealmInstance(userDrive).use { realm ->
+                FileController.getFileById(realm, file.id)
+            } ?: return null
+            if (liveRow.serverContentHash != serverHash) return null
+            val localReceipt = UploadFile.sha256OrNull(staged) ?: return null
+            return GenerationEstablishment.Established(
+                fresh = file,
+                serverHash = serverHash,
+                localSha256 = localReceipt,
+            )
         }
 
         /**
@@ -9957,12 +10055,23 @@ class DownloadOfflineFileManager(
                 return PublicationOutcome.FAILED
             }
             val outcome = runCatching {
+                // THE PROMOTION'S VERIFICATION TIER (review-53 §4, stage 5), as in the
+                // worker's promotion: a verified source cache record promotes to a
+                // VERIFIED publication (the content identity and the root chain are
+                // preserved); a metadata-tier source publishes EXPLICITLY UNRESOLVED —
+                // never a silent upgrade of a v2 record (the UI already refuses a pin
+                // confirmation over unproven content).
+                val promotionEstablishment = verifiedPromotionEstablishment(
+                    context, authoritativeFile, cacheFile, staged, userDrive,
+                )
                 publishStagedOfflineFile(
                     userDrive,
                     isInheritedDownload = false,
                     authoritativeFile,
                     offlineFile,
                     staged,
+                    explicitUnresolvedGeneration = promotionEstablishment == null,
+                    established = promotionEstablishment,
                     onPublishedLocked = {
                         // EXACT-GENERATION cache cleanup INSIDE the publication's locks
                         // (issues: round 17 #6, round 18 #11): the promoted cache goes only
