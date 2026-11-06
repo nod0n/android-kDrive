@@ -1750,6 +1750,40 @@ class DownloadOfflineFileManager(
             )
         }.getOrNull()?.takeIf { it.absolutePath == publishedFile.absolutePath }
 
+        /** THE READ-ONCE PUBLISHED-PROVENANCE EVIDENCE (review-42 #5): ABSENT (the record
+         * does not exist), INVALID (present but unreadable/malformed/unreadable-by-exception
+         * — uncertainty that RETAINS, never read as absence), VALID (a decoded record). The
+         * previous null return conflated absence with damage: an existing but unreadable
+         * later publication's record was overwritten by captured older evidence at the
+         * authority gates. Read once per decision; INVALID retains BEFORE any mutation. */
+        private sealed class PublishedProvenanceEvidence {
+            object Absent : PublishedProvenanceEvidence()
+            object Invalid : PublishedProvenanceEvidence()
+            class Valid(val record: PublishedProvenance) : PublishedProvenanceEvidence()
+        }
+
+        private fun readPublishedProvenanceEvidence(
+            context: Context,
+            publishedFile: IOFile,
+        ): PublishedProvenanceEvidence = runCatching {
+            val recordFile = provenanceFileFor(context, publishedFile)
+            if (!recordFile.exists()) return@runCatching PublishedProvenanceEvidence.Absent
+            val text = recordFile.readText().trim()
+            if (text.isEmpty()) return@runCatching PublishedProvenanceEvidence.Invalid
+            parseProvenanceText(text, expectedPath = publishedFile.absolutePath)
+                ?.takeIf { it.absolutePath == publishedFile.absolutePath }
+                ?.let { PublishedProvenanceEvidence.Valid(it) }
+                ?: PublishedProvenanceEvidence.Invalid
+        }.getOrDefault(PublishedProvenanceEvidence.Invalid)
+
+        /** CANCELLATION PROPAGATION (review-42 #9): a CancellationException from a cancelled
+         * executing job is rethrown — never consumed into an unresolved default; the durable
+         * operation state is retained (no disposal has run) and the next sweep re-drives it. */
+        private fun <T> Result<T>.getOrRethrowCancellation(default: T): T {
+            (exceptionOrNull() as? CancellationException)?.let { throw it }
+            return getOrDefault(default)
+        }
+
         /**
          * Parses one provenance record text (issues: round 20 #3, round 24 #11, round 25
          * #12, round 26 #15): an explicit "v2|" frame selects the framed format (the
@@ -4601,21 +4635,24 @@ class DownloadOfflineFileManager(
                                                                 ?: moveScopeKind,
                                                         )
                                                     // THE CURRENT-SOURCE PUBLICATION AUTHORITY
-                                                    // (review-41 #7): the source's live proof is
-                                                    // validated BEFORE any registry write — a later
-                                                    // publication's proof at the source (same bytes,
-                                                    // newer token) is never regressed by restoring
-                                                    // the recorded generation's evidence, and a
-                                                    // present record that neither certifies these
-                                                    // bytes nor matches the recorded publication is
-                                                    // uncertain evidence that retains WITHOUT
-                                                    // mutation.
-                                                    val currentSourceRecord =
-                                                        if (sourceFile.exists()) readPublishedProvenance(context, sourceFile) else null
+                                                    // (review-41 #7, typed evidence review-42 #5):
+                                                    // the source's live proof is read ONCE as typed
+                                                    // evidence — ABSENT (no record) is legitimate;
+                                                    // a VALID record must certify these bytes and
+                                                    // carry the recorded publication's id; an
+                                                    // INVALID (unreadable/malformed) record is
+                                                    // uncertainty that RETAINS BEFORE ANY MUTATION —
+                                                    // an existing but unreadable later publication's
+                                                    // record is never overwritten by the captured
+                                                    // older evidence.
                                                     val sourcePublicationAuthoritative =
-                                                        currentSourceRecord == null ||
-                                                            (currentSourceRecord.certifiesBytes(sourceFile) &&
-                                                                currentSourceRecord.publicationId == validatedSourceProof.publicationId)
+                                                        when (val sourceEvidence = readPublishedProvenanceEvidence(context, sourceFile)) {
+                                                            is PublishedProvenanceEvidence.Absent -> true
+                                                            is PublishedProvenanceEvidence.Valid ->
+                                                                sourceEvidence.record.certifiesBytes(sourceFile) &&
+                                                                    sourceEvidence.record.publicationId == validatedSourceProof.publicationId
+                                                            is PublishedProvenanceEvidence.Invalid -> false
+                                                        }
                                                     // THE FULL CARRIED-OBSERVATION BINDING (review-41
                                                     // #7), validated BEFORE any registry write: the
                                                     // carried observation is the operation's captured
@@ -4670,10 +4707,18 @@ class DownloadOfflineFileManager(
                                                                         provenanceFileFor(context, sourceFile).path + ".obs",
                                                                     ).exists()
                                                                 ) &&
+                                                            // THE DESTINATION'S TYPED EVIDENCE (review-42 #5):
+                                                            // a VALID record must carry this operation's own
+                                                            // publication id; an INVALID (unreadable)
+                                                            // record RETAINS — it is never read as absence
+                                                            // and overwritten.
                                                             run {
-                                                                val destinationRecord = readPublishedProvenance(context, target)
-                                                                destinationRecord == null ||
-                                                                    destinationRecord.publicationId == validatedTargetProof.publicationId
+                                                                when (val destinationEvidence = readPublishedProvenanceEvidence(context, target)) {
+                                                                    is PublishedProvenanceEvidence.Absent -> true
+                                                                    is PublishedProvenanceEvidence.Valid ->
+                                                                        destinationEvidence.record.publicationId == validatedTargetProof.publicationId
+                                                                    is PublishedProvenanceEvidence.Invalid -> false
+                                                                }
                                                             }
                                                         -> {
                                                             if (target.exists()) return@runCatching false
@@ -4785,24 +4830,29 @@ class DownloadOfflineFileManager(
                                                             }
                                                             // THE CARRIED OBSERVATION IS RESTORED WITH ITS
                                                             // PROOF (review-40 #10, full binding review-41
-                                                            // #7): a carried observation is re-bound to the
-                                                            // recorded source verbatim and its read-back is
-                                                            // verified against the FULL binding — location
-                                                            // AND (current format) the restored proof's
-                                                            // publication id — never the location alone; an
+                                                            // #7, exact read-back review-42 #5): a carried
+                                                            // observation is re-bound to the recorded
+                                                            // source verbatim and its read-back must EQUAL
+                                                            // the written payload AND satisfy the FULL
+                                                            // binding — location AND (current format) the
+                                                            // restored proof's publication id — with the
+                                                            // predicate required to be TRUE (a
+                                                            // parsed-but-false binding never passes); an
                                                             // explicit absence is the operation's own
                                                             // contract and restores nothing.
                                                             val observationRestored = !sourceProofRestored ||
                                                                 parsed.observationText == null || run {
                                                                     val sourceObs = IOFile(provenanceFileFor(context, sourceFile).path + ".obs")
                                                                     atomicWriteText(sourceObs, parsed.observationText) &&
-                                                                        parseObservationBinding(
-                                                                            sourceObs.readText().trim(),
-                                                                        )?.let { bound ->
-                                                                            bound.location == sourceFile.absolutePath &&
-                                                                                (bound.format != ObservationFormat.CURRENT ||
-                                                                                    bound.publicationId == validatedSourceProof.publicationId)
-                                                                        } != null
+                                                                        runCatching { sourceObs.readText().trim() }.getOrNull()
+                                                                            ?.let { writtenBack ->
+                                                                                writtenBack == parsed.observationText &&
+                                                                                    parseObservationBinding(writtenBack)?.let { bound ->
+                                                                                        bound.location == sourceFile.absolutePath &&
+                                                                                            (bound.format != ObservationFormat.CURRENT ||
+                                                                                                bound.publicationId == validatedSourceProof.publicationId)
+                                                                                    } == true
+                                                                            } == true
                                                                 }
                                                             // THE RETAINED AUTHORITY IS DURABLE BEFORE THE
                                                             // JOURNAL LEAVES (review-39 #5): the restored
@@ -5481,6 +5531,10 @@ class DownloadOfflineFileManager(
                             oldRecordText = record.oldRecordText,
                             oldTargetMtimeMillis = record.oldTargetMtimeMillis,
                             expectedBackupHash = backupHash,
+                            // THE FAILED OPERATION'S OWN PROOF (review-42 #2): the identity
+                            // the conditional evidence removal checks the restored state
+                            // against.
+                            failedOperationProofText = record.expectedPublicationRecordText,
                         )
                     }
                 }
@@ -5516,7 +5570,15 @@ class DownloadOfflineFileManager(
                     if (!atomicWriteText(provenanceFileFor(context, target), refreshed)) return false
                     if (readPublishedProvenance(context, target) == null) return false
                 } else {
-                    deletePublishedProvenance(context, target)
+                    // THE CONDITIONAL REMOVAL (review-42 #2, sibling of the rollback): the
+                    // target is still the backed-up generation — the failed operation's
+                    // proof (identity-checked against its own expected publication id) and
+                    // observation are removed with their absence verified; a later or
+                    // unreadable publication's record is never destroyed and mismatched
+                    // evidence retains the whole recovery state.
+                    if (!removeFailedOperationEvidence(context, target, record.expectedPublicationRecordText)) {
+                        return false
+                    }
                 }
                 // THE DURABILITY BARRIER BEFORE DISPOSAL (review-40 #4), as in the
                 // expected-publication arm: the already-restored generation's payload and
@@ -5638,6 +5700,9 @@ class DownloadOfflineFileManager(
                     oldRecordText = record.oldRecordText,
                     oldTargetMtimeMillis = record.oldTargetMtimeMillis,
                     expectedBackupHash = backupHash,
+                    // THE FAILED OPERATION'S OWN PROOF (review-42 #2), as in the
+                    // expected-publication rollback.
+                    failedOperationProofText = record.expectedPublicationRecordText,
                 )
             } else {
                 // An UNREADABLE CHANGED target (issue: round 23 #2): never overwritten —
@@ -5650,17 +5715,55 @@ class DownloadOfflineFileManager(
         private fun appContextForOwnership(): android.content.Context? = Realm.getApplicationContext()
 
         /**
+         * THE RESTORED-STATE EVIDENCE RESOLUTION (review-42 #2): the restored bytes are the
+         * backup's generation — the failed operation's proof and observation at the target
+         * must be removed and their absence VERIFIED, or the restored generation carries the
+         * failed publication's identity and the next Sync pass uploads the restored
+         * historical content as proven local drift. The removal is IDENTITY-CHECKED: only a
+         * VALID record carrying the failed operation's OWN publication id is removed — a
+         * later publication's token, an unreadable record or a mismatched identity retains
+         * the whole recovery state (no journal is ever disposed over mismatched evidence);
+         * an already-absent record is legitimate. Returns false when the restored state
+         * cannot be made coherent.
+         */
+        private fun removeFailedOperationEvidence(
+            context: Context,
+            target: IOFile,
+            failedOperationProofText: String?,
+        ): Boolean = when (val currentEvidence = readPublishedProvenanceEvidence(context, target)) {
+            is PublishedProvenanceEvidence.Absent -> true
+            is PublishedProvenanceEvidence.Invalid -> false
+            is PublishedProvenanceEvidence.Valid -> {
+                val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
+                if (failedPublicationId == null || currentEvidence.record.publicationId != failedPublicationId) {
+                    false
+                } else {
+                    deletePublishedProvenance(context, target)
+                    // THE REMOVAL IS VERIFIED: the record's absence is re-read as typed
+                    // evidence — a failed deletion never reads as a verified absence.
+                    readPublishedProvenanceEvidence(context, target) is PublishedProvenanceEvidence.Absent
+                }
+            }
+        }
+
+        /**
          * RESTORES the retained old bytes with their retained proof and verifies the result
-         * before disposing the recovery state (issues: round 21 #9, round 24 #2): the BACKUP
-         * is validated against its immutable recorded hash BEFORE anything is mutated — a
-         * damaged backup never reaches the target — and the restore is STAGED: the backup is
-         * copied to a verified stage, timestamped, and published by an ATOMIC RENAME, so a
-         * failed restore leaves the existing target bytes and proof untouched (the previous
-         * in-place copyTo destroyed the existing target before the verification could fail).
-         * On any failure the recovery backup and its durable record are RETAINED for the
-         * reconciliation sweep; on success — the published bytes re-hashed against the
-         * backup's own content hash, mtime restored, proof written back and read — they are
-         * disposed.
+         * before disposing the recovery state (issues: round 21 #9, round 24 #2, review-42
+         * #2): the BACKUP is validated against its immutable recorded hash BEFORE anything
+         * is mutated — a damaged backup never reaches the target — and the retained OLD
+         * proof is validated against the backup BEFORE publication (a proof that does not
+         * certify the backup's bytes never rides the restore). The restore is STAGED: the
+         * backup is copied to a verified stage, timestamped, and published by an ATOMIC
+         * RENAME, so a failed restore leaves the existing target bytes and proof untouched
+         * (the previous in-place copyTo destroyed the existing target before the
+         * verification could fail). The COMPLETE restored evidence state is prepared before
+         * the state is disposed: with a retained proof it is refreshed and written back;
+         * with a legitimately UNPROVEN historical backup the failed operation's proof and
+         * observation are conditionally removed (identity-checked) and their absence
+         * verified — never left riding the restored bytes. On any failure the recovery
+         * backup and its durable record are RETAINED for the reconciliation sweep; on
+         * success — the published bytes re-hashed against the backup's own content hash,
+         * mtime restored, evidence coherent and verified — they are disposed.
          */
         private fun restoreRecoveryCopy(
             context: Context,
@@ -5670,6 +5773,7 @@ class DownloadOfflineFileManager(
             oldRecordText: String?,
             oldTargetMtimeMillis: Long,
             expectedBackupHash: String? = null,
+            failedOperationProofText: String?,
         ): Boolean = runCatching {
             // BACKUP INTEGRITY BEFORE ANY TARGET MUTATION (issue: round 24 #2): the backup
             // must still hash to the record's immutable hash (a corrupted backup never
@@ -5677,6 +5781,16 @@ class DownloadOfflineFileManager(
             val backupHashNow = UploadFile.sha256OrNull(recoveryFile)
             if (backupHashNow == null || (expectedBackupHash != null && backupHashNow != expectedBackupHash)) {
                 return@runCatching false
+            }
+            // THE RETAINED PROOF IS VALIDATED AGAINST THE BACKUP BEFORE PUBLICATION
+            // (review-42 #2): a proof whose content identity does not certify the backup's
+            // bytes never rides the restore — the mismatch retains the whole state before
+            // any mutation.
+            if (oldRecordText != null) {
+                val oldProof = runCatching {
+                    parseProvenanceText(oldRecordText, expectedPath = target.absolutePath)
+                }.getOrNull()?.takeIf { it.absolutePath == target.absolutePath }
+                if (oldProof == null || oldProof.contentHash != backupHashNow) return@runCatching false
             }
             // THE RESTORE'S STAGE IS WRITTEN INTO A DURABLY ESTABLISHED CONTAINER
             // (review-41 #4): the staged backup bytes are recovery state — an
@@ -5720,6 +5834,16 @@ class DownloadOfflineFileManager(
                         ?: return@runCatching false
                     if (!atomicWriteText(provenanceFileFor(context, target), refreshed)) return@runCatching false
                     if (readPublishedProvenance(context, target) == null) return@runCatching false
+                } else {
+                    // THE UNPROVEN HISTORICAL BACKUP'S RESTORED STATE (review-42 #2): the
+                    // failed operation's proof and observation are conditionally removed
+                    // (identity-checked against the failed publication's own id) and their
+                    // absence verified — a mismatched or unreadable record retains the
+                    // recovery state; the restored bytes never carry another operation's
+                    // identity into the next Sync pass.
+                    if (!removeFailedOperationEvidence(context, target, failedOperationProofText)) {
+                        return@runCatching false
+                    }
                 }
                 // THE ROLLBACK DISPOSES THE RELOCATION STATE ITSELF (issue: round 25 #5):
                 // the previous order — the caller deleting the failed proof-move record
@@ -6500,6 +6624,10 @@ class DownloadOfflineFileManager(
                                 recordFile = rf,
                                 oldRecordText = oldRecordText,
                                 oldTargetMtimeMillis = oldTargetMtime,
+                                // THE FAILED PUBLICATION'S OWN PROOF (review-42 #2): the
+                                // staged publication's captured record text identifies the
+                                // proof the conditional removal may clear.
+                                failedOperationProofText = expectedPublicationRecordText,
                             )
                         } == true
                     if (restored) {
@@ -6935,6 +7063,9 @@ class DownloadOfflineFileManager(
                                                 recordFile = rf,
                                                 oldRecordText = oldRecordText,
                                                 oldTargetMtimeMillis = oldTargetMtime,
+                                                // THE FAILED PUBLICATION'S OWN PROOF (review-42
+                                                // #2), as in the coordinated publication.
+                                                failedOperationProofText = expectedPublicationRecordText,
                                             )
                                         } == true
                                     if (restored) {
