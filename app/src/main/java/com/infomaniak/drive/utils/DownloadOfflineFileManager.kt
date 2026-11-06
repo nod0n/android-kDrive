@@ -3488,6 +3488,32 @@ class DownloadOfflineFileManager(
         }
 
         /**
+         * THE RECOVERY/COMPLETION STAGE (review-42 #3/#4): on the SAME FILESYSTEM as the
+         * destination, so the publish step is an atomic rename. The app-owned staging
+         * directory shares the offline storage's volume by construction — but a plain-cache
+         * or converted-PDF destination lives on the internal cache filesystem, from which
+         * the (possibly external-media) staging directory's rename can NEVER publish: its
+         * stage sits beside the destination under a DETERMINISTIC OPERATION-OWNED name
+         * (derived from the destination's registry key, never colliding with a remote
+         * path's namespace shape) that an interrupted attempt's next sweep re-derives and
+         * either consumes or reconstructs. The final path never holds the in-progress
+         * copy. Returns null when no stage can be established.
+         */
+        private fun recoveryStageFor(context: Context, target: IOFile): IOFile? {
+            val appContext = Realm.getApplicationContext() ?: return null
+            val cacheRoot = appContext.cacheDir
+            return if (target.parentFile != null &&
+                target.absolutePath.startsWith(cacheRoot.absolutePath + IOFile.separator)
+            ) {
+                IOFile(target.parentFile, ".recovery-stage-" + provenanceKeyHex(target) + ".part")
+            } else {
+                durableStagingDirectory(context)?.let { container ->
+                    IOFile(container, "restore_" + provenanceKeyHex(target) + ".part")
+                }
+            }
+        }
+
+        /**
          * THE ORDERED DURABLE DESTINATION HIERARCHY (review-39 #2, reworked review-40 #3,
          * review-41 #2): EVERY ancestor's entry in ITS OWN parent is acknowledged, from the
          * target's immediate parent up to the ESTABLISHED DURABLE BASE OF THE TARGET'S
@@ -4724,42 +4750,77 @@ class DownloadOfflineFileManager(
                                                             }
                                                         -> {
                                                             if (target.exists()) return@runCatching false
-                                                            // THE VALIDATED SOURCE BYTES ARE COPIED TO THE
-                                                            // CAPTURED DESTINATION and verified against the
-                                                            // captured generation's hash before anything
-                                                            // else.
-                                                            val copyVerified = runCatching {
-                                                                sourceFile.copyTo(target, overwrite = false)
-                                                            }.isSuccess &&
-                                                                target.exists() &&
-                                                                target.length() == sourceFile.length() &&
-                                                                UploadFile.sha256OrNull(target) == validatedTargetProof.contentHash
-                                                            if (!copyVerified) {
-                                                                // OUR OWN PARTIAL OUTPUT at a path that was
-                                                                // absent is removed; the operation retains.
-                                                                runCatching { target.delete() }
-                                                                return@runCatching false
-                                                            }
-                                                            // THE CAPTURED GENERATION'S TIMESTAMP (review-41
-                                                            // #10 doctrine): the setter's result is required
-                                                            // and the resulting mtime is validated at the
-                                                            // precision the stored-copy reader uses — an
-                                                            // unacknowledged or imprecise timestamp would
-                                                            // publish bytes the reader classifies
-                                                            // ABSENT_OR_STALE.
-                                                            if (!target.setLastModified(validatedTargetProof.lastModifiedAt * 1_000L) ||
-                                                                target.lastModified() / 1_000L != validatedTargetProof.lastModifiedAt
-                                                            ) {
-                                                                runCatching { target.delete() }
-                                                                return@runCatching false
+                                                            // THE OPERATION-OWNED STAGE (review-42 #3): the
+                                                            // copy NEVER touches the final path — an
+                                                            // interrupted attempt leaves a re-derivable
+                                                            // stage on the destination filesystem, never a
+                                                            // partial final target (a partial final file
+                                                            // would leave the missing-target route
+                                                            // inapplicable and the mismatch route unable
+                                                            // to certify the bytes; a post-copy
+                                                            // pre-timestamp interruption would enter the
+                                                            // existing-target route with the wrong
+                                                            // timestamp). The stage's durable identity is
+                                                            // its deterministic operation-owned name: the
+                                                            // next sweep's same route re-derives it and
+                                                            // either consumes or reconstructs it.
+                                                            val stage = recoveryStageFor(context, target)
+                                                                ?: return@runCatching false
+                                                            try {
+                                                                // THE VALIDATED SOURCE BYTES ARE COPIED TO
+                                                                // THE STAGE and verified against the
+                                                                // captured generation's hash and length
+                                                                // before anything is published.
+                                                                val copyVerified = runCatching {
+                                                                    sourceFile.copyTo(stage, overwrite = true)
+                                                                }.isSuccess &&
+                                                                    stage.exists() &&
+                                                                    stage.length() == sourceFile.length() &&
+                                                                    UploadFile.sha256OrNull(stage) == validatedTargetProof.contentHash
+                                                                if (!copyVerified) {
+                                                                    return@runCatching false
+                                                                }
+                                                                // THE CAPTURED GENERATION'S TIMESTAMP
+                                                                // (review-41 #10 doctrine): the setter's
+                                                                // result is required and the resulting mtime
+                                                                // is validated at the precision the
+                                                                // stored-copy reader uses — an unacknowledged
+                                                                // or imprecise timestamp would publish bytes
+                                                                // the reader classifies ABSENT_OR_STALE.
+                                                                if (!stage.setLastModified(validatedTargetProof.lastModifiedAt * 1_000L) ||
+                                                                    stage.lastModified() / 1_000L != validatedTargetProof.lastModifiedAt
+                                                                ) {
+                                                                    return@runCatching false
+                                                                }
+                                                                // THE FINAL CONTENT SYNC AFTER THE TIMESTAMP
+                                                                // (the established finalization order), and
+                                                                // the stage's own directory entry on the
+                                                                // destination filesystem.
+                                                                if (!UploadFile.synchronizeFileContents(stage) ||
+                                                                    !UploadFile.synchronizeDirectoryEntry(stage.parentFile)
+                                                                ) {
+                                                                    return@runCatching false
+                                                                }
+                                                                // THE CONDITIONAL ATOMIC RENAME publishes the
+                                                                // verified stage: the final path was absent
+                                                                // under the held locks; if it appeared, the
+                                                                // stage is cleaned and the operation retains.
+                                                                if (target.exists() || !stage.renameTo(target)) {
+                                                                    return@runCatching false
+                                                                }
+                                                            } finally {
+                                                                // The stage never lingers after a survived
+                                                                // attempt; a killed attempt's stage is
+                                                                // re-derived and reconstructed by the next
+                                                                // sweep.
+                                                                runCatching { if (stage.exists()) stage.delete() }
                                                             }
                                                             // THE PAYLOAD'S DURABILITY BARRIER (review-41
                                                             // #3): contents, filename entry and the whole
-                                                            // ancestor chain, after the final timestamp
-                                                            // mutation; a still-failing barrier retains the
-                                                            // journal (the next sweep finds the target
-                                                            // existing and resolves through the
-                                                            // target-present arms).
+                                                            // ancestor chain, after the rename; a
+                                                            // still-failing barrier retains the journal
+                                                            // (the next sweep finds the target existing and
+                                                            // resolves through the target-present arms).
                                                             if (!payloadDurabilityEstablished(target)) {
                                                                 return@runCatching false
                                                             }
@@ -5857,11 +5918,12 @@ class DownloadOfflineFileManager(
                 }.getOrNull()?.takeIf { it.absolutePath == target.absolutePath }
                 if (oldProof == null || oldProof.contentHash != backupHashNow) return@runCatching false
             }
-            // THE RESTORE'S STAGE IS WRITTEN INTO A DURABLY ESTABLISHED CONTAINER
-            // (review-41 #4): the staged backup bytes are recovery state — an
-            // unestablishable container fails the restore before any target mutation.
-            val stageContainer = durableStagingDirectory(context) ?: return@runCatching false
-            val stage = IOFile(stageContainer, "restore_${UUID.randomUUID()}.part")
+            // THE RESTORE'S STAGE IS ON THE DESTINATION'S OWN FILESYSTEM (review-42 #4),
+            // inside a durably established container for the offline volume (review-41 #4):
+            // the staged backup bytes are recovery state — an unestablishable stage fails
+            // the restore before any target mutation, and a cache/converted destination's
+            // stage never attempts the cross-filesystem rename.
+            val stage = recoveryStageFor(context, target) ?: return@runCatching false
             try {
                 val stagedOk = runCatching {
                     recoveryFile.copyTo(stage, overwrite = true)
