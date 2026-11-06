@@ -3846,6 +3846,7 @@ class DownloadOfflineFileManager(
             expectedPublicationHash: String?,
             expectedPublicationRecordText: String?,
             attemptedObservation: AttemptedObservationCapture,
+            oldObservation: AttemptedObservationCapture,
         ): Boolean = runCatching {
             // RECORD v4 (issue: round 30 #7, refined round 31 #4): the operation's
             // ATTEMPTED OBSERVATION rides the record beside the expected proof — an
@@ -3867,6 +3868,19 @@ class DownloadOfflineFileManager(
             val attemptedObservationText = when (attemptedObservation) {
                 is AttemptedObservationCapture.Absent -> "A"
                 is AttemptedObservationCapture.Valid -> attemptedObservation.text
+                AttemptedObservationCapture.Invalid -> return@runCatching false
+            }
+            // THE OLD OBSERVATION STATE RIDES THE RECORD (review-43 #4): RECORD v6 adds
+            // the target's PRE-replacement observation state (explicit "A" absence or the
+            // carried observation verbatim), so a rollback restores the COMPLETE evidence
+            // state — a failed attempt's observation over the restored generation, or the
+            // old publication's dead-id observation, otherwise blocks every later capture.
+            // DAMAGED presence fails the record write (never persisted as absence). The
+            // previous v5 header stays readable as the prior format (its records carry no
+            // captured old state; the restore takes the validated legacy transition).
+            val oldObservationText = when (oldObservation) {
+                is AttemptedObservationCapture.Absent -> "A"
+                is AttemptedObservationCapture.Valid -> oldObservation.text
                 AttemptedObservationCapture.Invalid -> return@runCatching false
             }
             val recordFile = recoveryRecordFile(context, recoveryFile)
@@ -3895,7 +3909,7 @@ class DownloadOfflineFileManager(
             atomicWriteText(
                 recordFile,
                 listOf(
-                    "5",
+                    "6",
                     target.absolutePath,
                     recoveryFile.absolutePath,
                     oldTargetMtimeMillis.toString(),
@@ -3907,9 +3921,19 @@ class DownloadOfflineFileManager(
                     expectedPublicationHash ?: "",
                     expectedPublicationRecordText ?: "",
                     attemptedObservationText,
+                    oldObservationText,
                 ).joinToString("\n")
             )
         }.getOrDefault(false)
+
+        /** THE CAPTURED OLD OBSERVATION AS THE RESTORE'S TRI-STATE (review-43 #4): null
+         * = the record predates the capture (the validated legacy transition); Absent =
+         * the explicit "A"; Valid = the carried old observation. */
+        private fun RecoveryRecord.capturedOldObservation(): AttemptedObservationCapture? = when {
+            !oldObservationCaptured -> null
+            oldObservationText == null -> AttemptedObservationCapture.Absent
+            else -> AttemptedObservationCapture.Valid(oldObservationText)
+        }
 
         private class RecoveryRecord(
             val recordFile: IOFile,
@@ -3932,6 +3956,12 @@ class DownloadOfflineFileManager(
              * cannot be established from the record alone; disposal then requires the
              * validated target-evidence check instead of skipping establishment. */
             val attemptedObservationAmbiguous: Boolean = false,
+            /** THE CAPTURED OLD OBSERVATION STATE (review-43 #4) — v6 records only. When
+             * captured, [oldObservationText] null means the EXPLICIT "A" absence; a v6
+             * empty field is undecodable (retained). Records predating the capture carry
+             * no old state and take the validated legacy transition at restore. */
+            val oldObservationCaptured: Boolean = false,
+            val oldObservationText: String? = null,
             val legacy: Boolean,
             /** The owner scope was recovered from validated durable state (issue: round 24
              * #3) — a record whose scope could not be established is never locked, queried
@@ -3971,6 +4001,31 @@ class DownloadOfflineFileManager(
          */
         private fun readRecoveryRecord(recordFile: IOFile): RecoveryRecord? = runCatching {
             val text = recordFile.readText()
+            // RECORD v6 ON READ (review-43 #4): the captured OLD observation state rides
+            // the record (explicit "A" absence or the carried text). An EMPTY field is
+            // truncation of a current record, never legitimate absence — undecodable,
+            // retained unresolved.
+            val v6 = text.split("\n", limit = 13)
+            if (v6.size == 13 && v6[0].trim() == "6") {
+                if (v6[12].isEmpty()) return@runCatching null
+                return@runCatching RecoveryRecord(
+                    recordFile = recordFile,
+                    targetPath = v6[1],
+                    recoveryPath = v6[2],
+                    oldTargetMtimeMillis = v6[3].trim().toLongOrNull() ?: return null,
+                    oldRecordText = v6[4].takeIf { it.isNotEmpty() },
+                    fileId = v6[5].trim().toIntOrNull() ?: return null,
+                    userId = v6[6].trim().toIntOrNull() ?: return null,
+                    driveId = v6[7].trim().toIntOrNull() ?: return null,
+                    backupHash = v6[8].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationHash = v6[9].trim().takeIf { it.isNotEmpty() },
+                    expectedPublicationRecordText = v6[10].takeIf { it.isNotEmpty() },
+                    attemptedObservationText = v6[11].takeIf { it != "A" },
+                    oldObservationCaptured = true,
+                    oldObservationText = v6[12].takeIf { it != "A" },
+                    legacy = false,
+                )
+            }
             val v5 = text.split("\n", limit = 12)
             if (v5.size == 12 && v5[0].trim() == "5") {
                 // RECORD v5 ON READ (review-33 #7): the CURRENT format requires the
@@ -5003,14 +5058,28 @@ class DownloadOfflineFileManager(
                                                             // AMBIGUOUS field is unknown and never a
                                                             // fabricated "A". The retired source artifact
                                                             // is never required.
+                                                            // THE STRICT DESTINATION-EVIDENCE BINDING
+                                                            // (review-43 #10): independently existing
+                                                            // destination evidence counts ONLY when it
+                                                            // binds to the EXACT current operation (the
+                                                            // current format's publication id AND the
+                                                            // target location) — aligned with the strict
+                                                            // targetObservationEvidenceComplete; a
+                                                            // standalone LEGACY observation at the same
+                                                            // path is never operation authority and the
+                                                            // validated carried journal text is
+                                                            // established instead, so the retained
+                                                            // operation's attempt evidence is never
+                                                            // lost to an arbitrary sidecar.
                                                             val observationStateEstablished = run {
                                                                 val destinationObs = IOFile(provenanceFileFor(context, target).path + ".obs")
                                                                 val destinationBinding = runCatching { destinationObs.readText().trim() }
                                                                     .getOrNull()?.let { parseObservationBinding(it) }
                                                                 when {
-                                                                    destinationBinding?.location == target.absolutePath &&
-                                                                        (destinationBinding.format != ObservationFormat.CURRENT ||
-                                                                            destinationBinding.publicationId == validatedTargetProof.publicationId) -> true
+                                                                    destinationBinding != null &&
+                                                                        destinationBinding.format == ObservationFormat.CURRENT &&
+                                                                        destinationBinding.publicationId == validatedTargetProof.publicationId &&
+                                                                        destinationBinding.location == target.absolutePath -> true
                                                                     parsed.observationText != null ->
                                                                         establishRecoveredObservation(
                                                                             context,
@@ -5263,16 +5332,26 @@ class DownloadOfflineFileManager(
                                                 when {
                                                     ownerAtTarget -> runCatching {
                                                 // THE EXPECTED PUBLICATION IDENTITY (issue: round
-                                                // 26 #4): a target that already carries a
+                                                // 26 #4), TYPED AUTHORITY (review-43 #5): the
+                                                // target's current record is read ONCE as typed
+                                                // evidence — a target that already carries a
                                                 // self-certifying proof with a DIFFERENT
                                                 // publication id is owned by a NEWER publication or
                                                 // restoration — replaying the retained proof would
                                                 // replace that fresh identity with the older
-                                                // operation's. The superseded operation is disposed
-                                                // WITHOUT replaying its proof; an equal identity (or
-                                                // an absent target proof) is the recovery of the
-                                                // operation's own state and may be written.
-                                                val currentProof = readPublishedProvenance(context, target)
+                                                // operation's; the superseded operation is disposed
+                                                // WITHOUT replaying its proof. An UNREADABLE
+                                                // current record is INVALID evidence that RETAINS
+                                                // BEFORE ANY MUTATION — matching bytes never
+                                                // authorize destroying an unreadable publication's
+                                                // identity; an equal identity (or an absent target
+                                                // proof) is the recovery of the operation's own
+                                                // state and may be written.
+                                                val currentEvidence = readPublishedProvenanceEvidence(context, target)
+                                                if (currentEvidence is PublishedProvenanceEvidence.Invalid) {
+                                                    return@runCatching false
+                                                }
+                                                val currentProof = (currentEvidence as? PublishedProvenanceEvidence.Valid)?.record
                                                 // THE OPERATION'S OWN IDENTITY (review-33 #9): parsed
                                                 // from the retained proof text through the shared
                                                 // decoder's payload.
@@ -5295,7 +5374,10 @@ class DownloadOfflineFileManager(
                                                 val proofEstablished = recordTarget != null && runCatching {
                                                     atomicWriteText(recordTarget, proofText)
                                                 }.getOrDefault(false) &&
-                                                    readPublishedProvenance(context, target) != null
+                                                    // THE ESTABLISHED PROOF IS READ BACK AS TYPED
+                                                    // EVIDENCE (review-43 #5): only a VALID read-back
+                                                    // confirms the write.
+                                                    readPublishedProvenanceEvidence(context, target) is PublishedProvenanceEvidence.Valid
                                                 // THE OBSERVATION JOINS THE PROOFMOVE REPLAY
                                                 // (issue: round 30 #7): the retained proof is
                                                 // written only together with its attempt's
@@ -5842,6 +5924,8 @@ class DownloadOfflineFileManager(
                             // against.
                             failedOperationProofText = record.expectedPublicationRecordText,
                             checkCancelled = checkCancelled,
+                            // THE CAPTURED OLD OBSERVATION STATE (review-43 #4).
+                            oldObservation = record.capturedOldObservation(),
                         )
                     }
                 }
@@ -5873,9 +5957,41 @@ class DownloadOfflineFileManager(
                     return false
                 }
                 if (record.oldRecordText != null) {
+                    // THE TYPED AUTHORITY BEFORE THE REWRITE (review-43 #5): the target's
+                    // current record is read ONCE as typed evidence — an UNREADABLE record
+                    // retains BEFORE ANY MUTATION (matching bytes never authorize
+                    // destroying an unreadable publication's identity); a VALID record must
+                    // be the retained old publication itself or the failed operation's own
+                    // (both replaceable by this restoration) — any other publication's
+                    // token is never regressed.
+                    val currentEvidence = readPublishedProvenanceEvidence(context, target)
+                    val rewriteAuthorized = when (currentEvidence) {
+                        is PublishedProvenanceEvidence.Absent -> true
+                        is PublishedProvenanceEvidence.Invalid -> false
+                        is PublishedProvenanceEvidence.Valid -> {
+                            val oldPublicationId = publicationIdOfRecordText(record.oldRecordText)
+                            val failedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
+                            currentEvidence.record.publicationId == oldPublicationId ||
+                                (failedPublicationId != null &&
+                                    currentEvidence.record.publicationId == failedPublicationId)
+                        }
+                    }
+                    if (!rewriteAuthorized) return false
                     val refreshed = refreshedRecordText(record.oldRecordText, target) ?: return false
                     if (!atomicWriteText(provenanceFileFor(context, target), refreshed)) return false
                     if (readPublishedProvenance(context, target) == null) return false
+                    // THE OLD OBSERVATION STATE IS RESTORED COHERENTLY (review-43 #4),
+                    // re-bound to the restoration's fresh publication id and verified.
+                    if (!restoreOldObservationState(
+                            context,
+                            target,
+                            record.capturedOldObservation(),
+                            publicationIdOfRecordText(refreshed),
+                            record.expectedPublicationRecordText,
+                        )
+                    ) {
+                        return false
+                    }
                 } else {
                     // THE CONDITIONAL REMOVAL (review-42 #2, sibling of the rollback): the
                     // target is still the backed-up generation — the failed operation's
@@ -5884,6 +6000,20 @@ class DownloadOfflineFileManager(
                     // unreadable publication's record is never destroyed and mismatched
                     // evidence retains the whole recovery state.
                     if (!removeFailedOperationEvidence(context, target, record.expectedPublicationRecordText)) {
+                        return false
+                    }
+                    // THE OLD OBSERVATION STATE (review-43 #4): over an unproven
+                    // restoration a stale carried observation's own publication is provably
+                    // gone — retired and absence-verified, never kept to block every later
+                    // capture.
+                    if (!restoreOldObservationState(
+                            context,
+                            target,
+                            record.capturedOldObservation(),
+                            null,
+                            record.expectedPublicationRecordText,
+                        )
+                    ) {
                         return false
                     }
                 }
@@ -6011,6 +6141,8 @@ class DownloadOfflineFileManager(
                     // expected-publication rollback.
                     failedOperationProofText = record.expectedPublicationRecordText,
                     checkCancelled = checkCancelled,
+                    // THE CAPTURED OLD OBSERVATION STATE (review-43 #4).
+                    oldObservation = record.capturedOldObservation(),
                 )
             } else {
                 // An UNREADABLE CHANGED target (issue: round 23 #2): never overwritten —
@@ -6064,6 +6196,90 @@ class DownloadOfflineFileManager(
         }
 
         /**
+         * THE OLD TARGET OBSERVATION CAPTURE (review-43 #4): the observation state the
+         * target carried BEFORE the replacement — an explicit absence, a carried
+         * observation, or damaged presence. It rides the recovery record so a rollback can
+         * restore the complete evidence state coherently; damaged presence fails the
+         * record write (never persisted as absence), exactly like the attempted
+         * observation's capture.
+         */
+        private fun captureOldTargetObservation(context: Context, target: IOFile): AttemptedObservationCapture {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!observationFile.exists()) return AttemptedObservationCapture.Absent
+            val text = runCatching { observationFile.readText().trim() }.getOrNull()
+            if (text.isNullOrEmpty()) return AttemptedObservationCapture.Invalid
+            return if (parseObservationBinding(text) != null) {
+                AttemptedObservationCapture.Valid(text)
+            } else {
+                AttemptedObservationCapture.Invalid
+            }
+        }
+
+        /** THE RESTORED OBSERVATION STATE (review-43 #4): the restored generation's proof
+         * carries a FRESH publication id — an observation left from the failed attempt (or
+         * bound to the old publication's dead id) makes every later capture fail forever.
+         * A CAPTURED old state is restored explicitly: an explicit absence retires only an
+         * observation bound to the FAILED publication; a carried old observation is
+         * re-bound to the restoration's fresh publication id and verified. Records
+         * predating the capture take the VALIDATED TRANSITION: only an observation bound
+         * to the FAILED publication's own id is retired — anything else retains (never an
+         * invented absence). Over an UNPROVEN restoration (no publication at all) a stale
+         * carried observation's own publication is provably gone: it is retired and its
+         * absence verified, never re-bound to an invented identity and never kept to
+         * block every later capture. */
+        private fun restoreOldObservationState(
+            context: Context,
+            target: IOFile,
+            oldObservation: AttemptedObservationCapture?,
+            restorationPublicationId: Long?,
+            failedOperationProofText: String?,
+        ): Boolean {
+            val failedPublicationId = failedOperationProofText?.let { publicationIdOfRecordText(it) }
+            return when (oldObservation) {
+                null, is AttemptedObservationCapture.Absent ->
+                    removeObservationBoundTo(context, target, failedPublicationId)
+                is AttemptedObservationCapture.Valid -> {
+                    if (restorationPublicationId != null) {
+                        establishRecoveredObservation(context, target, oldObservation.text, restorationPublicationId)
+                    } else {
+                        removeAnyParsedObservation(context, target)
+                    }
+                }
+                is AttemptedObservationCapture.Invalid -> false
+            }
+        }
+
+        /** Retires the target's observation ONLY when it is a parseable observation bound
+         * to [boundPublicationId] in the current format; absence succeeds, anything else
+         * retains. The retirement is durably acknowledged (review-43 #2 discipline). */
+        private fun removeObservationBoundTo(context: Context, target: IOFile, boundPublicationId: Long?): Boolean {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!observationFile.exists()) return true
+            if (boundPublicationId == null) return false
+            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
+                ?.let { parseObservationBinding(it) }
+                ?: return false
+            if (parsed.format != ObservationFormat.CURRENT || parsed.publicationId != boundPublicationId) return false
+            return runCatching { observationFile.delete() }.getOrDefault(false) &&
+                UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
+                !observationFile.exists()
+        }
+
+        /** Retires ANY parseable observation at the target (a stale carried observation
+         * over an unproven restoration — its publication is provably gone); an unparseable
+         * observation retains. Durably acknowledged and absence-verified. */
+        private fun removeAnyParsedObservation(context: Context, target: IOFile): Boolean {
+            val observationFile = IOFile(provenanceFileFor(context, target).path + ".obs")
+            if (!observationFile.exists()) return true
+            val parsed = runCatching { observationFile.readText().trim() }.getOrNull()
+                ?.let { parseObservationBinding(it) }
+                ?: return false
+            return runCatching { observationFile.delete() }.getOrDefault(false) &&
+                UploadFile.synchronizeDirectoryEntry(observationFile.parentFile) &&
+                !observationFile.exists()
+        }
+
+        /**
          * RESTORES the retained old bytes with their retained proof and verifies the result
          * before disposing the recovery state (issues: round 21 #9, round 24 #2, review-42
          * #2): the BACKUP is validated against its immutable recorded hash BEFORE anything
@@ -6092,6 +6308,7 @@ class DownloadOfflineFileManager(
             expectedBackupHash: String? = null,
             failedOperationProofText: String?,
             checkCancelled: () -> Unit,
+            oldObservation: AttemptedObservationCapture?,
         ): Boolean = runCatching {
             // BACKUP INTEGRITY BEFORE ANY TARGET MUTATION (issue: round 24 #2): the backup
             // must still hash to the record's immutable hash (a corrupted backup never
@@ -6166,6 +6383,9 @@ class DownloadOfflineFileManager(
                 // the directories already exist; a still-failing barrier retains the
                 // backup and the recovery record.
                 if (!payloadDurabilityEstablished(target)) return@runCatching false
+                // THE RESTORATION'S PUBLICATION IDENTITY: the refreshed proof's fresh id,
+                // when the restoration carries a proof (review-43 #4).
+                val restorationPublicationId: Long?
                 if (oldRecordText != null) {
                     // A FRESH RESTORATION IDENTITY (issue: round 25 #10): the re-written
                     // proof carries a NEW publication id — the reused old text's id made a
@@ -6174,6 +6394,7 @@ class DownloadOfflineFileManager(
                         ?: return@runCatching false
                     if (!atomicWriteText(provenanceFileFor(context, target), refreshed)) return@runCatching false
                     if (readPublishedProvenance(context, target) == null) return@runCatching false
+                    restorationPublicationId = publicationIdOfRecordText(refreshed)
                 } else {
                     // THE UNPROVEN HISTORICAL BACKUP'S RESTORED STATE (review-42 #2): the
                     // failed operation's proof and observation are conditionally removed
@@ -6184,6 +6405,15 @@ class DownloadOfflineFileManager(
                     if (!removeFailedOperationEvidence(context, target, failedOperationProofText)) {
                         return@runCatching false
                     }
+                    restorationPublicationId = null
+                }
+                // THE OLD OBSERVATION STATE IS RESTORED COHERENTLY (review-43 #4): the
+                // complete restored evidence includes the observation — a failed attempt's
+                // observation (or the old publication's dead-id observation) over the
+                // restored generation blocks every later capture; the captured state is
+                // restored explicitly and verified BEFORE any fallback disposal.
+                if (!restoreOldObservationState(context, target, oldObservation, restorationPublicationId, failedOperationProofText)) {
+                    return@runCatching false
                 }
                 // THE ROLLBACK DISPOSES THE RELOCATION STATE ITSELF (issue: round 25 #5):
                 // the previous order — the caller deleting the failed proof-move record
@@ -6862,6 +7092,11 @@ class DownloadOfflineFileManager(
             // mis-classifying its output as an edit.
             val expectedPublicationHash = UploadFile.sha256OrNull(staged)
             val expectedPublicationRecordText = readPublishedProvenance(provenanceContext, staged)?.recordText(target)
+            // THE OLD TARGET OBSERVATION IS CAPTURED BEFORE THE REPLACEMENT (review-43
+            // #4): the rollback must be able to restore the COMPLETE evidence state, so
+            // the target's pre-publication observation (explicit absence or carried text)
+            // rides the record beside the old proof.
+            val oldObservationCapture = captureOldTargetObservation(provenanceContext, target)
             val recoveryRecorded = recoveryFile == null || (backupHash != null &&
                 writeRecoveryRecord(
                     provenanceContext,
@@ -6885,6 +7120,7 @@ class DownloadOfflineFileManager(
                         expectedObservationLocation = target.absolutePath,
                         requireObservation = explicitUnresolvedGeneration,
                     ),
+                    oldObservation = oldObservationCapture,
                 ))
             if (!recoveryOk || !recoveryRecorded) {
                 runCatching { recoveryFile?.delete() }
@@ -6971,6 +7207,10 @@ class DownloadOfflineFileManager(
                                 // THE EXECUTING JOB'S CANCELLATION (review-42 #9): the
                                 // publication core's own check.
                                 checkCancelled = checkCancelled,
+                                // THE CAPTURED OLD OBSERVATION STATE (review-43 #4): the
+                                // restored evidence includes the target's pre-publication
+                                // observation state.
+                                oldObservation = oldObservationCapture,
                             )
                         } == true
                     if (restored) {
@@ -7307,6 +7547,11 @@ class DownloadOfflineFileManager(
                         // shared publication above.
                         val expectedPublicationHash = UploadFile.sha256OrNull(staged)
                         val expectedPublicationRecordText = readPublishedProvenance(context, staged)?.recordText(target)
+                        // THE OLD TARGET OBSERVATION IS CAPTURED BEFORE THE REPLACEMENT
+                        // (review-43 #4), as in the coordinated publication: the target's
+                        // pre-publication observation state rides the record for the
+                        // rollback's complete evidence restoration.
+                        val oldObservationCapture = captureOldTargetObservation(context, target)
                         val recoveryRecorded = recoveryFile == null || (backupHash != null &&
                             writeRecoveryRecord(
                                 context,
@@ -7328,6 +7573,7 @@ class DownloadOfflineFileManager(
                                     expectedObservationLocation = target.absolutePath,
                                     requireObservation = !generationResolved,
                                 ),
+                                oldObservation = oldObservationCapture,
                             ))
                         if (!recoveryOk || !recoveryRecorded) {
                             runCatching { recoveryFile?.delete() }
@@ -7418,6 +7664,9 @@ class DownloadOfflineFileManager(
                                                 // the suspend caller's context captured once — a
                                                 // non-suspend lambda cannot read coroutineContext.
                                                 checkCancelled = { executingContext.ensureActive() },
+                                                // THE CAPTURED OLD OBSERVATION STATE (review-43 #4),
+                                                // as in the coordinated publication.
+                                                oldObservation = oldObservationCapture,
                                             )
                                         } == true
                                     if (restored) {
