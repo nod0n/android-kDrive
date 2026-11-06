@@ -5424,14 +5424,16 @@ class DownloadOfflineFileManager(
                     // THE AMBIGUITY-AWARE RESOLUTION (review-34 #8, review-37 #3), as in every
                     // recovery disposal: a carried text establishes; an ambiguous legacy
                     // absence converges through independent evidence (the validated target
-                    // evidence or the upload authority) and otherwise retains; an explicit
-                    // absence succeeds. No emptiness, line count or version participates.
+                    // evidence or the upload authority) and otherwise routes to the validated
+                    // rollback below; an explicit absence succeeds. No emptiness, line count
+                    // or version participates.
+                    val expectedPublicationId = publicationIdOfRecordText(record.expectedPublicationRecordText)
                     if (!observationEvidenceComplete(
                             context,
                             target,
                             record.attemptedObservationText,
                             record.attemptedObservationAmbiguous,
-                            publicationIdOfRecordText(record.expectedPublicationRecordText),
+                            expectedPublicationId,
                             fileId = record.fileId,
                             userDrive = UserDrive(
                                 userId = record.userId,
@@ -5440,7 +5442,40 @@ class DownloadOfflineFileManager(
                             ),
                         )
                     ) {
-                        return false
+                        // THE VALIDATED LEGACY-AMBIGUOUS ROLLBACK (review-41 #6): an
+                        // ambiguous legacy observation that the target evidence cannot
+                        // converge previously returned here on EVERY sweep — the intact
+                        // verified backup and the operation's own expected publication at
+                        // the target stayed unresolved forever, and the verified restore
+                        // remained reachable only for an absent target. The explicit
+                        // validated rollback transition runs when the operation's own
+                        // output is established at the target: the recorded owner
+                        // exclusively holds the path (checked above), the target's bytes
+                        // are exactly the expected publication's, and the target's
+                        // PRE-WRITE record was absent or THIS operation's own publication
+                        // — a later publication's token is never regressed, so any
+                        // intervening revision is preserved by refusing the rollback. A
+                        // failed CARRIED-text establishment is never routed here — damaged
+                        // carried evidence defers entirely and is never spent by a
+                        // rollback.
+                        if (record.attemptedObservationText != null || !record.attemptedObservationAmbiguous) {
+                            return false
+                        }
+                        if (expectedPublicationId == null) return false
+                        if (currentRecord != null && currentRecord.publicationId != expectedPublicationId) return false
+                        // THE BACKUP'S INTEGRITY IS RE-VERIFIED BEFORE THE RESTORE: the
+                        // verified backup is the rollback authority — a damaged backup
+                        // retains the whole state.
+                        if (UploadFile.sha256OrNull(recoveryFile) != backupHash) return false
+                        return restoreRecoveryCopy(
+                            context = context,
+                            recoveryFile = recoveryFile,
+                            target = target,
+                            recordFile = record.recordFile,
+                            oldRecordText = record.oldRecordText,
+                            oldTargetMtimeMillis = record.oldTargetMtimeMillis,
+                            expectedBackupHash = backupHash,
+                        )
                     }
                 }
                 // THE DURABILITY BARRIER BEFORE DISPOSAL (review-40 #4): the visible
