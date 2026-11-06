@@ -2536,21 +2536,33 @@ class DownloadOfflineFileManager(
                 storageKind = storageKind,
             )
             if (!sidecarWritten) return@runCatching false
-            // THE CAPTURED INTENT GENERATION (review-43 #8): the destination row's durable
-            // offlineIntentStamp rides the journal (0 = the row did not exist at capture).
-            // Admission compares the LIVE stamp, so an unpin-repin sequence after the
-            // capture can never let this operation publish for the newer request. A failed
-            // fresh view FAILS THE WRITE — the capture is required, never guessed (a stale
-            // capture could only ever force the conservative superseded route, but an
-            // honest failure aborts preparation instead).
+            // THE CAPTURED INTENT AND CONTENT GENERATION (review-43 #8, review-44 #8):
+            // the destination row's durable offlineIntentStamp AND its accepted content
+            // generation (version + lastModifiedAt) ride the journal in ONE fresh view
+            // (0/0/0 = the row did not exist at capture — its appearance is the expected
+            // commit, and the generation test needs no invented baseline). Admission
+            // compares the LIVE row against THIS captured generation — a change-since-
+            // capture test, so a PRE-EXISTING row that legitimately differs from the
+            // proof's source-derived metadata is the operation's own authorization
+            // baseline, never a permanent supersession — and the live stamp, so an
+            // unpin-repin sequence after the capture can never let this operation
+            // publish for the newer request. A failed fresh view FAILS THE WRITE — the
+            // capture is required, never guessed (a stale capture could only ever force
+            // the conservative superseded route, but an honest failure aborts
+            // preparation instead).
             val destinationUserId = proofFields.getOrNull(4)?.trim()?.toIntOrNull() ?: return@runCatching false
             val destinationDriveId = proofFields.getOrNull(5)?.trim()?.toIntOrNull() ?: return@runCatching false
             val destinationFileId = proofFields.getOrNull(6)?.trim()?.toIntOrNull() ?: return@runCatching false
-            val capturedIntentStamp = FileController.getRealmInstance(
+            val capturedDestinationGeneration = FileController.getRealmInstance(
                 UserDrive(userId = destinationUserId, driveId = destinationDriveId, sharedWithMe = sharedWithMe),
             ).use { realm ->
                 runCatching { realm.refresh() }.getOrThrow()
-                FileController.getFileById(realm, destinationFileId)?.offlineIntentStamp ?: 0L
+                val row = FileController.getFileById(realm, destinationFileId)
+                Triple(
+                    row?.offlineIntentStamp ?: 0L,
+                    row?.version?.number ?: 0,
+                    row?.lastModifiedAt ?: 0L,
+                )
             }
             // FOURTH LINE: THE CARRIED OBSERVATION (issue: round 30 #7) — the relocation
             // state retains the attempt's observation beside the proof, so the replay
@@ -2577,12 +2589,18 @@ class DownloadOfflineFileManager(
             // follows the recorded phase — never a source-hash or destination-location
             // inference.
             val operationPhase = if (flow == ProofRelocationFlow.STAGED_PUBLICATION) "M" else "P"
-            // RECORD v6 (review-43 #8): the NINTH line is the captured intent generation —
-            // the destination row's offlineIntentStamp at write time (0 = row absent then).
-            // The replay's admission compares it against the LIVE stamp, so an unpin-repin
-            // sequence after the capture supersedes this operation instead of letting it
-            // publish its captured bytes under the newer request's intent. v5's write-ahead
-            // grammar is otherwise unchanged; v4/v5 records stay decodable as before.
+            // RECORD v7 (review-43 #8, review-44 #8): the NINTH line is the captured
+            // intent stamp, the TENTH and ELEVENTH the captured destination content
+            // generation (version, lastModifiedAt) — all from ONE fresh row view at
+            // write time (0 = row absent then). The replay's admission compares the
+            // LIVE row against the CAPTURED generation (a change-since-capture test
+            // that never supersedes a pre-existing differing row) and the live stamp,
+            // so an unpin-repin sequence after the capture supersedes this operation
+            // instead of letting it publish its captured bytes under the newer
+            // request's intent. v6's proof-based generation comparison is retired with
+            // its emission (no v6 journal ever shipped — both round-43 builds' APKs
+            // were rejected); v5's write-ahead grammar is otherwise unchanged; v4/v5/v6
+            // records stay decodable exactly as their own grammars require.
             // RECORD v5 (review-40 #9): the WRITE-AHEAD phase contract — the journal's P
             // is durably written before any byte effect is authorized, B before the first
             // mutation, M after it; a durable P therefore strictly means no byte effect
@@ -2592,7 +2610,7 @@ class DownloadOfflineFileManager(
             atomicWriteText(
                 recordFile,
                 listOf(
-                    "6",
+                    "7",
                     target.absolutePath,
                     proofText,
                     attemptedObservationText,
@@ -2600,7 +2618,9 @@ class DownloadOfflineFileManager(
                     recordedSourceProofText,
                     previousDestinationRecordText,
                     "${if (sourceSharedWithMe) 1 else 0}|$sourceStorageKind|$operationPhase",
-                    capturedIntentStamp.toString(),
+                    capturedDestinationGeneration.first.toString(),
+                    capturedDestinationGeneration.second.toString(),
+                    capturedDestinationGeneration.third.toString(),
                 ).joinToString("\n"),
             )
         }.getOrDefault(false)
@@ -2715,12 +2735,21 @@ class DownloadOfflineFileManager(
              * B records the interim writer stranded) but never grants pre-byte authority.
              * False for v1–v4. */
             val phaseAuthoritative: Boolean = false,
-            /** THE CAPTURED INTENT GENERATION (review-43 #8) — v6 journals only: the
+            /** THE CAPTURED INTENT GENERATION (review-43 #8) — v6/v7 journals: the
              * destination row's durable offlineIntentStamp at journal-write time (0 = the
              * row did not exist at capture). Admission compares the LIVE stamp, so an
              * unpin-repin sequence after the capture can never let the old operation
              * publish for the newer request. Null for v1–v5. */
             val recordedIntentStamp: Long? = null,
+            /** THE CAPTURED DESTINATION CONTENT GENERATION (review-44 #8) — v7 journals
+             * only: the destination row's accepted version and lastModifiedAt at
+             * journal-write time (0/0 = row absent then). The admission's change-since-
+             * capture test runs against THIS baseline — a pre-existing row that
+             * legitimately differs from the proof's source-derived metadata is the
+             * operation's own authorization baseline, never a permanent supersession.
+             * Null for v1–v6. */
+            val recordedDestinationVersion: Int? = null,
+            val recordedDestinationLastModifiedAt: Long? = null,
             /** COMPLETE PROOF VALIDATION (review-34 #9): the retained proof text parses
              * under the FULL provenance grammar WITH the operation's target as its
              * expected embedded location — validated before any registry mutation. */
@@ -2758,11 +2787,11 @@ class DownloadOfflineFileManager(
             // closed at its arming transition. The limit PRESERVES trailing empty fields
             // (a v3 record legitimately ends with an empty previous-destination field);
             // excess fields surface as a '\n' inside the last part and are rejected
-            // explicitly by the per-version checks below. v4/v5 require EXACTLY 8 lines and
-            // v6 EXACTLY 9; an older record with more lines than its version requires still
-            // rejects through its own size/newline checks, and a journal damaged by extra
-            // lines is retained — never decoded.
-            val parts = recordFile.readText().split("\n", limit = 9)
+            // explicitly by the per-version checks below. v4/v5 require EXACTLY 8 lines,
+            // v6 EXACTLY 9 and v7 EXACTLY 11; an older record with more lines than its
+            // version requires still rejects through its own size/newline checks, and a
+            // journal damaged by extra lines is retained — never decoded.
+            val parts = recordFile.readText().split("\n", limit = 11)
             fun fields(proofText: String): List<String> = proofText.removePrefix(PROVENANCE_FRAME).split("|")
             // THE COMPLETE PROOF DECODE (review-34 #9): the embedded location is parsed
             // loose (any grammar) and strict (the operation's target expected) — the strict
@@ -2880,9 +2909,10 @@ class DownloadOfflineFileManager(
                         embeddedProofLocation = embeddedLocation,
                     )
                 }
-                "4", "5", "6" -> {
-                    // RECORD v4/v5/v6 (review-38 #6; the write-ahead contract v5, review-40
-                    // #9; the captured intent generation v6, review-43 #8): the v3
+                "4", "5", "6", "7" -> {
+                    // RECORD v4/v5/v6/v7 (review-38 #6; the write-ahead contract v5,
+                    // review-40 #9; the captured intent generation v6, review-43 #8; the
+                    // captured destination content generation v7, review-44 #8): the v3
                     // structure PLUS the EIGHTH line —
                     // the recorded SOURCE authority (the source's own Realm flavor and
                     // storage kind, distinct from the destination sidecar's) and the
@@ -2892,14 +2922,20 @@ class DownloadOfflineFileManager(
                     // as legacy — their repair keeps the validated source/destination
                     // transition (exclusive source ownership proven in the row's actual
                     // realm), never a source-hash or destination-location inference.
-                    // THE CAPTURED INTENT GENERATION LINE (review-43 #8): a v6 journal
-                    // REQUIRES its ninth line; a v4/v5 journal requires exactly eight. An
-                    // undecodable journal is retained, never guessed.
+                    // THE CAPTURED GENERATION LINES (review-43 #8, review-44 #8): a v6
+                    // journal REQUIRES its ninth line and a v7 journal its ninth through
+                    // eleventh; a v4/v5 journal requires exactly eight. An undecodable
+                    // journal is retained, never guessed.
                     val recordVersion = parts[0].trim()
-                    if (recordVersion != "4" && recordVersion != "5" && recordVersion != "6") {
+                    if (recordVersion != "4" && recordVersion != "5" && recordVersion != "6" && recordVersion != "7") {
                         return@runCatching null
                     }
-                    if (parts.size != (if (recordVersion == "6") 9 else 8)) return@runCatching null
+                    val requiredSize = when (recordVersion) {
+                        "7" -> 11
+                        "6" -> 9
+                        else -> 8
+                    }
+                    if (parts.size != requiredSize) return@runCatching null
                     val sourceField = parts[4]
                     val previousDestinationField = parts[6]
                     val sourceAuthorityField = parts[7]
@@ -2908,11 +2944,23 @@ class DownloadOfflineFileManager(
                     ) {
                         return@runCatching null
                     }
-                    val recordedIntentStamp = if (recordVersion == "6") {
+                    val recordedIntentStamp = if (recordVersion == "6" || recordVersion == "7") {
                         if (parts[8].contains('\n')) return@runCatching null
                         parts[8].trim().toLongOrNull() ?: return@runCatching null
                     } else {
                         null
+                    }
+                    // THE CAPTURED DESTINATION GENERATION (review-44 #8): required for a v7
+                    // journal — the accepted version and lastModifiedAt at write time.
+                    val recordedDestinationVersion: Int?
+                    val recordedDestinationLastModifiedAt: Long?
+                    if (recordVersion == "7") {
+                        if (parts[9].contains('\n') || parts[10].contains('\n')) return@runCatching null
+                        recordedDestinationVersion = parts[9].trim().toIntOrNull() ?: return@runCatching null
+                        recordedDestinationLastModifiedAt = parts[10].trim().toLongOrNull() ?: return@runCatching null
+                    } else {
+                        recordedDestinationVersion = null
+                        recordedDestinationLastModifiedAt = null
                     }
                     val authorityParts = sourceAuthorityField.split("|")
                     if (authorityParts.size != 3) return@runCatching null
@@ -2940,9 +2988,9 @@ class DownloadOfflineFileManager(
                         "P", "B", "M" -> authorityParts[2].trim()
                         else -> return@runCatching null
                     }
-                    // v5 AND v6 carry the authoritative write-ahead contract (v6 only
-                    // adds the captured intent generation).
-                    val phaseAuthoritative = recordVersion == "5" || recordVersion == "6"
+                    // v5, v6 AND v7 carry the authoritative write-ahead contract (v6/v7
+                    // only add the captured generations).
+                    val phaseAuthoritative = recordVersion == "5" || recordVersion == "6" || recordVersion == "7"
                     val proofFields = fields(parts[2])
                     val observationField = parts[3]
                     val (locationValid, embeddedLocation) = proofValidation(parts[2], parts[1])
@@ -2969,6 +3017,8 @@ class DownloadOfflineFileManager(
                         recordedPhase = recordedPhase,
                         phaseAuthoritative = phaseAuthoritative,
                         recordedIntentStamp = recordedIntentStamp,
+                        recordedDestinationVersion = recordedDestinationVersion,
+                        recordedDestinationLastModifiedAt = recordedDestinationLastModifiedAt,
                         proofLocationValid = locationValid,
                         embeddedProofLocation = embeddedLocation,
                     )
@@ -3442,14 +3492,21 @@ class DownloadOfflineFileManager(
                         return@runCatching false
                     }
                 }
-                // THE TRANSITION PRESERVES THE RECORD'S OWN FORMAT (review-43 #8): a v6
-                // journal keeps its header and captured intent-stamp line VERBATIM through
-                // the phase rewrite — only the authority line's phase advances; a v5
-                // journal stays exactly v5.
+                // THE TRANSITION PRESERVES THE RECORD'S OWN FORMAT (review-43 #8,
+                // review-44 #8): a v6 journal keeps its header and captured intent-stamp
+                // line and a v7 journal its captured generation lines VERBATIM through the
+                // phase rewrite — only the authority line's phase advances; a v5 journal
+                // stays exactly v5.
                 val rewritten = atomicWriteText(
                     recordFile,
                     buildList {
-                        add(if (parsed.recordedIntentStamp != null) "6" else "5")
+                        add(
+                            when {
+                                parsed.recordedDestinationVersion != null -> "7"
+                                parsed.recordedIntentStamp != null -> "6"
+                                else -> "5"
+                            }
+                        )
                         add(parsed.targetPath)
                         add(parsed.proofText)
                         add(parsed.observationText ?: if (parsed.observationFieldDamaged) "" else "A")
@@ -3459,6 +3516,10 @@ class DownloadOfflineFileManager(
                         add("${if (parsed.recordedSourceSharedWithMe == true) 1 else 0}|" +
                             "${parsed.recordedSourceStorageKind ?: "offline"}|$toPhase")
                         if (parsed.recordedIntentStamp != null) add(parsed.recordedIntentStamp.toString())
+                        if (parsed.recordedDestinationVersion != null) {
+                            add(parsed.recordedDestinationVersion.toString())
+                            add(parsed.recordedDestinationLastModifiedAt.toString())
+                        }
                     }.joinToString("\n"),
                 )
                 // THE TRANSITION IS VERIFIED BY DECODE (review-39 #9): a reported success
@@ -4842,6 +4903,8 @@ class DownloadOfflineFileManager(
                                         reread.recordedSourceStorageKind != parsed.recordedSourceStorageKind ||
                                         reread.recordedPhase != parsed.recordedPhase ||
                                         reread.recordedIntentStamp != parsed.recordedIntentStamp ||
+                                        reread.recordedDestinationVersion != parsed.recordedDestinationVersion ||
+                                        reread.recordedDestinationLastModifiedAt != parsed.recordedDestinationLastModifiedAt ||
                                         reread.proofLocationValid != parsed.proofLocationValid ||
                                         reread.embeddedProofLocation != parsed.embeddedProofLocation
                                     ) {
@@ -5177,37 +5240,66 @@ class DownloadOfflineFileManager(
                                                         storageKind = moveScopeKind,
                                                     )
                                                     // THE SUPERSEDED-AUTHORIZATION ADMISSION (review-43
-                                                    // #8): a matching row whose LIVE accepted content
-                                                    // generation (version + lastModifiedAt) differs
-                                                    // from the operation's captured target proof — or
-                                                    // whose LIVE intent stamp differs from a v6
-                                                    // journal's captured stamp — was re-contented or
-                                                    // re-authorized AFTER the capture (an unpin-repin
-                                                    // sequence commits newer stamps; a later sync
-                                                    // commits a newer generation). The operation is
-                                                    // then SUPERSEDED: it is never admitted to publish
-                                                    // its captured bytes under the newer request's
-                                                    // intent, and takes the SAME validated rollback as
-                                                    // a proven non-claim below — the source's
-                                                    // coherence is restored, the destination's
-                                                    // prepared-record resolution runs, and the
-                                                    // destination's own durable intent (the live pin
-                                                    // under its newer stamp, redriven by the pin
-                                                    // recovery) re-requests the transfer through the
-                                                    // ordinary sync path. Legacy v1–v5 journals carry
-                                                    // no stamp: their validated transition is the
-                                                    // CONTENT generation comparison — a real check,
-                                                    // never a Boolean-only admission and never a
-                                                    // stamp waiver (a captured stamp of 0 means the
-                                                    // row did not exist at capture; the generation
-                                                    // comparison governs those operations).
+                                                    // #8, the correct baseline review-44 #8): a
+                                                    // matching row whose accepted generation or intent
+                                                    // stamp CHANGED SINCE THE JOURNAL'S CAPTURE
+                                                    // supersedes the operation — it is never admitted
+                                                    // to publish its captured bytes under the newer
+                                                    // request's intent, and takes the SAME validated
+                                                    // rollback as a proven non-claim below (the
+                                                    // source's coherence is restored, the
+                                                    // destination's prepared-record resolution runs,
+                                                    // and the destination's own durable intent — the
+                                                    // live pin under its newer stamp, redriven by the
+                                                    // pin recovery traced in the round report —
+                                                    // re-requests the transfer through the ordinary
+                                                    // sync path). THE BASELINE IS THE JOURNAL'S OWN
+                                                    // CAPTURE, never the proof's source-derived
+                                                    // metadata: a v7 journal compares the live row
+                                                    // against its CAPTURED destination generation, so
+                                                    // a pre-existing row that legitimately differs from
+                                                    // the proof's version/lastModifiedAt is the
+                                                    // operation's own authorization baseline — never a
+                                                    // permanent supersession of the same operation; a
+                                                    // row that was ABSENT at capture (0) skips the
+                                                    // generation test (its appearance is the expected
+                                                    // commit — no baseline is invented) and the live
+                                                    // intent + publication-id gates govern. A v6
+                                                    // journal keeps its transitional proof-based
+                                                    // comparison (documented; no v6 journal ever
+                                                    // shipped). Legacy v1–v5 journals carry no capture:
+                                                    // their validated transition is the CONTENT
+                                                    // generation comparison against the proof — a real
+                                                    // check, never a Boolean-only admission and never a
+                                                    // stamp waiver; the intent at their capture is an
+                                                    // unprovable historical fact and is never invented
+                                                    // (the residual limit is documented, not waived
+                                                    // away).
                                                     val matchingState = destinationState as? DestinationRowState.Matching
-                                                    val supersededAuthorization = matchingState != null && (
-                                                        matchingState.rowVersion != validatedTargetProof.version ||
-                                                            matchingState.rowLastModifiedAt != validatedTargetProof.lastModifiedAt ||
-                                                            (parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
-                                                                parsed.recordedIntentStamp != matchingState.intentStamp)
-                                                        )
+                                                    val supersededAuthorization = matchingState != null && when (parsed.version) {
+                                                        7 ->
+                                                            if (parsed.recordedDestinationVersion != null &&
+                                                                parsed.recordedDestinationVersion > 0
+                                                            ) {
+                                                                matchingState.rowVersion != parsed.recordedDestinationVersion ||
+                                                                    matchingState.rowLastModifiedAt != parsed.recordedDestinationLastModifiedAt ||
+                                                                    (parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
+                                                                        parsed.recordedIntentStamp != matchingState.intentStamp)
+                                                            } else {
+                                                                // A ROW ABSENT AT CAPTURE: the expected
+                                                                // appearance — no generation baseline
+                                                                // exists and none is invented.
+                                                                false
+                                                            }
+                                                        6 ->
+                                                            matchingState.rowVersion != validatedTargetProof.version ||
+                                                                matchingState.rowLastModifiedAt != validatedTargetProof.lastModifiedAt ||
+                                                                (parsed.recordedIntentStamp != null && parsed.recordedIntentStamp > 0L &&
+                                                                    parsed.recordedIntentStamp != matchingState.intentStamp)
+                                                        else ->
+                                                            matchingState.rowVersion != validatedTargetProof.version ||
+                                                                matchingState.rowLastModifiedAt != validatedTargetProof.lastModifiedAt
+                                                    }
                                                     // THE TWO VALIDATED RESOLUTION ROUTES (review-41
                                                     // #9): with the complete operation validated, the
                                                     // destination's fresh row state decides the route —
@@ -5648,6 +5740,8 @@ class DownloadOfflineFileManager(
                                                             currentJournal.previousDestinationRecordText == parsed.previousDestinationRecordText &&
                                                             currentJournal.recordedPhase == parsed.recordedPhase &&
                                                             currentJournal.recordedIntentStamp == parsed.recordedIntentStamp &&
+                                                            currentJournal.recordedDestinationVersion == parsed.recordedDestinationVersion &&
+                                                            currentJournal.recordedDestinationLastModifiedAt == parsed.recordedDestinationLastModifiedAt &&
                                                             disposeRecoveryRecord(recordFile)
                                                     }
                                                 } else false
