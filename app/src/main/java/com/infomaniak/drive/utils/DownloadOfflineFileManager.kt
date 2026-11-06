@@ -4416,41 +4416,93 @@ class DownloadOfflineFileManager(
                                                         parsed.recordedPhase == "P"
                                                     tupleEqual && sourceOwnership && phaseRecordedPrepared
                                                 }.getOrDefault(false)
-                                                // THE EXPLICIT POST-COPY RECONCILIATION (review-39 #9): a
-                                                // B/M journal whose destination vanished is NEVER
-                                                // pre-byte authority — but when the COPY flow's source
-                                                // transition validates independently (the recorded
-                                                // source proof binds the bytes that still sit at the
-                                                // recorded source under the recorded source authority),
-                                                // the byte effect left nothing to recover at the
-                                                // destination and the journal disposes WITHOUT any
-                                                // destination mutation. A vacated source fails this
-                                                // validation and retains; no hash or location inference
-                                                // substitutes for the missing phase fact.
-                                                val postCopyResolved = parsed.version >= 4 &&
-                                                    parsed.recordedPhase != "P" &&
-                                                    parsed.recordedSourcePath != null &&
-                                                    parsed.recordedSourceProofText != null &&
-                                                    parsed.recordedSourceSharedWithMe != null && runCatching {
-                                                    val sourceFile = IOFile(parsed.recordedSourcePath)
+                                                // THE EXPLICIT POST-COPY RECONCILIATION (review-39 #9,
+                                                // reworked review-40 #10): a B/M journal whose
+                                                // destination vanished is NEVER pre-byte authority, and
+                                                // the copy's retained source bytes alone never authorize
+                                                // disposal. The arm requires the COMPLETE operation
+                                                // tuple (both payloads' full owner/generation/
+                                                // publication identity, exactly as the pre-byte
+                                                // authority validates it — a malformed-but-parseable
+                                                // payload never passes) AND BOTH captured ownership
+                                                // states, then DURABLY RESTORES the source's proof and
+                                                // its carried observation — the coherent source
+                                                // outcome, verified by read-back — before the journal
+                                                // is disposed. The committed destination graph's row
+                                                // state stays governed by the sweep's row-based arms.
+                                                val postCopyResolved = parsed.version >= 4 && runCatching {
+                                                    if (parsed.recordedPhase == "P" || parsed.recordedPhase == null) {
+                                                        return@runCatching false
+                                                    }
+                                                    if (parsed.observationAmbiguous) return@runCatching false
+                                                    val sourcePath = parsed.recordedSourcePath ?: return@runCatching false
+                                                    val sourceProofText = parsed.recordedSourceProofText
+                                                        ?: return@runCatching false
+                                                    val recordedSourceShared = parsed.recordedSourceSharedWithMe
+                                                        ?: return@runCatching false
+                                                    val sourceFile = IOFile(sourcePath)
                                                     val sourceHash = if (sourceFile.exists()) UploadFile.sha256OrNull(sourceFile) else null
                                                     val sourceProof = runCatching {
-                                                        parseProvenanceText(
-                                                            parsed.recordedSourceProofText,
-                                                            expectedPath = parsed.recordedSourcePath,
-                                                        )
-                                                    }.getOrNull()?.takeIf { it.absolutePath == parsed.recordedSourcePath }
-                                                    sourceFile.exists() && sourceHash != null && sourceProof != null &&
+                                                        parseProvenanceText(sourceProofText, expectedPath = sourcePath)
+                                                    }.getOrNull()?.takeIf { it.absolutePath == sourcePath }
+                                                    val targetProof = runCatching {
+                                                        parseProvenanceText(parsed.proofText, expectedPath = parsed.targetPath)
+                                                    }.getOrNull()?.takeIf { it.absolutePath == parsed.targetPath }
+                                                    // THE COMPLETE OPERATION TUPLE (review-37 #7), exactly
+                                                    // as the pre-byte authority demands it.
+                                                    val tupleEqual = sourceProof != null && targetProof != null &&
+                                                        sourceProof.userId == parsed.proofUserId &&
+                                                        sourceProof.driveId == parsed.proofDriveId &&
+                                                        sourceProof.fileId == parsed.proofFileId &&
+                                                        sourceProof.contentHash != null &&
+                                                        sourceProof.contentHash == parsed.proofContentHash &&
+                                                        sourceProof.version == targetProof.version &&
+                                                        sourceProof.lastModifiedAt == targetProof.lastModifiedAt &&
+                                                        sourceProof.revisedAt == targetProof.revisedAt &&
+                                                        sourceProof.updatedAt == targetProof.updatedAt &&
+                                                        sourceProof.publicationId == targetProof.publicationId
+                                                    // THE SOURCE'S OWNERSHIP (recorded scope) AND ITS
+                                                    // BYTES' IDENTITY.
+                                                    val sourceAuthoritative = sourceFile.exists() &&
+                                                        sourceHash != null && sourceProof != null &&
                                                         sourceHash == sourceProof.contentHash &&
                                                         currentOwnerHolds(
                                                             context, scope, proofFileId, sourceFile,
-                                                            sharedWithMe = parsed.recordedSourceSharedWithMe,
+                                                            sharedWithMe = recordedSourceShared,
                                                             storageKind = parsed.recordedSourceStorageKind
                                                                 ?: moveScopeKind,
-                                                        ) &&
-                                                        // THE RETAINED AUTHORITY IS DURABLE BEFORE THE
-                                                        // JOURNAL LEAVES (review-39 #5): the source is the
-                                                        // sole remaining authority for this generation.
+                                                        )
+                                                    // THE SOURCE'S PROOF IS DURABLY RESTORED AND VERIFIED
+                                                    // (review-40 #10): the captured source-bound payload is
+                                                    // written back through the atomic writer and read back
+                                                    // — the retained bytes are never left as bare unproven
+                                                    // content.
+                                                    val sourceProofRestored = sourceAuthoritative && run {
+                                                        val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
+                                                        sourceRecordFile != null &&
+                                                            atomicWriteText(sourceRecordFile, sourceProofText) &&
+                                                            readPublishedProvenance(context, sourceFile)?.let { restored ->
+                                                                restored.certifiesBytes(sourceFile) &&
+                                                                    restored.publicationId == sourceProof.publicationId
+                                                            } == true
+                                                    }
+                                                    // THE CARRIED OBSERVATION IS RESTORED WITH ITS PROOF
+                                                    // (review-40 #10): a carried observation re-binds to the
+                                                    // recorded source verbatim (it was captured against it)
+                                                    // and is parse-verified; an explicit absence is the
+                                                    // operation's own contract and restores nothing.
+                                                    val observationRestored = !sourceProofRestored ||
+                                                        parsed.observationText == null || run {
+                                                            val sourceObs = IOFile(provenanceFileFor(context, sourceFile).path + ".obs")
+                                                            atomicWriteText(sourceObs, parsed.observationText) &&
+                                                                parseObservationBinding(
+                                                                    sourceObs.readText().trim(),
+                                                                )?.location == sourceFile.absolutePath
+                                                        }
+                                                    // THE RETAINED AUTHORITY IS DURABLE BEFORE THE JOURNAL
+                                                    // LEAVES (review-39 #5): the restored source is the
+                                                    // coherent authority for this generation.
+                                                    tupleEqual && sourceProofRestored && observationRestored &&
                                                         UploadFile.synchronizeFileContents(sourceFile) &&
                                                         UploadFile.synchronizeDirectoryEntry(sourceFile.parentFile)
                                                 }.getOrDefault(false)
