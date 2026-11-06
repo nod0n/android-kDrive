@@ -554,20 +554,25 @@ object FileController {
                                     folderId = fileId,
                                     realm = realm,
                                 )
-                        // EXPLICITLY KEPT CHILDREN ARE RETAINED DESCENDANTS (review-38 #8):
-                        // the recursion skips a keepFiles child entirely, but its retention
-                        // still belongs in the aggregate when the child's LIVE parentId chain
-                        // still requires this row — deleting the parent would strand the kept
-                        // child's required ancestor and backlink (the My Shares replacement
-                        // keeps a child whose folder the refreshed list no longer carries,
-                        // while the child survives with parentId pointing at the deleted
-                        // row). Revalidated HERE, inside the coordination, before BOTH
-                        // parent-deletion branches; the caller's membership replacement
-                        // consumes the same aggregate. A kept child moved elsewhere is
-                        // classified accurately: its live row no longer requires this row as
-                        // its ancestor, so it contributes no retention here.
+                        // EXPLICITLY KEPT CHILDREN ARE RETAINED DESCENDANTS (review-38 #8,
+                        // review-39 #11): the recursion skips a keepFiles child entirely, but
+                        // its retention still belongs in the aggregate when the child's LIVE
+                        // durable parentId chain still requires this row — deleting the
+                        // parent would strand the kept child's required ancestor and backlink.
+                        // The retention is derived from each kept row's FRESH parentId chain
+                        // (the bounded boundary walk by id), INDEPENDENT of the children
+                        // backlinks: the presentation lists are incomplete (Favorites/My
+                        // Shares container insertion can persist a kept row with parentId = D
+                        // without linking it into D.children). Revalidated HERE, inside the
+                        // coordination, before BOTH parent-deletion branches; the caller's
+                        // membership replacement consumes the same aggregate. A kept child
+                        // moved elsewhere is classified accurately: its live chain no longer
+                        // requires this row, so it contributes no retention here.
                         val keptChildStillRequiresThisRow = file.isFolder() && keepFiles.isNotEmpty() &&
-                                file.children.createSnapshot().any { keepFiles.contains(it.id) && it.parentId == fileId }
+                                keepFiles.any { keptId ->
+                                    getFileById(realm, keptId)?.parentId
+                                        ?.let { ancestryReachesBoundary(realm, it, fileId) } == true
+                                }
                         if (keptChildStillRequiresThisRow) {
                             allRemoved = false
                         }
