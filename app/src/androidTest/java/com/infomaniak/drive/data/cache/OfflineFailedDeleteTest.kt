@@ -23,6 +23,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.RealmModules
 import io.realm.Realm
 import io.realm.RealmConfiguration
@@ -57,6 +58,16 @@ import java.util.UUID
  * the only offline-tree content removed in cleanup), and one SYNC_OFFLINE upload record in
  * the Sync realm (deleted in cleanup by its URI). No owner data, no account, no network.
  * The coder executes nothing — the orchestrator runs this on a device.
+ *
+ * HONEST PRECONDITION NOTE (the orchestrator's caution): the failed-unlink scenarios make
+ * the copy's directory unwritable and ASSERT that request via `check(setWritable(...))` —
+ * but Android's external-media FUSE layer may IGNORE chmod semantics, in which case the
+ * unlink can succeed and the failed-deletion assertions would fail. `setWritable`'s return
+ * is the fixture's prerequisite, NOT proof of runtime reachability; whether the real
+ * failed-unlink path is reachable at the offline tree's actual filesystem is decided by
+ * the FIRST DEVICE RUN alone. The assertions are deliberately not weakened — a
+ * chmod-ignoring device would surface as concrete scenario failures to adapt (a different
+ * real-failure mechanism at the same site), not as passing-by-luck.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class OfflineFailedDeleteTest {
@@ -88,8 +99,11 @@ class OfflineFailedDeleteTest {
                 .build()
         }
 
-        /** Seeds the offline bytes, the matching SYNC_OFFLINE upload record and the covered row. */
-        private fun seedCoveredCopy(realm: Realm): File {
+        /**
+         * Seeds the offline bytes, the matching SYNC_OFFLINE upload record and the covered
+         * row. Returns the SEEDED BYTE FILE (an [IOFile] — NOT the model row).
+         */
+        private fun seedCoveredCopy(realm: Realm): IOFile {
             val offlineFile = File()
                 .apply {
                     uid = "${FILE_ID}_$DRIVE_ID"
