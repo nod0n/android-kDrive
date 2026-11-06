@@ -2259,6 +2259,74 @@ class DownloadOfflineFileManager(
             }
         }.getOrDefault(false)
 
+        /** THE TYPED FRESH DESTINATION ROW STATE (review-42 #8): the rollback/completion
+         * decision can never reduce destination reality to a Boolean — a failed lookup, a
+         * failed realm refresh or an unresolved ancestry is FAILURE (the caller DEFERS,
+         * never reads it as "the destination does not claim the target" and never rolls
+         * back over it); a proven different or absent row is NOT-CLAIMING; a contested
+         * path is CONFLICT; a matching row carries its LIVE offline intent. */
+        private sealed class DestinationRowState {
+            /** The captured file's row exclusively resolves to the target under the fresh
+             * realm view; [intentPresent] is the row's CURRENT durable offline intent (an
+             * explicit pin or folder coverage) — an intervening unpin leaves the row and
+             * path in place and must never be answered by recreating the removed copy. */
+            class Matching(val intentPresent: Boolean) : DestinationRowState()
+
+            /** PROVEN non-claim: the row resolves elsewhere, or no row exists — never a
+             * failed lookup. */
+            object NotClaiming : DestinationRowState()
+
+            /** The path is contested (multiple claims). */
+            object Conflict : DestinationRowState()
+
+            /** A failed query: refresh failure, failed lookup, unknown storage kind. */
+            object Failed : DestinationRowState()
+        }
+
+        private fun freshDestinationRowState(
+            context: Context,
+            recordScope: UserDrive,
+            recordFileId: Int,
+            target: IOFile,
+            sharedWithMe: Boolean,
+            storageKind: String,
+        ): DestinationRowState = runCatching {
+            val realmScope = UserDrive(
+                userId = recordScope.userId,
+                driveId = recordScope.driveId,
+                sharedWithMe = sharedWithMe,
+            )
+            FileController.getRealmInstance(realmScope).use { realm ->
+                // REFRESH FAILURE IS A FAILED STATE, NEVER A NON-CLAIM (review-42 #8): a
+                // stale Realm view defers the decision.
+                runCatching { realm.refresh() }.onFailure { return@use DestinationRowState.Failed }
+                val row = FileController.getFileById(realm, recordFileId) ?: return@use DestinationRowState.NotClaiming
+                val ownedPath = when (storageKind) {
+                    "cache" -> row.getCacheFile(context, realmScope).absolutePath
+                    "converted" -> row.getConvertedPdfCache(context, realmScope).absolutePath
+                    // THE CAPTURED REALM FLAVOR RESOLVES THE PATH (issue: round 27 #9d), as
+                    // in the Boolean check this typed decision replaces.
+                    "offline" -> row.getOfflineFile(context, recordScope.userId, sharedWithMe = sharedWithMe)?.absolutePath
+                    // THE STRICT KIND WHITELIST (review-39 #10): an unknown kind fails.
+                    else -> return@use DestinationRowState.Failed
+                }
+                if (ownedPath != target.absolutePath) return@use DestinationRowState.NotClaiming
+                // ID-KEYED DESTINATIONS ARE STRUCTURALLY EXCLUSIVE (issue: round 28 #9), as
+                // in the Boolean check; a contested offline path is a CONFLICT.
+                val exclusivelyOwned = storageKind != "offline" ||
+                    appContextForOwnership()?.let { ctx ->
+                        OfflineFolderController.exclusivePathOwner(realm, ctx, realmScope, target.path)
+                    } == row.id
+                if (!exclusivelyOwned) return@use DestinationRowState.Conflict
+                // THE LIVE OFFLINE INTENT (review-42 #8): the row's CURRENT durable intent
+                // must still exist for a completion to run — an intervening unpin leaves
+                // the row and its path in place, and only the live intent distinguishes a
+                // wanted copy from a removed one. (The intent STAMP generation cannot be
+                // compared: the journal and recovery formats predate the stamp's capture.)
+                DestinationRowState.Matching(intentPresent = row.isOffline || row.isInOfflineFolder)
+            }
+        }.getOrDefault(DestinationRowState.Failed)
+
         /**
          * Whether [prefixFile]'s COMPLETE bytes equal the head of [fullFile] (issue: round
          * 25 #3): the ambiguity gate for legacy in-place restore output — a readable
@@ -4613,20 +4681,64 @@ class DownloadOfflineFileManager(
                                                 // the abort resolution.
                                                 val phasePreByte = parsed.phaseAuthoritative &&
                                                     parsed.recordedPhase == "P"
+                                                // THE ACTUAL-FORMAT GATE (review-42 #7): a recorded
+                                                // SOURCE PATH is the published-source evidence — a
+                                                // v2 journal predates the captured source-proof
+                                                // FIELD, and its absence never establishes a staged
+                                                // flow (the staged flow's journals carry NO source
+                                                // path at all). Missing later-added fields are
+                                                // never pre-byte permission and never route to the
+                                                // generic abort.
                                                 val postCopyAttempt = !phasePreByte &&
-                                                    !parsed.recordedSourcePath.isNullOrEmpty() &&
-                                                    !parsed.recordedSourceProofText.isNullOrEmpty()
+                                                    !parsed.recordedSourcePath.isNullOrEmpty()
                                                 val postCopyResolved = postCopyAttempt && runCatching {
                                                     val sourcePath = parsed.recordedSourcePath ?: return@runCatching false
-                                                    val sourceProofText = parsed.recordedSourceProofText
-                                                        ?: return@runCatching false
+                                                    // THE SOURCE AUTHORITY BY ACTUAL FORMAT (review-42
+                                                    // #7): v4/v5 journals carry the captured
+                                                    // source-bound proof and the source's own Realm
+                                                    // flavor; a v3 journal carries the proof but
+                                                    // predates the flavor field; a v2 journal predates
+                                                    // the proof field itself. The historical
+                                                    // SAME-REALM semantic (the v4 eighth line exists
+                                                    // precisely because the cross-Realm flow
+                                                    // introduced a distinct source realm) resolves
+                                                    // the legacy source scope — validated FRESH by
+                                                    // unique ownership below on every sweep, never
+                                                    // inferred into pre-byte permission; a v5-format
+                                                    // rewrite is deliberately not performed because a
+                                                    // v2/v3 journal's phase is unprovable.
+                                                    val capturedSourceProofText = parsed.recordedSourceProofText
                                                     val recordedSourceShared = parsed.recordedSourceSharedWithMe
-                                                        ?: return@runCatching false
+                                                        ?: moveScopeShared
+                                                    val recordedSourceKind = parsed.recordedSourceStorageKind
+                                                        ?: moveScopeKind
                                                     val sourceFile = IOFile(sourcePath)
                                                     val sourceHash = if (sourceFile.exists()) UploadFile.sha256OrNull(sourceFile) else null
-                                                    val sourceProof = runCatching {
-                                                        parseProvenanceText(sourceProofText, expectedPath = sourcePath)
-                                                    }.getOrNull()?.takeIf { it.absolutePath == sourcePath }
+                                                    val sourceProof = if (capturedSourceProofText != null) {
+                                                        runCatching {
+                                                            parseProvenanceText(capturedSourceProofText, expectedPath = sourcePath)
+                                                        }.getOrNull()?.takeIf { it.absolutePath == sourcePath }
+                                                    } else {
+                                                        // A v2 JOURNAL'S ROLLBACK AUTHORITY IS THE
+                                                        // SOURCE'S LIVE VALIDATED PROOF (review-42 #7):
+                                                        // read ONCE as typed evidence — only a VALID
+                                                        // record identifying this operation's row and
+                                                        // certifying the source bytes is authority;
+                                                        // absent or invalid retains.
+                                                        when (val liveSourceEvidence = readPublishedProvenanceEvidence(context, sourceFile)) {
+                                                            is PublishedProvenanceEvidence.Valid -> liveSourceEvidence.record.takeIf {
+                                                                it.identifies(
+                                                                    File(id = proofFileId, driveId = proofDriveId),
+                                                                    UserDrive(
+                                                                        userId = proofUserId,
+                                                                        driveId = proofDriveId,
+                                                                        sharedWithMe = recordedSourceShared,
+                                                                    ),
+                                                                )
+                                                            }
+                                                            else -> null
+                                                        }
+                                                    }
                                                     val targetProof = runCatching {
                                                         parseProvenanceText(parsed.proofText, expectedPath = parsed.targetPath)
                                                     }.getOrNull()?.takeIf { it.absolutePath == parsed.targetPath }
@@ -4649,16 +4761,18 @@ class DownloadOfflineFileManager(
                                                     // inference through boolean vals.
                                                     val validatedSourceProof = sourceProof ?: return@runCatching false
                                                     val validatedTargetProof = targetProof ?: return@runCatching false
-                                                    // THE SOURCE'S OWNERSHIP (recorded scope) AND ITS
-                                                    // BYTES' IDENTITY.
+                                                    // THE SOURCE'S OWNERSHIP (the recorded scope, or the
+                                                    // historical same-realm semantic for v2/v3) AND ITS
+                                                    // BYTES' IDENTITY — FRESH and UNIQUE under the
+                                                    // captured coordination on every sweep (review-42
+                                                    // #7).
                                                     val sourceAuthoritative = sourceFile.exists() &&
-                                                        sourceHash != null && sourceProof != null &&
-                                                        sourceHash == sourceProof.contentHash &&
+                                                        sourceHash != null &&
+                                                        sourceHash == validatedSourceProof.contentHash &&
                                                         currentOwnerHolds(
                                                             context, scope, proofFileId, sourceFile,
                                                             sharedWithMe = recordedSourceShared,
-                                                            storageKind = parsed.recordedSourceStorageKind
-                                                                ?: moveScopeKind,
+                                                            storageKind = recordedSourceKind,
                                                         )
                                                     // THE CURRENT-SOURCE PUBLICATION AUTHORITY
                                                     // (review-41 #7, typed evidence review-42 #5):
@@ -4697,13 +4811,17 @@ class DownloadOfflineFileManager(
                                                     val fullyValidated = tupleEqual && targetProof != null &&
                                                         sourceAuthoritative && sourcePublicationAuthoritative &&
                                                         carriedObservationBound
-                                                    // THE DESTINATION'S FRESH OWNERSHIP (review-41 #9
-                                                    // groundwork): the destination row's live state is
-                                                    // read under its captured scope BEFORE the
-                                                    // resolution is chosen — a destination whose row
-                                                    // already names the target is not rolled back
-                                                    // into a byteless claim.
-                                                    val destinationRowNamesTarget = currentOwnerHolds(
+                                                    // THE TYPED FRESH DESTINATION STATE (review-42 #8,
+                                                    // review-41 #9 groundwork): the destination row's
+                                                    // live state is read under its captured scope
+                                                    // BEFORE the resolution is chosen — a FAILED
+                                                    // lookup/refresh/ancestry DEFERS (it is never
+                                                    // read as "the destination does not claim the
+                                                    // target", which would discard the journal of a
+                                                    // committed shared row still requiring the absent
+                                                    // destination); a proven non-claim takes the
+                                                    // rollback; a CONFLICT retains.
+                                                    val destinationState = freshDestinationRowState(
                                                         context, scope, proofFileId, target,
                                                         sharedWithMe = moveScopeShared,
                                                         storageKind = moveScopeKind,
@@ -4734,7 +4852,14 @@ class DownloadOfflineFileManager(
                                                         // disposal carries its evidence in the journal
                                                         // text and the destination observation, never
                                                         // again at the source.
-                                                        fullyValidated && destinationRowNamesTarget &&
+                                                        fullyValidated &&
+                                                            // THE LIVE INTENT IS PART OF THE COMPLETION
+                                                            // AUTHORITY (review-42 #8): a matching row whose
+                                                            // offline intent is gone (an intervening unpin)
+                                                            // must never have its removed copy recreated —
+                                                            // the state retains.
+                                                            (destinationState as? DestinationRowState.Matching)
+                                                                ?.intentPresent == true &&
                                                             // THE DESTINATION'S TYPED EVIDENCE (review-42 #5):
                                                             // a VALID record must carry this operation's own
                                                             // publication id; an INVALID (unreadable)
@@ -4909,21 +5034,40 @@ class DownloadOfflineFileManager(
                                                         // journal (uncertainty is never disposed). A
                                                         // readable prepared proof alone is never
                                                         // permission to dispose.
-                                                        fullyValidated && !destinationRowNamesTarget -> {
+                                                        // A PROVEN NON-CLAIM (review-42 #8): only a typed
+                                                        // NOT-CLAIMING state — a failed lookup, refresh
+                                                        // or ancestry resolution is FAILURE and defers,
+                                                        // never rollback permission.
+                                                        fullyValidated && destinationState is DestinationRowState.NotClaiming -> {
                                                             // THE SOURCE'S PROOF IS DURABLY RESTORED AND
-                                                            // VERIFIED (review-40 #10, gated review-41 #7):
-                                                            // the captured source-bound payload is written
-                                                            // back through the atomic writer ONLY after the
-                                                            // full validation, and read back against the
-                                                            // bytes and the publication id.
+                                                            // VERIFIED (review-40 #10, gated review-41 #7,
+                                                            // format-aware review-42 #7): the captured
+                                                            // source-bound payload is written back through
+                                                            // the atomic writer ONLY after the full
+                                                            // validation and read back against the bytes
+                                                            // and the publication id; a v2 journal has no
+                                                            // captured payload — its LIVE validated
+                                                            // authority is verified in place (typed VALID,
+                                                            // certifying the bytes, the operation's
+                                                            // publication id), never rewritten, and its
+                                                            // durability is established by the barrier
+                                                            // below.
                                                             val sourceProofRestored = run {
-                                                                val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
-                                                                sourceRecordFile != null &&
-                                                                    atomicWriteText(sourceRecordFile, sourceProofText) &&
-                                                                    readPublishedProvenance(context, sourceFile)?.let { restored ->
-                                                                        restored.certifiesBytes(sourceFile) &&
-                                                                            restored.publicationId == validatedSourceProof.publicationId
-                                                                    } == true
+                                                                if (capturedSourceProofText != null) {
+                                                                    val sourceRecordFile = verifiedProvenanceFileFor(context, sourceFile)
+                                                                    sourceRecordFile != null &&
+                                                                        atomicWriteText(sourceRecordFile, capturedSourceProofText) &&
+                                                                        readPublishedProvenance(context, sourceFile)?.let { restored ->
+                                                                            restored.certifiesBytes(sourceFile) &&
+                                                                                restored.publicationId == validatedSourceProof.publicationId
+                                                                        } == true
+                                                                } else {
+                                                                    readPublishedProvenanceEvidence(context, sourceFile).let { liveEvidence ->
+                                                                        liveEvidence is PublishedProvenanceEvidence.Valid &&
+                                                                            liveEvidence.record.certifiesBytes(sourceFile) &&
+                                                                            liveEvidence.record.publicationId == validatedSourceProof.publicationId
+                                                                    }
+                                                                }
                                                             }
                                                             // THE CARRIED OBSERVATION IS RESTORED WITH ITS
                                                             // PROOF (review-40 #10, full binding review-41
