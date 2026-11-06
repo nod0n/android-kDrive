@@ -65,6 +65,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.invoke
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.CacheControl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import kotlin.coroutines.cancellation.CancellationException
@@ -983,6 +984,10 @@ class DownloadOfflineFileManager(
         val remoteDataHasBeenSaved = withDownloadResponse(
             fileUrl = ApiRoutes.downloadFile(file),
             okHttpClient = okHttpClient,
+            // THE ESTABLISHMENT'S DOWNLOAD IS NO-CACHE (review-53 §1/§5, stage 3): the
+            // bytes this request stages are the ones the content-hash ladder verifies —
+            // a cached stale 200 would hash the old generation and loop.
+            noCache = true,
             downloadInterceptor = downloadProgressInterceptor(
                 getMostRecentLastUpdate = { lastUpdateProgressMillis },
                 onLastUpdateChange = { lastUpdate -> lastUpdateProgressMillis = lastUpdate },
@@ -10552,6 +10557,7 @@ class DownloadOfflineFileManager(
             fileUrl: String,
             okHttpClient: OkHttpClient,
             downloadInterceptor: Interceptor?,
+            noCache: Boolean = false,
             consume: suspend (Response) -> T,
         ): T = coroutineScope {
             // THE ACTUAL CALL IS RETAINED (issue: round 32 #7): the lifetime constructs the
@@ -10559,8 +10565,17 @@ class DownloadOfflineFileManager(
             // left only the Response, so the cancellation watcher could close the body but
             // never reach the transport's call (a blocked read competes with the close and
             // is not interrupted by it).
+            //
+            // THE NO-CACHE DIRECTIVE (review-53 §1/§5, stage 3): the shared client carries
+            // an HTTP cache, and a cached 200 can serve STALE bytes for a retrying
+            // download — the establishment's content-hash ladder would then hash the old
+            // generation again and loop. FORCE_NETWORK is OkHttp's "no-cache": a stored
+            // response is never served without the network. Default false — every
+            // existing consumer keeps byte-identical request semantics.
             @OptIn(ManualAuthorizationRequired::class)
-            val request = Request.Builder().url(fileUrl).headers(HttpUtils.getHeaders(contentType = null)).get().build()
+            val request = Request.Builder().url(fileUrl).headers(HttpUtils.getHeaders(contentType = null)).get().apply {
+                if (noCache) cacheControl(CacheControl.FORCE_NETWORK)
+            }.build()
             val call = okHttpClient.newBuilder().apply {
                 downloadInterceptor?.let { interceptor -> addInterceptor(interceptor) }
             }.build().newCall(request)

@@ -380,6 +380,28 @@ object ApiRepository : ApiRepositoryCore() {
         okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
     ): ApiResponse<File> = callApiSuspend(ApiRoutes.getFileDetails(file), GET, okHttpClient = okHttpClient)
 
+    /**
+     * THE FRESH IDENTITY-DETAILS VARIANT (review-53 §1/§5; stage 3): the dedicated
+     * details-with-hash request ([ApiRoutes.getFileDetailsWithHash]) whose response is
+     * the ONLY authorized producer of a row's stored server content hash, fetched with
+     * NO cached response: Core's [ApiController] accepts no request headers and Core is
+     * not modifiable, so the no-cache requirement is enforced by building a cache-less
+     * VIEW of the caller's CAPTURED account client (`newBuilder().cache(null)`) — the
+     * auth interceptors, authenticator and dispatchers are carried over unchanged, and
+     * with no cache configured a stored response can never be served: the request
+     * always reaches the network, which is exactly the freshness a request-level
+     * `Cache-Control: no-cache` would enforce. Everything else (cancellation, error
+     * mapping, response shape) is Core's standard suspend pipeline.
+     */
+    suspend fun getFileDetailsWithHashNoCacheSuspend(
+        file: File,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<File> = callApiSuspend(
+        ApiRoutes.getFileDetailsWithHash(file),
+        GET,
+        okHttpClient = okHttpClient.newBuilder().cache(null).build(),
+    )
+
     fun getFileCount(file: File): ApiResponse<FileCount> {
         return callApi(ApiRoutes.getFileCount(file), GET)
     }
