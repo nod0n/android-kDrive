@@ -26,9 +26,13 @@ import org.junit.jupiter.api.Test
 /**
  * Unit tests for the pure decision logic of the recursive offline folders (issue #1902).
  *
- * NOT RUN: per owner override of 2026-11-03, no test execution is allowed yet (a separate test
- * user must be created first). These tests are JVM-only (no Realm, no Android framework) and are
- * expected to run with: ./gradlew app:testStandardDebugUnitTest --tests "com.infomaniak.drive.OfflineFolderPolicyTest"
+ * RUN AND GREEN (2026-11-06, dated update of the 2026-11-03 NOT-RUN note): the owner
+ * prerequisite is SATISFIED — the separate kDrive test user is ready — and the first targeted
+ * JVM run passed 17/17 at commit 25034955a (the exact XML + summary archived under
+ * notes/kdrive-android/test-results/20261106-initial-unit/; scope: pure policy, not server
+ * hash / migration / publication recovery / device acceptance). These tests are JVM-only
+ * (no Realm, no Android framework): ./gradlew app:testStandardDebugUnitTest --tests
+ * "com.infomaniak.drive.OfflineFolderPolicyTest"
  */
 class OfflineFolderPolicyTest {
 
