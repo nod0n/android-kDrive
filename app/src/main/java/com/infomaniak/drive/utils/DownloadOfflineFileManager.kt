@@ -6079,6 +6079,13 @@ class DownloadOfflineFileManager(
                 runCatching { staged.delete() }
                 return PublicationOutcome.FAILED
             }
+            // THE EXECUTING CONTEXT IS RECHECKED AFTER THE LAST BLOCKING PREPARATION
+            // (review-40 #12): the payload and hierarchy synchronization above can block —
+            // a cancellation arriving during them is observed HERE, immediately before the
+            // first destructive invalidation/rename, so a cancelled publication never
+            // replaces the target; the staged/recovery cleanup runs in the enclosing
+            // finally when this throws.
+            checkCancelled()
             // The OLD provenance is invalidated BEFORE the bytes are replaced (issue: round
             // 16 #12): a crash between the rename and the new sidecar write must never leave
             // the new bytes carrying the previous generation's provenance.
@@ -6467,6 +6474,12 @@ class DownloadOfflineFileManager(
                                 runCatching { staged.delete() }
                                 PublicationOutcome.FAILED
                             } else {
+                            // THE EXECUTING CONTEXT IS RECHECKED AFTER THE LAST BLOCKING
+                            // PREPARATION (review-40 #12), as in the coordinated path: the
+                            // hierarchy synchronization can block — the cancellation arriving
+                            // during it is observed immediately before the first destructive
+                            // invalidation/rename.
+                            coroutineContext.ensureActive()
                             deletePublishedProvenance(context, target)
                             when {
                                 staged.renameTo(target) &&
