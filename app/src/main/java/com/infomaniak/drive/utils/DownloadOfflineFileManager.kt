@@ -1426,7 +1426,15 @@ class DownloadOfflineFileManager(
         private fun verifiedProvenanceFileFor(context: Context, publishedFile: IOFile): IOFile? = runCatching {
             val recordFile = provenanceFileFor(context, publishedFile)
             val prefixDir = recordFile.parentFile
-            if (prefixDir == null || (!prefixDir.exists() && !prefixDir.mkdirs())) return null
+            if (prefixDir == null) return@runCatching null
+            // THE REGISTRY PREFIX'S OWN ENTRY IS ACKNOWLEDGED WHEN CREATED (review-40
+            // #3): a bare mkdirs left the fan-out directory's entry in the registry root
+            // unsynchronized — the record inside it was durable while its containing
+            // directory was not. The read path performs no synchronization.
+            if (!prefixDir.exists()) {
+                if (!prefixDir.mkdirs()) return@runCatching null
+                if (!UploadFile.synchronizeDirectoryEntry(prefixDir.parentFile)) return@runCatching null
+            }
             recordFile
         }.getOrNull()
 
@@ -3186,15 +3194,16 @@ class DownloadOfflineFileManager(
         internal fun beginRelocationByteEffects(context: Context, target: IOFile): Boolean =
             transitionRelocationPhase(context, target, "B")
 
-        /** THE REPLAY DURABILITY BARRIER (review-39 #5): a matching hash and the durable
-         * registry record never substitute for the payload's own durability — the
-         * publication's failed synchronization prerequisite is RETRIED before any replay
-         * branch acknowledges publication/restoration or disposes its fallback evidence.
-         * A still-failing barrier retains the evidence for the next sweep. */
+        /** THE REPLAY DURABILITY BARRIER (review-39 #5, review-40 #3/#4): a matching hash
+         * and the durable registry record never substitute for the payload's own
+         * durability — the payload's CONTENTS and its WHOLE ancestor-entry chain are
+         * synchronized before any replay branch acknowledges publication/restoration or
+         * disposes its fallback evidence. A still-failing barrier retains the evidence
+         * for the next sweep. */
         private fun payloadDurabilityEstablished(payload: IOFile): Boolean =
             payload.exists() &&
                 UploadFile.synchronizeFileContents(payload) &&
-                UploadFile.synchronizeDirectoryEntry(payload.parentFile)
+                ensureDurableDestinationHierarchy(payload)
 
         /** DISPOSES A COMPLETED RELOCATION'S STATE (review-34 #3): called after the
          * caller's metadata commit succeeded, for completions retained via
@@ -3384,33 +3393,47 @@ class DownloadOfflineFileManager(
          * user content can be staged-over or mistaken for residue (issue: round 3 #2).
          */
         private fun stagingDirectory(context: Context): IOFile =
-            IOFile(File.getOfflineFolder(context).parentFile, STAGING_FOLDER).apply { if (!exists()) mkdirs() }
+            IOFile(File.getOfflineFolder(context).parentFile, STAGING_FOLDER).apply {
+                if (!exists()) {
+                    mkdirs()
+                    // THE STAGING DIRECTORY'S OWN ENTRY IS ACKNOWLEDGED WHEN CREATED
+                    // (review-40 #3). A failed acknowledgment does not block the staging
+                    // protocol: the staged files' own atomic writes and publication
+                    // renames acknowledge their immediate entries, and the staging tree
+                    // itself is reconstructible — the sweep's journal-driven replay
+                    // re-stages what a lost staging directory held.
+                    runCatching { UploadFile.synchronizeDirectoryEntry(parentFile) }
+                }
+            }
 
         /**
-         * THE ORDERED DURABLE DESTINATION HIERARCHY (review-39 #2): every NEWLY CREATED
-         * ancestor of the publication target has its directory entry synchronized IN
-         * CREATION ORDER (topmost missing ancestor first, each inside its then-existing
-         * parent) — a multi-level mkdirs synchronized only at the final containing
-         * directory never establishes the intermediate entries. When the whole chain
-         * already exists, the immediate parent's entry is synchronized anyway: a previous
-         * attempt's unacknowledged creation is retried here, and exists() never
-         * substitutes for the durability acknowledgment. Returns false when any creation
-         * or synchronization fails; the caller retains instead of publishing.
+         * THE ORDERED DURABLE DESTINATION HIERARCHY (review-39 #2, reworked review-40 #3):
+         * EVERY ancestor's entry in ITS OWN parent is acknowledged, from the target's
+         * immediate parent up to an established durable root (the app-owned offline
+         * storage root or the staging directory) — a directory that merely EXISTS may have
+         * been created by getOfflineFile's mkdirs or by a prior attempt whose
+         * synchronization failed, and synchronizing its contents never acknowledged its
+         * own entry in its parent. Newly created ancestors are made ONE LEVEL at a time,
+         * each acknowledged in its then-existing parent. exists() is never the
+         * acknowledgment. Returns false when any creation or synchronization fails; the
+         * caller retains instead of publishing.
          */
         internal fun ensureDurableDestinationHierarchy(target: IOFile): Boolean {
-            val missing = ArrayDeque<IOFile>()
+            val context = Realm.getApplicationContext() ?: return false
+            val offlineRoot = File.getOfflineFolder(context)
+            val stagingRoot = IOFile(offlineRoot.parentFile, STAGING_FOLDER)
+            val chain = ArrayDeque<IOFile>()
             var ancestor: IOFile? = target.parentFile
-            while (ancestor != null && !ancestor.exists()) {
-                missing.addFirst(ancestor)
+            while (ancestor != null) {
+                chain.addFirst(ancestor)
+                if (ancestor == offlineRoot || ancestor == stagingRoot) break
                 ancestor = ancestor.parentFile
             }
-            if (ancestor == null) return false
-            for (directory in missing) {
-                if (!directory.mkdir()) return false
-                if (!UploadFile.synchronizeDirectoryEntry(directory.parentFile)) return false
+            for (directory in chain) {
+                if (!directory.exists() && !directory.mkdir()) return false
+                if (!UploadFile.synchronizeDirectoryEntry(directory.parentFile ?: return false)) return false
             }
-            if (missing.isEmpty() && !UploadFile.synchronizeDirectoryEntry(target.parentFile)) return false
-            return true
+            return chain.isNotEmpty()
         }
 
         /**

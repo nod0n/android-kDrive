@@ -763,7 +763,16 @@ class MainViewModel(
                                                                         // sweep's synchronized replay or a verified
                                                                         // rollback resolves them — never disposed
                                                                         // over moved bytes.
-                                                                        val renameSucceeded = oldBytes.renameTo(newBytes)
+                                                                        // THE DESTINATION HIERARCHY IS DURABLY
+                                                                        // CREATED (review-40 #3): the shared-tree
+                                                                        // rename publishes into a hierarchy whose
+                                                                        // ancestor entries are acknowledged up to
+                                                                        // the established root — never inferred
+                                                                        // from existence.
+                                                                        val hierarchyDurable = runCatching {
+                                                                            DownloadOfflineFileManager.ensureDurableDestinationHierarchy(newBytes)
+                                                                        }.getOrDefault(false)
+                                                                        val renameSucceeded = hierarchyDurable && oldBytes.renameTo(newBytes)
                                                                         val renameDurable = renameSucceeded && (
                                                                             UploadFile.synchronizeDirectoryEntry(newBytes.parentFile) ||
                                                                                 UploadFile.synchronizeDirectoryEntry(newBytes.parentFile)
