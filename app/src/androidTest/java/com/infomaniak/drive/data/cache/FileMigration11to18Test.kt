@@ -44,7 +44,8 @@ import java.util.UUID
  *  (A) create a disposable TYPED realm at the FULL current module schema STAMPED 11,
  *  (B) open the SAME file as a [DynamicRealm] at 11 and remove ONLY this branch's additions —
  *      the file then holds the TRUE v11 shape, verified by a schema audit before closing,
- *  (C) reopen at [FileMigration.DB_VERSION] (18) with the REAL [FileMigration] and the FULL
+ *  (C) reopen at [FileMigration.DB_VERSION] (now 19: the migration runs through 18→19,
+ *      whose added provenance column this test does not audit) with the REAL [FileMigration] and the FULL
  *      production module — exactly what a production upgrade executes — and audit ONLY the
  *      11→18 difference: the six columns exist with the right nullability, the registered
  *      OfflineFolderRoot table exists empty, the pre-existing pin reads back as a direct pin,

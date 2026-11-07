@@ -52,7 +52,8 @@ import java.util.UUID
  *  (B) open the SAME file as a [DynamicRealm] at 17 and shape-correct it to the TRUE v17
  *      schema (remove this branch's four columns and table, add the dev columns, recreate the
  *      dev OfflineRoot table and seed it), every step verified before closing,
- *  (C) reopen at [FileMigration.DB_VERSION] (18) with the REAL [FileMigration] and the FULL
+ *  (C) reopen at [FileMigration.DB_VERSION] (now 19: the migration runs through 18→19,
+ *      whose added provenance column this test does not audit) with the REAL [FileMigration] and the FULL
  *      production module — exactly what a production upgrade executes — and audit ONLY the
  *      17→18 difference: OfflineRoot rows are TRANSFORMED into OfflineFolderRoot rows (new
  *      three-part uid), the dev table is gone, the undeclared dev File fields are removed

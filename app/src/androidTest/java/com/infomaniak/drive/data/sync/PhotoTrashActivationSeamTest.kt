@@ -91,6 +91,15 @@ class PhotoTrashActivationSeamTest {
     private val context = ApplicationProvider.getApplicationContext<android.content.Context>()
     private val fixtureConfigs = mutableListOf<RealmConfiguration>()
 
+    /**
+     * The dedicated fault the rollback case injects at the generated SyncSettings marshal's
+     * getTime() seam. Asserting THIS type (an IllegalStateException subtype, so the real-seam
+     * invariant is retained) proves the surfaced failure is the intended injected fault, not
+     * an incidental harness or transaction failure wearing the same supertype.
+     */
+    private class MarshalFaultSentinel :
+        IllegalStateException("injected marshal fault after real in-transaction column writes")
+
     @BeforeAll
     fun initRealm() {
         Realm.init(context)
@@ -398,11 +407,19 @@ class PhotoTrashActivationSeamTest {
         val inTransactionStillEnabled = AtomicBoolean(false)
         class FaultingDate : Date() {
             override fun getTime(): Long {
-                val row = Realm.getInstance(config).where(SyncSettings::class.java)
-                    .equalTo(SyncSettings::userId.name, 983).findFirst()
-                inTransactionDriveId.set(row?.driveId ?: Int.MIN_VALUE)
-                inTransactionStillEnabled.set(row?.photoTrashSyncEnabled ?: false)
-                throw IllegalStateException("injected marshal fault after real in-transaction column writes")
+                // The nested read releases its acquired reference BEFORE the fault
+                // propagates: on this same thread getInstance returns the cached
+                // in-transaction instance (its queries see the uncommitted state), and
+                // `use` balances the acquisition — an unclosed nested reference here would
+                // leak the fixture realm past tearDown's deleteRealm (independent source
+                // review, RESUME-6877 item 1).
+                Realm.getInstance(config).use { nested ->
+                    val row = nested.where(SyncSettings::class.java)
+                        .equalTo(SyncSettings::userId.name, 983).findFirst()
+                    inTransactionDriveId.set(row?.driveId ?: Int.MIN_VALUE)
+                    inTransactionStillEnabled.set(row?.photoTrashSyncEnabled ?: false)
+                }
+                throw MarshalFaultSentinel()
             }
         }
         val faultingSettings = SyncSettings(
@@ -416,7 +433,7 @@ class PhotoTrashActivationSeamTest {
         writer.start()
         writer.join(15_000)
         assertFalse(writer.isAlive, "the faulting writer finished")
-        assertTrue(failure.get() is IllegalStateException, "the marshal fault surfaced through the real seam: ${failureText(failure)}")
+        assertTrue(failure.get() is MarshalFaultSentinel, "the intended sentinel surfaced through the real seam (not an incidental ${failure.get()?.javaClass?.simpleName}): ${failureText(failure)}")
         assertEquals(0, PhotoTrashController.activationWritesUnsettled(), "the rolled-back write settled in its finally: nothing stranded")
 
         // POSITIVE in-transaction evidence: the marshal had already written the NEW driveId
