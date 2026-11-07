@@ -68,12 +68,38 @@ object PhotoTrashController {
 
     /**
      * Records the authoritative pairing of a completed upload: the finish-session response's
-     * created server file bound to the uploaded local source. Called only from the upload
-     * finish path; a pairing for a reused URI is replaced (the newest upload identity wins).
+     * created server file bound to the uploaded local source. Bases are bound from the
+     * ACTUAL upload and ONE MediaStore observation at pairing time — this is the activation
+     * baseline's correct point (a trash after pairing is a transition, never a baseline),
+     * and it keeps every later local comparison same-producer (a fallback producer's
+     * timestamp precision used to latch conflicts for unchanged content). A later re-read
+     * never re-blesses changed content: the recorded digest is re-verified only at the
+     * destructive boundary. A pairing for a reused URI is replaced (the newest upload
+     * identity wins); unknown evidence is recorded as null and preserves.
+     *
+     * [uploadedContentDigest] is the digest of the bytes the upload actually transferred
+     * (the direct-upload stream). When it is unavailable (chunked or empty uploads), ONE
+     * pairing-time sample is taken — the window between the transfer and this sample is a
+     * disclosed residual race. [remoteFile]'s server identity (hash/size/lastModifiedAt
+     * when the response established them) becomes the REMOTE basis.
      */
-    fun recordPairing(uploadFile: UploadFile, remoteFileId: Int) {
-        if (remoteFileId <= 0) return
-        UploadFile.getRealmInstance().use { realm ->
+    fun recordPairing(
+        context: Context,
+        uploadFile: UploadFile,
+        remoteFile: File?,
+        uploadedContentDigest: String?,
+        customRealm: Realm? = null,
+    ) {
+        val remoteFileId = remoteFile?.id?.takeIf { it > 0 } ?: return
+        val local = queryLocalMedia(context, uploadFile.uri)
+        val baseline = when {
+            local == null -> null // unavailable: stays pending; a later capture re-observes
+            !local.exists -> false // an absent row starts as the present-and-not-trashed baseline
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> local.isTrashed
+            else -> false // trash state is not observable below API 30; the feature is inert there
+        }
+        val localDigest = uploadedContentDigest ?: local?.takeIf { it.exists }?.let { digestContent(context, uploadFile.uri) }
+        withPairingRealm(customRealm) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, uploadFile.uri)
@@ -84,8 +110,12 @@ object PhotoTrashController {
                     driveId = uploadFile.driveId
                     this.remoteFileId = remoteFileId
                     fileName = uploadFile.fileName
-                    localSizeAtPairing = uploadFile.fileSize
-                    localModifiedAtPairing = uploadFile.getLastModified()
+                    localSizeAtPairing = local?.takeIf { it.exists }?.size ?: uploadFile.fileSize
+                    localModifiedAtPairing = local?.takeIf { it.exists }?.lastModified ?: uploadFile.getLastModified()
+                    localContentDigest = localDigest
+                    remoteContentHash = remoteFile?.serverContentHash
+                    baselineTrashed = baseline
+                    lastObservedTrashed = baseline ?: false
                     pairedAt = Date()
                     state = PhotoPairing.State.ACTIVE.name
                 }
@@ -102,21 +132,33 @@ object PhotoTrashController {
         }
     }
 
-    /** Captures the activation baseline for one pairing: the current MediaStore trashed-state. */
-    fun captureActivationBaseline(context: Context, pairing: PhotoPairing): Boolean {
+    /**
+     * Captures a pairing's activation baseline from the CURRENT MediaStore trashed-state —
+     * the retry/recovery path for rows left pending (their pairing-time observation was
+     * unavailable) and for pre-existing pairings at opt-in. An observation that arrives only
+     * LATE cannot tell a pre-activation trash from a post-activation delete: a TRUE baseline
+     * captured here is therefore recorded as a visible [PhotoPairing.State.INCONCLUSIVE]
+     * state, never silently relabeled as history. An unavailable observation stays pending
+     * and is retried on a later pass. Never call this on a blocking UI thread.
+     */
+    fun captureActivationBaseline(context: Context, pairing: PhotoPairing, customRealm: Realm? = null): Boolean {
         val local = queryLocalMedia(context, pairing.uri)
         val baseline = when {
-            local == null || !local.exists -> false // absent rows start as present-and-not-trashed baseline
+            local == null -> return false // unavailable: the baseline stays pending
+            !local.exists -> false
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> local.isTrashed
             else -> false // trash state is not observable below API 30; baseline: not trashed
         }
-        UploadFile.getRealmInstance().use { realm ->
+        withPairingRealm(customRealm) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, pairing.uri)
                     .findFirst()?.let { row ->
                         row.baselineTrashed = baseline
                         row.lastObservedTrashed = baseline
+                        if (baseline && row.state == PhotoPairing.State.ACTIVE.name) {
+                            row.state = PhotoPairing.State.INCONCLUSIVE.name
+                        }
                     }
             }
         }
@@ -124,18 +166,30 @@ object PhotoTrashController {
     }
 
     /**
+     * Activation point for the opt-in (the settings save runs it on its existing IO
+     * context): captures the real MediaStore trashed-state for every pairing still missing
+     * a baseline. Upload-created pairings capture theirs at pairing time; this is the
+     * recovery path for rows left pending. No blocking IO on the settings UI thread.
+     */
+    fun capturePendingActivationBaselines(context: Context, customRealm: Realm? = null) {
+        getPairings(customRealm).filter { it.baselineTrashed == null }.forEach { pairing ->
+            captureActivationBaseline(context, pairing, customRealm)
+        }
+    }
+
+    /**
      * One local pass over the current user's pairings: captures pending baselines, then
      * decides and executes local->remote transitions. Returns the number of propagated trashes.
      */
-    suspend fun runLocalReconciliation(context: Context): Int = withContext(Dispatchers.IO) {
+    suspend fun runLocalReconciliation(context: Context, customRealm: Realm? = null): Int = withContext(Dispatchers.IO) {
         if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse()) return@withContext 0
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext 0
 
         var propagated = 0
         val okHttpClient = AccountUtils.getHttpClient(AccountUtils.currentUserId, null)
-        getPairings().forEach { pairing ->
+        getPairings(customRealm).forEach { pairing ->
             ensureActive()
-            ensurePairingBaseline(context, pairing)
+            ensurePairingBaseline(context, pairing, customRealm)
 
             val local = queryLocalMedia(context, pairing.uri)
             val remote = queryRemoteState(pairing, okHttpClient)
@@ -147,22 +201,35 @@ object PhotoTrashController {
                 remote = remote,
                 pairingSize = pairing.localSizeAtPairing,
                 pairingModifiedAt = pairing.localModifiedAtPairing,
+                localDigestBound = pairing.localContentDigest != null,
+                remoteBasisHash = pairing.remoteContentHash,
             )
 
             when (decision) {
                 is PhotoTrashRules.LocalDecision.PropagateTrash -> {
-                    val remoteFile = remote.file
-                    if (remoteFile != null && ApiRepository.deleteFile(remoteFile).isSuccess()) {
-                        markLocalTrashReconciled(pairing.uri, observedTrashed = true)
-                        propagated++
-                    } else {
-                        markInconclusive(pairing.uri)
+                    // Destructive boundary: the recorded upload digest (when known) is
+                    // re-verified against the CURRENT local bytes — the only local re-read
+                    // that exists, so a changed source is caught here or never. A mismatch
+                    // is a conflict, never an authority; an unreadable or unbound source is
+                    // INCONCLUSIVE — unknown evidence preserves, it never authorizes.
+                    when (verifyLocalDigestAtBoundary(context, pairing)) {
+                        DigestBoundary.MISMATCH -> markConflict(pairing.uri, PhotoPairing.State.CONFLICT_LOCAL_CHANGED, customRealm)
+                        DigestBoundary.UNREADABLE, DigestBoundary.NOT_BOUND -> markInconclusive(pairing.uri, customRealm)
+                        DigestBoundary.VERIFIED -> {
+                            val remoteFile = remote.file
+                            if (remoteFile != null && ApiRepository.deleteFile(remoteFile).isSuccess()) {
+                                markLocalTrashReconciled(pairing.uri, observedTrashed = true, customRealm = customRealm)
+                                propagated++
+                            } else {
+                                markInconclusive(pairing.uri, customRealm)
+                            }
+                        }
                     }
                 }
-                is PhotoTrashRules.LocalDecision.RecordObservedTrashed -> markLocalTrashReconciled(pairing.uri, observedTrashed = true)
-                is PhotoTrashRules.LocalDecision.MarkRestored -> markLocalTrashReconciled(pairing.uri, observedTrashed = false)
-                is PhotoTrashRules.LocalDecision.Conflict -> markConflict(pairing.uri, decision.state)
-                is PhotoTrashRules.LocalDecision.Inconclusive -> markInconclusive(pairing.uri)
+                is PhotoTrashRules.LocalDecision.RecordObservedTrashed -> markLocalTrashReconciled(pairing.uri, observedTrashed = true, customRealm = customRealm)
+                is PhotoTrashRules.LocalDecision.MarkRestored -> markLocalTrashReconciled(pairing.uri, observedTrashed = false, customRealm = customRealm)
+                is PhotoTrashRules.LocalDecision.Conflict -> markConflict(pairing.uri, decision.state, customRealm)
+                is PhotoTrashRules.LocalDecision.Inconclusive -> markInconclusive(pairing.uri, customRealm)
                 is PhotoTrashRules.LocalDecision.None -> Unit
             }
 
@@ -176,9 +243,11 @@ object PhotoTrashController {
                     remote = remote,
                     pairingSize = pairing.localSizeAtPairing,
                     pairingModifiedAt = pairing.localModifiedAtPairing,
+                    localDigestBound = pairing.localContentDigest != null,
+                    remoteBasisHash = pairing.remoteContentHash,
                 )
                 if (remoteDecision is PhotoTrashRules.RemoteDecision.RequestConsent) {
-                    armRemoteTrashPending(pairing)?.let { armed -> pendingConsents.tryEmit(armed) }
+                    armRemoteTrashPending(pairing, customRealm)?.let { armed -> pendingConsents.tryEmit(armed) }
                 }
             }
         }
@@ -190,9 +259,9 @@ object PhotoTrashController {
      * current remote state, checks the local content binding and either arms the pending
      * consent state or clears a stale one. The consent dialog itself is UI.
      */
-    suspend fun onRemoteTrashEvent(context: Context, remoteFileId: Int, driveId: Int): PhotoPairing? {
+    suspend fun onRemoteTrashEvent(context: Context, remoteFileId: Int, driveId: Int, customRealm: Realm? = null): PhotoPairing? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
-        val pairing = getPairings().firstOrNull {
+        val pairing = getPairings(customRealm).firstOrNull {
             it.remoteFileId == remoteFileId && it.driveId == driveId && it.userId == AccountUtils.currentUserId
         } ?: return null
         if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse()) return null
@@ -208,14 +277,16 @@ object PhotoTrashController {
             remote = remote,
             pairingSize = pairing.localSizeAtPairing,
             pairingModifiedAt = pairing.localModifiedAtPairing,
+            localDigestBound = pairing.localContentDigest != null,
+            remoteBasisHash = pairing.remoteContentHash,
         )) {
-            is PhotoTrashRules.RemoteDecision.RequestConsent -> armRemoteTrashPending(pairing)
+            is PhotoTrashRules.RemoteDecision.RequestConsent -> armRemoteTrashPending(pairing, customRealm)
             is PhotoTrashRules.RemoteDecision.ClearPending -> {
-                clearRemoteTrashPending(pairing.uri)
+                clearRemoteTrashPending(pairing.uri, customRealm)
                 null
             }
             is PhotoTrashRules.RemoteDecision.Conflict -> {
-                markConflict(pairing.uri, decision.state)
+                markConflict(pairing.uri, decision.state, customRealm)
                 null
             }
             is PhotoTrashRules.RemoteDecision.Inconclusive, is PhotoTrashRules.RemoteDecision.None -> null
@@ -225,11 +296,12 @@ object PhotoTrashController {
     /**
      * Records the user's consent result for a pending cloud->device trash. A grant re-activates
      * the pairing; a DECLINE records the denial so the same remote trash is not re-asked on
-     * every pass — the denial expires when the remote is restored (ClearPending) or the local
-     * content changes (a conflict state re-evaluates the pairing).
+     * every pass — the denial expires when the remote is restored (ClearPending resets a
+     * DENIED row to ACTIVE) or the local content changes (a conflict state re-evaluates the
+     * pairing). [customRealm] keeps the write on the caller's request identity.
      */
-    fun onRemoteTrashConsentResult(uri: String, granted: Boolean) {
-        UploadFile.getRealmInstance().use { realm ->
+    fun onRemoteTrashConsentResult(uri: String, granted: Boolean, customRealm: Realm? = null) {
+        withPairingRealm(customRealm) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, uri)
@@ -248,10 +320,13 @@ object PhotoTrashController {
 
     //region Realm state helpers
 
+    private inline fun <T> withPairingRealm(customRealm: Realm?, block: (Realm) -> T): T =
+        customRealm?.let(block) ?: UploadFile.getRealmInstance().use(block)
+
     /** Persists the pending consent state and returns the (detached) pairing with the fresh stamp. */
-    private fun armRemoteTrashPending(pairing: PhotoPairing): PhotoPairing? {
+    private fun armRemoteTrashPending(pairing: PhotoPairing, customRealm: Realm? = null): PhotoPairing? {
         val now = System.currentTimeMillis()
-        UploadFile.getRealmInstance().use { realm ->
+        withPairingRealm(customRealm) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, pairing.uri)
@@ -262,13 +337,13 @@ object PhotoTrashController {
         return pairing
     }
 
-    private fun ensurePairingBaseline(context: Context, pairing: PhotoPairing) {
+    private fun ensurePairingBaseline(context: Context, pairing: PhotoPairing, customRealm: Realm? = null) {
         if (pairing.baselineTrashed != null) return
-        captureActivationBaseline(context, pairing)
+        captureActivationBaseline(context, pairing, customRealm)
     }
 
-    private fun markLocalTrashReconciled(uri: String, observedTrashed: Boolean) {
-        UploadFile.getRealmInstance().use { realm ->
+    private fun markLocalTrashReconciled(uri: String, observedTrashed: Boolean, customRealm: Realm? = null) {
+        withPairingRealm(customRealm) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, uri)
@@ -282,8 +357,8 @@ object PhotoTrashController {
         }
     }
 
-    private fun markConflict(uri: String, state: PhotoPairing.State) {
-        UploadFile.getRealmInstance().use { realm ->
+    private fun markConflict(uri: String, state: PhotoPairing.State, customRealm: Realm? = null) {
+        withPairingRealm(customRealm) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, uri)
@@ -295,8 +370,8 @@ object PhotoTrashController {
         }
     }
 
-    private fun markInconclusive(uri: String) {
-        UploadFile.getRealmInstance().use { realm ->
+    private fun markInconclusive(uri: String, customRealm: Realm? = null) {
+        withPairingRealm(customRealm) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, uri)
@@ -307,12 +382,20 @@ object PhotoTrashController {
         }
     }
 
-    private fun clearRemoteTrashPending(uri: String) {
-        UploadFile.getRealmInstance().use { realm ->
+    private fun clearRemoteTrashPending(uri: String, customRealm: Realm? = null) {
+        withPairingRealm(customRealm) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, uri)
-                    .findFirst()?.remoteTrashPendingSince = 0L
+                    .findFirst()?.let { row ->
+                        row.remoteTrashPendingSince = 0L
+                        // A remote restore EXPIRES a recorded denial: the row becomes
+                        // eligible again, so a later re-delete re-arms a fresh consent —
+                        // a stored DENIED state is never permanent.
+                        if (row.state == PhotoPairing.State.DENIED.name) {
+                            row.state = PhotoPairing.State.ACTIVE.name
+                        }
+                    }
             }
         }
     }
@@ -367,10 +450,56 @@ object PhotoTrashController {
                 isTrashed = file.isTrashed(),
                 size = file.size,
                 lastModifiedAt = file.lastModifiedAt,
+                serverHash = file.serverContentHash,
                 file = file,
             )
         }
     }
+
+    //endregion
+
+    //region Content binding
+
+    /** Result of the destructive-boundary re-verification of the local source. */
+    private enum class DigestBoundary {
+        /** The current bytes equal the recorded upload digest. */
+        VERIFIED,
+        /** The current bytes diverge from the recorded upload digest: a conflict, never an authority. */
+        MISMATCH,
+        /** The current bytes could not be read: inconclusive. */
+        UNREADABLE,
+        /** No digest was recorded at pairing: metadata binding only (disclosed). */
+        NOT_BOUND,
+    }
+
+    /**
+     * The ONLY re-read of the local source that exists: at the destructive boundary, the
+     * pairing's recorded upload digest is compared to the CURRENT bytes. A digest sampled or
+     * computed anywhere else could bless changed content; here a changed source is caught or
+     * the binding stays unknown ([DigestBoundary.NOT_BOUND]).
+     */
+    private suspend fun verifyLocalDigestAtBoundary(context: Context, pairing: PhotoPairing): DigestBoundary = withContext(Dispatchers.IO) {
+        val recorded = pairing.localContentDigest ?: return@withContext DigestBoundary.NOT_BOUND
+        val current = digestContent(context, pairing.uri) ?: return@withContext DigestBoundary.UNREADABLE
+        if (current == recorded) DigestBoundary.VERIFIED else DigestBoundary.MISMATCH
+    }
+
+    /** sha-256 of the CURRENT local content behind [uriString]; null when unreadable. */
+    private fun digestContent(context: Context, uriString: String): String? = runCatching {
+        val uri = android.net.Uri.parse(uriString)
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }
+    }.onFailure { exception ->
+        SentryLog.w(TAG, "Local content digest failed for $uriString (binding unavailable)", exception)
+    }.getOrNull()
 
     //endregion
 

@@ -459,6 +459,13 @@ class SyncSettingsActivity : BaseActivity() {
                         SentryLog.i(TAG, "start update appSettings")
                         UploadFile.setAppSyncSettings(syncSettings)
                         SentryLog.i(TAG, "appSettings updated")
+                        // Activation point for pairings that predate this enable (a previous
+                        // opt-out normally removed them; these are recovery cases): their
+                        // real MediaStore trashed-state is captured NOW, off the UI thread —
+                        // a trash after activation must become a transition, never a baseline.
+                        if (oldSyncSettings?.photoTrashSyncEnabled != true && syncSettings.photoTrashSyncEnabled) {
+                            PhotoTrashController.capturePendingActivationBaselines(applicationContext)
+                        }
                         if (oldSyncSettings?.driveId != syncSettings.driveId) {
                             UploadFile.deleteAllSyncFile()
                             cancelPeriodicSync()

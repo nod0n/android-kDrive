@@ -80,6 +80,8 @@ import splitties.experimental.ExperimentalSplittiesApi
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.io.InputStream
+import java.security.DigestInputStream
+import java.security.MessageDigest
 import java.util.Date
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
@@ -104,6 +106,13 @@ class UploadTask(
 
     /** The server file created by the last successful upload response, when it was parsed. */
     private var createdRemoteFile: File? = null
+
+    /**
+     * sha-256 of the bytes this upload actually transferred, captured from the direct-upload
+     * stream (null for chunked/empty uploads — [PhotoTrashController.recordPairing] then takes
+     * a disclosed pairing-time sample instead).
+     */
+    private var uploadedContentDigest: String? = null
 
     private val uploadedBytes = AtomicLong(value = 0L)
     private val uploadedBytesUpdates = MutableSharedFlow<Unit>(extraBufferCapacity = 1, replay = 1).also {
@@ -166,7 +175,12 @@ class UploadTask(
 
     private suspend fun uploadDirectly(httpClient: HttpClient) {
         SentryLog.i(TAG, "upload ${uploadFile.uri} directly with ${uploadFile.fileSize}")
-        getInputStream().buffered().use { inputStream ->
+        // The digest is computed from the EXACT stream the upload reads — this is the local
+        // content binding for photo trash propagation (direct uploads are the dominant case;
+        // chunked/empty uploads fall back to a pairing-time sample, see recordPairing).
+        val messageDigest = MessageDigest.getInstance("SHA-256")
+        getInputStream().buffered().use { source ->
+            val digestingStream = DigestInputStream(source, messageDigest)
             val url = ApiRoutes.uploadFileDirectlyUrl(
                 driveId = uploadFile.driveId,
                 directoryId = uploadFile.remoteFolder,
@@ -177,7 +191,9 @@ class UploadTask(
                 createdAt = uploadFile.fileCreatedAt,
                 lastModifiedAt = Date(uploadFile.getLastModified()),
             )
-            uploadChunkUnchecked(inputStream, httpClient, url = url, length = uploadFile.fileSize)
+            uploadChunkUnchecked(digestingStream, httpClient, url = url, length = uploadFile.fileSize)
+            // The transfer read the whole body: bind the digest of the uploaded bytes.
+            uploadedContentDigest = messageDigest.digest().joinToString("") { "%02x".format(it) }
         }
     }
 
@@ -303,11 +319,10 @@ class UploadTask(
         shareProgress(100, true)
         UploadFile.uploadFinished(uri)
         // Photo trash propagation pairs only from an authoritative upload response: bind the
-        // uploaded source to the server file the upload actually created.
+        // uploaded source to the server file the upload actually created, with the content
+        // digest of the actual transfer (or a pairing-time sample when none was captured).
         if (uploadFile.isSync()) {
-            createdRemoteFile?.id?.takeIf { it > 0 }?.let { remoteFileId ->
-                PhotoTrashController.recordPairing(uploadFile, remoteFileId)
-            }
+            PhotoTrashController.recordPairing(context, uploadFile, createdRemoteFile, uploadedContentDigest)
         }
     }
 

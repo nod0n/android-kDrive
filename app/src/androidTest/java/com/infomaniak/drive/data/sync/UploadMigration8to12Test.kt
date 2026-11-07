@@ -36,7 +36,7 @@ import java.util.Date
 import java.util.UUID
 
 /**
- * THE REAL 8→11 UPLOAD MIGRATION FIXTURE (androidTest instrumentation — Realm Java is a
+ * THE REAL 8→21 UPLOAD MIGRATION FIXTURE (androidTest instrumentation — Realm Java is a
  * native engine and CANNOT open on the JVM; this is why the test lives here and not under
  * src/test).
  *
@@ -45,9 +45,9 @@ import java.util.UUID
  * SyncSettings.photoTrashSyncEnabled and the whole PhotoPairing table. Following the T-0079
  * pattern: (A) typed realm at the full current module STAMPED 8, (B) DynamicRealm shape
  * correction to the TRUE v8 schema (remove only this branch's additions, verified by audit),
- * (C) reopen at [UploadMigration.DB_VERSION] (11) with the REAL [UploadMigration] and the
+ * (C) reopen at [UploadMigration.DB_VERSION] (12) with the REAL [UploadMigration] and the
  * FULL production module — exactly what a production upgrade executes — and audit ONLY the
- * 8→11 difference: the opt-in column exists (REQUIRED, reads false: nothing is auto-enabled),
+ * 8→21 difference: the opt-in column exists (REQUIRED, reads false: nothing is auto-enabled),
  * the pairing table exists empty, pending and completed upload rows are preserved byte-equal,
  * and the pairing table is writable.
  *
@@ -55,9 +55,9 @@ import java.util.UUID
  * target's cacheDir; every row is a synthetic constant — NO owner data, NO account, NO network.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class UploadMigration8to11Test {
+class UploadMigration8to12Test {
 
-    private val fixtureName = "uploadMigration8to11-${UUID.randomUUID()}"
+    private val fixtureName = "uploadMigration8to12-${UUID.randomUUID()}"
     private val fixtureDir = ApplicationProvider.getApplicationContext<android.content.Context>().cacheDir
 
     private val configAt8 = RealmConfiguration.Builder()
@@ -67,7 +67,7 @@ class UploadMigration8to11Test {
         .directory(fixtureDir)
         .build()
 
-    private val configAt11 = RealmConfiguration.Builder()
+    private val configAt21 = RealmConfiguration.Builder()
         .schemaVersion(UploadMigration.DB_VERSION)
         .migration(UploadMigration())
         .modules(RealmModules.SyncFilesModule())
@@ -99,8 +99,8 @@ class UploadMigration8to11Test {
     }
 
     @Test
-    @DisplayName("migration 8 to 11 adds the opt-in flag and the empty pairing table and preserves rows")
-    fun migration8to11AddsOptInAndPairingTableAndPreservesRows() {
+    @DisplayName("migration 8 to 21 adds the opt-in flag and the empty pairing table and preserves rows")
+    fun migration8to12AddsOptInAndPairingTableAndPreservesRows() {
         // ---- PHASE A: a disposable typed realm at the full current module shape, stamped 8.
         Realm.getInstance(configAt8).use { realm ->
             realm.executeTransaction { transactionRealm ->
@@ -138,8 +138,8 @@ class UploadMigration8to11Test {
         }
 
         // ---- PHASE C: reopen at 11 with the REAL migration + the full module; audit ONLY
-        // the 8→11 difference.
-        Realm.getInstance(configAt11).use { realm ->
+        // the 8→21 difference.
+        Realm.getInstance(configAt21).use { realm ->
             val settingsSchema = realm.schema.get("SyncSettings")
             check(settingsSchema != null)
             assertTrue(settingsSchema.hasField(SyncSettings::photoTrashSyncEnabled.name), "the migration adds the opt-in column")
@@ -172,12 +172,18 @@ class UploadMigration8to11Test {
             assertTrue(pairingSchema.isNullable("baselineTrashed"), "the activation baseline column is nullable")
             assertTrue(pairingSchema.isNullable("pairedAt"), "pairedAt is nullable")
             assertTrue(pairingSchema.isRequired("remoteFileId"), "remoteFileId is REQUIRED")
+            // v12 content binding: both columns are genuinely NULLABLE — unknown evidence
+            // preserves, and an unbound pairing is never eligible for a destructive action.
+            assertTrue(pairingSchema.isNullable("localContentDigest"), "the uploaded-source digest column is nullable")
+            assertTrue(pairingSchema.isNullable("remoteContentHash"), "the remote basis hash column is nullable")
             realm.executeTransaction {
                 realm.createObject(com.infomaniak.drive.data.models.PhotoPairing::class.java, "content://fixture/pairing")
             }
             val pendingPairing = realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java)
                 .equalTo("uri", "content://fixture/pairing").findFirst()!!
             assertEquals(null, pendingPairing.baselineTrashed, "a pairing with no observed baseline reads back null")
+            assertNull(pendingPairing.localContentDigest, "an unbound upload digest reads back null")
+            assertNull(pendingPairing.remoteContentHash, "an unbound remote basis reads back null")
             assertEquals(1L, realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java).count())
         }
     }
@@ -186,7 +192,7 @@ class UploadMigration8to11Test {
     fun cleanup() {
         // ONLY the random own-cache fixture is deleted — never any other realm, never any
         // owner data.
-        runCatching { Realm.deleteRealm(configAt11) }
+        runCatching { Realm.deleteRealm(configAt21) }
         runCatching { Realm.deleteRealm(configAt8) }
     }
 }

@@ -28,6 +28,7 @@ import io.realm.RealmConfiguration
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
@@ -36,7 +37,7 @@ import java.util.Date
 import java.util.UUID
 
 /**
- * THE REAL 10→11 UPLOAD MIGRATION FIXTURE (androidTest instrumentation — Realm Java is a
+ * THE REAL 10→12 UPLOAD MIGRATION FIXTURE (androidTest instrumentation — Realm Java is a
  * native engine and CANNOT open on the JVM; this is why the test lives here and not under
  * src/test).
  *
@@ -49,8 +50,8 @@ import java.util.UUID
  * pattern: (A) typed realm at the full current module STAMPED 10, (B) DynamicRealm shape
  * correction to the TRUE v10 schema (remove this branch's additions, add the dev columns, seed
  * one row with dev values), verified by audit, (C) reopen at [UploadMigration.DB_VERSION]
- * (11) with the REAL [UploadMigration] and the FULL production module — exactly what a
- * production upgrade executes — and audit ONLY the 10→11 difference: the undeclared dev fields
+ * (12) with the REAL [UploadMigration] and the FULL production module — exactly what a
+ * production upgrade executes — and audit ONLY the 10→12 difference: the undeclared dev fields
  * are removed EXPLICITLY (never implicitly — the migration names each one), rows and pending
  * uploads are preserved, the opt-in reads false, and the pairing table is writable.
  *
@@ -58,19 +59,19 @@ import java.util.UUID
  * target's cacheDir; every row is a synthetic constant — NO owner data, NO account, NO network.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class UploadMigration10to11Test {
+class UploadMigration10to12Test {
 
-    private val fixtureName = "uploadMigration10to11-${UUID.randomUUID()}"
+    private val fixtureName = "uploadMigration10to12-${UUID.randomUUID()}"
     private val fixtureDir = ApplicationProvider.getApplicationContext<android.content.Context>().cacheDir
 
-    private val configAt10 = RealmConfiguration.Builder()
+    private val configAt20 = RealmConfiguration.Builder()
         .schemaVersion(10L)
         .modules(RealmModules.SyncFilesModule())
         .name(fixtureName)
         .directory(fixtureDir)
         .build()
 
-    private val configAt11 = RealmConfiguration.Builder()
+    private val configAt21 = RealmConfiguration.Builder()
         .schemaVersion(UploadMigration.DB_VERSION)
         .migration(UploadMigration())
         .modules(RealmModules.SyncFilesModule())
@@ -83,9 +84,9 @@ class UploadMigration10to11Test {
 
     @Test
     @DisplayName("migration 10 to 11 removes the dev fields explicitly and preserves pending uploads")
-    fun migration10to11RemovesDevFieldsExplicitlyAndPreservesRows() {
+    fun migration10to12RemovesDevFieldsExplicitlyAndPreservesRows() {
         // ---- PHASE A: a disposable typed realm at the full current module shape, stamped 10.
-        Realm.getInstance(configAt10).use { realm ->
+        Realm.getInstance(configAt20).use { realm ->
             realm.executeTransaction { transactionRealm ->
                 transactionRealm.createObject(UploadFile::class.java, "content://fixture/pending-10").apply {
                     driveId = 741
@@ -106,7 +107,7 @@ class UploadMigration10to11Test {
 
         // ---- PHASE B: the same file as a DynamicRealm at 10 — correct the shape to the TRUE
         // v10 schema (sources: the offline-folder development branch), then verify.
-        DynamicRealm.getInstance(configAt10).use { dynamic ->
+        DynamicRealm.getInstance(configAt20).use { dynamic ->
             dynamic.executeTransaction { transactionRealm ->
                 val uploadSchema = transactionRealm.schema.get("UploadFile")
                 check(uploadSchema != null)
@@ -134,8 +135,8 @@ class UploadMigration10to11Test {
         }
 
         // ---- PHASE C: reopen at 11 with the REAL migration + the full module; audit ONLY
-        // the 10→11 difference.
-        Realm.getInstance(configAt11).use { realm ->
+        // the 10→12 difference.
+        Realm.getInstance(configAt21).use { realm ->
             val uploadSchema = realm.schema.get("UploadFile")
             check(uploadSchema != null)
             devUploadFields.forEach { field ->
@@ -165,12 +166,18 @@ class UploadMigration10to11Test {
             assertTrue(pairingSchema.isNullable("baselineTrashed"), "the activation baseline column is nullable")
             assertTrue(pairingSchema.isNullable("pairedAt"), "pairedAt is nullable")
             assertTrue(pairingSchema.isRequired("remoteFileId"), "remoteFileId is REQUIRED")
+            // v12 content binding: both columns are genuinely NULLABLE — unknown evidence
+            // preserves, and an unbound pairing is never eligible for a destructive action.
+            assertTrue(pairingSchema.isNullable("localContentDigest"), "the uploaded-source digest column is nullable")
+            assertTrue(pairingSchema.isNullable("remoteContentHash"), "the remote basis hash column is nullable")
             realm.executeTransaction {
                 realm.createObject(com.infomaniak.drive.data.models.PhotoPairing::class.java, "content://fixture/pairing-10")
             }
             val pendingPairing = realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java)
                 .equalTo("uri", "content://fixture/pairing-10").findFirst()!!
             assertEquals(null, pendingPairing.baselineTrashed, "a pairing with no observed baseline reads back null")
+            assertNull(pendingPairing.localContentDigest, "an unbound upload digest reads back null")
+            assertNull(pendingPairing.remoteContentHash, "an unbound remote basis reads back null")
             assertEquals(1L, realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java).count())
         }
     }
@@ -179,7 +186,7 @@ class UploadMigration10to11Test {
     fun cleanup() {
         // ONLY the random own-cache fixture is deleted — never any other realm, never any
         // owner data.
-        runCatching { Realm.deleteRealm(configAt11) }
-        runCatching { Realm.deleteRealm(configAt10) }
+        runCatching { Realm.deleteRealm(configAt21) }
+        runCatching { Realm.deleteRealm(configAt20) }
     }
 }

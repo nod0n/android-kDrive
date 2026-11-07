@@ -161,10 +161,29 @@ class UploadMigration : RealmMigration {
 
             oldVersionTemp = 11L
         }
+        //endregion
+
+        //region Migrate to version 12: photo content binding (TRIAGE-02 item 2).
+        // The recorded upload id proves which remote ITEM was created, not that the content
+        // still equals the uploaded source. These nullable columns bind the smallest real
+        // content evidence to the actual successful upload: the digest of the uploaded
+        // source bytes (direct-upload stream, else a pairing-time sample) and the created
+        // file's server content hash as the REMOTE basis. Both are nullable: unknown
+        // evidence preserves — an unbound pairing is never eligible for a destructive
+        // action on either side (no metadata-only fallback).
+        if (oldVersionTemp == 11L) {
+            schema.get(PhotoPairing::class.java.simpleName)!!.apply {
+                addField(PhotoPairing::localContentDigest.name, String::class.java)
+                addField(PhotoPairing::remoteContentHash.name, String::class.java)
+            }
+
+            oldVersionTemp = 12L
+        }
+        //endregion
 
     }
 
     companion object {
-        const val DB_VERSION = 11L // Must be bumped when the schema changes
+        const val DB_VERSION = 12L // Must be bumped when the schema changes
     }
 }

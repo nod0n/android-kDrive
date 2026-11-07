@@ -40,6 +40,7 @@ object PhotoTrashRules {
         val isTrashed: Boolean,
         val size: Long? = null,
         val lastModifiedAt: Long? = null, // s
+        val serverHash: String? = null, // the with=hash identity, when this response established one
         val file: com.infomaniak.drive.data.models.File? = null, // the detailed remote file, when reachable
     )
 
@@ -67,6 +68,20 @@ object PhotoTrashRules {
      * Decision for one pairing in one local pass. A pairing without a captured activation
      * baseline is never eligible for a destructive action.
      *
+     * Each observation is compared to ITS OWN producer's basis: the local side against the
+     * pairing-time local basis ([pairingSize]/[pairingModifiedAt], bound from the same
+     * MediaStore source the pass reads), the remote side against the recorded remote
+     * content hash ([remoteBasisHash], bound at pairing from the created file's identity).
+     * The recorded local digest itself is NOT checked here — it is re-verified against the
+     * current bytes at the destructive boundary only (on IO, by the caller), so a mid-pass
+     * re-read can never bless changed content as the uploaded body.
+     *
+     * CONTENT IDENTITY IS REQUIRED ON BOTH SIDES, and there is NO metadata-only fallback:
+     * an unbound local digest or an unbound/unprovable remote hash is unknown evidence —
+     * it preserves ([Inconclusive]), it never authorizes the destructive action. Without
+     * hash support the feature stays observe-only (a documented limitation, like offline
+     * folders without hash support).
+     *
      * @param local null when the row/volume could not be resolved at all
      */
     fun decideLocalPropagation(
@@ -77,6 +92,8 @@ object PhotoTrashRules {
         remote: RemoteObservation,
         pairingSize: Long,
         pairingModifiedAt: Long,
+        localDigestBound: Boolean,
+        remoteBasisHash: String?,
     ): LocalDecision = when {
         baselineTrashed == null -> LocalDecision.None // baseline pending: observe nothing destructive
         local == null || !local.exists -> LocalDecision.Inconclusive
@@ -91,8 +108,10 @@ object PhotoTrashRules {
             local.size == null || local.lastModified == null -> LocalDecision.Inconclusive
             local.size != pairingSize -> LocalDecision.Conflict(PhotoPairing.State.CONFLICT_LOCAL_CHANGED)
             local.lastModified != pairingModifiedAt -> LocalDecision.Conflict(PhotoPairing.State.CONFLICT_LOCAL_CHANGED)
-            remote.size != null && remote.size != pairingSize -> LocalDecision.Conflict(PhotoPairing.State.CONFLICT_REMOTE_CHANGED)
-            remote.lastModifiedAt != null && remote.lastModifiedAt * 1000 != pairingModifiedAt -> LocalDecision.Conflict(PhotoPairing.State.CONFLICT_REMOTE_CHANGED)
+            // Unbound content evidence is unknown evidence: it preserves, never authorizes.
+            !localDigestBound -> LocalDecision.Inconclusive
+            remoteBasisHash == null || remote.serverHash == null -> LocalDecision.Inconclusive
+            remote.serverHash != remoteBasisHash -> LocalDecision.Conflict(PhotoPairing.State.CONFLICT_REMOTE_CHANGED)
             else -> LocalDecision.PropagateTrash
         }
     }
@@ -111,6 +130,14 @@ object PhotoTrashRules {
      * cleared when the remote is no longer trashed. A pairing the user already declined
      * ([denied]) is not re-armed on every pass: without a remote trash timestamp a decline
      * can only expire when the remote is restored or the local content changes.
+     *
+     * Arming a consent dialog is a permission grant: Android performs the trash at APPROVAL
+     * without an app pre-grant callback, so the last app-controlled check is the launch.
+     * Both content identities must therefore be BOUND and MATCHING before arming — the
+     * trashed remote item must still be the uploaded item ([remoteBasisHash] vs the fresh
+     * hash), and the local content must be digest-bound ([localDigestBound]) and matching
+     * the pairing basis. Unbound evidence is unknown evidence: it stays inconclusive, never
+     * a consent (no metadata-only fallback).
      */
     fun decideRemotePropagation(
         pendingSince: Long,
@@ -119,13 +146,18 @@ object PhotoTrashRules {
         remote: RemoteObservation,
         pairingSize: Long,
         pairingModifiedAt: Long,
+        localDigestBound: Boolean,
+        remoteBasisHash: String?,
     ): RemoteDecision = when {
         !remote.reachable -> if (pendingSince > 0L) RemoteDecision.None else RemoteDecision.Inconclusive
         !remote.isTrashed -> RemoteDecision.ClearPending // restored remotely (or stale event): re-arm
         pendingSince > 0L -> RemoteDecision.None // consent already outstanding
+        remoteBasisHash == null || remote.serverHash == null -> RemoteDecision.Inconclusive // unbound remote content
+        remote.serverHash != remoteBasisHash -> RemoteDecision.Conflict(PhotoPairing.State.CONFLICT_REMOTE_CHANGED)
         local == null || !local.exists -> RemoteDecision.Inconclusive
         local.isTrashed -> RemoteDecision.None // both sides trashed: consistent, nothing to consent to
         denied -> RemoteDecision.None // the user declined this trash; respect it until it expires
+        !localDigestBound -> RemoteDecision.Inconclusive // unbound local content: the dialog must never arm
         // Arming a consent dialog is an action too: without a readable content binding the
         // pairing cannot be told apart from replaced content, so it stays inconclusive.
         local.size == null || local.lastModified == null -> RemoteDecision.Inconclusive

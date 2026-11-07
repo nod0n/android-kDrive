@@ -42,6 +42,22 @@ open class PhotoPairing(
     var fileName: String = "",
     var localSizeAtPairing: Long = 0L,
     var localModifiedAtPairing: Long = 0L, // local media lastModified (ms) bound at pairing
+    /**
+     * sha-256 of the uploaded source bytes, bound to the ACTUAL upload: the digest of the
+     * direct-upload stream when it was available, otherwise a pairing-time sample (the
+     * transfer-to-sample window is a disclosed residual race). null = unknown — there is NO
+     * metadata-only fallback: an unbound pairing is never eligible for a destructive action
+     * on either side (the destructive boundary re-verification and the consent arming both
+     * require this binding).
+     */
+    var localContentDigest: String? = null,
+    /**
+     * Server content hash of the created file at pairing (the response's with=hash identity);
+     * null = the response did not establish one. The remote side of every destructive
+     * decision compares fresh remote hashes against this basis — an unbound basis is unknown
+     * evidence and preserves.
+     */
+    var remoteContentHash: String? = null,
     var pairedAt: Date? = null,
     /** Activation baseline: trashed-state of the local item when the feature was enabled; null = baseline not yet captured. */
     var baselineTrashed: Boolean? = null,
