@@ -54,6 +54,7 @@ import java.io.ByteArrayInputStream
 import java.util.Date
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import android.database.Cursor
@@ -109,6 +110,9 @@ class PhotoTrashOrchestrationTest {
     /** > 0: the remote-details query parks this long, so tests can flip state mid-IO. */
     private val remoteQueryPauseMillis = AtomicLong(0L)
 
+    /** How many times the pass actually REACHED the gated remote-details boundary. */
+    private val remoteQueryEntered = AtomicInteger(0)
+
     private val fixtureName = "photoTrashOrch-${UUID.randomUUID()}"
     private val config = RealmConfiguration.Builder()
         .schemaVersion(UploadMigration.DB_VERSION)
@@ -135,6 +139,8 @@ class PhotoTrashOrchestrationTest {
         remoteHash.set(pairingHash)
         deleteRequests.set(0)
         syncSettingsEnabled.set(true)
+        remoteQueryPauseMillis.set(0L)
+        remoteQueryEntered.set(0)
 
         val mockResolver = mockk<android.content.ContentResolver>()
         every { mockResolver.query(any(), any(), any(), any(), any()) } answers { mediaCursor(mediaTrashed.get(), mediaRowPresent.get()) }
@@ -178,6 +184,7 @@ class PhotoTrashOrchestrationTest {
      * gate, then release.
      */
     private fun remoteQueryGate() {
+        remoteQueryEntered.incrementAndGet()
         val pauseMillis = remoteQueryPauseMillis.get()
         if (pauseMillis > 0L) {
             Thread.sleep(pauseMillis)
@@ -399,6 +406,7 @@ class PhotoTrashOrchestrationTest {
         assertEquals(0L, deleteRequests.get(), "the destructive API was never reached after the switch-off")
         assertEquals(PhotoPairing.State.ACTIVE.name, row().state, "no state was written by the unauthorized pass")
         assertEquals(0L, row().lastLocalTrashReconciledAt, "the reconciliation marker was never set")
+        assertTrue(remoteQueryEntered.get() >= 1, "the pass actually reached the gated mid-IO boundary")
     }
 
     @Test
@@ -461,7 +469,8 @@ class PhotoTrashOrchestrationTest {
     @Test
     @DisplayName("an unbound upload digest never propagates and never calls the server trash")
     fun unboundDigestNeverPropagates() {
-        // Chunked upload whose pairing-time sample failed: NO content binding.
+        // Chunked upload with NO bound content identity (no stream digest, no validated
+        // server-to-source match): NO content binding.
         seedPairing(localDigest = null)
         mediaTrashed.set(true)
 
@@ -488,6 +497,161 @@ class PhotoTrashOrchestrationTest {
         val conflicted = row()
         assertEquals(PhotoPairing.State.CONFLICT_LOCAL_CHANGED.name, conflicted.state, "the replacement is a visible conflict")
         assertTrue(conflicted.lastObservedTrashed)
+    }
+
+    @Test
+    @DisplayName("a same-URI replacement between observation and effect is never trashed or mutated by the stale pass")
+    fun staleObservationCannotTrashAReplacementPairing() {
+        seedPairing()
+        mediaTrashed.set(true)
+        remoteQueryPauseMillis.set(300L)
+
+        val propagated = runBlocking {
+            val pass = async { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+            // While the pass sits in its remote IO, the user re-uploads the SAME uri: a NEW
+            // binding — new remote file, new pairing moment, new content binding.
+            Thread.sleep(100)
+            PhotoTrashController.recordPairing(
+                context = mockContext,
+                uploadFile = uploadFile(),
+                remoteFile = File(id = 900_502, driveId = driveId).apply { serverContentHash = pairingHash },
+                uploadedContentDigest = sha256Hex(contentB),
+                customRealmConfig = config,
+            )
+            // The stale pass's boundary re-read still verifies its OWN recorded digest
+            // (contentA): the witness must catch the replacement, not the digest.
+            resolverContent.set(contentA)
+            pass.await()
+        }
+
+        assertTrue(remoteQueryEntered.get() >= 1, "the pass reached the gated mid-IO boundary")
+        assertEquals(0, propagated, "the stale pass propagated nothing")
+        assertEquals(0L, deleteRequests.get(), "the stale pass never reached the destructive call")
+        val replacement = row()
+        assertEquals(900_502, replacement.remoteFileId, "the live row is the replacement binding")
+        assertEquals(PhotoPairing.State.ACTIVE.name, replacement.state, "no stale write touched the replacement")
+        assertEquals(0L, replacement.lastLocalTrashReconciledAt, "no stale reconciled marker on the replacement")
+    }
+
+    @Test
+    @DisplayName("an OFF->ON activation between observation and effect is never bypassed by the in-flight pass")
+    fun offOnActivationBetweenObservationAndEffectIsNeverBypassed() {
+        seedPairing(baselineTrashed = false, lastObservedTrashed = false)
+        mediaTrashed.set(true)
+        remoteQueryPauseMillis.set(300L)
+
+        val propagated = runBlocking {
+            val pass = async { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+            // The user turns the option OFF->ON mid-pass: the activation capture re-baselines
+            // EVERY row off the real MediaStore — the trashed item becomes a visible
+            // INCONCLUSIVE. The in-flight pass holds the PRE-toggle detached copy.
+            Thread.sleep(100)
+            PhotoTrashController.captureActivationBaselines(mockContext, config)
+            pass.await()
+        }
+
+        assertTrue(remoteQueryEntered.get() >= 1, "the pass reached the gated mid-IO boundary")
+        assertEquals(0, propagated, "the stale-baseline pass propagated nothing")
+        assertEquals(0L, deleteRequests.get(), "the destructive API was never called by the stale pass")
+        val activated = row()
+        assertEquals(true, activated.baselineTrashed, "the activation re-baseline stands")
+        assertEquals(PhotoPairing.State.INCONCLUSIVE.name, activated.state, "the activation's fresh-start protection is NOT bypassed")
+        assertEquals(0L, activated.lastLocalTrashReconciledAt, "the stale pass left no reconciled marker")
+    }
+
+    @Test
+    @DisplayName("a stale expiry cannot clear a replaced binding's fresh arming")
+    fun staleExpiryCannotClearAReplacedBindingFreshArming() {
+        seedPairing()
+        realm().use { realm ->
+            realm.executeTransaction { mutableRealm ->
+                mutableRealm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, pairingUri).findFirst()?.remoteTrashPendingSince = 1_000L
+            }
+        }
+        mediaTrashed.set(false)
+        remoteTrashed.set(false) // the stale pass will observe a restored remote
+        remoteQueryPauseMillis.set(300L)
+
+        runBlocking {
+            val pass = async { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+            Thread.sleep(100)
+            // The binding is replaced AND freshly armed (a new remote trash the old pass
+            // knows nothing about) while the pass sits in its remote IO.
+            PhotoTrashController.recordPairing(
+                context = mockContext,
+                uploadFile = uploadFile(),
+                remoteFile = File(id = 900_502, driveId = driveId).apply { serverContentHash = pairingHash },
+                uploadedContentDigest = sha256Hex(contentA),
+                customRealmConfig = config,
+            )
+            realm().use { realm ->
+                realm.executeTransaction { mutableRealm ->
+                    mutableRealm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, pairingUri).findFirst()?.remoteTrashPendingSince = 9_000L
+                }
+            }
+            pass.await()
+        }
+
+        assertTrue(remoteQueryEntered.get() >= 1, "the pass reached the gated mid-IO boundary")
+        assertEquals(9_000L, row().remoteTrashPendingSince, "the stale expiry never cleared the replacement's fresh arming")
+    }
+
+    @Test
+    @DisplayName("a row absent at pairing and visible later rides the content binding, never a false metadata conflict")
+    fun absentRowMetadataBecomesVisibleWithoutFalseConflict() {
+        // Pairing while the MediaStore row is ABSENT: baseline pending, NO metadata bound
+        // (the -1 sentinel — never a different-producer fallback).
+        mediaRowPresent.set(false)
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = uploadFile(),
+            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = pairingHash },
+            uploadedContentDigest = sha256Hex(contentA),
+            customRealmConfig = config,
+        )
+        assertNull(row().baselineTrashed)
+        assertEquals(-1L, row().localSizeAtPairing, "an unobservable row binds NO metadata")
+        assertEquals(-1L, row().localModifiedAtPairing)
+
+        // The row becomes VISIBLE, content unchanged: the late capture fills the baseline,
+        // and the pass propagates on the content binding alone — no false metadata conflict.
+        mediaRowPresent.set(true)
+        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        assertEquals(false, row().baselineTrashed, "the late capture fills the pending baseline")
+        mediaTrashed.set(true)
+        assertEquals(1, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }, "the unchanged visible row propagates")
+        assertEquals(1L, deleteRequests.get())
+        assertEquals(PhotoPairing.State.ACTIVE.name, row().state)
+
+        // The CHANGED variant: a pairing recorded while absent, the row becomes visible with
+        // REPLACED bytes (not trashed) — the late capture fills the baseline, then a trash
+        // reaches the destructive boundary where the digest (not metadata) catches it.
+        val replacedUri = "content://fixture/photo-trash-orch-absent-replaced"
+        mediaRowPresent.set(false)
+        mediaTrashed.set(false)
+        resolverContent.set(contentB)
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = uploadFile(uri = replacedUri),
+            remoteFile = File(id = 900_503, driveId = driveId).apply { serverContentHash = pairingHash },
+            uploadedContentDigest = sha256Hex(contentA), // the transfer carried A; the row now serves B
+            customRealmConfig = config,
+        )
+        mediaRowPresent.set(true) // visible again, still serving B
+        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        assertEquals(false, realm().use { realm ->
+            realm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, replacedUri).findFirst()!!.baselineTrashed
+        }, "the visible row's baseline filled")
+        mediaTrashed.set(true) // the user trashes the replaced item
+        assertEquals(0, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }, "replaced bytes never propagate")
+        assertEquals(1L, deleteRequests.get(), "no additional destructive call")
+        assertEquals(
+            PhotoPairing.State.CONFLICT_LOCAL_CHANGED.name,
+            realm().use { realm ->
+                realm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, replacedUri).findFirst()!!.state
+            },
+            "the boundary digest caught the replacement",
+        )
     }
 
     @AfterEach

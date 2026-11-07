@@ -106,6 +106,15 @@ object PhotoTrashRules {
             // A destructive action is only ever taken on a VERIFIABLE content binding: a row
             // whose size or last-modified cannot be read is inconclusive, never deletable.
             local.size == null || local.lastModified == null -> LocalDecision.Inconclusive
+            // Pairing metadata from an UNOBSERVABLE row is unbound (the -1 sentinel): the
+            // metadata comparison is skipped entirely — content identity rides the content
+            // binding, which the destructive boundary re-verifies against the current bytes.
+            !metadataBound(pairingSize, pairingModifiedAt) -> when {
+                !localDigestBound -> LocalDecision.Inconclusive
+                remoteBasisHash == null || remote.serverHash == null -> LocalDecision.Inconclusive
+                remote.serverHash != remoteBasisHash -> LocalDecision.Conflict(PhotoPairing.State.CONFLICT_REMOTE_CHANGED)
+                else -> LocalDecision.PropagateTrash
+            }
             local.size != pairingSize -> LocalDecision.Conflict(PhotoPairing.State.CONFLICT_LOCAL_CHANGED)
             local.lastModified != pairingModifiedAt -> LocalDecision.Conflict(PhotoPairing.State.CONFLICT_LOCAL_CHANGED)
             // Unbound content evidence is unknown evidence: it preserves, never authorizes.
@@ -161,8 +170,15 @@ object PhotoTrashRules {
         // Arming a consent dialog is an action too: without a readable content binding the
         // pairing cannot be told apart from replaced content, so it stays inconclusive.
         local.size == null || local.lastModified == null -> RemoteDecision.Inconclusive
+        // Pairing metadata from an UNOBSERVABLE row is unbound (the -1 sentinel): no
+        // metadata comparison — the launch-time digest check still guards the content.
+        !metadataBound(pairingSize, pairingModifiedAt) -> RemoteDecision.RequestConsent
         local.size != pairingSize -> RemoteDecision.Conflict(PhotoPairing.State.CONFLICT_LOCAL_CHANGED)
         local.lastModified != pairingModifiedAt -> RemoteDecision.Conflict(PhotoPairing.State.CONFLICT_LOCAL_CHANGED)
         else -> RemoteDecision.RequestConsent
     }
+
+    /** Pairing metadata below zero is the UNOBSERVABLE-ROW sentinel, never a comparable basis. */
+    private fun metadataBound(pairingSize: Long, pairingModifiedAt: Long): Boolean =
+        pairingSize >= 0L && pairingModifiedAt >= 0L
 }

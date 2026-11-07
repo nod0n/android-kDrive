@@ -39,6 +39,7 @@ class PhotoTrashConsentUiQueueTest {
         driveId = 751,
         remoteFileId = 900_501,
         pendingSince = stamp,
+        pairedAt = 0L,
     )
 
     @Test

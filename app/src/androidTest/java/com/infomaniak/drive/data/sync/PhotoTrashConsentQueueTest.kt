@@ -51,8 +51,10 @@ import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import java.io.ByteArrayInputStream
+import java.util.Date
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import android.database.Cursor
@@ -96,6 +98,9 @@ class PhotoTrashConsentQueueTest {
     private val remoteHash = AtomicReference(pairingHash)
     private val remoteQueryPauseMillis = AtomicLong(0L)
 
+    /** How many times the poll actually REACHED the gated remote-details boundary. */
+    private val remoteQueryEntered = AtomicInteger(0)
+
     private val fixtureName = "photoTrashConsentQueue-${UUID.randomUUID()}"
     private val config = RealmConfiguration.Builder()
         .schemaVersion(UploadMigration.DB_VERSION)
@@ -119,6 +124,8 @@ class PhotoTrashConsentQueueTest {
         mediaTrashed.set(false)
         remoteTrashed.set(true)
         remoteHash.set(pairingHash)
+        remoteQueryPauseMillis.set(0L)
+        remoteQueryEntered.set(0)
 
         val mockResolver = mockk<android.content.ContentResolver>()
         every { mockResolver.query(any(), any(), any(), any(), any()) } answers { mediaCursor(mediaTrashed.get()) }
@@ -154,6 +161,7 @@ class PhotoTrashConsentQueueTest {
     /** A live account flip DURING the poll's remote IO must end the drain (softcheck #3):
      *  tests park here, flip the identity, then release. */
     private fun remoteQueryGate() {
+        remoteQueryEntered.incrementAndGet()
         val pauseMillis = remoteQueryPauseMillis.get()
         if (pauseMillis > 0L) {
             Thread.sleep(pauseMillis)
@@ -202,12 +210,14 @@ class PhotoTrashConsentQueueTest {
         uri: String,
         remoteFileId: Int,
         stamp: Long,
+        pairedAt: Long = 0L,
     ) = PhotoTrashController.ConsentRequest(
         uri = uri,
         userId = userId,
         driveId = driveId,
         remoteFileId = remoteFileId,
         pendingSince = stamp,
+        pairedAt = pairedAt,
     )
 
     @Test
@@ -333,6 +343,7 @@ class PhotoTrashConsentQueueTest {
         assertNull(surfaced, "a drain that lost its account mid-flight launches nothing")
         assertEquals(stampA, row(uriA).remoteTrashPendingSince, "the request stays armed for the owner account")
         assertEquals(PhotoPairing.State.ACTIVE.name, row(uriA).state, "no state was written by the unauthorized drain")
+        assertTrue(remoteQueryEntered.get() >= 1, "the poll actually reached the gated mid-IO boundary")
     }
 
     @Test
@@ -373,6 +384,48 @@ class PhotoTrashConsentQueueTest {
         assertNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "unknown evidence never reaches the dialog")
         assertEquals(PhotoPairing.State.INCONCLUSIVE.name, row(uriA).state)
         assertEquals(0L, row(uriA).remoteTrashPendingSince)
+    }
+
+    @Test
+    @DisplayName("a replaced binding never receives an older request's result")
+    fun aReplacedBindingNeverReceivesAnOlderRequestsResult() {
+        seedArmedRow(uriA, remoteFileIdA, stampA)
+
+        val surfaced = runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
+            ?: throw AssertionError("the armed request must surface")
+        assertEquals(0L, surfaced.pairedAt, "the seeded binding has no pairing moment; the request carries the 0 sentinel")
+
+        // The binding is REPLACED (a re-upload of the same uri) after the request was handed
+        // out: a NEW pairing moment — the older request's answer must never apply to it.
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = UploadFile(
+                uri = uriA,
+                userId = userId,
+                driveId = driveId,
+                fileName = "fixture-queue.jpg",
+                fileSize = contentA.size.toLong(),
+                fileModifiedAt = Date(1_700_000_000_000L),
+            ),
+            remoteFile = File(id = remoteFileIdA, driveId = driveId),
+            uploadedContentDigest = sha256Hex(contentA),
+            customRealmConfig = config,
+        )
+        PhotoTrashController.onRemoteTrashConsentResult(surfaced, granted = true, customRealmConfig = config)
+
+        assertEquals(0L, row(uriA).lastRemoteTrashAppliedAt, "the older request's result never applied to the replacement binding")
+    }
+
+    @Test
+    @DisplayName("an unreachable remote while polling keeps the request pending, untouched")
+    fun unreachableRemoteWhilePollingKeepsTheRequestPending() {
+        seedArmedRow(uriA, remoteFileIdA, stampA)
+        every { ApiRepository.getFileDetailsWithHash(any(), any()) } returns ApiResponse(result = ApiResponseStatus.ERROR)
+
+        assertNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "an unreachable remote surfaces nothing")
+        assertEquals(stampA, row(uriA).remoteTrashPendingSince, "the armed request stays pending for a later entry")
+        assertEquals(PhotoPairing.State.ACTIVE.name, row(uriA).state, "a transient network failure never rewrites state")
+        assertTrue(remoteQueryEntered.get() >= 1, "the poll actually reached the remote query boundary")
     }
 
     @AfterEach

@@ -242,6 +242,7 @@ class MainActivity : BaseActivity() {
                     driveId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_DRIVE),
                     remoteFileId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_REMOTE_FILE),
                     pendingSince = savedInstanceState.getLong(SAVED_PHOTO_TRASH_STAMP),
+                    pairedAt = savedInstanceState.getLong(SAVED_PHOTO_TRASH_PAIRED_AT),
                 )
             )
         }
@@ -570,6 +571,7 @@ class MainActivity : BaseActivity() {
             outState.putInt(SAVED_PHOTO_TRASH_DRIVE, request.driveId)
             outState.putInt(SAVED_PHOTO_TRASH_REMOTE_FILE, request.remoteFileId)
             outState.putLong(SAVED_PHOTO_TRASH_STAMP, request.pendingSince)
+            outState.putLong(SAVED_PHOTO_TRASH_PAIRED_AT, request.pairedAt)
         }
     }
 
@@ -947,5 +949,6 @@ class MainActivity : BaseActivity() {
         private const val SAVED_PHOTO_TRASH_DRIVE = "savedPhotoTrashConsentDriveId"
         private const val SAVED_PHOTO_TRASH_REMOTE_FILE = "savedPhotoTrashConsentRemoteFileId"
         private const val SAVED_PHOTO_TRASH_STAMP = "savedPhotoTrashConsentPendingSince"
+        private const val SAVED_PHOTO_TRASH_PAIRED_AT = "savedPhotoTrashConsentPairedAt"
     }
 }

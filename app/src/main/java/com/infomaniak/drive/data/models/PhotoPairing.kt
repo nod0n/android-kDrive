@@ -44,8 +44,11 @@ open class PhotoPairing(
     var localModifiedAtPairing: Long = 0L, // local media lastModified (ms) bound at pairing
     /**
      * sha-256 of the uploaded source bytes, bound to the ACTUAL upload: the digest of the
-     * direct-upload stream when it was available, otherwise a pairing-time sample (the
-     * transfer-to-sample window is a disclosed residual race). null = unknown — there is NO
+     * direct-upload stream when the transfer read it (the empty-body identity for an empty
+     * upload), otherwise — for chunked/resumed transfers whose parallel per-chunk streams
+     * cannot compose a whole-body digest — the receipt validated against the created file's
+     * server hash in ONE same-pass read over the source (a mismatch or an unknown server
+     * algorithm records null). There is NO post-upload sample. null = unknown — there is NO
      * metadata-only fallback: an unbound pairing is never eligible for a destructive action
      * on either side (the destructive boundary re-verification and the consent arming both
      * require this binding).

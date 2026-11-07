@@ -296,5 +296,60 @@ class PhotoTrashRulesTest {
         assertEquals(RemoteDecision.RequestConsent, reTrashed)
     }
 
+    @Test
+    fun `unbound pairing metadata never latches a conflict and rides the content binding`() {
+        // An ABSENT-row pairing binds the -1 sentinel metadata: when the row later becomes
+        // visible, the different-producer values must not latch a false CONFLICT_LOCAL_CHANGED
+        // — the metadata is not consulted, and the destructive authority stays the content
+        // binding (which the boundary re-verifies against the current bytes).
+        val visibleRow = LocalObservation(exists = true, isTrashed = true, size = 123L, lastModified = 4_567L)
+        assertEquals(
+            LocalDecision.PropagateTrash,
+            PhotoTrashRules.decideLocalPropagation(
+                baselineTrashed = false,
+                lastObservedTrashed = false,
+                lastLocalTrashReconciledAt = 0L,
+                local = visibleRow,
+                remote = unchangedRemote,
+                pairingSize = -1L,
+                pairingModifiedAt = -1L,
+                localDigestBound = true,
+                remoteBasisHash = basisHash,
+            ),
+            "unchanged-content evidence rides the content binding alone",
+        )
+
+        assertEquals(
+            LocalDecision.Inconclusive,
+            PhotoTrashRules.decideLocalPropagation(
+                baselineTrashed = false,
+                lastObservedTrashed = false,
+                lastLocalTrashReconciledAt = 0L,
+                local = visibleRow,
+                remote = unchangedRemote,
+                pairingSize = -1L,
+                pairingModifiedAt = -1L,
+                localDigestBound = false,
+                remoteBasisHash = basisHash,
+            ),
+            "without a content binding the unbound-metadata pairing preserves",
+        )
+
+        assertEquals(
+            RemoteDecision.RequestConsent,
+            PhotoTrashRules.decideRemotePropagation(
+                pendingSince = 0L,
+                denied = false,
+                local = visibleRow.copy(isTrashed = false),
+                remote = unchangedRemote.copy(isTrashed = true),
+                pairingSize = -1L,
+                pairingModifiedAt = -1L,
+                localDigestBound = true,
+                remoteBasisHash = basisHash,
+            ),
+            "the consent side arms on unbound metadata too; the launch-time digest still guards",
+        )
+    }
+
     //endregion
 }

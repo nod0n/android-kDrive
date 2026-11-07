@@ -167,7 +167,8 @@ class UploadMigration : RealmMigration {
         // The recorded upload id proves which remote ITEM was created, not that the content
         // still equals the uploaded source. These nullable columns bind the smallest real
         // content evidence to the actual successful upload: the digest of the uploaded
-        // source bytes (direct-upload stream, else a pairing-time sample) and the created
+        // source bytes (direct-upload stream, else the same-pass receipt validated against
+        // the created file's server hash — no post-upload sample exists) and the created
         // file's server content hash as the REMOTE basis. Both are nullable: unknown
         // evidence preserves — an unbound pairing is never eligible for a destructive
         // action on either side (no metadata-only fallback).
