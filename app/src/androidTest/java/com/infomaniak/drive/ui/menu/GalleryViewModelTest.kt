@@ -37,6 +37,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -106,7 +107,8 @@ class GalleryViewModelTest {
     }
 
     @Test
-    fun `a superseded all-media response produces no side effect after a filter switch`() {
+    @DisplayName("a superseded all-media response produces no side effect after a filter switch")
+    fun supersededAllMediaResponseProducesNoSideEffectAfterFilterSwitch() {
         val vm = GalleryViewModel()
         val blockedResponse = CountDownLatch(1)
         val stalePage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE), file(2, ExtensionTypes.VIDEO)), cursor = "stale-cursor", hasMore = false)
@@ -137,7 +139,8 @@ class GalleryViewModelTest {
     }
 
     @Test
-    fun `a reordered response of an older request is dropped within the same filter`() {
+    @DisplayName("a reordered response of an older request is dropped within the same filter")
+    fun reorderedResponseOfAnOlderRequestIsDroppedWithinTheSameFilter() {
         val vm = GalleryViewModel()
         val blockedResponse = CountDownLatch(1)
         val olderPage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE)), cursor = "older-cursor", hasMore = false)
@@ -165,7 +168,8 @@ class GalleryViewModelTest {
     }
 
     @Test
-    fun `a response of a changed account scope is dropped before any side effect`() {
+    @DisplayName("a response of a changed account scope is dropped before any side effect")
+    fun responseOfAChangedAccountScopeIsDroppedBeforeAnySideEffect() {
         val vm = GalleryViewModel()
         val blockedResponse = CountDownLatch(1)
         val staleUserPage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE)), cursor = "other-user", hasMore = false)
@@ -190,7 +194,8 @@ class GalleryViewModelTest {
     }
 
     @Test
-    fun `filtered responses are locally matched and never write the shared cache`() {
+    @DisplayName("filtered responses are locally matched and never write the shared cache")
+    fun filteredResponsesAreLocallyMatchedAndNeverWriteTheSharedCache() {
         val vm = GalleryViewModel()
         vm.setMediaFilter(GalleryMediaFilter.VIDEOS)
 
@@ -210,7 +215,8 @@ class GalleryViewModelTest {
     }
 
     @Test
-    fun `an all-media first page replaces the shared cache and cleans orphans`() {
+    @DisplayName("an all-media first page replaces the shared cache and cleans orphans")
+    fun allMediaFirstPageReplacesTheSharedCacheAndCleansOrphans() {
         val vm = GalleryViewModel()
         every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } returns
             apiPage(files = listOf(file(1, ExtensionTypes.IMAGE), file(2, ExtensionTypes.VIDEO)), cursor = null, hasMore = false)

@@ -267,10 +267,14 @@ class PhotoTrashConsentQueueTest {
         val appliedAt = row(uriA).lastRemoteTrashAppliedAt
         assertTrue(appliedAt > 0L)
 
-        // A DUPLICATE delivery of the same result: the stamp no longer matches (the row was
-        // already consumed) — dropped, never re-applied.
-        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdA, stampA), granted = true, customRealmConfig = config)
-        assertEquals(appliedAt, row(uriA).lastRemoteTrashAppliedAt, "the duplicate result did not re-apply")
+        // A DUPLICATE delivery of the same request — this time as a DENIAL: the stamp no
+        // longer matches (the row was already consumed), so it must be dropped. A denial is
+        // decisive regardless of clock granularity: a wrongly-applied duplicate would flip
+        // the row ACTIVE->DENIED (two same-millisecond timestamps could not tell a repeated
+        // grant apart).
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdA, stampA), granted = false, customRealmConfig = config)
+        assertEquals(PhotoPairing.State.ACTIVE.name, row(uriA).state, "the duplicate result did not re-apply")
+        assertEquals(appliedAt, row(uriA).lastRemoteTrashAppliedAt, "the duplicate result did not re-stamp")
 
         // A re-arm, then a STALE result from the older request: dropped, the newer request
         // stays armed.

@@ -88,17 +88,40 @@ class UploadTaskDigestCaptureTest {
     private val recordedDigest = AtomicReference<String?>(null)
     private val recordedRemoteFile = AtomicReference<File?>(null)
 
+    /**
+     * The bytes the mocked MediaStore currently serves. EVERY openInputStream returns a NEW
+     * stream over this content — exactly what a real resolver does and what the chunked
+     * transfer requires (each chunk opens its own stream and skips ahead).
+     */
+    private val resolverContent = AtomicReference(contentA)
+
+    /** The app context with its ContentResolver replaced by the fixture resolver. */
+    private lateinit var mockContext: android.content.Context
+
     @BeforeEach
     fun setUp() {
         MockKAnnotations.init(this)
         transferredBodies.clear()
         recordedDigest.set(null)
         recordedRemoteFile.set(null)
+        resolverContent.set(contentA)
+
+        val mockResolver = mockk<android.content.ContentResolver>()
+        every { mockResolver.openInputStream(any()) } answers { ByteArrayInputStream(resolverContent.get()) }
+        mockContext = spyk(context)
+        every { mockContext.contentResolver } returns mockResolver
 
         mockkObject(ApiRepository)
         mockkObject(AccountUtils)
         every { AccountUtils.currentUserId } returns userId
         coEvery { AccountUtils.getHttpClient(any(), any(), any(), any()) } returns OkHttpClient()
+
+        // FAILURE-PATH ISOLATION: the transfer paths catch failures (e.g. a vanished source)
+        // and call real UploadFile cleanup methods, which would open the PRODUCTION Sync
+        // realm. Any such access must fail the test loudly here instead.
+        mockkObject(UploadFile.Companion)
+        every { UploadFile.getRealmInstance() } throws
+            AssertionError("UploadTaskDigestCaptureTest must never open the production Sync realm")
 
         mockkObject(PhotoTrashController)
         every {
@@ -109,7 +132,6 @@ class UploadTaskDigestCaptureTest {
             Unit
         }
 
-        mockkObject(UploadFile.Companion)
         every { UploadFile.uploadFinished(any()) } returns Unit
     }
 
@@ -151,7 +173,7 @@ class UploadTaskDigestCaptureTest {
 
     private fun runUpload(uploadFile: UploadFile): Boolean = runBlocking {
         UploadTask(
-            context = context,
+            context = mockContext,
             uploadFile = uploadFile,
             setProgress = ::progressSink,
             notificationManagerCompat = mockk(relaxed = true),
@@ -191,6 +213,7 @@ class UploadTaskDigestCaptureTest {
     @Test
     @DisplayName("a fresh chunked upload passes NO stream digest; the finish-session file is passed through")
     fun freshChunkedUploadPassesNoStreamDigest() {
+        resolverContent.set(chunkedContent)
         coEvery { ApiRepository.startUploadSession(any(), any(), any()) } answers {
             ApiResponse(
                 result = ApiResponseStatus.SUCCESS,
@@ -229,6 +252,7 @@ class UploadTaskDigestCaptureTest {
     @Test
     @DisplayName("a resumed chunked upload passes NO stream digest and skips the already-valid chunks")
     fun resumedChunkedUploadPassesNoStreamDigest() {
+        resolverContent.set(chunkedContent)
         val chunkConfig = FileChunkSizeManager().computeChunkConfig(fileSize = chunkedContent.size.toLong())
         coEvery { ApiRepository.getValidChunks(any(), any(), any()) } answers {
             ApiResponse(

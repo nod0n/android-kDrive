@@ -54,8 +54,11 @@ realm-gradle-plugin = { module = "io.realm:realm-gradle-plugin", version.ref = "
 touch-image-view = { module = "com.github.MikeOrtiz:TouchImageView", version.ref = "touchImageView" }
 
 # Unit tests
-android-test-core = { module = "de.mannodermaus.junit5:android-test-core", version.ref = "androidTest" }
-android-test-runner = { module = "de.mannodermaus.junit5:android-test-runner", version.ref = "androidTest" }
+# The android-junit5 plugin (2.0.1) injects the JUnit-6 variants of the instrumentation
+# runner/core for the pinned Jupiter 6.x; the explicit aliases must reference the SAME
+# artifacts or the packaging duplicate-class check fails (both variants on one classpath).
+android-test-core = { module = "de.mannodermaus.junit5:android-test-core-junit6", version.ref = "androidTest" }
+android-test-runner = { module = "de.mannodermaus.junit5:android-test-runner-junit6", version.ref = "androidTest" }
 androidx-espresso-checker = { module = "org.checkerframework:checker", version.ref = "checkerFramework" } # Not unused, don't remove it
 androidx-espresso-contrib = { module = "androidx.test.espresso:espresso-contrib", version.ref = "espresso" }
 androidx-espresso-core = { module = "androidx.test.espresso:espresso-core", version.ref = "espresso" }
