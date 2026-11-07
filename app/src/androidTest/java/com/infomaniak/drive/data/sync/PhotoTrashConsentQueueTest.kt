@@ -43,6 +43,7 @@ import okhttp3.OkHttpClient
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -417,6 +418,72 @@ class PhotoTrashConsentQueueTest {
             (replaced.pairedAt?.time ?: 0L) > (pairedAtBefore?.time ?: 0L),
             "the replacement's pairing moment is strictly past the previous binding's",
         )
+        assertEquals(0L, replaced.remoteTrashPendingSince, "the replacement starts unarmed; no old request leaked through")
+    }
+
+    @Test
+    @DisplayName("a binding write ALREADY in flight before the poll starts surfaces nothing")
+    fun aBindingWriteAlreadyInFlightBeforeThePollSurfacesNothing() {
+        seedArmedRow(uriA, remoteFileIdA, stampA)
+        val generationBefore = PhotoTrashController.bindingGeneration(uriA)
+
+        // The writer thread begins the REAL replacement: recordPairing marks itself
+        // unsettled and pre-bumps the generation BEFORE its transaction, which then BLOCKS
+        // on the write lock this thread holds — so the writer is in flight (bumped,
+        // uncommitted) before the poll starts, the schedule the mid-drain regression could
+        // not see.
+        val holder = realm()
+        holder.beginTransaction()
+        val writerFailure = AtomicReference<Throwable?>(null)
+        val writer = Thread {
+            try {
+                PhotoTrashController.recordPairing(
+                    context = mockContext,
+                    uploadFile = UploadFile().apply {
+                        uri = uriA
+                        userId = userId
+                        driveId = driveId
+                        fileName = "fixture-queue.jpg"
+                    },
+                    remoteFile = File(id = remoteFileIdA, driveId = driveId).apply {
+                        serverContentHash = "xxh3:0123456789abcdef"
+                        lastModifiedAt = 1_700_000_000L
+                        size = contentA.size.toLong()
+                    },
+                    uploadedContentDigest = null,
+                    customRealmConfig = config,
+                )
+            } catch (throwable: Throwable) {
+                writerFailure.set(throwable)
+            }
+        }
+        try {
+            writer.start()
+            // Deterministic condition poll (no interleaving by timing): the writer's
+            // pre-commit bump is the condition; only its visibility is awaited.
+            val deadline = System.currentTimeMillis() + 15_000
+            while (PhotoTrashController.bindingGeneration(uriA) == generationBefore && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10)
+            }
+            assertTrue(
+                PhotoTrashController.bindingGeneration(uriA) > generationBefore,
+                "the in-flight writer pre-bumped the generation before its commit",
+            )
+
+            // The poll runs on a worker thread (this thread holds the fixture write lock):
+            val surfaced = runBlocking {
+                val poll = async(Dispatchers.IO) { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
+                poll.await()
+            }
+            assertNull(surfaced, "a drain that starts while a binding write is in flight surfaces nothing")
+        } finally {
+            holder.commitTransaction() // releases the write lock; the replacement commits
+        }
+        writer.join(15_000)
+        assertFalse(writer.isAlive, "the replacement writer finished")
+        assertNull(writerFailure.get(), "the replacement committed cleanly: ${writerFailure.get()}")
+        assertTrue(PhotoTrashController.bindingGeneration(uriA) > generationBefore, "the replacement advanced the generation")
+        val replaced = row(uriA)
         assertEquals(0L, replaced.remoteTrashPendingSince, "the replacement starts unarmed; no old request leaked through")
     }
 
