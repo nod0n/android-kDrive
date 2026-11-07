@@ -32,6 +32,7 @@ import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.UploadTask
 import com.infomaniak.drive.data.api.UploadTask.Companion.ConflictOption
 import com.infomaniak.drive.data.cache.DriveInfosController
+import com.infomaniak.drive.data.sync.PhotoTrashController
 import com.infomaniak.drive.data.sync.UploadMigration
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IOFile
@@ -447,12 +448,15 @@ open class UploadFile(
                 realm.executeTransaction { it.insertOrUpdate(syncSettings) }
             }
             customRealm?.let(block) ?: getRealmInstance().use(block)
+            // The single settings write seam refreshes the Main-readable opt-in mirror.
+            PhotoTrashController.noteOptInValue(syncSettings.photoTrashSyncEnabled)
         }
 
         fun getAppSyncSettings(): SyncSettings? {
             return getRealmInstance().use { realm ->
                 val realmObject = realm.where(SyncSettings::class.java).findFirst()
                 realmObject?.let {
+                    PhotoTrashController.noteOptInValue(it.photoTrashSyncEnabled)
                     realm.copyFromRealm(it, 0)
                 }
             }

@@ -135,6 +135,7 @@ import com.infomaniak.drive.utils.copyToDriveResultMessage
 import com.infomaniak.drive.utils.openSupport
 import com.infomaniak.drive.utils.showQuotasExceededSnackbar
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.invoke
@@ -177,14 +178,18 @@ class MainActivity : BaseActivity() {
      * instance state so a result delivered to a RECREATED activity is still attributed to
      * the request it answers — never dropped or misattributed to a newly drained request.
      */
-    private var pendingPhotoTrashRequest: PhotoTrashController.ConsentRequest? = null
-
-    /** True while a drain is polling: keeps concurrent wakes from double-launching a dialog. */
-    private var drainingPhotoTrashConsents = false
+    /**
+     * The Main-confined consent dialog state (see [PhotoTrashConsentUiQueue]): the durable
+     * pending row state IS the queue; this object carries only the per-activity phases
+     * (draining / validating / launched) with their distinct persistence semantics — only a
+     * LAUNCHED dialog persists across recreation and can receive a result.
+     */
+    private val photoTrashConsentQueue = PhotoTrashConsentUiQueue()
 
     private val photoTrashConsentResult = registerForActivityResult(StartIntentSenderForResult()) { result ->
-        val request = pendingPhotoTrashRequest ?: return@registerForActivityResult
-        pendingPhotoTrashRequest = null
+        // Exactly the shown request, taken out once: a duplicate or late delivery finds
+        // nothing here, and the controller-side identity checks drop stale stamps.
+        val request = photoTrashConsentQueue.onResultDelivered() ?: return@registerForActivityResult
         val granted = result.resultCode == RESULT_OK
         lifecycleScope.launch(Dispatchers.IO) {
             PhotoTrashController.onRemoteTrashConsentResult(request, granted)
@@ -224,16 +229,20 @@ class MainActivity : BaseActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Restore the outstanding consent request FIRST: a system-dialog result can be
-        // delivered to the recreated activity, and it must be attributed to the request
-        // it answers (not dropped, not misattributed to a newly drained request).
-        pendingPhotoTrashRequest = savedInstanceState?.getString(SAVED_PHOTO_TRASH_URI)?.let { uri ->
-            PhotoTrashController.ConsentRequest(
-                uri = uri,
-                userId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_USER),
-                driveId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_DRIVE),
-                remoteFileId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_REMOTE_FILE),
-                pendingSince = savedInstanceState.getLong(SAVED_PHOTO_TRASH_STAMP),
+        // Restore the LAUNCHED consent request FIRST (a merely VALIDATING one is intentionally
+        // not persisted: no dialog was ever shown, the durable row stays armed, and the first
+        // drain re-surfaces it — persisting it was the zombie-drain bug): a system-dialog
+        // result delivered to the recreated activity must be attributed to the request it
+        // answers (not dropped, not misattributed to a newly drained request).
+        savedInstanceState?.getString(SAVED_PHOTO_TRASH_URI)?.let { uri ->
+            photoTrashConsentQueue.onLaunchedRequestRestored(
+                PhotoTrashController.ConsentRequest(
+                    uri = uri,
+                    userId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_USER),
+                    driveId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_DRIVE),
+                    remoteFileId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_REMOTE_FILE),
+                    pendingSince = savedInstanceState.getLong(SAVED_PHOTO_TRASH_STAMP),
+                )
             )
         }
         setContentView(binding.root)
@@ -455,53 +464,93 @@ class MainActivity : BaseActivity() {
     }
 
     /**
-     * Serialized consent drain: polls the durable pending queue for the next STILL-valid
-     * request (fully revalidated at launch: opt-in, fresh remote trash with unchanged bound
-     * identity, unchanged local digest) and shows its system dialog. The Android approval
-     * applies the trash itself at the moment the user approves — no app pre-apply callback
-     * exists, so these launch-time checks are the last app-controlled gate (the residual
-     * same-metadata window is disclosed in the controller, not closable).
+     * Serialized consent drain: every wake — lifecycle entry, ActivityResult, MQTT event,
+     * controller emission — funnels onto MAIN before any queue state is touched, so the
+     * single-outstanding guard is exact (the previous plain-field guard was read and written
+     * from both Main and IO and could double-poll). Polls the durable pending queue for the
+     * next STILL-valid request (fully revalidated at launch: opt-in, fresh remote trash with
+     * an unchanged bound identity, unchanged local digest) and shows its system dialog. The
+     * Android approval applies the trash itself at the moment the user approves — no app
+     * pre-apply callback exists, so these launch-time checks are the last app-controlled
+     * gate (the residual same-metadata window is disclosed in the controller, not closable).
      */
     private fun drainPhotoTrashConsents() {
-        if (pendingPhotoTrashRequest != null || drainingPhotoTrashConsents) return
-        drainingPhotoTrashConsents = true
+        lifecycleScope.launch { drainPhotoTrashConsentsOnMain() }
+    }
+
+    private fun drainPhotoTrashConsentsOnMain() {
+        if (!photoTrashConsentQueue.canBeginDrain()) return
+        photoTrashConsentQueue.onDrainBegan()
         lifecycleScope.launch(Dispatchers.IO) {
             val next = runCatching { PhotoTrashController.pollNextPendingConsent(applicationContext) }
-                .onFailure { exception -> SentryLog.e("PhotoTrash", "consent drain failed", exception) }
+                .onFailure { exception ->
+                    // A cancelled scope means the activity is going away: rethrow instead of
+                    // swallowing it into a null result.
+                    if (exception is CancellationException) throw exception
+                    SentryLog.e("PhotoTrash", "consent drain failed", exception)
+                }
                 .getOrNull()
             withContext(Dispatchers.Main) {
-                drainingPhotoTrashConsents = false
-                next?.let { requestPhotoTrashConsent(it) }
+                if (next == null) {
+                    photoTrashConsentQueue.onDrainEndedWithNothing()
+                } else {
+                    photoTrashConsentQueue.onDrainEndedWithRequest(next)
+                    requestPhotoTrashConsent(next)
+                }
             }
         }
     }
 
     /**
-     * Launches the system trash-consent dialog for a captured [request] — but only after a
-     * FINAL pre-launch revalidation on IO: the poll returned this request earlier, and
-     * opt-in/scope/pending identity must still match the LIVE row immediately before the
-     * launch (the application-side window between poll and launch). Still UI state stays
-     * on the main thread; the launch itself is the effect.
+     * Launches the system trash-consent dialog for a surfaced [request]: first the
+     * launch-time revalidation on IO (the poll returned it earlier; opt-in/scope/pending
+     * identity must still match the LIVE row immediately before the launch), then the FINAL
+     * Main-side gates — current account, STARTED lifecycle, and the fresh opt-in mirror —
+     * evaluated synchronously in this same Main block. That closes the application-side
+     * window between the IO verdict and this queued continuation (a change landing there is
+     * caught HERE, without any realm open on Main); the platform's own approval-time
+     * mutation race stays unclosable and disclosed (distinct from this closable gap).
      */
     private fun requestPhotoTrashConsent(request: PhotoTrashController.ConsentRequest) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-        if (pendingPhotoTrashRequest != null) return
-        pendingPhotoTrashRequest = request
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            photoTrashConsentQueue.onValidationFailed()
+            return
+        }
         lifecycleScope.launch(Dispatchers.IO) {
             val stillPending = runCatching { PhotoTrashController.isConsentStillPending(request) }
-                .onFailure { exception -> SentryLog.e("PhotoTrash", "consent revalidation failed", exception) }
+                .onFailure { exception ->
+                    if (exception is CancellationException) throw exception
+                    SentryLog.e("PhotoTrash", "consent revalidation failed", exception)
+                }
                 .getOrDefault(false)
             withContext(Dispatchers.Main) {
                 if (!stillPending) {
-                    pendingPhotoTrashRequest = null
-                    drainPhotoTrashConsents() // the request expired: surface the next one
+                    photoTrashConsentQueue.onValidationFailed()
+                    drainPhotoTrashConsentsOnMain() // the request expired: surface the next one
+                    return@withContext
+                }
+                if (!PhotoTrashConsentUiQueue.launchAllowedNow(
+                        request = request,
+                        currentUserId = AccountUtils.currentUserId,
+                        optInMirrorValue = PhotoTrashController.optInMirror,
+                        lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
+                    )
+                ) {
+                    // Scope/opt-in/account changed after the IO verdict: nothing launches,
+                    // nothing is erased — the durable row stays armed for a later drain.
+                    photoTrashConsentQueue.onValidationFailed()
                     return@withContext
                 }
                 runCatching {
                     val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(request.uri.toUri()), true)
                     photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
+                    // The system accepted the launch: from here the result (or process death)
+                    // owns the LAUNCHED identity. Set only after launch returned on Main — a
+                    // result callback can only run on a LATER main-loop pass, so the identity
+                    // is in place before any result; a throwing launch leaves nothing set.
+                    photoTrashConsentQueue.onValidationLaunched(request)
                 }.onFailure { exception ->
-                    pendingPhotoTrashRequest = null
+                    photoTrashConsentQueue.onValidationFailed()
                     SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
                 }
             }
@@ -510,10 +559,12 @@ class MainActivity : BaseActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        // The outstanding consent request's FULL scoped identity survives recreation so a
-        // late system-dialog result stays attributable (and the single-outstanding guard
-        // holds across recreation, so no second dialog can launch while one is out).
-        pendingPhotoTrashRequest?.let { request ->
+        // The LAUNCHED consent request's full scoped identity survives recreation so a late
+        // system-dialog result stays attributable (and the single-outstanding guard holds
+        // across recreation, so no second dialog can launch while one is out). A merely
+        // VALIDATING request is deliberately not persisted: no dialog was shown, and a
+        // restored non-null field would suppress every future drain.
+        photoTrashConsentQueue.requestForSavedState()?.let { request ->
             outState.putString(SAVED_PHOTO_TRASH_URI, request.uri)
             outState.putInt(SAVED_PHOTO_TRASH_USER, request.userId)
             outState.putInt(SAVED_PHOTO_TRASH_DRIVE, request.driveId)

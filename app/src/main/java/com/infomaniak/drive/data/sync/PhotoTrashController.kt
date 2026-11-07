@@ -52,6 +52,22 @@ object PhotoTrashController {
     /** Pairings whose cloud->device trash just became pending user consent (UI shows the dialog). */
     val pendingConsents = MutableSharedFlow<PhotoPairing>(extraBufferCapacity = 4)
 
+    /**
+     * Main-readable mirror of the opt-in flag, for the dialog launch gate. Written on EVERY
+     * settings seam call ([UploadFile.setAppSyncSettings] — the only writer) and refreshed
+     * on every [UploadFile.getAppSyncSettings] read, so a Main-side gate (which must never
+     * open the settings realm on the UI thread) sees any opt-in change that happened before
+     * the gate runs. null = never observed: the gate treats it as fail-closed.
+     */
+    @Volatile
+    var optInMirror: Boolean? = null
+        private set
+
+    /** Records a freshly observed opt-in value for the Main-side launch gate. */
+    internal fun noteOptInValue(value: Boolean?) {
+        if (value != null) optInMirror = value
+    }
+
     /** All pairings of the current user, detached. */
     fun getPairings(customRealmConfig: RealmConfiguration? = null): List<PhotoPairing> {
         val block: (Realm) -> List<PhotoPairing> = { realm ->
