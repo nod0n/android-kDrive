@@ -109,44 +109,56 @@ class PhotoTrashConsentUiQueue {
          * revalidation and the queued Main continuation. In-memory only (no realm open, no
          * network, no hash work on Main):
          *  - the account check reads the in-memory current user;
-         *  - [activationSnapshot] is the versioned activation authority
-         *    ([PhotoTrashController.ActivationSnapshot]): null (nothing observed) fails
-         *    closed, a mismatched scope user fails closed, a non-enabled snapshot fails
-         *    closed, and an EPOCH different from the request's invalidates the request —
-         *    an activation cycle that landed after the IO validation is caught here even
-         *    when it ended at identical Boolean values;
-         *  - SETTLEDNESS: [activationAuthoritySettled] reports that NO activation write is
-         *    unsettled (begun but not yet published or abandoned). A write is unavailable
-         *    to destructive launch from BEFORE it can commit (its in-transaction marking)
-         *    until its committed authority is published — refusing here covers the
-         *    commit->publish interval AND the open-transaction interval, and a rolled-back
-         *    write releases the gate without stranding it. Refusing never erases anything:
-         *    the durable row stays armed and the next drain re-surfaces the request;
-         *  - [bindingGenerationCurrent] is the process-local revision of the request uri's
-         *    binding: a pairing replacement that landed after the IO validation (a NEW
-         *    binding even at identical metadata) is caught here;
+         *  - [activationWitness] is ONE coherent capture of the activation authority
+         *    ([PhotoTrashController.captureLaunchWitness], taken INSIDE the caller's launch
+         *    section): null fails closed; a witness whose snapshot is missing, whose scope
+         *    user differs, that is not enabled, or whose EPOCH differs from the request's
+         *    fails closed — an activation cycle that landed after the IO validation is
+         *    caught here even when it ended at identical Boolean values;
+         *  - WITNESS SETTLEDNESS covers what two independent atomic reads cannot: that the
+         *    snapshot the gate consumes IS the current settled committed authority — no
+         *    activation write is unsettled (begun but not yet published or abandoned) and no
+         *    write landed between the capture's reads (a complete disable landing there
+         *    would otherwise pair a stale enabled snapshot with a settled flag). It also
+         *    covers an abandoned write: rollback and post-commit publication failure leave
+         *    the counter leading the mirror, the witness reads INCOHERENT and the gate
+         *    refuses until a certified read has rebuilt the mirror. Refusing never erases
+         *    anything: the durable row stays armed and the next drain re-surfaces the
+         *    request;
+         *  - the witness's BINDING side carries the request uri's process-local generation
+         *    captured with the same coherence rules: a pairing replacement that landed after
+         *    the IO validation (a NEW binding even at identical metadata) or during the
+         *    capture is caught here;
          *  - a lifecycle that is not at least STARTED cannot show a dialog.
-         * Unknown evidence and mismatched scope fail closed: nothing launches, nothing is
-         * erased, the durable row stays armed for the next drain. The platform's own
-         * approval-time mutation race stays unclosable and is disclosed in the controller —
-         * it is distinct from THIS closable gap.
+         * The caller holds [PhotoTrashController.tryBeginLaunchSection] around this
+         * evaluation and the launch call: no authority writer can begin between the witness
+         * capture and the completed launch, so the app-controlled check->launch interval is
+         * closed in both orders (write wins -> the witness is incoherent/unsettled; launch
+         * wins -> the writer observes a request already issued). Unknown evidence and
+         * mismatched scope fail closed: nothing launches, nothing is erased, the durable row
+         * stays armed for the next drain. The platform's own approval-time mutation race
+         * (after the launch call returned, while the system dialog is on screen) spans no
+         * app lock and stays disclosed in the controller.
          */
         fun launchAllowedNow(
             request: PhotoTrashController.ConsentRequest,
             currentUserId: Int,
-            activationSnapshot: PhotoTrashController.ActivationSnapshot?,
-            activationAuthoritySettled: Boolean,
-            bindingGenerationCurrent: Long,
+            activationWitness: PhotoTrashController.LaunchWitness?,
             lifecycleStarted: Boolean,
-        ): Boolean = lifecycleStarted &&
-            currentUserId == request.userId &&
-            activationSnapshot != null &&
-            activationSnapshot.userId == currentUserId &&
-            activationSnapshot.optIn &&
-            activationSnapshot.activationEpoch == request.activationEpoch &&
-            // No activation write may be unsettled (begun, not yet published or abandoned):
-            // the mirror is only authoritative at a settled state.
-            activationAuthoritySettled &&
-            bindingGenerationCurrent == request.bindingGeneration
+        ): Boolean {
+            val witness = activationWitness ?: return false
+            val snapshot = witness.activationSnapshot ?: return false
+            return lifecycleStarted &&
+                currentUserId == request.userId &&
+                // The captured bundle is coherent and settled: the snapshot the gate
+                // consumes is the current committed authority, and the binding generation
+                // was captured from a settled registry.
+                witness.activationSettled &&
+                witness.bindingSettled &&
+                snapshot.userId == currentUserId &&
+                snapshot.optIn &&
+                snapshot.activationEpoch == request.activationEpoch &&
+                witness.bindingGeneration == request.bindingGeneration
+        }
     }
 }

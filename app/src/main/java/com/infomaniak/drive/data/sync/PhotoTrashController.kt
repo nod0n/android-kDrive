@@ -77,14 +77,16 @@ object PhotoTrashController {
      *    observation or strictly newer revision) — invalidating snapshots follow the SAME
      *    ordering, so a stale fail-closed candidate can never rewind the authority, and a
      *    late publish of an earlier commit loses to a later commit's publish.
-     *  - THE SERIALIZATION POINT for an app-controlled write vs the final launch is the
-     *    Main-thread gate evaluation itself: [PhotoTrashConsentUiQueue.launchAllowedNow]
-     *    refuses while writes are unsettled, so the mirror it reads is the latest COMMITTED
-     *    AND PUBLISHED state. Two independent atomic reads followed by a launch do not
-     *    serialize with a writer that begins after the check — that residue is the same
-     *    platform class as the disclosed approval-time race (the system applies the trash
-     *    at approval; no app-side lock spans the system dialog), and it is disclosed as
-     *    such in the controller's poll kDoc.
+     *  - THE SERIALIZATION POINTS for an app-controlled write vs the final launch are the
+     *    begin points under ONE monitor (the LAUNCH SECTION below): a writer may not begin
+     *    while a Main launch section is active, and a section that begins later necessarily
+     *    reads the writer's marks ([captureLaunchWitness]). The gate refuses an incoherent
+     *    or unsettled bundle, so the mirror it consumes is the latest COMMITTED AND
+     *    PUBLISHED state; the write that wins excludes the launch, and the launch that wins
+     *    excludes any write from beginning until it completed. The interval this closes is
+     *    APP-CONTROLLED check->launch; the only residue is the Android APPROVAL window
+     *    (after the launch call returned, the system applies the trash at approval; no
+     *    app-side lock spans the system dialog), which is disclosed as such.
      *  - A READER publishes ONLY a CERTIFIED observation ([beginActivationRead] /
      *    [isActivationReadCertified], applied by [UploadFile.getAppSyncSettings]): the
      *    read slot must BEGIN quiescent (no unsettled writes), read a FRESH snapshot (the
@@ -116,10 +118,17 @@ object PhotoTrashController {
      * write seam INSIDE its transaction, BEFORE any mutation: from this instant (before the
      * write can commit) the authority is unavailable to destructive launch until the write
      * settles — its publish lands, or the write is abandoned and [endActivationWrite] runs.
+     *
+     * The begin is EXCLUDED from a running Main launch section (see [tryBeginLaunchSection]):
+     * the writer waits for the section to end, and its unsettled mark lands INSIDE the same
+     * monitor hold, so a section that begins later necessarily reads the mark in its
+     * [captureLaunchWitness]. An interruption while waiting marks nothing and strands
+     * nothing (the seam's `began` stays false).
      */
-    internal fun beginActivationWrite(): Long {
+    internal fun beginActivationWrite(): Long = synchronized(launchGate) {
+        while (launchSectionActive) (launchGate as java.lang.Object).wait()
         unsettledActivationWrites.incrementAndGet()
-        return mirrorRevision.incrementAndGet()
+        mirrorRevision.incrementAndGet()
     }
 
     /**
@@ -172,6 +181,103 @@ object PhotoTrashController {
     }
 
     /**
+     * ONE monitor shared by the Main LAUNCH SECTION and EVERY authority writer family's
+     * BEGIN point ([beginActivationWrite], [beginBindingWrite]). The section is the
+     * app-controlled check->launch exclusion:
+     *  - Main holds the SECTION (a flag — it never waits for a writer) across the witness
+     *    capture ([captureLaunchWitness]), the final gate evaluation and the system launch
+     *    call, releasing it in a `finally` ([endLaunchSection]);
+     *  - a writer cannot BEGIN while a section is active (it waits on [launchGate], notified
+     *    by [endLaunchSection]), and a writer's marks that landed before the section began
+     *    are necessarily read by the section's witness.
+     * Both launch/write orders are therefore closed: WRITE WINS — the marks predate the
+     * section, the witness reads them and the gate refuses; LAUNCH WINS — no disable can
+     * begin, commit or publish between the witness capture and the completed launch, and the
+     * writer proceeding after [endLaunchSection] observes a request ALREADY ISSUED. The
+     * section runs on Main and does NO realm/network/waiting work; writers wait only for the
+     * short section, never the reverse.
+     */
+    private val launchGate = Any()
+
+    @Volatile
+    private var launchSectionActive = false
+
+    /**
+     * Begins the Main launch section (fail-closed: refuses if one is somehow already
+     * active). MUST be followed by [endLaunchSection] in a `finally`, on the same thread.
+     */
+    fun tryBeginLaunchSection(): Boolean = synchronized(launchGate) {
+        if (launchSectionActive) {
+            false
+        } else {
+            launchSectionActive = true
+            true
+        }
+    }
+
+    /** Ends the Main launch section and releases writers waiting at their begin points. */
+    fun endLaunchSection() {
+        synchronized(launchGate) {
+            launchSectionActive = false
+            (launchGate as java.lang.Object).notifyAll()
+        }
+    }
+
+    /**
+     * The launch gate's input: ONE coherent capture of both authorities, read in a fixed
+     * order and RE-VERIFIED (the mirror identity re-read; the binding stamp bracketed around
+     * the generation read), so an authority movement DURING the capture can never present a
+     * coherent-looking stale bundle.
+     *
+     *  - [LaunchWitness.activationSettled] is the settledness OF THE SNAPSHOT THE GATE WILL
+     *    USE: the snapshot's revision equals the counter, no activation write is unsettled,
+     *    and the mirror still holds the read snapshot. Two independent atomic reads at a
+     *    call site cannot provide this — a complete disable landing between them would pair
+     *    a stale enabled snapshot with a settled flag (the launch would accept an opt-in the
+     *    user just switched off BEFORE the gate was even evaluated). It also covers an
+     *    abandoned write, whether rollback or a post-commit publication failure: in both the
+     *    counter then leads the mirror, the witness reads INCOHERENT and the gate refuses
+     *    until a certified read has republished the committed state — rollback and
+     *    post-commit failure are not distinguished because neither may be trusted without
+     *    that rebuild.
+     *  - [LaunchWitness.bindingSettled] reports that no binding write is in flight and the
+     *    stamp did not move across the generation read, so the captured
+     *    [LaunchWitness.bindingGeneration] belongs to a fully settled registry (a write
+     *    between the stamp reads either flips the in-flight marker — always marked before
+     *    any bump — or moves the stamp).
+     *
+     * Evaluated INSIDE a launch section, no writer family can begin during or after the
+     * capture until the section ends, so the captured bundle stays valid for the launch call.
+     */
+    data class LaunchWitness(
+        val activationSnapshot: ActivationSnapshot?,
+        val activationSettled: Boolean,
+        val bindingGeneration: Long,
+        val bindingSettled: Boolean,
+    )
+
+    /** Captures the coherent launch authority bundle for [uri] (see [LaunchWitness]). */
+    fun captureLaunchWitness(uri: String): LaunchWitness {
+        val activation = activationMirror.get()
+        val revision = mirrorRevision.get()
+        val unsettled = unsettledActivationWrites.get()
+        val activationRecheck = activationMirror.get()
+        val bindingStampBefore = bindingWrites.get()
+        val bindingInFlight = bindingWritesInFlight.get()
+        val generation = bindingGeneration(uri)
+        val bindingStampAfter = bindingWrites.get()
+        return LaunchWitness(
+            activationSnapshot = activation,
+            activationSettled = unsettled == 0 &&
+                activation != null &&
+                activation.revision == revision &&
+                activationRecheck === activation,
+            bindingGeneration = generation,
+            bindingSettled = bindingInFlight == 0 && bindingStampBefore == bindingStampAfter,
+        )
+    }
+
+    /**
      * Process-local revision of one uri's BINDING. Every binding write ([recordPairing]'s
      * replacement — bumped BEFORE the transaction, so no Main launch can read the old
      * identity after the new binding is visible — and [removeAllPairings]'s wipe) advances
@@ -205,7 +311,8 @@ object PhotoTrashController {
      * open or its post-commit work pending). A write ALREADY IN FLIGHT before the drain
      * starts must make the registry uncertifiable too: its bump is already visible in
      * [bindingWrites] and [bindingGeneration], but its row is not committed — a hand-out
-     * in that state would bless the OLD row with the NEW generation.
+     * in that state would bless the OLD row with the NEW generation. The mark is acquired
+     * through [beginBindingWrite], which is also the launch-section exclusion point.
      */
     private val bindingWritesInFlight = AtomicInteger(0)
 
@@ -310,7 +417,7 @@ object PhotoTrashController {
         // in flight must hand out nothing (its bump is already visible in the registry but
         // its row is not committed — the old row must not be blessed with the new
         // generation).
-        bindingWritesInFlight.incrementAndGet()
+        beginBindingWrite()
         try {
             noteBindingWritten(uploadFile.uri)
             withPairingRealm(customRealmConfig) { realm ->
@@ -352,6 +459,19 @@ object PhotoTrashController {
         }
     }
 
+    /**
+     * Marks a binding write in flight, EXCLUDED from a running Main launch section (see
+     * [tryBeginLaunchSection]): the mark lands inside the monitor hold that waited for the
+     * section, so a section beginning later necessarily reads the in-flight marker at its
+     * [captureLaunchWitness], and a section already running holds this begin until it ends.
+     * A write's bumps ([noteBindingWritten] / [invalidateAllBindings]) follow the mark, so
+     * the in-flight marker always precedes any visible registry movement.
+     */
+    private fun beginBindingWrite(): Int = synchronized(launchGate) {
+        while (launchSectionActive) (launchGate as java.lang.Object).wait()
+        bindingWritesInFlight.incrementAndGet()
+    }
+
     /** Drops pairings and any pending destructive state when the option is turned off. */
     fun removeAllPairings(customRealmConfig: RealmConfiguration? = null) {
         // Pre-invalidation, matching recordPairing's pre-commit bump, and UNSETTLED marking
@@ -359,7 +479,7 @@ object PhotoTrashController {
         // commit) — and from the moment it has begun — no Main-side launch may still read
         // the previous generation, and a drain that starts or hands out while the wipe is
         // in flight must surface nothing.
-        bindingWritesInFlight.incrementAndGet()
+        beginBindingWrite()
         try {
             invalidateAllBindings()
             withPairingRealm(customRealmConfig) { realm ->

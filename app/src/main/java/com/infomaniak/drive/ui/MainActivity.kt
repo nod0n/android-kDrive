@@ -508,13 +508,20 @@ class MainActivity : BaseActivity() {
      * Launches the system trash-consent dialog for a surfaced [request]: first the
      * launch-time revalidation on IO (the poll returned it earlier; opt-in/scope/pending
      * identity must still match the LIVE row immediately before the launch), then the FINAL
-     * Main-side gates — current account, STARTED lifecycle, and the activation mirror checked
-     * for SETTLEDNESS (no activation write begun-but-unsettled: a settings write in flight
-     * or committed-but-unpublished refuses the launch here, with no realm open on Main) —
+     * Main-side gates — current account, STARTED lifecycle, and ONE coherent activation
+     * witness ([PhotoTrashController.captureLaunchWitness], no realm open on Main) —
      * evaluated synchronously in this same Main block. That closes the application-side
      * window between the IO verdict and this queued continuation (a change landing there is
-     * caught HERE, without any realm open on Main); the platform's own approval-time
-     * mutation race stays unclosable and disclosed (distinct from this closable gap).
+     * caught HERE, without any realm open on Main).
+     *
+     * THE LAUNCH SECTION: [PhotoTrashController.tryBeginLaunchSection] is taken BEFORE the
+     * witness capture and released in a `finally`, so no activation or binding writer can
+     * BEGIN between the witness capture and the completed launch — the app-controlled
+     * check->launch interval is closed in both orders (a write that began earlier makes the
+     * witness incoherent and the gate refuses; a launch that wins leaves the writer observing
+     * a request already issued after the section ends). The platform's own approval-time
+     * mutation race (after the launch call returned, while the system dialog is on screen)
+     * spans no app lock and stays disclosed in the controller.
      */
     private fun requestPhotoTrashConsent(request: PhotoTrashController.ConsentRequest) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
@@ -534,32 +541,39 @@ class MainActivity : BaseActivity() {
                     drainPhotoTrashConsentsOnMain() // the request expired: surface the next one
                     return@withContext
                 }
-                if (!PhotoTrashConsentUiQueue.launchAllowedNow(
-                        request = request,
-                        currentUserId = AccountUtils.currentUserId,
-                        activationSnapshot = PhotoTrashController.currentActivationSnapshot,
-                        activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
-                        bindingGenerationCurrent = PhotoTrashController.bindingGeneration(request.uri),
-                        lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
-                    )
-                ) {
-                    // Scope/opt-in/activation/binding changed after the IO verdict: nothing
-                    // launches, nothing is erased — the durable row stays armed for a later
-                    // drain.
+                if (!PhotoTrashController.tryBeginLaunchSection()) {
                     photoTrashConsentQueue.onValidationFailed()
                     return@withContext
                 }
-                runCatching {
-                    val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(request.uri.toUri()), true)
-                    photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
-                    // The system accepted the launch: from here the result (or process death)
-                    // owns the LAUNCHED identity. Set only after launch returned on Main — a
-                    // result callback can only run on a LATER main-loop pass, so the identity
-                    // is in place before any result; a throwing launch leaves nothing set.
-                    photoTrashConsentQueue.onValidationLaunched(request)
-                }.onFailure { exception ->
-                    photoTrashConsentQueue.onValidationFailed()
-                    SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
+                try {
+                    if (!PhotoTrashConsentUiQueue.launchAllowedNow(
+                            request = request,
+                            currentUserId = AccountUtils.currentUserId,
+                            activationWitness = PhotoTrashController.captureLaunchWitness(request.uri),
+                            lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
+                        )
+                    ) {
+                        // Scope/opt-in/activation/binding changed after the IO verdict, or
+                        // the captured authority bundle is unsettled/incoherent: nothing
+                        // launches, nothing is erased — the durable row stays armed for a
+                        // later drain.
+                        photoTrashConsentQueue.onValidationFailed()
+                        return@withContext
+                    }
+                    runCatching {
+                        val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(request.uri.toUri()), true)
+                        photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
+                        // The system accepted the launch: from here the result (or process death)
+                        // owns the LAUNCHED identity. Set only after launch returned on Main — a
+                        // result callback can only run on a LATER main-loop pass, so the identity
+                        // is in place before any result; a throwing launch leaves nothing set.
+                        photoTrashConsentQueue.onValidationLaunched(request)
+                    }.onFailure { exception ->
+                        photoTrashConsentQueue.onValidationFailed()
+                        SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
+                    }
+                } finally {
+                    PhotoTrashController.endLaunchSection()
                 }
             }
         }

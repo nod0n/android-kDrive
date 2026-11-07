@@ -23,6 +23,8 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * The Main-confined consent dialog state machine and the final Main-side launch gate
@@ -41,7 +43,8 @@ class PhotoTrashConsentUiQueueTest {
         pendingSince = stamp,
         pairedAt = 0L,
         activationEpoch = 3L,
-        bindingGeneration = 7L,
+        // The LIVE registry generation for this uri (the witness captures the same value).
+        bindingGeneration = PhotoTrashController.bindingGeneration("content://fixture/queue"),
     )
 
     private fun snapshot(
@@ -49,6 +52,30 @@ class PhotoTrashConsentUiQueueTest {
         epoch: Long = 3L,
         optIn: Boolean = true,
     ) = PhotoTrashController.ActivationSnapshot(userId = userId, activationEpoch = epoch, optIn = optIn, revision = 1L)
+
+    /** A witness as the controller would capture it, with overridable parts for the table. */
+    private fun witness(
+        userId: Int = 951,
+        epoch: Long = 3L,
+        optIn: Boolean = true,
+        settled: Boolean = true,
+        bindingGeneration: Long = PhotoTrashController.bindingGeneration("content://fixture/queue"),
+        bindingSettled: Boolean = true,
+    ) = PhotoTrashController.LaunchWitness(
+        activationSnapshot = snapshot(userId = userId, epoch = epoch, optIn = optIn),
+        activationSettled = settled,
+        bindingGeneration = bindingGeneration,
+        bindingSettled = bindingSettled,
+    )
+
+    /** The gate exactly as production evaluates it: ONE fresh coherent capture, in-section. */
+    private fun gate(request: PhotoTrashController.ConsentRequest): Boolean =
+        PhotoTrashConsentUiQueue.launchAllowedNow(
+            request = request,
+            currentUserId = 951,
+            activationWitness = PhotoTrashController.captureLaunchWitness(request.uri),
+            lifecycleStarted = true,
+        )
 
     @Test
     fun `a drain holds the guard exactly until it ends`() {
@@ -121,16 +148,18 @@ class PhotoTrashConsentUiQueueTest {
     @Test
     fun `the final launch gate fails closed on every missing condition`() {
         val req = request()
+        val otherGeneration = PhotoTrashController.bindingGeneration(req.uri) + 1L
 
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = false), "a stopped lifecycle shows no dialog")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 952, activationSnapshot = snapshot(), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "another account's request never launches")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = null, activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "unknown activation evidence fails closed")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(optIn = false), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "an opted-out account never launches")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(userId = 952), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "an authority scoped to another user fails closed")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(epoch = 4L), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "a newer activation cycle invalidates the request even at the same enabled value")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationAuthoritySettled = true, bindingGenerationCurrent = 8L, lifecycleStarted = true), "a replaced binding after the IO validation is caught at launch")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationAuthoritySettled = false, bindingGenerationCurrent = 7L, lifecycleStarted = true), "an unsettled activation write (in flight or committed-unpublished) fails closed")
-        assertTrue(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true))
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = witness(), lifecycleStarted = false), "a stopped lifecycle shows no dialog")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 952, activationWitness = witness(), lifecycleStarted = true), "another account's request never launches")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = null, lifecycleStarted = true), "unknown activation evidence fails closed")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = witness(optIn = false), lifecycleStarted = true), "an opted-out account never launches")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = witness(userId = 952), lifecycleStarted = true), "an authority scoped to another user fails closed")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = witness(epoch = 4L), lifecycleStarted = true), "a newer activation cycle invalidates the request even at the same enabled value")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = witness(bindingGeneration = otherGeneration), lifecycleStarted = true), "a replaced binding after the IO validation is caught at launch")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = witness(settled = false), lifecycleStarted = true), "an unsettled or incoherent activation capture fails closed")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = witness(bindingSettled = false), lifecycleStarted = true), "a binding write in flight or moved during the capture fails closed")
+        assertTrue(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationWitness = witness(), lifecycleStarted = true))
     }
 
     /**
@@ -291,31 +320,13 @@ class PhotoTrashConsentUiQueueTest {
             assertEquals(permit, this?.revision, "the certified observation stands at its own revision")
         }
 
-        // The Main launch gate accepts the settled mirror:
+        // The Main launch gate accepts the settled mirror (one coherent capture):
         val req = request().copy(activationEpoch = 1L)
-        assertTrue(
-            PhotoTrashConsentUiQueue.launchAllowedNow(
-                request = req,
-                currentUserId = 951,
-                activationSnapshot = PhotoTrashController.currentActivationSnapshot,
-                activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
-                bindingGenerationCurrent = 7L,
-                lifecycleStarted = true,
-            ),
-        )
-        // And refuses the very same mirror while any write is unsettled:
+        assertTrue(gate(req))
+        // And refuses the very same mirror while any write is unsettled — a FRESH capture
+        // reads the begin (the earlier witness value is by design never reused):
         PhotoTrashController.beginActivationWrite()
-        assertFalse(
-            PhotoTrashConsentUiQueue.launchAllowedNow(
-                request = req,
-                currentUserId = 951,
-                activationSnapshot = PhotoTrashController.currentActivationSnapshot,
-                activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
-                bindingGenerationCurrent = 7L,
-                lifecycleStarted = true,
-            ),
-            "an unsettled write refuses the launch even with a fresh mirror",
-        )
+        assertFalse(gate(req), "an unsettled write refuses the launch even with a fresh mirror")
         PhotoTrashController.endActivationWrite()
     }
 
@@ -325,61 +336,135 @@ class PhotoTrashConsentUiQueueTest {
         PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true, revision = base)
         val req = request().copy(activationEpoch = 2L)
 
-        fun gate() = PhotoTrashConsentUiQueue.launchAllowedNow(
-            request = req,
-            currentUserId = 951,
-            activationSnapshot = PhotoTrashController.currentActivationSnapshot,
-            activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
-            bindingGenerationCurrent = 7L,
-            lifecycleStarted = true,
-        )
-
-        assertTrue(gate(), "the settled published mirror launches")
+        assertTrue(gate(req), "the settled published mirror launches")
 
         // The write BEGINS (in its transaction, before it can commit): refused — this is
         // the whole [begin -> publish] span, covering both the open-transaction and the
         // commit-before-publish intervals.
         val writeRevision = PhotoTrashController.beginActivationWrite()
-        assertFalse(gate(), "an unsettled write is unavailable to destructive launch from before it can commit")
+        assertFalse(gate(req), "an unsettled write is unavailable to destructive launch from before it can commit")
         assertFalse(PhotoTrashController.isActivationReadCertified(base), "reads are uncertified for the same span")
 
         // The commit lands and the publish follows; only then does the gate reopen:
         PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = false, revision = writeRevision)
         PhotoTrashController.endActivationWrite()
         assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn)
-        assertFalse(gate(), "now refused on the opt-in itself, not on settledness")
+        assertFalse(gate(req), "now refused on the opt-in itself, not on settledness")
     }
 
     @Test
-    fun `an abandoned write never strands the authority or the certified reads`() {
+    fun `an abandoned write is incoherent until a certified read rebuilds the mirror`() {
         val base = revisionBase()
         PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true, revision = base)
         val req = request().copy(activationEpoch = 2L)
 
-        fun gate() = PhotoTrashConsentUiQueue.launchAllowedNow(
-            request = req,
-            currentUserId = 951,
-            activationSnapshot = PhotoTrashController.currentActivationSnapshot,
-            activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
-            bindingGenerationCurrent = 7L,
-            lifecycleStarted = true,
-        )
-
         // A write begins and is ABANDONED (rollback/exception): it settles without a
-        // publish — the last published mirror remains the committed truth.
+        // publish — the last published mirror's CONTENT is still the committed truth.
         PhotoTrashController.beginActivationWrite()
-        assertFalse(gate())
+        assertFalse(gate(req))
         assertNull(PhotoTrashController.beginActivationRead())
         PhotoTrashController.endActivationWrite()
 
-        // Recovery WITHOUT requiring another write: the gate reopens on the old (still
-        // committed) mirror and certified reads resume at the current revision.
-        assertTrue(gate(), "an abandoned write releases the gate; the old committed state is still the truth")
+        // The counter now LEADS the mirror: the authority is INCOHERENT. A rollback and a
+        // post-commit publication failure are indistinguishable without a rebuild, and
+        // neither may be trusted — the gate stays closed even though the mirror "looks"
+        // committed. No revision is stranded; certified reads resume immediately.
+        with(PhotoTrashController.captureLaunchWitness(req.uri)) {
+            assertFalse(activationSettled, "the counter leading the mirror is an incoherent capture")
+            assertTrue(activationSnapshot?.optIn == true, "the mirror content is unchanged; settledness is what failed")
+        }
+        assertFalse(gate(req), "the launch gate refuses an incoherent authority until it is rebuilt")
         assertEquals(0, PhotoTrashController.activationWritesUnsettled())
         assertTrue(PhotoTrashController.isActivationReadCertified(PhotoTrashController.beginActivationRead()))
         with(PhotoTrashController.currentActivationSnapshot) {
             assertEquals(true, this?.optIn)
             assertEquals(base, this?.revision)
+        }
+
+        // The rebuild is ANY certified read (the drains perform them constantly): it
+        // republishes the committed state at the CURRENT counter, and coherence — and the
+        // gate — return without another write.
+        val permit = PhotoTrashController.beginActivationRead()
+        PhotoTrashController.noteActivationObserved(permit = permit!!, userId = 951, activationEpoch = 2L, optIn = true)
+        with(PhotoTrashController.captureLaunchWitness(req.uri)) {
+            assertTrue(activationSettled, "a certified read rebuilds coherence")
+        }
+        assertTrue(gate(req), "the rebuilt mirror launches again")
+    }
+
+    @Test
+    fun `a complete disable landing before the section capture is read coherently by it`() {
+        val base = revisionBase()
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true, revision = base)
+        val req = request().copy(activationEpoch = 2L)
+
+        // The between-arguments schedule, at the authority: Main captures the enabled
+        // snapshot, a writer performs its ENTIRE disable, Main evaluates. Two independent
+        // atomic reads would pair the stale enabled snapshot with settled=true; the ONE
+        // coherent capture reads whatever landed before it — the disable is in it.
+        val staleArgumentRead = PhotoTrashController.currentActivationSnapshot
+        val writeRevision = PhotoTrashController.beginActivationWrite()
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = false, revision = writeRevision)
+        PhotoTrashController.endActivationWrite()
+
+        assertEquals(true, staleArgumentRead?.optIn, "the old-style argument read is stale by construction")
+        assertFalse(gate(req), "the gate refuses the completed disable on its content — never a stale enabled snapshot")
+        with(PhotoTrashController.captureLaunchWitness(req.uri)) {
+            assertTrue(activationSettled, "the capture is coherent (the write settled before it)")
+            assertEquals(false, activationSnapshot?.optIn, "and it read the DISABLED state")
+        }
+    }
+
+    @Test
+    fun `a launch section excludes a writer's begin until it ends`() {
+        val base = revisionBase()
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true, revision = base)
+        val req = request().copy(activationEpoch = 2L)
+        val settleNow = CountDownLatch(1)
+        var writer: Thread? = null
+
+        assertTrue(PhotoTrashController.tryBeginLaunchSection(), "Main takes the launch section")
+        assertFalse(PhotoTrashController.tryBeginLaunchSection(), "a second section is refused (fail-closed)")
+        try {
+            // The section's witness is coherent and the gate accepts — the launch decision:
+            with(PhotoTrashController.captureLaunchWitness(req.uri)) {
+                assertTrue(activationSettled, "the section's capture is coherent")
+            }
+            assertTrue(gate(req))
+
+            // A writer arriving NOW cannot begin: it waits at its begin point under the
+            // section's monitor. A violation counts the latch EARLY (detected immediately);
+            // observing the correct absence costs the bounded window.
+            val writerBegan = CountDownLatch(1)
+            writer = Thread {
+                PhotoTrashController.beginActivationWrite()
+                writerBegan.countDown()
+                settleNow.await(15, TimeUnit.SECONDS)
+                PhotoTrashController.endActivationWrite()
+            }
+            writer.start()
+            assertFalse(writerBegan.await(500, TimeUnit.MILLISECONDS), "no writer may begin while a launch section is active")
+            assertEquals(0, PhotoTrashController.activationWritesUnsettled(), "the witness stays valid: nothing began mid-section")
+
+            // LAUNCH WINS: the section ends after the launch completed; the writer then
+            // begins — observing a request already issued — and its disable publishes.
+            PhotoTrashController.endLaunchSection()
+            assertTrue(writerBegan.await(15, TimeUnit.SECONDS), "the writer proceeds once the section ends")
+            assertEquals(1, PhotoTrashController.activationWritesUnsettled(), "the writer's begin landed after the launch section")
+            assertFalse(PhotoTrashController.captureLaunchWitness(req.uri).activationSettled, "the section is gone; the writer's begin is visible to the next capture")
+
+            PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = false, revision = base + 1L)
+            settleNow.countDown()
+            writer.join(15_000)
+            assertFalse(writer.isAlive, "the writer settled")
+            assertEquals(0, PhotoTrashController.activationWritesUnsettled())
+            assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn, "the disable landed after the launch decision consumed the pre-disable witness")
+            assertFalse(gate(req), "the NEXT gate evaluation reads the disabled state")
+        } finally {
+            // Never leak the section or an unsettled write into other tests, whatever failed.
+            PhotoTrashController.endLaunchSection()
+            settleNow.countDown()
+            writer?.join(15_000)
         }
     }
 }
