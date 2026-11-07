@@ -25,6 +25,7 @@ import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.OfflineFolderRoot
 import com.infomaniak.drive.data.models.UserDrive
+import com.infomaniak.drive.data.services.BaseDownloadWorker
 import io.mockk.MockKAnnotations
 import io.mockk.coEvery
 import io.mockk.every
@@ -76,6 +77,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
     private val context = ApplicationProvider.getApplicationContext<android.content.Context>()
     private val userDrive = UserDrive(userId = 951, driveId = 751)
     private val fileId = 900_401
+    private val coveredFolderId = 800_401
     private val offlineRoot = JavaFile(
         File.getOfflineFolder(context),
         "${userDrive.userId}/${userDrive.driveId}",
@@ -143,7 +145,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         .build()
 
     /** The details payload the stub serves (counting happens at INVOCATION, in stubDetails). */
-    private fun detailsPayload(hash: String?, modifiedAtSec: Long, size: Long?): ApiResponse<File> {
+    private fun detailsPayload(hash: String?, modifiedAtSec: Long, size: Long?, parentId: Int? = null): ApiResponse<File> {
         return ApiResponse(
             result = ApiResponseStatus.SUCCESS,
             data = File(id = fileId, driveId = userDrive.driveId).apply {
@@ -152,16 +154,24 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 lastModifiedAt = modifiedAtSec
                 this.size = size
                 serverContentHash = hash
+                // A real details response carries the file's REAL parent: getFileFromRemote
+                // passes the response through updateExistingFile (insertOrUpdate writes
+                // parentId over the row) and returns the RAW response file, whose parentId
+                // then drives isRootCoveredCopy's chain walk and the offline path. Runtime
+                // evidence (device-8ad8): the default 0 clobbered the seeded covered parent,
+                // ended the coverage walk, and routed the covered initial download into the
+                // destructive branch instead of the staged path.
+                parentId?.let { this.parentId = it }
             },
         )
     }
 
-    private fun stubDetails(hash: String?, modifiedAtSec: Long, size: Long?) {
+    private fun stubDetails(hash: String?, modifiedAtSec: Long, size: Long?, parentId: Int? = null) {
         // The counter increments from an ANSWER at actual request time — a `returns` value
         // is built once at stub SETUP, which counted setups, not network orchestration.
         every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
             detailsRequests.incrementAndGet()
-            detailsPayload(hash, modifiedAtSec, size)
+            detailsPayload(hash, modifiedAtSec, size, parentId)
         }
     }
 
@@ -516,6 +526,25 @@ class OfflineFolderMaintenanceOrchestrationTest {
         }
     }
 
+    /**
+     * The manager for the covered cases: notification parity is out of scope here (the
+     * production covered branch says so itself), so the notification lookup is stubbed to the
+     * legitimate null state — a relaxed mock would otherwise return a child mock whose
+     * titleResId=0 drives context.getString(0) on the REAL app context inside
+     * [DownloadOfflineFileManager.fileDownloaded], an unrelated crash on a boundary these
+     * cases do not test.
+     */
+    private fun coveredManager(): DownloadOfflineFileManager {
+        val worker: BaseDownloadWorker = mockk(relaxed = true)
+        every { worker.downloadNotification() } returns null
+        return DownloadOfflineFileManager(
+            userDrive = userDrive,
+            filesCount = 1,
+            downloadWorker = worker,
+            notificationManagerCompat = mockk(relaxed = true),
+        )
+    }
+
     @Test
     @DisplayName("a covered copy's initial download publishes through the staged path (owned staging, atomic rename)")
     fun coveredInitialDownloadPublishesThroughTheStagedPath() {
@@ -523,13 +552,10 @@ class OfflineFolderMaintenanceOrchestrationTest {
         val offlineFile = getOfflineFixtureFile()
         lastAnswerBody.set(bodyV1)
 
-        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
-        val manager = DownloadOfflineFileManager(
-            userDrive = userDrive,
-            filesCount = 1,
-            downloadWorker = mockk(relaxed = true),
-            notificationManagerCompat = mockk(relaxed = true),
-        )
+        // The REAL parent: the details response must keep the fixture on the covered path
+        // (device-8ad8: the default parentId 0 ended the coverage walk before it began).
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong(), parentId = coveredFolderId)
+        val manager = coveredManager()
         val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
 
         // Bounded failure evidence (DEVICE-2d4d-TRIAGE-1958): the production outcome enums
@@ -565,17 +591,12 @@ class OfflineFolderMaintenanceOrchestrationTest {
         val offlineFile = getOfflineFixtureFile()
         lastAnswerBody.set(bodyV1)
 
-        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong(), parentId = coveredFolderId)
         // The user unmarks the root WHILE the transfer is in flight: the body is delivered
         // only after the unmark completed. The unmark runs inside the ONE counting transport
         // stub (armed below) — an override stub would stop counting at the real boundary.
         deliverBodyAfterUnmark = true
-        val manager = DownloadOfflineFileManager(
-            userDrive = userDrive,
-            filesCount = 1,
-            downloadWorker = mockk(relaxed = true),
-            notificationManagerCompat = mockk(relaxed = true),
-        )
+        val manager = coveredManager()
         val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
 
         // Bounded failure evidence, as in the covered-initial case above.

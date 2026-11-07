@@ -96,10 +96,52 @@ class GalleryViewModelTest {
      * Java stack could be collected — so the last emitted marker must localize the hang
      * (setUp phase, MockK registration, ViewModel construction, test entry/exit). These
      * markers carry no account, token or photo payloads.
+     *
+     * Device-8ad8 localization: the last recorded marker is "setUp AccountUtils mocked"; the
+     * intervening block is [FileController] mocking, so the markers below split every
+     * operation in it, and a bounded watchdog dumps the process's thread stacks once at 45 s
+     * (debuggerd -j was root-denied on device — this in-process dump is the only stack
+     * evidence available; frames only, no payloads). The dump fires at most once and the
+     * runner's own bound still terminates the class.
      */
     @RegisterExtension
     @JvmField
     val phaseLogger: PhaseLogger = PhaseLogger()
+
+    @Volatile
+    private var setupWatchdog: Thread? = null
+
+    private fun mark(message: String) {
+        println("GalleryVMTest: $message")
+        Log.i("GalleryVMTest", "GalleryVMTest: $message")
+    }
+
+    /** One bounded stack dump if the guarded setup block never finishes (frames only). */
+    private fun armSetupWatchdog(owner: Thread) {
+        setupWatchdog = Thread {
+            try {
+                Thread.sleep(45_000)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            val dump = StringBuilder("GalleryVMTest: SETUP WATCHDOG — setup did not finish in 45s; thread stacks:\n")
+            Thread.getAllStackTraces().forEach { (thread, frames) ->
+                dump.append("  [").append(thread.name).append("] state=").append(thread.state).append('\n')
+                frames.take(30).forEach { frame -> dump.append("    at ").append(frame).append('\n') }
+            }
+            val line = dump.toString()
+            println(line)
+            Log.w("GalleryVMTest", line)
+        }.apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun disarmSetupWatchdog() {
+        setupWatchdog?.interrupt()
+        setupWatchdog = null
+    }
 
     class PhaseLogger : BeforeTestExecutionCallback, TestWatcher {
         private fun mark(message: String, displayName: String) {
@@ -124,35 +166,46 @@ class GalleryViewModelTest {
 
     @BeforeEach
     fun setUp() {
-        println("GalleryVMTest: setUp begin"); Log.i("GalleryVMTest", "GalleryVMTest: setUp begin")
+        mark("setUp begin")
         MockKAnnotations.init(this)
-        println("GalleryVMTest: setUp MockKAnnotations done"); Log.i("GalleryVMTest", "GalleryVMTest: setUp MockKAnnotations done")
+        mark("setUp MockKAnnotations done")
         Dispatchers.setMain(testMainDispatcher)
         ArchTaskExecutor.getInstance().setDelegate(synchronousTaskExecutor)
-        println("GalleryVMTest: setUp dispatchers done"); Log.i("GalleryVMTest", "GalleryVMTest: setUp dispatchers done")
+        mark("setUp dispatchers done")
 
         mockkObject(AccountUtils)
         every { AccountUtils.currentUserId } returns USER_ID
         every { AccountUtils.currentDriveId } returns DRIVE_ID
-        println("GalleryVMTest: setUp AccountUtils mocked"); Log.i("GalleryVMTest", "GalleryVMTest: setUp AccountUtils mocked")
+        mark("setUp AccountUtils mocked")
 
+        // device-8ad8: the run died between "AccountUtils mocked" and "FileController
+        // mocked" — split every operation in this block and guard it with the one-shot
+        // stack-dump watchdog so the next run names the exact blocking frame.
+        armSetupWatchdog(Thread.currentThread())
+        mark("setUp FileController mockkObject begin")
         mockkObject(FileController)
+        mark("setUp FileController object mocked")
         every { FileController.getGalleryDrive() } returns arrayListOf()
+        mark("setUp FileController getGalleryDrive stubbed")
         every { FileController.storeGalleryDrive(any(), any()) } returns Unit
+        mark("setUp FileController storeGalleryDrive stubbed")
         every { FileController.removeOrphanFiles() } returns Unit
-        println("GalleryVMTest: setUp FileController mocked"); Log.i("GalleryVMTest", "GalleryVMTest: setUp FileController mocked")
+        mark("setUp FileController removeOrphanFiles stubbed")
+        disarmSetupWatchdog()
+        mark("setUp FileController mocked")
 
         mockkObject(ApiRepository)
-        println("GalleryVMTest: setUp done"); Log.i("GalleryVMTest", "GalleryVMTest: setUp done")
+        mark("setUp done")
     }
 
     @AfterEach
     fun tearDown() {
-        println("GalleryVMTest: tearDown begin"); Log.i("GalleryVMTest", "GalleryVMTest: tearDown begin")
+        disarmSetupWatchdog()
+        mark("tearDown begin")
         unmockkAll()
         ArchTaskExecutor.getInstance().setDelegate(null)
         Dispatchers.resetMain()
-        println("GalleryVMTest: tearDown done"); Log.i("GalleryVMTest", "GalleryVMTest: tearDown done")
+        mark("tearDown done")
     }
 
     /**

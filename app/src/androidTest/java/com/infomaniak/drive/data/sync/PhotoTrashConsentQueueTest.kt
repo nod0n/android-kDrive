@@ -571,7 +571,13 @@ class PhotoTrashConsentQueueTest {
     @DisplayName("an unreachable remote while polling keeps the request pending, untouched")
     fun unreachableRemoteWhilePollingKeepsTheRequestPending() {
         seedArmedRow(uriA, remoteFileIdA, stampA)
-        every { ApiRepository.getFileDetailsWithHash(any(), any()) } returns ApiResponse(result = ApiResponseStatus.ERROR)
+        // The override must stay routed through the counting gate: device evidence (device-8ad8)
+        // showed a plain `returns` override REPLACES the setUp answer, so the poll verifiably
+        // reached the seam (the state asserts passed) while the boundary counter stayed 0.
+        every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
+            remoteQueryGate()
+            ApiResponse(result = ApiResponseStatus.ERROR)
+        }
 
         assertNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "an unreachable remote surfaces nothing")
         assertEquals(stampA, row(uriA).remoteTrashPendingSince, "the armed request stays pending for a later entry")
