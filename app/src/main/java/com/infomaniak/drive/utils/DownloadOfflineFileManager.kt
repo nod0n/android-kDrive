@@ -80,6 +80,9 @@ class DownloadOfflineFileManager(
 
     private var lastUpdateProgressMillis = System.currentTimeMillis()
 
+    /** The row's validation-gate state: live offline intent and root coverage at one read. */
+    private data class GateState(val liveIntent: Boolean, val rootCovered: Boolean)
+
     suspend fun execute(
         context: Context,
         file: File,
@@ -91,11 +94,21 @@ class DownloadOfflineFileManager(
         // unmarked, the pin withdrawn, a release applied — any queued work (initial bulk
         // chain, retry, a download enqueued before an unmark) is stale: no cache move, no
         // delete-then-transfer, no resurrection of a preserved copy.
-        val liveIntent = FileController.getRealmInstance(userDrive).use { realm ->
-            FileController.getFileProxyById(file.id, customRealm = realm)
-                ?.let { OfflineFolderSyncUtils.hasLiveOfflineIntent(it, realm, userDrive) } == true
+        // ROOT COVERAGE IS CAPTURED HERE, at the validation gate: a real remote move (or
+        // unknown parent metadata) during the details refresh below rewrites the row's
+        // parent, so coverage recomputed AFTER the refresh can silently vanish — queued
+        // root-owned work must then keep the root contract (the staged preservation path),
+        // never fall to the destructive baseline. Direct pins have no root coverage here and
+        // keep their baseline behavior unchanged.
+        val gate = FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
+                GateState(
+                    liveIntent = OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive),
+                    rootCovered = OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, userDrive),
+                )
+            }
         }
-        if (!liveIntent) {
+        if (gate == null || !gate.liveIntent) {
             SentryLog.d(TAG, "Stale offline download skipped for ${file.id}: no live offline intent")
             return ListenableWorker.Result.success()
         }
@@ -113,10 +126,12 @@ class DownloadOfflineFileManager(
         // replace existing bytes, and a covered copy's lifecycle belongs to the root
         // contract — a stale queued download (initial bulk work, retry, or a download
         // enqueued before an unmark) must never reach them. The root maintenance pass
-        // refreshes covered copies through the staged path instead.
+        // refreshes covered copies through the staged path instead. Coverage honored here is
+        // the UNION of the refresh-time walk and the gate-time capture: the gate capture is
+        // what survives a real remote move that rewrote the row's parent mid-flight.
         val coveredByRoot = FileController.getRealmInstance(userDrive).use { realm ->
             OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)
-        }
+        } || gate.rootCovered
         if (offlineFile.exists() && coveredByRoot) {
             // The preserved bytes are NOT blessed with the new remote identity: no accepted
             // transfer happened here, so no publication evidence may be recorded.
@@ -146,7 +161,10 @@ class DownloadOfflineFileManager(
             // instead of deleting bytes at the final path after the fact. The captured
             // details identity describes the body this transfer fetches. Notification
             // progress parity is not kept here (the maintenance pass has none either); the
-            // bulk chain's onFinish finalizes pending markers and the notification.
+            // bulk chain's onFinish finalizes pending markers and the notification. The
+            // gate-captured coverage keeps a root-owned copy here even when a real remote
+            // move rewrote its parent during the details refresh: an edited or unknown
+            // copy is then preserved by the staged decision, never destroyed.
             val outcome = runCatching {
                 OfflineFolderSyncUtils.stagedRedownload(context, userDrive, file, establishedServerHash = acceptedServerHash)
             }.cancellable().onFailure { exception ->
