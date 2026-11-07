@@ -145,6 +145,7 @@ class UploadMigration10to12Test {
             val settingsSchemaAfter = realm.schema.get("SyncSettings")
             check(settingsSchemaAfter != null)
             assertTrue(settingsSchemaAfter.hasField(SyncSettings::photoTrashSyncEnabled.name), "the migration adds the opt-in column")
+            assertTrue(settingsSchemaAfter.hasField(SyncSettings::photoTrashActivationEpoch.name), "the migration adds the activation-epoch column (v13)")
             assertTrue(realm.schema.contains("PhotoPairing"))
 
             val pending = realm.where(UploadFile::class.java).equalTo("uri", "content://fixture/pending-10").findFirst()!!
@@ -156,6 +157,7 @@ class UploadMigration10to12Test {
 
             val settings = realm.where(SyncSettings::class.java).equalTo("userId", 941).findFirst()!!
             assertFalse(settings.photoTrashSyncEnabled, "the opt-in is NEVER auto-enabled by the migration")
+            assertEquals(0L, settings.photoTrashActivationEpoch, "migrated rows start in the never-activated generation")
             assertEquals(741, settings.driveId)
 
             // THE PAIRING TABLE IS WRITABLE (the recordPairing seam's contract), and the
@@ -178,6 +180,7 @@ class UploadMigration10to12Test {
             assertEquals(null, pendingPairing.baselineTrashed, "a pairing with no observed baseline reads back null")
             assertNull(pendingPairing.localContentDigest, "an unbound upload digest reads back null")
             assertNull(pendingPairing.remoteContentHash, "an unbound remote basis reads back null")
+            assertEquals(0L, pendingPairing.activationEpoch, "a migrated pairing starts in the never-activated generation")
             assertEquals(1L, realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java).count())
         }
     }
