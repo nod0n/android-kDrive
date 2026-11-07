@@ -915,10 +915,12 @@ object OfflineFolderSyncUtils {
             }
 
             // PASS-WIDE COORDINATED RELEASE (RESUME-b528-2212 item 2, extended by
-            // FHNW-1189 A3/A6/A7, RESTRUCTURED by RESUME-962c item 5 / FHNW-962c P2-5):
-            // one authority hold, gated on the registry re-read still matching the pass-start
-            // snapshot (a root registered or withdrawn mid-pass invalidates the snapshot) AND
-            // on EVERY registered root's walk having completed this pass. The former
+            // FHNW-1189 A3/A6/A7, RESTRUCTURED by RESUME-962c item 5 / FHNW-962c P2-5,
+            // registration LIFETIME by RESUME-33dd item 2): one authority hold, gated on
+            // the registry re-read still matching the pass-start snapshot AS REGISTRATION
+            // LIFETIMES (a root registered or withdrawn mid-pass invalidates the snapshot,
+            // and a same-id remove+re-register is a DIFFERENT lifetime) AND on EVERY
+            // registered root's walk having completed this pass. The former
             // per-completed-root partial-pass release is GONE — FHNW-962c P2-5 proved its
             // schedule: X sat in A's cached previousSubtree, moved to B remotely during the
             // pass, B's walk was incomplete, and X's cached chain still reached A — so the
@@ -937,14 +939,27 @@ object OfflineFolderSyncUtils {
             val job = currentCoroutineContext()[Job]
             withContext(Dispatchers.IO) {
                 OfflineCommitAuthority.withCommitAuthority {
-                    val registryNow = certifiedFreshRealm(userDrive).use { realm ->
+                    // THE REGISTRATION-LIFETIME MAP (RESUME-33dd item 2): the folder-id set
+                    // alone cannot distinguish a registration from its remove+re-register
+                    // successor — an unmark+re-mark of the SAME folder while the pass is
+                    // parked (the parked refresh spans are real suspension windows) rebuilds
+                    // the identical uid set but a NEW contract lifetime, because markedAt is
+                    // stamped at every mark. Judging this pass's union evidence against the
+                    // successor's claims would release a claim the successor's own marking
+                    // walk just re-acquired (the same-row ABA): the gate therefore compares
+                    // the (uid, markedAt) lifetime map against the pass-start snapshot. A
+                    // mid-pass re-registration defers the WHOLE release; the NEXT pass
+                    // captures the successor at ITS start and its own walk judges the row
+                    // from current evidence. markedAt has millisecond precision — a
+                    // same-millisecond re-register is indistinguishable and merely leaves
+                    // the disclosed bounded-churn residual (never a byte decision).
+                    val registryLifetimes = certifiedFreshRealm(userDrive).use { realm ->
                         realm.where(OfflineFolderRoot::class.java)
                             .equalTo(OfflineFolderRoot::driveId.name, userDrive.driveId)
                             .findAll()
-                            .map { it.folderId }
-                            .toSet()
+                            .associate { it.uid to it.markedAt.time }
                     }
-                    if (registryNow != roots.map { it.folderId }.toSet()) {
+                    if (registryLifetimes != roots.associate { it.uid to it.markedAt.time }) {
                         SentryLog.i(TAG, "Offline root registry changed during the maintenance pass; releases skipped")
                         return@withCommitAuthority
                     }
@@ -1055,16 +1070,39 @@ object OfflineFolderSyncUtils {
         val remoteFolder = details.data
         return when {
             details.isSuccess() && remoteFolder != null && !remoteFolder.isTrashed() -> {
-                // RESUME-962c item 2: the cached row is ABSENT here — the very premise of
-                // this branch — so the refresh-only [FileController.updateExistingFile] was
-                // a silent no-op that still reported recovery. The coordinated INSERT
-                // lever actually creates the row (the remote details carry the folder's
-                // identity; the registry's intent stands untouched).
-                certifiedFreshRealm(userDrive).use { realm ->
-                    FileController.upsertMissingRemoteFile(newFile = remoteFolder, realm = realm)
+                // RESUME-33dd item 1: the recovery writes only when the response identifies
+                // the REQUESTED folder on the REQUESTED drive — a live answer for any other
+                // row is inconclusive for this registration (it stands; the next pass
+                // retries), never a recovery and never a withdrawal.
+                if (remoteFolder.id != root.folderId || remoteFolder.driveId != userDrive.driveId) {
+                    SentryLog.w(
+                        TAG,
+                        "Offline root ${root.uid}: the remote details answer does not identify the requested folder; the registration stands",
+                    )
+                    MissingRootResolution.UNRESOLVED
+                } else {
+                    // RESUME-962c item 2: the cached row is ABSENT here — the very premise of
+                    // this branch — so the refresh-only [FileController.updateExistingFile] was
+                    // a silent no-op that still reported recovery. The coordinated INSERT
+                    // lever actually creates the row (the remote details carry the folder's
+                    // identity; the registry's intent stands untouched). RESUME-33dd item 1:
+                    // the lever rechecks absence inside its write transaction — a row a
+                    // concurrent listing writer recreated while this request was in flight is
+                    // PRESERVED (it is the newer state), not overwritten by this detached
+                    // snapshot.
+                    val inserted = certifiedFreshRealm(userDrive).use { realm ->
+                        FileController.upsertMissingRemoteFile(newFile = remoteFolder, realm = realm)
+                    }
+                    if (inserted) {
+                        SentryLog.i(TAG, "Offline root ${root.uid}: the cached folder row was recovered from the remote details")
+                    } else {
+                        SentryLog.i(
+                            TAG,
+                            "Offline root ${root.uid}: the cached folder row already reappeared (a concurrent writer recreated it); the recovery preserved it",
+                        )
+                    }
+                    MissingRootResolution.RECOVERED
                 }
-                SentryLog.i(TAG, "Offline root ${root.uid}: the cached folder row was recovered from the remote details")
-                MissingRootResolution.RECOVERED
             }
             remoteFolder?.isTrashed() == true || details.error?.code == ErrorCode.OBJECT_NOT_FOUND -> {
                 OfflineCommitAuthority.withCommitAuthority {

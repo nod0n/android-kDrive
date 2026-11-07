@@ -496,13 +496,31 @@ object FileController {
      * every row-creation writer and stores the remote representation as-is — there is no
      * local row whose offline/pin fields could be preserved, and the registry's intent is
      * untouched (the registration stands, the next pass walks the recovered row).
+     *
+     * RESUME-33dd item 1: the absence premise is established BEFORE the remote details
+     * request, outside any hold — while the recovery waits, a real listing/tree writer may
+     * recreate the row with newer cache state and child links. The insert therefore RECHECKS
+     * absence inside the authoritative write transaction and PRESERVES a row that has since
+     * appeared: a detached details snapshot is never preferred over a live writer's row (the
+     * listing is the fresher remote state, and the recovery's only goal — a walkable row —
+     * is already achieved). Returns true when it inserted the absent row, false when a row
+     * was already there and was preserved as-is.
      */
-    fun upsertMissingRemoteFile(newFile: File, realm: Realm) {
+    fun upsertMissingRemoteFile(newFile: File, realm: Realm): Boolean {
+        var inserted = false
         OfflineCommitAuthority.withCommitAuthority {
             realm.executeTransaction { transactionRealm ->
-                transactionRealm.insertOrUpdate(newFile)
+                val existing = transactionRealm.where(File::class.java)
+                    .equalTo(File::id.name, newFile.id)
+                    .equalTo(File::driveId.name, newFile.driveId)
+                    .findFirst()
+                if (existing == null) {
+                    transactionRealm.insertOrUpdate(newFile)
+                    inserted = true
+                }
             }
         }
+        return inserted
     }
 
     private fun insertOrUpdateFile(
