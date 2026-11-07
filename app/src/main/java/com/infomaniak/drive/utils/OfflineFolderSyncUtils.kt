@@ -801,6 +801,7 @@ object OfflineFolderSyncUtils {
                     return true // the preserved basis still describes the actual bytes
                 }
             }
+            var recorded = false
             realm.executeTransaction { mutableRealm ->
                 FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { row ->
                     // Defense-in-depth inside the transaction (the lock excludes every
@@ -818,9 +819,13 @@ object OfflineFolderSyncUtils {
                     row.offlineBasisModifiedAt = remoteFile.lastModifiedAt
                     row.offlineBasisSize = remoteFile.size
                     offlineFile?.let { row.offlinePublishedPath = it.path }
+                    recorded = true
                 }
             }
-            return true
+            // Same discipline as the metadata-unchanged branch above: a decline inside the
+            // transaction (row vanished or intent withdrawn by a mutation outside the
+            // coordination) is reported as a DECLINE, never as a successful adoption.
+            return recorded
         }
     }
 
