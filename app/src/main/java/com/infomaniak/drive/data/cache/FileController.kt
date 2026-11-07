@@ -313,14 +313,20 @@ object FileController {
      * Removes a row and its caches. The [remoteEviction] cohort (FHNW-33dd item 2) covers
      * the callers that evict on REMOTE evidence — the folder provider's activity
      * FILE_DELETE/FILE_TRASH route, the actionFile-null upsert eviction and the shares
-     * replacement — as opposed to explicit user deletion and the shared-with-me transplant,
-     * which keep the default baseline. For that cohort the byte delete and the row delete
-     * run in ONE authority hold on a FRESH in-hold row read (the caller's realm may be a
-     * retained stale view; a failed view refresh skips the destructive work entirely), and
-     * the ROOT CLAIM cohort (offlineOwnedByRoot without a standing pin) is preserved: its
-     * bytes and provenance belong to the root contract, whose complete-traversal releases
-     * retain bytes — a remote activity delete must not end them outside that contract.
-     * Never-root and directly pinned rows keep today's eviction semantics.
+     * replacement — as opposed to the shared-with-me transplant (its own baseline) and the
+     * explicit-deletion helper, which keep the default path. For that cohort the byte delete
+     * and the row delete run in ONE authority hold on a FRESH in-hold row read (the caller's
+     * realm may be a retained stale view; a failed view refresh skips the destructive work
+     * entirely), and the ROOT-PRESERVED cohort ([OfflineFolderSyncUtils.isRootOwnedCopy] —
+     * LIVE coverage from the roots registry, independent of a direct pin, OR the recorded
+     * claim without a standing pin) is preserved: RESUME-9b3b item 2 (reviewer-confirmed) —
+     * the former predicate (recorded claim only) destroyed a pinned copy still inside a live
+     * root and an already-offline copy after registry insertion but before the walk stamps
+     * its claim. The preserved rows' bytes and provenance belong to the root contract, whose
+     * complete-traversal releases retain bytes — a remote activity delete must not end them
+     * outside that contract. Never-root UNCOVERED rows keep today's eviction semantics (the
+     * guarded predicate never consults byte state: edited/unknown claimed bytes are simply
+     * not deleted here, whatever their classification).
      */
     fun removeFile(
         fileId: Int,
@@ -329,13 +335,14 @@ object FileController {
         customRealm: Realm? = null,
         recursive: Boolean = true,
         remoteEviction: Boolean = false,
+        userDrive: UserDrive = UserDrive(),
     ) {
         val block: (Realm) -> Unit? = { realm ->
             getFileById(realm, fileId)?.let { file ->
                 if (recursive) {
                     file.children.createSnapshot().forEach {
                         if (!keepFiles.contains(it.id)) {
-                            removeFile(it.id, keepFileCaches, keepFiles, realm, remoteEviction = remoteEviction)
+                            removeFile(it.id, keepFileCaches, keepFiles, realm, remoteEviction = remoteEviction, userDrive = userDrive)
                         }
                     }
                 }
@@ -349,11 +356,11 @@ object FileController {
                             }
                             val freshRow = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()
                             if (freshRow != null) {
-                                val rootClaimCohort = freshRow.offlineOwnedByRoot && !freshRow.isDirectlyPinned
-                                if (!rootClaimCohort && !keepFileCaches.contains(fileId)) {
+                                val rootPreserved = OfflineFolderSyncUtils.isRootOwnedCopy(freshRow, realm, userDrive)
+                                if (!rootPreserved && !keepFileCaches.contains(fileId)) {
                                     freshRow.deleteCaches(Realm.getApplicationContext()!!)
                                 }
-                                if (!rootClaimCohort && !keepFiles.contains(fileId) && freshRow.isValid) {
+                                if (!rootPreserved && !keepFiles.contains(fileId) && freshRow.isValid) {
                                     realm.executeTransaction { freshRow.deleteFromRealm() }
                                 }
                             }
@@ -621,18 +628,25 @@ object FileController {
                     files[index].isOffline = true
                     keepCaches.add(file.id)
                 } else {
-                    // FHNW-33dd item 3 (+ ADDENDUM A3): the root guard and the destructive
-                    // delete must participate TOGETHER in one authority hold on a fresh
-                    // in-hold read — the former guard ran outside the authority on a row
-                    // read before the loop, and a claim/coverage writer could commit
-                    // between the guard and the delete (or the retained realm was stale).
-                    // A row that has since vanished is skipped too: a fresh root check
-                    // returning false is not by itself permission to act on a stale
-                    // selection. Never-root rows keep the baseline delete.
+                    // FHNW-33dd item 3 (+ ADDENDUM A3; RESUME-9b3b item 4): the guard and
+                    // the destructive delete participate TOGETHER in one authority hold on
+                    // a fresh in-hold read, and the selection itself is revalidated — the
+                    // required behavior, stated without negation slips: DELETE only when
+                    // the row EXISTS, carries CURRENT live offline intent, and has NO root
+                    // protection; PRESERVE when the current intent is false (after a
+                    // preserving withdrawal the row still exists while isOffline/claim/
+                    // intent are cleared — rootOwned=false alone does not authorize
+                    // deleting those preserved bytes; the checked withdrawal paths own
+                    // them) and when the row has vanished (a fresh root check returning
+                    // false is not by itself permission to act on a stale selection).
+                    // Never-root rows carrying live intent keep the baseline delete.
                     OfflineCommitAuthority.withCommitAuthority {
                         OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
                             val freshOld = freshRealm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
-                            if (freshOld != null && !OfflineFolderSyncUtils.isRootOwnedCopy(freshOld, freshRealm, userDrive)) {
+                            if (freshOld != null &&
+                                OfflineFolderSyncUtils.hasLiveOfflineIntent(freshOld, freshRealm, userDrive) &&
+                                !OfflineFolderSyncUtils.isRootOwnedCopy(freshOld, freshRealm, userDrive)
+                            ) {
                                 offlineFile?.delete()
                             }
                         }
@@ -640,11 +654,10 @@ object FileController {
                 }
             }
 
-            // FHNW-33dd item 2: the shares replacement is a remote cache eviction — the
-            // root claim cohort rides the guarded cohort (its rows are already in
-            // keepFiles; its bytes were previously reachable through deleteCaches because
-            // only INTACT copies entered keepCaches).
-            if (replaceOldData) removeFile(MyShares.id, keepCaches, keepFiles, realm, remoteEviction = true)
+            // FHNW-33dd item 2 (RESUME-9b3b item 2): the shares replacement is a remote
+            // cache eviction riding the widened root-preserved cohort (live coverage OR
+            // unsuppressed claim), with the actual drive identity for the coverage walk.
+            if (replaceOldData) removeFile(MyShares.id, keepCaches, keepFiles, realm, remoteEviction = true, userDrive = userDrive)
             saveFiles(MyShares.file, files, replaceOldData, realm)
         }
     }

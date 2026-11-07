@@ -204,21 +204,24 @@ class DownloadOfflineFileManager(
 
         onProgress(0, file.id)
 
-        // FHNW-33dd item 4 (ADDENDUM A3): the pre-transfer cleanup is destructive and its
-        // guards sat OUTSIDE it — a root acquisition after the gate/coverage reads above
-        // must not let it act on newly protected bytes, and a row whose intent was
-        // withdrawn since the gate is stale work. The fresh authorization (existence,
-        // live intent, root ownership) and the deletion participate in ONE authority
-        // hold — local reads only, no network and no awaited coroutine under it; the
-        // transfer starts after the hold releases.
+        // RESUME-9b3b item 1 (reviewer-corrected): the fresh authorization and the DELETES
+        // share ONE authority hold — the former shape computed staleOrRootOwned under the
+        // hold and deleted AFTER it released, which is guard-then-effect again: a marking
+        // writer committing between the hold's end and the deletes still destroyed bytes.
+        // The deletes are local IO (no network, no whole-file copy, no awaited coroutine),
+        // so the hold stays IO-sized; the transfer starts after it releases.
         val staleOrRootOwned = OfflineCommitAuthority.withCommitAuthority {
             OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
                 val row = FileController.getFileProxyById(file.id, customRealm = realm)
                 when {
-                    row == null -> true // the selection is stale: nothing to act on
+                    row == null -> true // the selection is stale: nothing to act on, nothing to delete
                     !OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive) -> true // withdrawn since the gate
                     OfflineFolderSyncUtils.isRootOwnedCopy(row, realm, userDrive) -> true // the root contract owns the copy: preserve, no isOffline flip
-                    else -> false
+                    else -> {
+                        if (offlineFile.exists()) offlineFile.delete()
+                        if (cacheFile.exists()) cacheFile.delete()
+                        false // fresh baseline selection: the cleanup ran inside this hold
+                    }
                 }
             }
         }
@@ -227,8 +230,6 @@ class DownloadOfflineFileManager(
             lastDownloadedFile = offlineFile
             return ListenableWorker.Result.success()
         }
-        if (offlineFile.exists()) offlineFile.delete()
-        if (cacheFile.exists()) cacheFile.delete()
 
         lastDownloadedFile = offlineFile
 
@@ -515,42 +516,117 @@ class DownloadOfflineFileManager(
         )
 
         if (!response.isSuccessful) return@withContext ListenableWorker.Result.failure()
-        makeSureFileExists(offlineFile) ?: return@withContext ListenableWorker.Result.failure()
 
-        runCatching {
-            val remoteDataHasBeenSaved = saveRemoteData(downloadWorker.workerTag(), response, offlineFile)
+        // RESUME-9b3b item 5 (reviewer-corrected): the body used to stream DIRECTLY to the
+        // final path, so a root acquired AFTER the pre-transfer hold while the stream was
+        // pending was clobbered by the in-place write and its publication recorded over the
+        // root contract's row. STAGED FINAL PUBLICATION: the network work stays OUTSIDE the
+        // authority (the body streams to a staging temp in the offline directory), and ONE
+        // short hold re-derives the CURRENT contract at publication from a fresh in-hold
+        // read — an acquisition during the stream is visible there and the staged body is
+        // discarded instead of published.
+        val parentDir = offlineFile.parentFile
+        if (parentDir == null || (!parentDir.exists() && !parentDir.mkdirs())) {
+            return@withContext ListenableWorker.Result.failure()
+        }
+        val staging = try {
+            java.io.File.createTempFile("offline_stream_staging_", null, parentDir)
+        } catch (stagingFailure: java.io.IOException) {
+            SentryLog.e(TAG, "Could not create the download staging file for ${file.id}", stagingFailure)
+            return@withContext ListenableWorker.Result.failure()
+        }
+        try {
+            runCatching {
+                val remoteDataHasBeenSaved = saveRemoteData(downloadWorker.workerTag(), response, staging)
+                if (!remoteDataHasBeenSaved || !staging.exists()) {
+                    return@runCatching ListenableWorker.Result.failure()
+                }
 
-            if (remoteDataHasBeenSaved && offlineFile.exists()) {
-                onProgress(100, file.id)
-                notifyCompleted(file, offlineFile, context, acceptedServerHash)
-                ListenableWorker.Result.success()
-            } else {
-                ListenableWorker.Result.failure()
-            }
-        }.cancellable().getOrElse {
-            offlineFile.delete()
-            throw it
+                // Digest + timestamp evidence computed OUTSIDE the hold (a hold never
+                // digests). The staged bytes carry the remote mtime BEFORE the rename, so
+                // the recorded basis never describes an mtime the bytes do not carry.
+                val stagedLength = staging.length()
+                val stagedDigest = OfflineFolderSyncUtils.computeDigestForEvidence(staging)
+                staging.setLastModified(file.getLastModifiedInMilliSecond())
+
+                when (publishStagedDownload(file, offlineFile, staging, stagedDigest, stagedLength)) {
+                    StreamPublication.PUBLISHED -> {
+                        onProgress(100, file.id)
+                        finishCompleted(file, offlineFile, context, OfflineFolderSyncUtils.PublicationOutcome.PUBLISHED)
+                        ListenableWorker.Result.success()
+                    }
+                    // The intent was withdrawn (or the row vanished) during the transfer:
+                    // the staged bytes are unwanted and are discarded WITHOUT ever touching
+                    // the final path — no unrecorded copy lingers anywhere, and the unmark's
+                    // post-condition (copy gone) was already restored by the in-hold cleanup.
+                    StreamPublication.CONTRACT_ENDED -> ListenableWorker.Result.success()
+                    // A root acquisition landed after the pre-transfer hold, while the
+                    // stream was pending: the copy's lifecycle belongs to the root contract
+                    // now — the staged body is discarded, the final path stands untouched,
+                    // and no accepted basis is recorded over the root contract's row.
+                    StreamPublication.ROOT_OWNED_NOW -> {
+                        filesDownloaded += 1
+                        ListenableWorker.Result.success()
+                    }
+                    StreamPublication.FAILED -> ListenableWorker.Result.failure()
+                }
+            }.cancellable().getOrElse { throw it }
+        } finally {
+            // Every refused or failed transfer discards ITS OWN staged bytes; the final
+            // path is never cleaned up here (it was cleaned inside the pre-transfer hold,
+            // and bytes published there since by another writer are not this transfer's).
+            if (staging.exists()) staging.delete()
         }
     }
 
+    /** Outcome of the staged download's final publication. */
+    private enum class StreamPublication { PUBLISHED, CONTRACT_ENDED, ROOT_OWNED_NOW, FAILED }
+
     /**
-     * The freshly accepted bytes are on disk: the publication seam records the basis (it also
-     * sets [File.isOffline], under its live-intent gate — an unpin or release that happened
-     * during the transfer is not overridden). When the intent was withdrawn mid-transfer, the
-     * just-written bytes are unwanted and unrecorded: they are removed, so no unrecorded copy
-     * lingers at the offline path and the unmark's post-condition (copy gone) is restored.
-     * The captured with=hash identity describes THESE bytes, because they were just fetched
-     * from the server; the cache-move path passes null (unknown identity).
+     * The staged transfer's final publication: ONE authority hold re-derives the current
+     * contract from a fresh in-hold read, then either publishes with one atomic rename plus
+     * the accepted-basis record ([OfflineFolderSyncUtils.recordAcceptedPublicationInHold] —
+     * the digest evidence was computed outside), or leaves the staged bytes to the finally
+     * cleanup without touching the final path. Local IO only — the network and the
+     * whole-file digest stayed outside the hold. The record's own withdrawn outcome (a
+     * bypassing mutation; the hold excludes every coordinated writer) restores the unmark
+     * post-condition on THESE just-published bytes, exactly as the former post-record
+     * cleanup did.
      */
-    private suspend fun notifyCompleted(
+    private fun publishStagedDownload(
         file: File,
         offlineFile: java.io.File,
-        context: Context,
-        acceptedServerHash: String?,
-    ) {
-        offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
-        val outcome = OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
-        finishCompleted(file, offlineFile, context, outcome)
+        staging: java.io.File,
+        stagedDigest: String?,
+        stagedLength: Long,
+    ): StreamPublication = OfflineCommitAuthority.withCommitAuthority {
+        OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
+            val row = FileController.getFileProxyById(file.id, customRealm = realm)
+            when {
+                row == null -> StreamPublication.CONTRACT_ENDED
+                !OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive) -> StreamPublication.CONTRACT_ENDED
+                OfflineFolderSyncUtils.isRootOwnedCopy(row, realm, userDrive) -> StreamPublication.ROOT_OWNED_NOW
+                else -> {
+                    if (!staging.renameTo(offlineFile)) return@withCommitAuthority StreamPublication.FAILED
+                    when (OfflineFolderSyncUtils.recordAcceptedPublicationInHold(
+                        userDrive = userDrive,
+                        remoteFile = file,
+                        offlineFile = offlineFile,
+                        acceptedServerHash = acceptedServerHash,
+                        acceptedDigest = stagedDigest,
+                        acceptedLength = stagedLength,
+                    )) {
+                        OfflineFolderSyncUtils.PublicationOutcome.PUBLISHED,
+                        OfflineFolderSyncUtils.PublicationOutcome.NOT_RECORDED,
+                        -> StreamPublication.PUBLISHED // published; a failed digest stays unrecorded (UNKNOWN), preserved by maintenance
+                        OfflineFolderSyncUtils.PublicationOutcome.INTENT_WITHDRAWN -> {
+                            if (offlineFile.exists()) offlineFile.delete()
+                            StreamPublication.CONTRACT_ENDED
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -571,24 +647,6 @@ class DownloadOfflineFileManager(
         }
         if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
         fileDownloaded(context, file.id)
-    }
-
-    private fun makeSureFileExists(offlineFile: java.io.File): Unit? {
-        val parentExists = offlineFile.parentFile?.exists()
-
-        runCatching {
-            if (parentExists == false) offlineFile.parentFile?.mkdirs()
-            // This line is here to help some devices that don't succeed in automatically creating the file…
-            offlineFile.createNewFile()
-        }.onFailure {
-            SentryLog.e(TAG, "Failed to create a new file", it) { scope ->
-                scope.setExtra("does parent exist", parentExists.toString())
-            }
-
-            return null
-        }
-
-        return Unit
     }
 
     private fun fileDownloaded(context: Context, fileId: Int) {

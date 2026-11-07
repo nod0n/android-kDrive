@@ -239,7 +239,22 @@ object SyncOfflineUtils {
                 downloadOfflineFile(context, localFile, remoteFile, ioFile, userDrive, realm)
             }
             fileAction.lastAction in renameActions -> {
-                remoteFile.getOfflineFile(context)?.let { ioFile.renameTo(it) }
+                // RESUME-9b3b item 5: the rename is a LOCAL destructive effect (rename(2)
+                // replaces the destination) that acted on the pass-head selection. The
+                // fresh revalidation (existence + CURRENT live intent + ownership) and the
+                // rename share ONE hold — local IO only. A withdrawn or root-owned copy's
+                // rename is skipped: the checked withdrawal and the root contract own it.
+                OfflineCommitAuthority.withCommitAuthority {
+                    OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
+                        val freshRow = FileController.getFileProxyById(localFile.id, customRealm = freshRealm)
+                        if (freshRow != null &&
+                            OfflineFolderSyncUtils.hasLiveOfflineIntent(freshRow, freshRealm, userDrive) &&
+                            !OfflineFolderSyncUtils.isRootOwnedCopy(freshRow, freshRealm, userDrive)
+                        ) {
+                            remoteFile.getOfflineFile(context)?.let { ioFile.renameTo(it) }
+                        }
+                    }
+                }
             }
         }
 
@@ -254,7 +269,24 @@ object SyncOfflineUtils {
     private fun migrateOfflineIfNeeded(context: Context, file: File, ioFile: IOFile, userDrive: UserDrive) {
         val offlineDir = context.getString(R.string.EXPOSED_OFFLINE_DIR)
         val oldPath = IOFile(context.filesDir, "$offlineDir/${userDrive.userId}/${userDrive.driveId}/${file.id}")
-        if (oldPath.exists()) oldPath.renameTo(ioFile)
+        if (!oldPath.exists()) return
+        // RESUME-9b3b item 5: this rename is a LOCAL destructive effect (it MOVES the stored
+        // bytes) that ran BEFORE the pass's root guards. The fresh revalidation (existence +
+        // CURRENT live intent + ownership) and the rename share ONE hold — local IO only.
+        // A root-owned copy's migration is skipped (its bytes stay where the root contract
+        // can still see them; a preserved V1 file is never destroyed); a withdrawn row's
+        // migration is skipped with it.
+        OfflineCommitAuthority.withCommitAuthority {
+            OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
+                val freshRow = FileController.getFileProxyById(file.id, customRealm = freshRealm)
+                if (freshRow != null &&
+                    OfflineFolderSyncUtils.hasLiveOfflineIntent(freshRow, freshRealm, userDrive) &&
+                    !OfflineFolderSyncUtils.isRootOwnedCopy(freshRow, freshRealm, userDrive)
+                ) {
+                    oldPath.renameTo(ioFile)
+                }
+            }
+        }
     }
 
     /**
@@ -272,23 +304,40 @@ object SyncOfflineUtils {
         val fileModifiedAt = Date(ioFile.lastModified())
 
         if (UploadFile.canUpload(uri, fileModifiedAt)) {
-            if (remoteFile != null) {
-                remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
-                remoteFile.size = ioFile.length()
-                FileController.updateExistingFile(newFile = remoteFile, realm = realm)
-            }
-            UploadFile(
-                uri = uri.toString(),
-                driveId = userDrive.driveId,
-                fileModifiedAt = fileModifiedAt,
-                fileName = localFile.name,
-                fileSize = ioFile.length(),
-                remoteFolder = localFile.parentId,
-                type = UploadFile.Type.SYNC_OFFLINE.name,
-                userId = userDrive.userId,
-            ).store()
+            // RESUME-9b3b item 5: the upload REGISTERS local work and schedules it — both
+            // are the effect points the pass-head selection must be revalidated at: a
+            // root-owned copy's local edits are preserved locally and resolved by the user,
+            // never silently pushed by a stale baseline pass; a withdrawn intent's edits
+            // are not pushed either. Fresh authorization + the row-metadata write + the
+            // registration + the schedule share ONE hold (local DB work and a WorkManager
+            // enqueue — no network, no awaited dispatch under it).
+            OfflineCommitAuthority.withCommitAuthority {
+                OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
+                    val freshRow = FileController.getFileProxyById(localFile.id, customRealm = freshRealm)
+                    if (freshRow != null &&
+                        OfflineFolderSyncUtils.hasLiveOfflineIntent(freshRow, freshRealm, userDrive) &&
+                        !OfflineFolderSyncUtils.isRootOwnedCopy(freshRow, freshRealm, userDrive)
+                    ) {
+                        if (remoteFile != null) {
+                            remoteFile.lastModifiedAt = ioFile.lastModified() / 1000
+                            remoteFile.size = ioFile.length()
+                            FileController.updateExistingFile(newFile = remoteFile, realm = freshRealm)
+                        }
+                        UploadFile(
+                            uri = uri.toString(),
+                            driveId = userDrive.driveId,
+                            fileModifiedAt = fileModifiedAt,
+                            fileName = localFile.name,
+                            fileSize = ioFile.length(),
+                            remoteFolder = localFile.parentId,
+                            type = UploadFile.Type.SYNC_OFFLINE.name,
+                            userId = userDrive.userId,
+                        ).store()
 
-            context.syncImmediately(isAutomaticTrigger = false)
+                        context.syncImmediately(isAutomaticTrigger = false)
+                    }
+                }
+            }
         }
     }
 
@@ -306,14 +355,31 @@ object SyncOfflineUtils {
         val remoteOfflineFile = remoteFile.getOfflineFile(context, userDrive.userId) ?: return
         val pathChanged = offlineFile.path != remoteOfflineFile.path
 
-        if (pathChanged) {
-            if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
-            offlineFile.delete()
-        }
+        // RESUME-9b3b item 5: the pathChanged delete is a LOCAL destructive effect (it
+        // removes the stored bytes at the old path), and the enqueue below publishes the
+        // remote body at the new path — both acted on the pass-head selection. The fresh
+        // revalidation (existence + CURRENT live intent + ownership) and BOTH effects share
+        // ONE hold: local IO plus a WorkManager enqueue — no network under it. A root-owned
+        // copy's delete/enqueue is skipped (the root contract refreshes it through the
+        // staged path); a withdrawn intent's cleanup belongs to the checked withdrawal.
+        OfflineCommitAuthority.withCommitAuthority {
+            OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
+                val freshRow = FileController.getFileProxyById(file.id, customRealm = freshRealm)
+                if (freshRow != null &&
+                    OfflineFolderSyncUtils.hasLiveOfflineIntent(freshRow, freshRealm, userDrive) &&
+                    !OfflineFolderSyncUtils.isRootOwnedCopy(freshRow, freshRealm, userDrive)
+                ) {
+                    if (pathChanged) {
+                        if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
+                        offlineFile.delete()
+                    }
 
-        if (!file.isMarkedAsOffline && (!remoteFile.isOfflineAndIntact(remoteOfflineFile) || pathChanged)) {
-            FileController.updateExistingFile(newFile = remoteFile, realm = realm)
-            Utils.downloadAsOfflineFile(context, remoteFile, userDrive)
+                    if (!file.isMarkedAsOffline && (!remoteFile.isOfflineAndIntact(remoteOfflineFile) || pathChanged)) {
+                        FileController.updateExistingFile(newFile = remoteFile, realm = freshRealm)
+                        Utils.downloadAsOfflineFile(context, remoteFile, userDrive)
+                    }
+                }
+            }
         }
     }
 }

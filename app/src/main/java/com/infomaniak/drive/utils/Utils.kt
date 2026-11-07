@@ -319,26 +319,58 @@ object Utils {
      * REFUSED: FHNW-33dd ADDENDUM A4 — the destination may hold the ACTIVE root contract's
      * preserved bytes (a released-then-re-marked row is pending with isOffline=false and
      * keeps its edited/unknown bytes at the offline path, so the row's flags alone cannot
-     * tell the UI the destination is occupied). When a live root covers this row, the
-     * destination bytes are the root contract's and the destructive replace is refused
-     * BEFORE the direct-pin commit; the caller still records the pin intent. Rows outside
-     * every root keep the unconditional baseline (the pre-existing direct-pin semantics).
+     * tell the UI the destination is occupied). RESUME-9b3b item 3 (reviewer-confirmed):
+     * the guard, the destination delete and the final publication share ONE short authority
+     * hold on a certified-fresh read of the file's ACTUAL drive — the former shape's
+     * uncoordinated check could not see an acquisition landing between it and the replace,
+     * and its plain instance read did not advance a retained view. The whole-file copy is
+     * STAGED outside the hold (a hold never copies), and only the atomic rename publishes.
+     * The refusal also covers a MISSING row (F3 sharpening: the former nullable lookup
+     * authorized the replace on a row-miss — bytes nobody vouches for are never replaced)
+     * and an unreadable view. The caller still records the pin intent on a refusal. Rows
+     * outside every root keep the unconditional baseline (the pre-existing direct-pin
+     * semantics — no generic pin-preservation feature).
      */
     fun moveCacheFileToOffline(file: File, cacheFile: IOFile, offlineFile: IOFile): Boolean {
-        if (offlineFile.exists()) {
-            val activelyRootCovered = runCatching {
-                FileController.getRealmInstance().use { realm ->
-                    FileController.getFileProxyById(file.id, customRealm = realm)
-                        ?.let { row -> OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, UserDrive()) } == true
-                }
-            }.getOrDefault(true) // an unreadable cache view never authorizes the destructive replace
-            if (activelyRootCovered) return false
-            offlineFile.delete()
+        val userDrive = UserDrive(driveId = file.driveId)
+        val parentDir = offlineFile.parentFile
+        if (parentDir == null || (!parentDir.exists() && !parentDir.mkdirs())) return false
+        val staging = try {
+            java.io.File.createTempFile("offline_pin_staging_", null, parentDir)
+        } catch (stagingFailure: java.io.IOException) {
+            return false
         }
-        cacheFile.copyTo(offlineFile)
-        cacheFile.delete()
-        offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
-        return true
+        try {
+            cacheFile.copyTo(staging, overwrite = true)
+            // The published bytes must carry the file's mtime (the baseline set it after the
+            // copy; setting it on the staging file publishes it with the rename).
+            staging.setLastModified(file.getLastModifiedInMilliSecond())
+            var published = false
+            runCatching {
+                OfflineCommitAuthority.withCommitAuthority {
+                    OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
+                        val row = FileController.getFileProxyById(file.id, customRealm = realm)
+                        when {
+                            // A vanished row refuses: the destination may hold bytes whose
+                            // owner is unknown, and a fresh miss is not permission to act.
+                            row == null -> return@withCommitAuthority
+                            // The actively covered destination holds the root contract's
+                            // preserved bytes: refuse BEFORE the direct-pin commit.
+                            offlineFile.exists() && OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, userDrive) -> return@withCommitAuthority
+                            else -> {
+                                if (offlineFile.exists()) offlineFile.delete()
+                                published = staging.renameTo(offlineFile)
+                            }
+                        }
+                    }
+                }
+            } // a failed fresh read (unreadable view) leaves published=false: refuse conservatively
+            if (!published) return false
+            cacheFile.delete()
+            return true
+        } finally {
+            if (staging.exists()) staging.delete()
+        }
     }
 
     fun downloadAsOfflineFile(context: Context, file: File, userDrive: UserDrive = UserDrive()) {
