@@ -36,6 +36,7 @@ import io.mockk.spyk
 import io.mockk.unmockkAll
 import io.realm.Realm
 import io.realm.RealmConfiguration
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import org.junit.jupiter.api.AfterAll
@@ -84,13 +85,16 @@ class PhotoTrashOrchestrationTest {
     private val contentA = "fixture-photo-content-A".toByteArray()
     private val contentB = "fixture-photo-content-B".toByteArray() // same length: a same-stat replacement
 
-    private val pairingHash = "pairing-hash"
+    /** A STRICTLY CANONICAL server hash token (the official example's exact shape): the
+     *  parse ladder must accept it, and the rules compare server-vs-server equality only. */
+    private val pairingHash = "xxh3:00ec7bec63e548df"
 
     /** The bytes the mocked MediaStore currently serves through openInputStream. */
     private val resolverContent = AtomicReference(contentA)
 
     /** The mocked MediaStore row's trashed flag (size/mtime never change: the adversarial case). */
     private val mediaTrashed = AtomicBoolean(false)
+    private val mediaRowPresent = AtomicBoolean(true)
     private val mediaSize = contentA.size.toLong()
     private val mediaModifiedSec = 1_700_000_000L
 
@@ -98,6 +102,12 @@ class PhotoTrashOrchestrationTest {
     private val remoteTrashed = AtomicBoolean(false)
     private val remoteHash = AtomicReference(pairingHash)
     private val deleteRequests = AtomicLong(0)
+
+    /** The live opt-in value the mocked settings serve (flippable mid-pass). */
+    private val syncSettingsEnabled = AtomicBoolean(true)
+
+    /** > 0: the remote-details query parks this long, so tests can flip state mid-IO. */
+    private val remoteQueryPauseMillis = AtomicLong(0L)
 
     private val fixtureName = "photoTrashOrch-${UUID.randomUUID()}"
     private val config = RealmConfiguration.Builder()
@@ -120,12 +130,14 @@ class PhotoTrashOrchestrationTest {
         runCatching { Realm.deleteRealm(config) }
         resolverContent.set(contentA)
         mediaTrashed.set(false)
+        mediaRowPresent.set(true)
         remoteTrashed.set(false)
         remoteHash.set(pairingHash)
         deleteRequests.set(0)
+        syncSettingsEnabled.set(true)
 
         val mockResolver = mockk<android.content.ContentResolver>()
-        every { mockResolver.query(any(), any(), any(), any(), any()) } answers { mediaCursor(mediaTrashed.get()) }
+        every { mockResolver.query(any(), any(), any(), any(), any()) } answers { mediaCursor(mediaTrashed.get(), mediaRowPresent.get()) }
         every { mockResolver.openInputStream(any()) } answers { ByteArrayInputStream(resolverContent.get()) }
         mockContext = spyk(context)
         every { mockContext.contentResolver } returns mockResolver
@@ -135,16 +147,19 @@ class PhotoTrashOrchestrationTest {
         every { AccountUtils.currentUserId } returns userId
         coEvery { AccountUtils.getHttpClient(any(), any(), any(), any()) } returns OkHttpClient()
         mockkObject(UploadFile.Companion)
-        every { UploadFile.getAppSyncSettings() } returns SyncSettings(
-            userId = userId,
-            driveId = driveId,
-            photoTrashSyncEnabled = true,
-        )
+        every { UploadFile.getAppSyncSettings() } answers {
+            SyncSettings(
+                userId = userId,
+                driveId = driveId,
+                photoTrashSyncEnabled = syncSettingsEnabled.get(),
+            )
+        }
         every { ApiRepository.deleteFile(any()) } answers {
             deleteRequests.incrementAndGet()
             ApiResponse(result = ApiResponseStatus.SUCCESS)
         }
         every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
+            remoteQueryGate()
             ApiResponse(
                 result = ApiResponseStatus.SUCCESS,
                 data = File(id = remoteFileId, driveId = driveId).apply {
@@ -157,8 +172,20 @@ class PhotoTrashOrchestrationTest {
         }
     }
 
-    private fun mediaCursor(trashed: Boolean): Cursor = mockk(relaxed = true) {
-        every { moveToFirst() } returns true
+    /**
+     * The remote-query gate: a live opt-in/scope flip DURING a pass's network IO must be
+     * caught by the FINAL pre-delete recheck (softcheck #3). Tests park here, flip the
+     * gate, then release.
+     */
+    private fun remoteQueryGate() {
+        val pauseMillis = remoteQueryPauseMillis.get()
+        if (pauseMillis > 0L) {
+            Thread.sleep(pauseMillis)
+        }
+    }
+
+    private fun mediaCursor(trashed: Boolean, rowPresent: Boolean = true): Cursor = mockk(relaxed = true) {
+        every { moveToFirst() } returns rowPresent
         every { getLong(0) } returns mediaSize
         every { getLong(1) } returns mediaModifiedSec
         every { getInt(2) } returns if (trashed) 1 else 0
@@ -270,27 +297,30 @@ class PhotoTrashOrchestrationTest {
     @Test
     @DisplayName("a pairing binds through validated server-to-source evidence, never an unconditional sample")
     fun pairingBindsThroughValidatedServerToSourceEvidence() {
-        // Chunked upload (no stream digest): the created file's server hash is over the
-        // bytes the server assembled; a matching local read binds the source.
+        // Chunked upload (no stream digest): the created file's server hash is the REAL
+        // documented format (xxh3: + 16 hex — the archived API evidence), and BOTH
+        // receipts (the server-algorithm digest AND the local sha-256 receipt) are
+        // computed from ONE stream pass over the same bytes.
+        val serverTokenA = PhotoTrashServerHash.hashStreaming(ByteArrayInputStream(contentA))
         PhotoTrashController.recordPairing(
             context = mockContext,
             uploadFile = uploadFile(),
-            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = sha256Hex(contentA) },
+            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = serverTokenA },
             uploadedContentDigest = null,
             customRealmConfig = config,
         )
-        assertEquals(sha256Hex(contentA), row().localContentDigest, "the matching local read binds the server-to-source identity")
-        assertEquals(sha256Hex(contentA), row().remoteContentHash)
+        assertEquals(sha256Hex(contentA), row().localContentDigest, "the local receipt comes from the SAME pass that matched the server token")
+        assertEquals(serverTokenA, row().remoteContentHash, "the remote basis is the server's own identity")
 
         // A same-metadata URI replacement BEFORE pairing: the fresh local read no longer
-        // matches the server hash — unknown evidence, NEVER a binding (the rejected sample
-        // fallback would have recorded the replacement's digest as the uploaded identity).
+        // matches the server token — unknown evidence, NEVER a binding (the rejected
+        // sample fallback would have recorded the replacement's digest as the identity).
         val replacedUri = "content://fixture/photo-trash-orch-replaced"
         resolverContent.set(contentB)
         PhotoTrashController.recordPairing(
             context = mockContext,
             uploadFile = uploadFile(uri = replacedUri),
-            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = sha256Hex(contentA) },
+            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = serverTokenA },
             uploadedContentDigest = null,
             customRealmConfig = config,
         )
@@ -300,6 +330,75 @@ class PhotoTrashOrchestrationTest {
             },
             "a replaced source records NO digest: unknown preserves",
         )
+
+        // An UNSUPPORTED server algorithm (here: a bare sha-256 hex receipt — the app's
+        // own algorithm is NOT a server identity): unknown preserves, never a binding
+        // that was manufactured by comparing different algorithms.
+        val shaUri = "content://fixture/photo-trash-orch-sha"
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = uploadFile(uri = shaUri),
+            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = sha256Hex(contentA) },
+            uploadedContentDigest = null,
+            customRealmConfig = config,
+        )
+        assertNull(
+            realm().use { realm ->
+                realm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, shaUri).findFirst()!!.localContentDigest
+            },
+            "a non-canonical server token records NO digest: unknown preserves",
+        )
+    }
+
+    @Test
+    @DisplayName("an absent or unreadable local row stays pending — never an assumed false baseline")
+    fun absentLocalRowStaysPending() {
+        // Pairing-time observation: the MediaStore row is ABSENT (query returns no row).
+        mediaRowPresent.set(false)
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = uploadFile(),
+            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = pairingHash },
+            uploadedContentDigest = sha256Hex(contentA),
+            customRealmConfig = config,
+        )
+        assertNull(row().baselineTrashed, "an absent row never starts as a present-and-not-trashed baseline")
+
+        // Reactivation over an ALREADY-POPULATED baseline with the row still absent: the
+        // old baseline must not survive as eligible through an observation that could not
+        // actually see the item — the capture resets it to pending.
+        realm().use { realm ->
+            realm.executeTransaction { mutableRealm ->
+                mutableRealm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, pairingUri).findFirst()?.baselineTrashed = false
+            }
+        }
+        mediaRowPresent.set(false)
+        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        assertNull(row().baselineTrashed, "an unavailable reactivation observation resets the baseline to pending")
+        assertEquals(PhotoPairing.State.ACTIVE.name, row().state, "no state promotion happens without a real observation")
+    }
+
+    @Test
+    @DisplayName("an option switched off DURING the pass stops it: zero delete calls, no state writes")
+    fun optionDisabledMidPassStopsBeforeTheDestructiveCall() {
+        seedPairing()
+        mediaTrashed.set(true)
+        remoteQueryPauseMillis.set(300L)
+
+        val propagated = runBlocking {
+            val pass = async {
+                PhotoTrashController.runLocalReconciliation(mockContext, config)
+            }
+            // The option is switched off WHILE the pass sits in its remote-details IO.
+            Thread.sleep(100)
+            syncSettingsEnabled.set(false)
+            pass.await()
+        }
+
+        assertEquals(0, propagated, "the unauthorized pass propagated nothing")
+        assertEquals(0L, deleteRequests.get(), "the destructive API was never reached after the switch-off")
+        assertEquals(PhotoPairing.State.ACTIVE.name, row().state, "no state was written by the unauthorized pass")
+        assertEquals(0L, row().lastLocalTrashReconciledAt, "the reconciliation marker was never set")
     }
 
     @Test

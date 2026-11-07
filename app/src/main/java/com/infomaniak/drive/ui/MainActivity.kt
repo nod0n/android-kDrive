@@ -172,21 +172,22 @@ class MainActivity : BaseActivity() {
     }
 
     /**
-     * The cloud->device consent request currently shown to the user: uri + the pending stamp
-     * it was launched with. One system dialog at a time; the stamp keys the result to the
-     * same request across recreation (a stale or duplicate result is dropped controller-side).
+     * The cloud->device consent request currently outstanding, with its FULL scoped
+     * operation identity. One system dialog at a time; the identity is persisted in saved
+     * instance state so a result delivered to a RECREATED activity is still attributed to
+     * the request it answers — never dropped or misattributed to a newly drained request.
      */
-    private var pendingPhotoTrashRequest: Pair<String, Long>? = null
+    private var pendingPhotoTrashRequest: PhotoTrashController.ConsentRequest? = null
 
     /** True while a drain is polling: keeps concurrent wakes from double-launching a dialog. */
     private var drainingPhotoTrashConsents = false
 
     private val photoTrashConsentResult = registerForActivityResult(StartIntentSenderForResult()) { result ->
-        val (uri, stamp) = pendingPhotoTrashRequest ?: return@registerForActivityResult
+        val request = pendingPhotoTrashRequest ?: return@registerForActivityResult
         pendingPhotoTrashRequest = null
         val granted = result.resultCode == RESULT_OK
         lifecycleScope.launch(Dispatchers.IO) {
-            PhotoTrashController.onRemoteTrashConsentResult(uri, granted, expectedPendingSince = stamp)
+            PhotoTrashController.onRemoteTrashConsentResult(request, granted)
             drainPhotoTrashConsents()
         }
     }
@@ -223,6 +224,18 @@ class MainActivity : BaseActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Restore the outstanding consent request FIRST: a system-dialog result can be
+        // delivered to the recreated activity, and it must be attributed to the request
+        // it answers (not dropped, not misattributed to a newly drained request).
+        pendingPhotoTrashRequest = savedInstanceState?.getString(SAVED_PHOTO_TRASH_URI)?.let { uri ->
+            PhotoTrashController.ConsentRequest(
+                uri = uri,
+                userId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_USER),
+                driveId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_DRIVE),
+                remoteFileId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_REMOTE_FILE),
+                pendingSince = savedInstanceState.getLong(SAVED_PHOTO_TRASH_STAMP),
+            )
+        }
         setContentView(binding.root)
 
         addTwoFactorAuthOverlay(isDarkTheme = isNightModeEnabled())
@@ -463,16 +476,49 @@ class MainActivity : BaseActivity() {
         }
     }
 
-    private fun requestPhotoTrashConsent(pairing: PhotoPairing) {
+    /**
+     * Launches the system trash-consent dialog for a captured [request] — but only after a
+     * FINAL pre-launch revalidation on IO: the poll returned this request earlier, and
+     * opt-in/scope/pending identity must still match the LIVE row immediately before the
+     * launch (the application-side window between poll and launch). Still UI state stays
+     * on the main thread; the launch itself is the effect.
+     */
+    private fun requestPhotoTrashConsent(request: PhotoTrashController.ConsentRequest) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         if (pendingPhotoTrashRequest != null) return
-        pendingPhotoTrashRequest = pairing.uri to pairing.remoteTrashPendingSince
-        runCatching {
-            val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(pairing.uri.toUri()), true)
-            photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
-        }.onFailure { exception ->
-            pendingPhotoTrashRequest = null
-            SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
+        pendingPhotoTrashRequest = request
+        lifecycleScope.launch(Dispatchers.IO) {
+            val stillPending = runCatching { PhotoTrashController.isConsentStillPending(request) }
+                .onFailure { exception -> SentryLog.e("PhotoTrash", "consent revalidation failed", exception) }
+                .getOrDefault(false)
+            withContext(Dispatchers.Main) {
+                if (!stillPending) {
+                    pendingPhotoTrashRequest = null
+                    drainPhotoTrashConsents() // the request expired: surface the next one
+                    return@withContext
+                }
+                runCatching {
+                    val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(request.uri.toUri()), true)
+                    photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
+                }.onFailure { exception ->
+                    pendingPhotoTrashRequest = null
+                    SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
+                }
+            }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // The outstanding consent request's FULL scoped identity survives recreation so a
+        // late system-dialog result stays attributable (and the single-outstanding guard
+        // holds across recreation, so no second dialog can launch while one is out).
+        pendingPhotoTrashRequest?.let { request ->
+            outState.putString(SAVED_PHOTO_TRASH_URI, request.uri)
+            outState.putInt(SAVED_PHOTO_TRASH_USER, request.userId)
+            outState.putInt(SAVED_PHOTO_TRASH_DRIVE, request.driveId)
+            outState.putInt(SAVED_PHOTO_TRASH_REMOTE_FILE, request.remoteFileId)
+            outState.putLong(SAVED_PHOTO_TRASH_STAMP, request.pendingSince)
         }
     }
 
@@ -842,5 +888,13 @@ class MainActivity : BaseActivity() {
         private const val MEDIASTORE_DELETE_BATCH_LIMIT = 2_000
 
         private const val DEFAULT_APP_REVIEW_LAUNCHES = 20
+
+        // Saved-instance-state keys for the outstanding photo-trash consent request
+        // (its full scoped operation identity, restored in onCreate).
+        private const val SAVED_PHOTO_TRASH_URI = "savedPhotoTrashConsentUri"
+        private const val SAVED_PHOTO_TRASH_USER = "savedPhotoTrashConsentUserId"
+        private const val SAVED_PHOTO_TRASH_DRIVE = "savedPhotoTrashConsentDriveId"
+        private const val SAVED_PHOTO_TRASH_REMOTE_FILE = "savedPhotoTrashConsentRemoteFileId"
+        private const val SAVED_PHOTO_TRASH_STAMP = "savedPhotoTrashConsentPendingSince"
     }
 }

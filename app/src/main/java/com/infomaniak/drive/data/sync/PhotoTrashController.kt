@@ -102,18 +102,29 @@ object PhotoTrashController {
         val remoteFileId = remoteFile?.id?.takeIf { it > 0 } ?: return
         val local = queryLocalMedia(context, uploadFile.uri)
         val baseline = when {
-            local == null -> null // unavailable: stays pending; a later capture re-observes
-            !local.exists -> false // an absent row starts as the present-and-not-trashed baseline
+            // An ABSENT or unreadable row is UNKNOWN — it never starts as a
+            // present-and-not-trashed baseline (a trashed-then-vanished item or an
+            // unmounted volume would be misclassified as a fresh post-pairing
+            // transition). It stays pending; a later capture re-observes.
+            local == null || !local.exists -> null
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> local.isTrashed
             else -> false // trash state is not observable below API 30; the feature is inert there
         }
         val localDigest = when {
             uploadedContentDigest != null -> uploadedContentDigest
             // Server-to-source validation (chunked/resumed/any transfer without a stream
-            // digest): bind only when the local bytes provably equal what the server
-            // received. Everything else stays unknown evidence and preserves.
+            // digest): the server identity is parsed STRICTLY (only the documented
+            // "xxh3:" + 16-hex form is supported — an unknown algorithm preserves), then
+            // ONE single-stream pass over the source computes BOTH receipts (the server
+            // algorithm's digest AND the local sha-256 receipt) from the same snapshot.
+            // The binding lands only when the same-pass server-algorithm digest matches:
+            // two separate reads could validate A and record a replaced B.
             remoteFile?.serverContentHash != null ->
-                digestContent(context, uploadFile.uri)?.takeIf { it == remoteFile.serverContentHash }
+                when (val parsed = PhotoTrashServerHash.parse(remoteFile.serverContentHash)) {
+                    is PhotoTrashServerHash.Parsed.Supported ->
+                        digestContentValidatedByServerHash(context, uploadFile.uri, parsed.canonical)
+                    is PhotoTrashServerHash.Parsed.Absent, is PhotoTrashServerHash.Parsed.Unsupported -> null
+                }
             else -> null
         }
         withPairingRealm(customRealmConfig) { realm ->
@@ -161,8 +172,11 @@ object PhotoTrashController {
     fun captureActivationBaseline(context: Context, pairing: PhotoPairing, customRealmConfig: RealmConfiguration? = null): Boolean {
         val local = queryLocalMedia(context, pairing.uri)
         val baseline = when {
-            local == null -> return false // unavailable: the baseline stays pending
-            !local.exists -> false
+            // An ABSENT or unreadable row is UNKNOWN: the baseline is reset to PENDING
+            // (never assumed not-trashed) so a later capture re-observes when the row is
+            // readable — an old populated baseline must not survive as eligible through
+            // an observation that could not actually see the item.
+            local == null || !local.exists -> null
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> local.isTrashed
             else -> false // trash state is not observable below API 30; baseline: not trashed
         }
@@ -172,14 +186,16 @@ object PhotoTrashController {
                     .equalTo(PhotoPairing::uri.name, pairing.uri)
                     .findFirst()?.let { row ->
                         row.baselineTrashed = baseline
-                        row.lastObservedTrashed = baseline
-                        if (baseline && row.state == PhotoPairing.State.ACTIVE.name) {
-                            row.state = PhotoPairing.State.INCONCLUSIVE.name
+                        if (baseline != null) {
+                            row.lastObservedTrashed = baseline
+                            if (baseline && row.state == PhotoPairing.State.ACTIVE.name) {
+                                row.state = PhotoPairing.State.INCONCLUSIVE.name
+                            }
                         }
                     }
             }
         }
-        return baseline
+        return baseline ?: false
     }
 
     /**
@@ -240,12 +256,23 @@ object PhotoTrashController {
                         DigestBoundary.MISMATCH -> markConflict(pairing.uri, PhotoPairing.State.CONFLICT_LOCAL_CHANGED, customRealmConfig)
                         DigestBoundary.UNREADABLE, DigestBoundary.NOT_BOUND -> markInconclusive(pairing.uri, customRealmConfig)
                         DigestBoundary.VERIFIED -> {
+                            // FINAL boundary recheck, immediately before the destructive
+                            // call: the pass captured its row list and ran network/digest
+                            // IO since its top-of-pass gate — the option could have been
+                            // switched off or the account switched DURING the pass. An
+                            // unauthorized pass stops WITHOUT marking any state and
+                            // WITHOUT calling the API; the next authorized pass re-decides.
+                            val stillAuthorized = UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled == true &&
+                                pairing.userId == AccountUtils.currentUserId
                             val remoteFile = remote.file
-                            if (remoteFile != null && ApiRepository.deleteFile(remoteFile).isSuccess()) {
-                                markLocalTrashReconciled(pairing.uri, observedTrashed = true, customRealmConfig = customRealmConfig)
-                                propagated++
-                            } else {
-                                markInconclusive(pairing.uri, customRealmConfig)
+                            when {
+                                !stillAuthorized -> return@withContext propagated
+                                remoteFile == null -> markInconclusive(pairing.uri, customRealmConfig)
+                                ApiRepository.deleteFile(remoteFile).isSuccess() -> {
+                                    markLocalTrashReconciled(pairing.uri, observedTrashed = true, customRealmConfig = customRealmConfig)
+                                    propagated++
+                                }
+                                else -> markInconclusive(pairing.uri, customRealmConfig)
                             }
                         }
                     }
@@ -334,29 +361,69 @@ object PhotoTrashController {
     }
 
     /**
-     * Records the user's consent result for a pending cloud->device trash. The result is
-     * keyed to the SAME request: it applies only when the row still carries the consent
-     * stamp the dialog was launched with ([expectedPendingSince]) and belongs to the
-     * current account — a duplicate delivery, a result that raced a re-arm, or one from a
-     * switched account is dropped, never applied to a newer request. A grant re-activates
-     * the pairing; a DECLINE records the denial so the same remote trash is not re-asked on
-     * every pass — the denial expires when the remote is observed restored (the maintenance
-     * pass or [pollNextPendingConsent] clears the pending state and resets a DENIED row to
-     * ACTIVE) or the local content changes (a conflict state re-evaluates the pairing).
+     * THE SCOPED OPERATION IDENTITY of one cloud->device consent request: the pairing
+     * (uri + owner account + drive + remote file) plus the consent stamp of the exact
+     * outstanding request. The identity is captured at the poll, carried through the
+     * pre-launch revalidation and persisted across activity recreation, and a dialog
+     * result applies only when the LIVE row still matches it in full — never to a newer
+     * re-arm, a replaced pairing, or another account's row.
      */
-    fun onRemoteTrashConsentResult(
-        uri: String,
-        granted: Boolean,
-        expectedPendingSince: Long,
-        customRealmConfig: RealmConfiguration? = null,
-    ) {
+    data class ConsentRequest(
+        val uri: String,
+        val userId: Int,
+        val driveId: Int,
+        val remoteFileId: Int,
+        val pendingSince: Long,
+    )
+
+    /**
+     * The pre-launch revalidation of a captured [ConsentRequest] against the LIVE row and
+     * gates, closing the APPLICATION-side window between a poll return and the dialog
+     * launch (a switch/disable that happens during this check is caught; the platform's
+     * own approval-time mutation race stays unclosable and disclosed).
+     */
+    fun isConsentStillPending(request: ConsentRequest, customRealmConfig: RealmConfiguration? = null): Boolean {
+        if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse()) return false
+        if (request.userId != AccountUtils.currentUserId) return false
+        return withPairingRealm(customRealmConfig) { realm ->
+            realm.where(PhotoPairing::class.java)
+                .equalTo(PhotoPairing::uri.name, request.uri)
+                .findFirst()?.let { row ->
+                    row.userId == request.userId &&
+                        row.driveId == request.driveId &&
+                        row.remoteFileId == request.remoteFileId &&
+                        row.remoteTrashPendingSince == request.pendingSince &&
+                        row.state != PhotoPairing.State.DENIED.name
+                } ?: false
+        }
+    }
+
+    /**
+     * Records the user's consent result for a pending cloud->device trash. The result is
+     * keyed to the SAME [ConsentRequest]: it applies only when the live row still matches
+     * the request's full identity (account, drive, remote file, consent stamp) AND belongs
+     * to the current account — a duplicate delivery, a result that raced a re-arm, a
+     * replaced pairing, or one from a switched account is dropped, never applied to a
+     * newer request. A grant re-activates the pairing; a DECLINE records the denial so the
+     * same remote trash is not re-asked on every pass — the denial expires when the remote
+     * is observed restored (the maintenance pass or [pollNextPendingConsent] clears the
+     * pending state and resets a DENIED row to ACTIVE) or the local content changes (a
+     * conflict state re-evaluates the pairing).
+     */
+    fun onRemoteTrashConsentResult(request: ConsentRequest, granted: Boolean, customRealmConfig: RealmConfiguration? = null) {
         withPairingRealm(customRealmConfig) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
-                    .equalTo(PhotoPairing::uri.name, uri)
+                    .equalTo(PhotoPairing::uri.name, request.uri)
                     .findFirst()?.let { row ->
                         if (row.userId != AccountUtils.currentUserId) return@let
-                        if (row.remoteTrashPendingSince != expectedPendingSince) return@let
+                        if (row.userId != request.userId ||
+                            row.driveId != request.driveId ||
+                            row.remoteFileId != request.remoteFileId ||
+                            row.remoteTrashPendingSince != request.pendingSince
+                        ) {
+                            return@let
+                        }
                         row.remoteTrashPendingSince = 0L
                         if (granted) {
                             row.lastRemoteTrashAppliedAt = System.currentTimeMillis()
@@ -373,7 +440,8 @@ object PhotoTrashController {
      * The durable serialized consent drain: the EXISTING pending row state
      * ([PhotoPairing.remoteTrashPendingSince]) IS the queue, so armed requests survive
      * process death and are re-surfaced on every app entry without any in-memory collector.
-     * Returns the OLDEST armed pairing that is STILL valid right now — fully revalidated at
+     * Returns the OLDEST armed request that is STILL valid right now, as its full-identity
+     * [ConsentRequest] — fully revalidated at
      * launch time (opt-in still on, fresh remote state still trashed with an unchanged bound
      * identity, local content present with an UNCHANGED digest — the destructive boundary
      * check of the cloud->device direction). The rules are re-run AS IF arming now
@@ -382,9 +450,9 @@ object PhotoTrashController {
      * place (a remote restore expires the pending state and any denial; a changed local
      * source is a conflict; unreadable or unbound content is inconclusive; a local item
      * already trashed makes the request moot) and the next row is polled, so a drain hands
-     * the caller at most ONE dialog request and a stale request can never reach the user.
-     * An unreachable remote is transient: the row stays armed for a later entry.
-     * null = nothing to ask right now.
+     * the caller at most ONE full-identity [ConsentRequest] and a stale request can never
+     * reach the user. An unreachable remote is transient: the row stays armed for a later
+     * entry. null = nothing to ask right now.
      *
      * THE UNCLOSEABLE APPROVAL RACE (disclosed, not closable app-side): arming a consent is
      * a permission grant — Android applies the MediaStore trash at the moment the user
@@ -393,7 +461,7 @@ object PhotoTrashController {
      * trashed by the approval itself. No lock or recheck can close a system-dialog window;
      * the residual window is bounded only by this fresh digest check at launch.
      */
-    suspend fun pollNextPendingConsent(context: Context, customRealmConfig: RealmConfiguration? = null): PhotoPairing? =
+    suspend fun pollNextPendingConsent(context: Context, customRealmConfig: RealmConfiguration? = null): ConsentRequest? =
         withContext(Dispatchers.IO) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext null
             if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse()) return@withContext null
@@ -404,6 +472,12 @@ object PhotoTrashController {
                 .sortedBy { it.remoteTrashPendingSince }
             for (pairing in armedRows) {
                 ensureActive()
+                // LIVE recheck per row: the opt-in/account gate ran once before the IO
+                // block, and this row's revalidation involves network + digest IO — the
+                // option or account could have changed in between. A changed gate ends
+                // the drain: nothing is returned, nothing is marked.
+                if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse()) return@withContext null
+                if (pairing.userId != AccountUtils.currentUserId) return@withContext null
                 // Revalidation evaluates the request AS IF arming it now (pendingSince = 0):
                 // the rules' "consent already outstanding -> None" guard exists for arming
                 // paths, not for validating an outstanding one. An unreachable remote is a
@@ -431,7 +505,25 @@ object PhotoTrashController {
                             markInconclusive(pairing.uri, customRealmConfig)
                             clearRemoteTrashPending(pairing.uri, customRealmConfig)
                         }
-                        DigestBoundary.VERIFIED -> return@withContext pairing
+                        DigestBoundary.VERIFIED -> {
+                            // FINAL gate at the hand-out point: the live checks ran before
+                            // this row's remote/digest IO — the option or account could
+                            // have changed DURING it. The request is handed out only when
+                            // the gate still holds now; otherwise the drain ends with
+                            // nothing surfaced and the row's state untouched.
+                            if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse() ||
+                                pairing.userId != AccountUtils.currentUserId
+                            ) {
+                                return@withContext null
+                            }
+                            return@withContext ConsentRequest(
+                                uri = pairing.uri,
+                                userId = pairing.userId,
+                                driveId = pairing.driveId,
+                                remoteFileId = pairing.remoteFileId,
+                                pendingSince = pairing.remoteTrashPendingSince,
+                            )
+                        }
                     }
                     is PhotoTrashRules.RemoteDecision.ClearPending -> clearRemoteTrashPending(pairing.uri, customRealmConfig)
                     is PhotoTrashRules.RemoteDecision.Conflict -> {
@@ -640,6 +732,42 @@ object PhotoTrashController {
         }
     }.onFailure { exception ->
         SentryLog.w(TAG, "Local content digest failed for $uriString (binding unavailable)", exception)
+    }.getOrNull()
+
+    /**
+     * ONE single-stream pass over the source computing BOTH receipts from the same
+     * snapshot: the server-algorithm (XXH3-64) digest and the local sha-256 receipt. The
+     * sha-256 receipt is returned ONLY when the same-pass XXH3 digest equals
+     * [serverHashCanonical] — the server-to-source identity proven against the exact
+     * bytes the receipt describes. A mismatch, an unreadable source, or a mid-read
+     * failure records nothing (null = unknown preserves).
+     */
+    private fun digestContentValidatedByServerHash(context: Context, uriString: String, serverHashCanonical: String): String? = runCatching {
+        val uri = android.net.Uri.parse(uriString)
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            // Every byte the XXH3 pass reads also updates the sha-256 receipt: both
+            // digests see ONE read sequence, so a mid-pass source change can neither
+            // split the two receipts nor validate one and record the other.
+            val localDigest = java.security.MessageDigest.getInstance("SHA-256")
+            val dualDigestSource = object : java.io.FilterInputStream(input) {
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    val read = super.read(b, off, len)
+                    if (read > 0) localDigest.update(b, off, read)
+                    return read
+                }
+
+                override fun read(): Int {
+                    val read = super.read()
+                    if (read >= 0) localDigest.update(read.toByte())
+                    return read
+                }
+            }
+            val serverAlgorithmDigest = PhotoTrashServerHash.hashStreaming(dualDigestSource)
+            val localReceipt = localDigest.digest().joinToString("") { "%02x".format(it) }
+            localReceipt.takeIf { serverAlgorithmDigest == serverHashCanonical }
+        }
+    }.onFailure { exception ->
+        SentryLog.w(TAG, "Server-to-source validation read failed for $uriString (binding unavailable)", exception)
     }.getOrNull()
 
     //endregion

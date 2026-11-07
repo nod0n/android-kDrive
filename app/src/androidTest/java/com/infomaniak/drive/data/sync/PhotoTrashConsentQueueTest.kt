@@ -36,6 +36,7 @@ import io.mockk.spyk
 import io.mockk.unmockkAll
 import io.realm.Realm
 import io.realm.RealmConfiguration
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import org.junit.jupiter.api.AfterAll
@@ -52,6 +53,7 @@ import org.junit.jupiter.api.TestInstance
 import java.io.ByteArrayInputStream
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import android.database.Cursor
 
@@ -92,6 +94,7 @@ class PhotoTrashConsentQueueTest {
     private val mediaTrashed = AtomicBoolean(false)
     private val remoteTrashed = AtomicBoolean(true)
     private val remoteHash = AtomicReference(pairingHash)
+    private val remoteQueryPauseMillis = AtomicLong(0L)
 
     private val fixtureName = "photoTrashConsentQueue-${UUID.randomUUID()}"
     private val config = RealmConfiguration.Builder()
@@ -134,6 +137,7 @@ class PhotoTrashConsentQueueTest {
             photoTrashSyncEnabled = true,
         )
         every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
+            remoteQueryGate()
             val requested = firstArg<File>()
             ApiResponse(
                 result = ApiResponseStatus.SUCCESS,
@@ -144,6 +148,15 @@ class PhotoTrashConsentQueueTest {
                     serverContentHash = remoteHash.get()
                 },
             )
+        }
+    }
+
+    /** A live account flip DURING the poll's remote IO must end the drain (softcheck #3):
+     *  tests park here, flip the identity, then release. */
+    private fun remoteQueryGate() {
+        val pauseMillis = remoteQueryPauseMillis.get()
+        if (pauseMillis > 0L) {
+            Thread.sleep(pauseMillis)
         }
     }
 
@@ -184,6 +197,19 @@ class PhotoTrashConsentQueueTest {
             .let { realm.copyFromRealm(it, 0) }
     }
 
+    /** The full scoped request identity MainActivity would have captured for a row. */
+    private fun consentRequest(
+        uri: String,
+        remoteFileId: Int,
+        stamp: Long,
+    ) = PhotoTrashController.ConsentRequest(
+        uri = uri,
+        userId = userId,
+        driveId = driveId,
+        remoteFileId = remoteFileId,
+        pendingSince = stamp,
+    )
+
     @Test
     @DisplayName("armed requests survive a restart with no collector and surface oldest first")
     fun armedRequestsSurviveRestartAndSurfaceOldestFirst() {
@@ -195,7 +221,7 @@ class PhotoTrashConsentQueueTest {
         val first = runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
             ?: throw AssertionError("the durable queue must resurface armed requests after a restart")
         assertEquals(uriA, first.uri, "the OLDEST armed request is surfaced first")
-        assertEquals(stampA, first.remoteTrashPendingSince, "the launch carries the consent stamp of that request")
+        assertEquals(stampA, first.pendingSince, "the launch carries the consent stamp of that request")
     }
 
     @Test
@@ -205,10 +231,10 @@ class PhotoTrashConsentQueueTest {
         seedArmedRow(uriB, remoteFileIdB, stampB)
 
         assertEquals(uriA, runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }?.uri)
-        PhotoTrashController.onRemoteTrashConsentResult(uriA, granted = true, expectedPendingSince = stampA, customRealmConfig = config)
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdA, stampA), granted = true, customRealmConfig = config)
 
         assertEquals(uriB, runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }?.uri, "the second item is only offered after the first result")
-        PhotoTrashController.onRemoteTrashConsentResult(uriB, granted = true, expectedPendingSince = stampB, customRealmConfig = config)
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriB, remoteFileIdB, stampB), granted = true, customRealmConfig = config)
 
         assertNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "the queue drains to empty")
         assertEquals(0L, row(uriA).remoteTrashPendingSince)
@@ -222,13 +248,13 @@ class PhotoTrashConsentQueueTest {
         seedArmedRow(uriB, remoteFileIdB, stampB)
 
         assertEquals(uriA, runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }?.uri)
-        PhotoTrashController.onRemoteTrashConsentResult(uriA, granted = false, expectedPendingSince = stampA, customRealmConfig = config)
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdA, stampA), granted = false, customRealmConfig = config)
         assertEquals(PhotoPairing.State.DENIED.name, row(uriA).state, "the denial is recorded")
 
         val next = runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
         assertEquals(uriB, next?.uri, "the denial does not block the second request")
         assertNotNull(next)
-        PhotoTrashController.onRemoteTrashConsentResult(uriB, granted = true, expectedPendingSince = stampB, customRealmConfig = config)
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriB, remoteFileIdB, stampB), granted = true, customRealmConfig = config)
         assertEquals(PhotoPairing.State.ACTIVE.name, row(uriB).state)
     }
 
@@ -237,13 +263,13 @@ class PhotoTrashConsentQueueTest {
     fun duplicateAndStaleResultsAreDropped() {
         seedArmedRow(uriA, remoteFileIdA, stampA)
 
-        PhotoTrashController.onRemoteTrashConsentResult(uriA, granted = true, expectedPendingSince = stampA, customRealmConfig = config)
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdA, stampA), granted = true, customRealmConfig = config)
         val appliedAt = row(uriA).lastRemoteTrashAppliedAt
         assertTrue(appliedAt > 0L)
 
         // A DUPLICATE delivery of the same result: the stamp no longer matches (the row was
         // already consumed) — dropped, never re-applied.
-        PhotoTrashController.onRemoteTrashConsentResult(uriA, granted = true, expectedPendingSince = stampA, customRealmConfig = config)
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdA, stampA), granted = true, customRealmConfig = config)
         assertEquals(appliedAt, row(uriA).lastRemoteTrashAppliedAt, "the duplicate result did not re-apply")
 
         // A re-arm, then a STALE result from the older request: dropped, the newer request
@@ -255,9 +281,13 @@ class PhotoTrashConsentQueueTest {
                 }
             }
         }
-        PhotoTrashController.onRemoteTrashConsentResult(uriA, granted = false, expectedPendingSince = stampA, customRealmConfig = config)
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdA, stampA), granted = false, customRealmConfig = config)
         assertEquals(5_000L, row(uriA).remoteTrashPendingSince, "the stale result did not touch the newer request")
         assertEquals(PhotoPairing.State.ACTIVE.name, row(uriA).state, "the stale denial was not recorded")
+
+        // A MISMATCHED identity (right uri+stamp, WRONG remote file): dropped, never applied.
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdB, 5_000L), granted = true, customRealmConfig = config)
+        assertEquals(5_000L, row(uriA).remoteTrashPendingSince, "a wrong-pair result did not consume the request")
     }
 
     @Test
@@ -268,7 +298,7 @@ class PhotoTrashConsentQueueTest {
         // Account switch: the queue serves only the CURRENT account's rows.
         every { AccountUtils.currentUserId } returns userId + 1
         assertNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "another account's armed rows are not offered")
-        PhotoTrashController.onRemoteTrashConsentResult(uriA, granted = true, expectedPendingSince = stampA, customRealmConfig = config)
+        PhotoTrashController.onRemoteTrashConsentResult(consentRequest(uriA, remoteFileIdA, stampA), granted = true, customRealmConfig = config)
         assertEquals(stampA, row(uriA).remoteTrashPendingSince, "a result from a switched account is dropped")
 
         // Back on the owner account, an opt-out stops the drain but keeps the row state.
@@ -280,6 +310,25 @@ class PhotoTrashConsentQueueTest {
         )
         assertNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "an opt-out stops the queue")
         assertEquals(stampA, row(uriA).remoteTrashPendingSince, "the armed request is preserved until the option returns")
+    }
+
+    @Test
+    @DisplayName("an account switched DURING the poll's remote IO ends the drain without launching")
+    fun accountSwitchMidPollEndsTheDrain() {
+        seedArmedRow(uriA, remoteFileIdA, stampA)
+        remoteQueryPauseMillis.set(300L)
+
+        val surfaced = runBlocking {
+            val poll = async { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
+            // The account is switched WHILE the poll sits in its remote-details IO.
+            Thread.sleep(100)
+            every { AccountUtils.currentUserId } returns userId + 1
+            poll.await()
+        }
+
+        assertNull(surfaced, "a drain that lost its account mid-flight launches nothing")
+        assertEquals(stampA, row(uriA).remoteTrashPendingSince, "the request stays armed for the owner account")
+        assertEquals(PhotoPairing.State.ACTIVE.name, row(uriA).state, "no state was written by the unauthorized drain")
     }
 
     @Test
