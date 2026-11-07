@@ -149,7 +149,13 @@ class DownloadOfflineFileManager(
             return ListenableWorker.Result.success()
         }
 
-        if (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) return ListenableWorker.Result.success()
+        when (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) {
+            CacheMoveOutcome.MOVED -> return ListenableWorker.Result.success()
+            // R1 (FHNW-caf1): the authority was declined inside the move seam itself — the
+            // cache bytes are preserved where they are, nothing was published.
+            CacheMoveOutcome.OWNERSHIP_STALE -> return ListenableWorker.Result.success()
+            CacheMoveOutcome.NOT_INTACT -> Unit // continue below
+        }
 
         if (file.isOfflineAndIntact(offlineFile)) {
             // We can have this case for example when we try to put a lot of files at once in offline mode
@@ -241,13 +247,41 @@ class DownloadOfflineFileManager(
         }
     }
 
+    /** Outcome of the cache-move entry (R1, FHNW-caf1): the move is the seam's FIRST
+     *  irreversible effect, so the stale-ownership authority is decided inside the same
+     *  dispatch, immediately before it. */
+    private enum class CacheMoveOutcome { MOVED, NOT_INTACT, OWNERSHIP_STALE }
+
     private suspend fun moveCacheFileIfIntact(
         context: Context,
         file: File,
         cacheFile: IOFile,
         offlineFile: IOFile,
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): CacheMoveOutcome = withContext(Dispatchers.IO) {
         if (!file.isObsoleteOrNotIntact(cacheFile)) {
+            // R1 (FHNW-caf1 addendum C): the by-id cache file survives a row move (it is
+            // addressed by id, not by path), so a moved-out root-owned row's previously-
+            // viewed bytes are intact HERE — and moving them would publish a persistent
+            // offline copy at the moved-out location through the accepted-publication seam
+            // (whose live-intent check still passes: the pending marker stands). The
+            // stale-ownership authority is re-derived in THIS dispatch, immediately before
+            // the move: recorded ownership without live coverage (and not directly pinned)
+            // means the root contract's reach ended — a cached tree update moved the row
+            // out while the chain ran. On a decline the cache bytes are PRESERVED where
+            // they are (preserving beats move-then-delete); the seam's in-record refusal
+            // stays as the state-write defense for a move-out landing inside the residual
+            // check-to-move gap (a non-participating tree writer — the design's disclosed
+            // window).
+            val staleOwnership = FileController.getRealmInstance(userDrive).use { realm ->
+                FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
+                    row.offlineOwnedByRoot && !row.isDirectlyPinned &&
+                        !OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, userDrive)
+                } ?: false
+            }
+            if (staleOwnership) {
+                SentryLog.w(TAG, "Root ownership stale before the cache move for ${file.id}; cache bytes preserved, nothing published")
+                return@withContext CacheMoveOutcome.OWNERSHIP_STALE
+            }
             Utils.moveCacheFileToOffline(file, cacheFile, offlineFile)
             // The moved bytes come from the cache, not from this transfer: their content is
             // NOT proven to match the current remote identity (metadata equality is not proof
@@ -255,9 +289,9 @@ class DownloadOfflineFileManager(
             // next maintenance pass then performs one verified body fetch and completes it.
             notifyCompleted(file, offlineFile, context, acceptedServerHash = null)
             lastDownloadedFile = offlineFile
-            return@withContext true
+            return@withContext CacheMoveOutcome.MOVED
         }
-        return@withContext false
+        return@withContext CacheMoveOutcome.NOT_INTACT
     }
 
     private suspend fun getFileFromRemote(

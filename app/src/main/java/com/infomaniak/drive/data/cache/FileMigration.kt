@@ -490,8 +490,13 @@ class FileMigration : RealmMigration {
                                 row.setBoolean(File::offlineOwnedByRoot.name, true)
                                 break
                             }
+                            // The walk is DRIVE-SCOPED: file ids are per-drive sequences, so the
+                            // same id exists on several drives of one realm — an unscoped lookup
+                            // could route the chain through ANOTHER drive's rows and derive a
+                            // false ownership (the 18→19 fixture's same-ids twin pins this).
                             val parent = realm.where(File::class.java.simpleName)
                                 .equalTo(File::id.name, parentId)
+                                .equalTo(File::driveId.name, row.getInt(File::driveId.name))
                                 .findFirst() ?: break
                             // parentId is a REQUIRED Int column: an absent parent holds the
                             // 0 default, whose lookup below finds no row and ends the walk.
