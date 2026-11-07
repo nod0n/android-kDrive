@@ -86,6 +86,20 @@ class DownloadOfflineFileManager(
         onProgress: (progress: Int, fileId: Int) -> Unit,
     ): ListenableWorker.Result {
 
+        // Stale-work gate FIRST, before any filesystem effect: this worker only ever
+        // downloads for live offline intent. If the current row carries none — the root was
+        // unmarked, the pin withdrawn, a release applied — any queued work (initial bulk
+        // chain, retry, a download enqueued before an unmark) is stale: no cache move, no
+        // delete-then-transfer, no resurrection of a preserved copy.
+        val liveIntent = FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.getFileProxyById(file.id, customRealm = realm)
+                ?.let { OfflineFolderSyncUtils.hasLiveOfflineIntent(it, realm, userDrive) } == true
+        }
+        if (!liveIntent) {
+            SentryLog.d(TAG, "Stale offline download skipped for ${file.id}: no live offline intent")
+            return ListenableWorker.Result.success()
+        }
+
         val file = getFileFromRemote(context, file.id, userDrive)
         currentFile = file
         val cacheFile = file.getCacheFile(context, userDrive)
@@ -262,8 +276,11 @@ class DownloadOfflineFileManager(
     /**
      * The freshly accepted bytes are on disk: the publication seam records the basis (it also
      * sets [File.isOffline], under its live-intent gate — an unpin or release that happened
-     * during the transfer is not overridden). The captured with=hash identity describes THESE
-     * bytes, because they were just fetched from the server.
+     * during the transfer is not overridden). When the intent was withdrawn mid-transfer, the
+     * just-written bytes are unwanted and unrecorded: they are removed, so no unrecorded copy
+     * lingers at the offline path and the unmark's post-condition (copy gone) is restored.
+     * The captured with=hash identity describes THESE bytes, because they were just fetched
+     * from the server; the cache-move path passes null (unknown identity).
      */
     private suspend fun notifyCompleted(
         file: File,
@@ -272,7 +289,11 @@ class DownloadOfflineFileManager(
         acceptedServerHash: String?,
     ) {
         offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
-        OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
+        val outcome = OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
+        if (outcome == OfflineFolderSyncUtils.PublicationOutcome.INTENT_WITHDRAWN) {
+            runCatching { if (offlineFile.exists()) offlineFile.delete() }
+                .onFailure { SentryLog.e(TAG, "Could not clean up the withdrawn offline copy of ${file.id}", it) }
+        }
         if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
         fileDownloaded(context, file.id)
     }

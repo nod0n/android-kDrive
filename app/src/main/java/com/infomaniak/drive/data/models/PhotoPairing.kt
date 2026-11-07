@@ -62,5 +62,12 @@ open class PhotoPairing(
         CONFLICT_REMOTE_CHANGED,
         /** Last observation was inconclusive (missing volume, revoked access, transient error). */
         INCONCLUSIVE,
+        /**
+         * The user declined the pending cloud->device trash consent. The denial is respected
+         * until the remote file is restored (ClearPending expires it) or the local content
+         * changes (a conflict re-evaluates the pairing) — without a remote trash timestamp,
+         * re-asking on every pass would be a consent nagging loop.
+         */
+        DENIED,
     }
 }

@@ -139,7 +139,10 @@ class UploadMigration : RealmMigration {
                     addField(PhotoPairing::localSizeAtPairing.name, Long::class.java, FieldAttribute.REQUIRED)
                     addField(PhotoPairing::localModifiedAtPairing.name, Long::class.java, FieldAttribute.REQUIRED)
                     addField(PhotoPairing::pairedAt.name, Date::class.java)
-                    addField(PhotoPairing::baselineTrashed.name, Boolean::class.java) // boxed -> nullable
+                    // The model declares Boolean? (baseline pending until actually observed):
+                    // the column must be BOXED/nullable, never a REQUIRED primitive, or the
+                    // migrated schema would not validate against the typed module.
+                    addField(PhotoPairing::baselineTrashed.name, Boolean::class.javaObjectType)
                     addField(PhotoPairing::lastObservedTrashed.name, Boolean::class.java, FieldAttribute.REQUIRED)
                     addField(PhotoPairing::lastLocalTrashReconciledAt.name, Long::class.java, FieldAttribute.REQUIRED)
                     addField(PhotoPairing::remoteTrashPendingSince.name, Long::class.java, FieldAttribute.REQUIRED)

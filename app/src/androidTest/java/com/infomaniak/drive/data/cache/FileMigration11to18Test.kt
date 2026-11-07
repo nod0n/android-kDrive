@@ -38,15 +38,15 @@ import java.util.UUID
  * engine and CANNOT open on the JVM; this is why the test lives here and not under src/test).
  *
  * Version 11 is the PUBLIC BASELINE schema (origin/main), so the true v11 shape is exactly the
- * current [RealmModules.LocalFilesModule] classes MINUS this branch's additions: the five new
+ * current [RealmModules.LocalFilesModule] classes MINUS this branch's additions: the six new
  * File fields (isDirectlyPinned, offlineBasisModifiedAt, offlineBasisSize, offlineContentDigest,
- * serverContentHash) and the whole OfflineFolderRoot table. Following the T-0079 pattern:
+ * serverContentHash, offlinePublishedPath) and the whole OfflineFolderRoot table. Following the T-0079 pattern:
  *  (A) create a disposable TYPED realm at the FULL current module schema STAMPED 11,
  *  (B) open the SAME file as a [DynamicRealm] at 11 and remove ONLY this branch's additions —
  *      the file then holds the TRUE v11 shape, verified by a schema audit before closing,
  *  (C) reopen at [FileMigration.DB_VERSION] (18) with the REAL [FileMigration] and the FULL
  *      production module — exactly what a production upgrade executes — and audit ONLY the
- *      11→18 difference: the five columns exist with the right nullability, the registered
+ *      11→18 difference: the six columns exist with the right nullability, the registered
  *      OfflineFolderRoot table exists empty, the pre-existing pin reads back as a direct pin,
  *      nothing else was invented, every pre-existing field is preserved, and the new nullable
  *      columns are writable.
@@ -95,6 +95,7 @@ class FileMigration11to18Test {
         File::offlineBasisSize.name,
         File::offlineContentDigest.name,
         File::serverContentHash.name,
+        File::offlinePublishedPath.name,
     )
 
     /** A baseline pin: the persistent state in the public baseline is isOffline (not the
@@ -172,9 +173,11 @@ class FileMigration11to18Test {
             assertTrue(fileSchema.hasField(File::offlineBasisSize.name), "the migration adds the basis size")
             assertTrue(fileSchema.hasField(File::offlineContentDigest.name), "the migration adds the basis digest")
             assertTrue(fileSchema.hasField(File::serverContentHash.name), "the migration adds the server hash identity")
+            assertTrue(fileSchema.hasField(File::offlinePublishedPath.name), "the migration adds the published path")
             assertTrue(fileSchema.isNullable(File::offlineBasisSize.name), "the basis size is nullable")
             assertTrue(fileSchema.isNullable(File::offlineContentDigest.name), "the digest is nullable")
             assertTrue(fileSchema.isNullable(File::serverContentHash.name), "the server hash is nullable")
+            assertTrue(fileSchema.isNullable(File::offlinePublishedPath.name), "the published path is nullable")
             assertFalse(fileSchema.isNullable(File::isDirectlyPinned.name), "the direct-pin provenance is required")
             assertFalse(fileSchema.isNullable(File::offlineBasisModifiedAt.name), "the basis timestamp is required")
             assertEquals(

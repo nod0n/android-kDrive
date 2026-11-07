@@ -171,6 +171,7 @@ object PhotoTrashController {
             if (pairing.remoteTrashPendingSince == 0L && remote.reachable && remote.isTrashed) {
                 val remoteDecision = PhotoTrashRules.decideRemotePropagation(
                     pendingSince = pairing.remoteTrashPendingSince,
+                    denied = pairing.state == PhotoPairing.State.DENIED.name,
                     local = local,
                     remote = remote,
                     pairingSize = pairing.localSizeAtPairing,
@@ -202,6 +203,7 @@ object PhotoTrashController {
 
         return when (val decision = PhotoTrashRules.decideRemotePropagation(
             pendingSince = pairing.remoteTrashPendingSince,
+            denied = pairing.state == PhotoPairing.State.DENIED.name,
             local = local,
             remote = remote,
             pairingSize = pairing.localSizeAtPairing,
@@ -220,7 +222,12 @@ object PhotoTrashController {
         }
     }
 
-    /** Records the user's consent result for a pending cloud->device trash. */
+    /**
+     * Records the user's consent result for a pending cloud->device trash. A grant re-activates
+     * the pairing; a DECLINE records the denial so the same remote trash is not re-asked on
+     * every pass — the denial expires when the remote is restored (ClearPending) or the local
+     * content changes (a conflict state re-evaluates the pairing).
+     */
     fun onRemoteTrashConsentResult(uri: String, granted: Boolean) {
         UploadFile.getRealmInstance().use { realm ->
             realm.executeTransaction { mutableRealm ->
@@ -228,7 +235,12 @@ object PhotoTrashController {
                     .equalTo(PhotoPairing::uri.name, uri)
                     .findFirst()?.let { row ->
                         row.remoteTrashPendingSince = 0L
-                        if (granted) row.lastRemoteTrashAppliedAt = System.currentTimeMillis()
+                        if (granted) {
+                            row.lastRemoteTrashAppliedAt = System.currentTimeMillis()
+                            row.state = PhotoPairing.State.ACTIVE.name
+                        } else {
+                            row.state = PhotoPairing.State.DENIED.name
+                        }
                     }
             }
         }

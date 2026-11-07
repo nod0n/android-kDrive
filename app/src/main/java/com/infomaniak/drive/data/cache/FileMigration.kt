@@ -388,9 +388,11 @@ class FileMigration : RealmMigration {
 
         // Migrated to version 18:
         // - Recursive offline folders: new OfflineFolderRoot table; File.isDirectlyPinned
-        //   (pin provenance), File.serverContentHash (official with=hash identity) and the
+        //   (pin provenance), File.serverContentHash (official with=hash identity), the
         //   publication basis fields (offlineBasisModifiedAt/offlineBasisSize/
-        //   offlineContentDigest) used for local-edit and change classification.
+        //   offlineContentDigest) used for local-edit and change classification, and
+        //   File.offlinePublishedPath (where the accepted bytes live, so server-side
+        //   renames relocate the copy instead of orphaning or re-downloading it).
         // Versions 12..17 only ever existed on the uninstalled offline-folder development
         // branch. The one actually installed source above 11 is the T-0079 device test build
         // at version 17; this block migrates it too: existing pins are preserved as direct
@@ -412,6 +414,9 @@ class FileMigration : RealmMigration {
                 }
                 if (!hasField(File::serverContentHash.name)) {
                     addField(File::serverContentHash.name, String::class.java)
+                }
+                if (!hasField(File::offlinePublishedPath.name)) {
+                    addField(File::offlinePublishedPath.name, String::class.java)
                 }
             }
 

@@ -89,6 +89,7 @@ class FileMigration17to18Test {
         File::offlineBasisModifiedAt.name,
         File::offlineBasisSize.name,
         File::offlineContentDigest.name,
+        File::offlinePublishedPath.name,
     )
 
     /** The dev columns that v17 HAD and this branch's schema does not declare. */

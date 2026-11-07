@@ -186,6 +186,7 @@ class PhotoTrashRulesTest {
     fun `an unreadable local row never arms a remote-trash consent either`() {
         val decision = PhotoTrashRules.decideRemotePropagation(
             pendingSince = 0L,
+            denied = false,
             local = LocalObservation(exists = true, isTrashed = false, size = null, lastModified = null),
             remote = unchangedRemote.copy(isTrashed = true),
             pairingSize = pairingSize,
@@ -244,6 +245,7 @@ class PhotoTrashRulesTest {
     fun `a remote trash arms exactly one pending consent`() {
         val first = PhotoTrashRules.decideRemotePropagation(
             pendingSince = 0L,
+            denied = false,
             local = unchangedLocal,
             remote = unchangedRemote.copy(isTrashed = true),
             pairingSize = pairingSize,
@@ -253,6 +255,7 @@ class PhotoTrashRulesTest {
 
         val second = PhotoTrashRules.decideRemotePropagation(
             pendingSince = 42L,
+            denied = false,
             local = unchangedLocal,
             remote = unchangedRemote.copy(isTrashed = true),
             pairingSize = pairingSize,
@@ -265,6 +268,7 @@ class PhotoTrashRulesTest {
     fun `a remote restore clears a stale pending consent`() {
         val decision = PhotoTrashRules.decideRemotePropagation(
             pendingSince = 42L,
+            denied = false,
             local = unchangedLocal,
             remote = unchangedRemote.copy(isTrashed = false),
             pairingSize = pairingSize,
@@ -277,6 +281,7 @@ class PhotoTrashRulesTest {
     fun `a locally edited photo is not trashed on the device under the old pairing`() {
         val decision = PhotoTrashRules.decideRemotePropagation(
             pendingSince = 0L,
+            denied = false,
             local = unchangedLocal.copy(lastModified = 5_000L),
             remote = unchangedRemote.copy(isTrashed = true),
             pairingSize = pairingSize,
@@ -289,6 +294,7 @@ class PhotoTrashRulesTest {
     fun `an unreachable remote with no pending state is inconclusive`() {
         val decision = PhotoTrashRules.decideRemotePropagation(
             pendingSince = 0L,
+            denied = false,
             local = unchangedLocal,
             remote = unreachableRemote,
             pairingSize = pairingSize,
@@ -301,12 +307,67 @@ class PhotoTrashRulesTest {
     fun `a missing local row cannot be trashed on the device`() {
         val decision = PhotoTrashRules.decideRemotePropagation(
             pendingSince = 0L,
+            denied = false,
             local = LocalObservation(exists = false, isTrashed = false),
             remote = unchangedRemote.copy(isTrashed = true),
             pairingSize = pairingSize,
             pairingModifiedAt = pairingModifiedAt,
         )
         assertEquals(RemoteDecision.Inconclusive, decision)
+    }
+
+    @Test
+    fun `a pairing whose local item is already trashed never arms a device-trash consent`() {
+        // Both sides trashed is a CONSISTENT state: asking the user to trash an item that is
+        // already in the local trash would be a nonsense dialog on every pass.
+        val decision = PhotoTrashRules.decideRemotePropagation(
+            pendingSince = 0L,
+            denied = false,
+            local = trashedLocal,
+            remote = unchangedRemote.copy(isTrashed = true),
+            pairingSize = pairingSize,
+            pairingModifiedAt = pairingModifiedAt,
+        )
+        assertEquals(RemoteDecision.None, decision)
+    }
+
+    @Test
+    fun `a declined consent is not re-armed on every pass`() {
+        // Regression: after a denial the remote stays trashed and the local copy unchanged —
+        // indistinguishable from a fresh remote trash without a denial memory, which used to
+        // re-open the consent dialog endlessly.
+        val decision = PhotoTrashRules.decideRemotePropagation(
+            pendingSince = 0L,
+            denied = true,
+            local = unchangedLocal,
+            remote = unchangedRemote.copy(isTrashed = true),
+            pairingSize = pairingSize,
+            pairingModifiedAt = pairingModifiedAt,
+        )
+        assertEquals(RemoteDecision.None, decision)
+    }
+
+    @Test
+    fun `a denial expires when the remote is restored, so a future trash re-arms`() {
+        val restored = PhotoTrashRules.decideRemotePropagation(
+            pendingSince = 0L,
+            denied = true,
+            local = unchangedLocal,
+            remote = unchangedRemote.copy(isTrashed = false),
+            pairingSize = pairingSize,
+            pairingModifiedAt = pairingModifiedAt,
+        )
+        assertEquals(RemoteDecision.ClearPending, restored)
+
+        val reTrashed = PhotoTrashRules.decideRemotePropagation(
+            pendingSince = 0L,
+            denied = false, // ClearPending expired the denial in the controller
+            local = unchangedLocal,
+            remote = unchangedRemote.copy(isTrashed = true),
+            pairingSize = pairingSize,
+            pairingModifiedAt = pairingModifiedAt,
+        )
+        assertEquals(RemoteDecision.RequestConsent, reTrashed)
     }
 
     //endregion

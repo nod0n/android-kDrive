@@ -108,10 +108,13 @@ object PhotoTrashRules {
     /**
      * Decision for one cloud-side event (MQTT or batched catch-up). The caller must have
      * verified the current remote state before asking for consent; a stale pending request is
-     * cleared when the remote is no longer trashed.
+     * cleared when the remote is no longer trashed. A pairing the user already declined
+     * ([denied]) is not re-armed on every pass: without a remote trash timestamp a decline
+     * can only expire when the remote is restored or the local content changes.
      */
     fun decideRemotePropagation(
         pendingSince: Long,
+        denied: Boolean,
         local: LocalObservation?,
         remote: RemoteObservation,
         pairingSize: Long,
@@ -121,6 +124,8 @@ object PhotoTrashRules {
         !remote.isTrashed -> RemoteDecision.ClearPending // restored remotely (or stale event): re-arm
         pendingSince > 0L -> RemoteDecision.None // consent already outstanding
         local == null || !local.exists -> RemoteDecision.Inconclusive
+        local.isTrashed -> RemoteDecision.None // both sides trashed: consistent, nothing to consent to
+        denied -> RemoteDecision.None // the user declined this trash; respect it until it expires
         // Arming a consent dialog is an action too: without a readable content binding the
         // pairing cannot be told apart from replaced content, so it stays inconclusive.
         local.size == null || local.lastModified == null -> RemoteDecision.Inconclusive

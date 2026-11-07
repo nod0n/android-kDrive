@@ -378,6 +378,15 @@ object FileController {
                 currentRealm.executeTransaction {
                     getFileById(currentRealm, fileId)?.let { file ->
                         file.isOffline = isOffline
+                        if (!isOffline) {
+                            // Withdrawn offline intent must clear EVERY intent signal — a
+                            // surviving pending marker or direct pin would authorize stale
+                            // queued work and resurrect the copy the user just removed. The
+                            // publication basis is deliberately kept: it is evidence for
+                            // preserved-byte decisions, not an intent signal.
+                            file.isMarkedAsOffline = false
+                            file.isDirectlyPinned = false
+                        }
                     }
                 }
             }
@@ -1013,6 +1022,7 @@ object FileController {
         offlineBasisModifiedAt = oldFile.offlineBasisModifiedAt
         offlineBasisSize = oldFile.offlineBasisSize
         offlineContentDigest = oldFile.offlineContentDigest
+        offlinePublishedPath = oldFile.offlinePublishedPath
         // serverContentHash is the identity OF THE ACCEPTED BYTES (the publication basis), not
         // the current remote metadata: it must survive every listing/details refresh unchanged
         // and advance only through the verified publication paths (the download seam, a

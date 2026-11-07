@@ -566,6 +566,9 @@ class MainViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             FileController.updateOfflineStatus(file.id, isOffline = false)
             FileController.setDirectlyPinned(fileId = file.id, isDirectlyPinned = false) // direct pin intent withdrawn
+            // A surviving pending marker would authorize stale queued work to resurrect the
+            // copy the user just removed.
+            FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false)
         }
         deleteFile(file, offlineFile, cacheFile, userDrive, onFileRemovedFromOffline)
     }

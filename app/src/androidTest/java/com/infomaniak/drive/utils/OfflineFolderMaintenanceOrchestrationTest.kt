@@ -23,10 +23,12 @@ import com.infomaniak.core.network.models.ApiResponse
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
+import com.infomaniak.drive.data.models.OfflineFolderRoot
 import com.infomaniak.drive.data.models.UserDrive
 import io.mockk.MockKAnnotations
 import io.mockk.coEvery
 import io.mockk.every
+import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkAll
 import io.realm.Realm
@@ -40,6 +42,7 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
@@ -160,6 +163,12 @@ class OfflineFolderMaintenanceOrchestrationTest {
         offlineFile.parentFile?.mkdirs()
         offlineFile.writeBytes(bodyBytes)
         check(offlineFile.setLastModified(modifiedAtSec * 1000)) { "fixture bytes must carry the basis mtime" }
+        // The publication seam records where the accepted bytes live; do the same here.
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()?.offlinePublishedPath = offlineFile.path
+            }
+        }
     }
 
     private fun getOfflineFixtureFile(): JavaFile {
@@ -250,6 +259,165 @@ class OfflineFolderMaintenanceOrchestrationTest {
         assertEquals(2L, detailsRequests.get())
         assertEquals(0L, bodyRequests.get())
         assertTrue(offlineFile.readBytes().contentEquals(bodyV1))
+    }
+
+    @Test
+    @DisplayName("a deleted local copy with an unchanged remote is restored with exactly one body")
+    fun deletedCopyIsRestoredWithExactlyOneBody() {
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_000L, hash = "hash-1")
+        val offlineFile = getOfflineFixtureFile()
+        lastAnswerBody.set(bodyV1)
+
+        // The user (or storage cleanup) removes the local bytes; the row keeps its basis.
+        check(offlineFile.delete()) { "fixture setup: the copy must be removable" }
+
+        // Pass 1: MISSING -> one staged body republishes the copy.
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+        refresh()
+        assertEquals(1L, bodyRequests.get(), "a missing copy costs exactly one body")
+        assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(bodyV1), "the copy is restored")
+
+        // Pass 2: intact again -> details only, no repeated body.
+        refresh()
+        assertEquals(2L, detailsRequests.get())
+        assertEquals(1L, bodyRequests.get(), "no repeated body for the restored copy")
+        assertTrue(offlineFile.readBytes().contentEquals(bodyV1))
+    }
+
+    @Test
+    @DisplayName("a server-side rename relocates the accepted copy instead of re-downloading it")
+    fun serverRenameRelocatesTheAcceptedCopy() {
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_000L, hash = "hash-1")
+        val oldOfflineFile = getOfflineFixtureFile()
+        lastAnswerBody.set(bodyV2) // must never be fetched
+
+        // Simulate the listing refresh for a renamed file: row name and path move on.
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()?.apply {
+                    name = "fixture-orch-renamed.bin"
+                    path = "Private/fixture-orch-renamed.bin"
+                }
+            }
+        }
+        val newOfflineFile = getOfflineFixtureFile()
+        check(newOfflineFile.path != oldOfflineFile.path) { "fixture setup: the rename must move the location" }
+
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+        refresh()
+
+        assertEquals(0L, bodyRequests.get(), "a relocated copy is never re-downloaded")
+        assertEquals(1L, detailsRequests.get())
+        assertTrue(newOfflineFile.exists() && newOfflineFile.readBytes().contentEquals(bodyV1), "the bytes moved to the renamed location")
+        assertTrue(!oldOfflineFile.exists(), "no orphan copy is left at the old path")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertEquals(newOfflineFile.path, row.offlinePublishedPath)
+            assertEquals("hash-1", row.serverContentHash)
+            assertEquals(sha256Hex(bodyV1), row.offlineContentDigest)
+        }
+    }
+
+    @Test
+    @DisplayName("a renamed location does not un-protect a same-stat local edit")
+    fun renameRelocatesAndStillPreservesASameStatEdit() {
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_000L, hash = "hash-1")
+        val oldOfflineFile = getOfflineFixtureFile()
+        lastAnswerBody.set(bodyV2) // must never be fetched
+
+        // Same-stat edit at the OLD location, then the server renames the file.
+        oldOfflineFile.writeBytes(editedBody)
+        check(oldOfflineFile.setLastModified(1_700_000_000L * 1000)) { "fixture edit must keep the basis mtime" }
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()?.apply {
+                    name = "fixture-orch-renamed.bin"
+                    path = "Private/fixture-orch-renamed.bin"
+                }
+            }
+        }
+        val newOfflineFile = getOfflineFixtureFile()
+
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+        refresh()
+
+        assertEquals(0L, bodyRequests.get(), "edited bytes are never re-downloaded over")
+        assertTrue(newOfflineFile.exists() && newOfflineFile.readBytes().contentEquals(editedBody), "the edited bytes were relocated, not replaced")
+        assertTrue(!oldOfflineFile.exists(), "no orphan copy is left at the old path")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertEquals("hash-1", row.serverContentHash, "the metadata-only adoption was refused: the digest diverges")
+            assertEquals(sha256Hex(bodyV1), row.offlineContentDigest, "the basis still describes the preserved publication")
+            assertEquals(1_700_000_000L, row.offlineBasisModifiedAt)
+        }
+    }
+
+    @Test
+    @DisplayName("a stale queued common worker after an unmark neither touches preserved bytes nor resurrects offline state")
+    fun staleWorkerAfterUnmarkPreservesEditedBytes() {
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_000L, hash = "hash-1")
+        val offlineFile = getOfflineFixtureFile()
+        lastAnswerBody.set(bodyV2) // must never be fetched
+
+        // The file lives inside a marked root (parent chain), and the user edited the copy
+        // without changing size or mtime.
+        val folderId = 800_401
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.createObject(File::class.java, "${folderId}_${userDrive.driveId}").apply {
+                    id = folderId
+                    driveId = userDrive.driveId
+                    name = "fixture-orch-folder"
+                    path = "Private/fixture-orch-folder"
+                    type = "dir"
+                }
+                transactionRealm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()?.parentId = folderId
+                transactionRealm.createObject(
+                    OfflineFolderRoot::class.java,
+                    OfflineFolderRoot.buildUid(folderId, userDrive.driveId, userDrive.userId),
+                ).apply {
+                    this.folderId = folderId
+                    driveId = userDrive.driveId
+                    userId = userDrive.userId
+                }
+            }
+        }
+        offlineFile.writeBytes(editedBody)
+        check(offlineFile.setLastModified(1_700_000_000L * 1000)) { "fixture edit must keep the basis mtime" }
+
+        // The explicit unmark: the edited bytes are preserved, coverage released, the root row gone.
+        val unmarkConfirmed = runBlocking { OfflineFolderSyncUtils.unmarkFolderOffline(context, folderRow(folderId), userDrive) }
+        assertTrue(unmarkConfirmed, "the unmark completes (nothing refused)")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            assertTrue(realm.where(OfflineFolderRoot::class.java).count() == 0L, "the root row is removed")
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(!row.isOffline && !row.isMarkedAsOffline && !row.isDirectlyPinned, "no intent signal survives")
+            assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(editedBody), "the unmark preserved the edited bytes")
+        }
+
+        // The stale queued common worker then runs: the top gate sees no live intent and
+        // performs no filesystem effect at all.
+        val manager = DownloadOfflineFileManager(
+            userDrive = userDrive,
+            filesCount = 1,
+            downloadWorker = mockk(relaxed = true),
+            notificationManagerCompat = mockk(relaxed = true),
+        )
+        val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
+
+        assertTrue(result.toString().contains("Success"), "stale work completes silently")
+        assertEquals(0L, bodyRequests.get(), "the stale worker never fetches a body")
+        assertEquals(0L, detailsRequests.get(), "the stale worker never even refreshes details")
+        assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(editedBody), "the preserved bytes are untouched")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(!row.isOffline, "no offline resurrection")
+            assertNull(row.serverContentHash, "no identity is bound to the preserved bytes")
+        }
+    }
+
+    private fun folderRow(folderId: Int): File = FileController.getRealmInstance(userDrive).use { realm ->
+        realm.copyFromRealm(realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()!!, 0)
     }
 
     @AfterEach

@@ -157,10 +157,20 @@ class UploadMigration10to11Test {
             assertFalse(settings.photoTrashSyncEnabled, "the opt-in is NEVER auto-enabled by the migration")
             assertEquals(741, settings.driveId)
 
-            // THE PAIRING TABLE IS WRITABLE (the recordPairing seam's contract).
+            // THE PAIRING TABLE IS WRITABLE (the recordPairing seam's contract), and the
+            // baselineTrashed column is genuinely NULLABLE: a pairing whose activation
+            // baseline has not been observed yet must read back as null, not as a REQUIRED
+            // primitive default.
+            val pairingSchema = realm.schema.get("PhotoPairing")!!
+            assertTrue(pairingSchema.isNullable("baselineTrashed"), "the activation baseline column is nullable")
+            assertTrue(pairingSchema.isNullable("pairedAt"), "pairedAt is nullable")
+            assertTrue(pairingSchema.isRequired("remoteFileId"), "remoteFileId is REQUIRED")
             realm.executeTransaction {
                 realm.createObject(com.infomaniak.drive.data.models.PhotoPairing::class.java, "content://fixture/pairing-10")
             }
+            val pendingPairing = realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java)
+                .equalTo("uri", "content://fixture/pairing-10").findFirst()!!
+            assertEquals(null, pendingPairing.baselineTrashed, "a pairing with no observed baseline reads back null")
             assertEquals(1L, realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java).count())
         }
     }

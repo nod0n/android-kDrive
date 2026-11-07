@@ -166,9 +166,18 @@ class UploadMigration8to11Test {
             assertEquals(1_111L, completed.fileSize)
 
             // THE PAIRING TABLE IS WRITABLE (the recordPairing seam's contract).
+            // The baselineTrashed column is genuinely NULLABLE: a pairing whose activation
+            // baseline has not been observed yet must read back as null.
+            val pairingSchema = realm.schema.get("PhotoPairing")!!
+            assertTrue(pairingSchema.isNullable("baselineTrashed"), "the activation baseline column is nullable")
+            assertTrue(pairingSchema.isNullable("pairedAt"), "pairedAt is nullable")
+            assertTrue(pairingSchema.isRequired("remoteFileId"), "remoteFileId is REQUIRED")
             realm.executeTransaction {
                 realm.createObject(com.infomaniak.drive.data.models.PhotoPairing::class.java, "content://fixture/pairing")
             }
+            val pendingPairing = realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java)
+                .equalTo("uri", "content://fixture/pairing").findFirst()!!
+            assertEquals(null, pendingPairing.baselineTrashed, "a pairing with no observed baseline reads back null")
             assertEquals(1L, realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java).count())
         }
     }
