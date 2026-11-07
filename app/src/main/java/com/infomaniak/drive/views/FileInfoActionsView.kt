@@ -409,17 +409,18 @@ class FileInfoActionsView @JvmOverloads constructor(
         if (cacheFile.exists() && path.isNotEmpty() && !isObsoleteOrNotIntact(cacheFile)) {
             getOfflineFile(context)?.let { offlineFile ->
                 Utils.moveCacheFileToOffline(file = this, cacheFile, offlineFile)
-                CoroutineScope(Dispatchers.IO).launch {
-                    FileController.updateOfflineStatus(id, isOffline = true)
-                    FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
-                }
+                // Recorded synchronously BEFORE anything observes the file: the publication
+                // gate reads this intent, so it must already be committed when a worker (or
+                // the next sync pass) looks at the copy.
+                FileController.updateOfflineStatus(id, isOffline = true)
+                FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
                 isOffline = true
                 onItemClickListener.onCacheAddedToOffline()
             }
         } else {
-            CoroutineScope(Dispatchers.IO).launch {
-                FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
-            }
+            // Same as above: the pin intent must be committed before the worker that will
+            // publish the downloaded copy can even start.
+            FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
             Utils.downloadAsOfflineFile(context, file = this)
             if (isMarkedAsOffline) mainViewModel.updateOfflineFile.value = id
         }

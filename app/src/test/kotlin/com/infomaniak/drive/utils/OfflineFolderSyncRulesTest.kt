@@ -21,6 +21,7 @@ import com.infomaniak.drive.utils.OfflineFolderSyncUtils.DetailsDecision
 import com.infomaniak.drive.utils.OfflineFolderSyncUtils.ListingDecision
 import com.infomaniak.drive.utils.OfflineFolderSyncUtils.LocalCopyState
 import com.infomaniak.drive.utils.OfflineFolderSyncUtils.PublicationBasis
+import com.infomaniak.drive.utils.OfflineFolderSyncUtils.PublicationDecision
 import com.infomaniak.drive.utils.OfflineFolderSyncUtils.RemoteMeta
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
@@ -133,6 +134,147 @@ class OfflineFolderSyncRulesTest {
 
     //endregion
 
+    //region decidePublication — the pre-publication guards of a verified staged download
+    //
+    // Missing evidence always preserves: an unreadable digest, an unreadable stat, an unknown
+    // copy or a same-size/time edit can never authorize destruction. Only a copy PROVEN intact
+    // against the accepted publication (metadata AND digest) may be adopted or replaced.
+
+    @Test
+    fun `an unreadable existing digest preserves the copy - replacement never gambles`() {
+        // Regression: a read/hash failure used to fall through the guard and proceed to delete
+        // or replace bytes nobody could read.
+        assertEquals(
+            PublicationDecision.PRESERVE_EXISTING,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = basis,
+                localExists = true,
+                localSize = basis.size,
+                localModifiedSec = basis.modifiedAt,
+                existingDigest = null,
+                downloadDigest = "digest-2",
+            ),
+        )
+    }
+
+    @Test
+    fun `a same-size and mtime local edit is preserved even when the staged body is unchanged`() {
+        // Regression: the digest-identical early return used to re-stamp and bless an edited
+        // copy as clean before the guards ran (edit hidden, accepted identity faked).
+        assertEquals(
+            PublicationDecision.PRESERVE_EXISTING,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = basis,
+                localExists = true,
+                localSize = basis.size,
+                localModifiedSec = basis.modifiedAt,
+                existingDigest = "digest-edited",
+                downloadDigest = "digest-1",
+            ),
+        )
+    }
+
+    @Test
+    fun `an edited copy is preserved against a changed staged body`() {
+        assertEquals(
+            PublicationDecision.PRESERVE_EXISTING,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = basis,
+                localExists = true,
+                localSize = basis.size,
+                localModifiedSec = basis.modifiedAt,
+                existingDigest = "digest-edited",
+                downloadDigest = "digest-2",
+            ),
+        )
+    }
+
+    @Test
+    fun `a verified clean copy adopts metadata when the body equals the publication`() {
+        assertEquals(
+            PublicationDecision.ADOPT_METADATA_ONLY,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = basis,
+                localExists = true,
+                localSize = basis.size,
+                localModifiedSec = basis.modifiedAt,
+                existingDigest = "digest-1",
+                downloadDigest = "digest-1",
+            ),
+        )
+    }
+
+    @Test
+    fun `a verified clean copy is replaced when the server content changed`() {
+        assertEquals(
+            PublicationDecision.REPLACE_BYTES,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = basis,
+                localExists = true,
+                localSize = basis.size,
+                localModifiedSec = basis.modifiedAt,
+                existingDigest = "digest-1",
+                downloadDigest = "digest-2",
+            ),
+        )
+    }
+
+    @Test
+    fun `missing local bytes are always replaced, even when the body equals the old publication`() {
+        // Regression: the digest-identical early return used to setLastModified a non-existent
+        // file, fail, and dead-lock the copy in a permanent MISSING retry loop.
+        assertEquals(
+            PublicationDecision.REPLACE_BYTES,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = basis,
+                localExists = false,
+                localSize = null,
+                localModifiedSec = null,
+                existingDigest = null,
+                downloadDigest = "digest-1",
+            ),
+        )
+    }
+
+    @Test
+    fun `an unknown copy without a basis and unreadable stats are never replaced`() {
+        assertEquals(
+            PublicationDecision.PRESERVE_EXISTING,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = null,
+                localExists = true,
+                localSize = 500L,
+                localModifiedSec = meta.lastModifiedAt,
+                existingDigest = "digest-x",
+                downloadDigest = "digest-1",
+            ),
+        )
+        assertEquals(
+            PublicationDecision.PRESERVE_EXISTING,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = basis,
+                localExists = true,
+                localSize = null,
+                localModifiedSec = null,
+                existingDigest = "digest-1",
+                downloadDigest = "digest-1",
+            ),
+        )
+        assertEquals(
+            PublicationDecision.PRESERVE_EXISTING,
+            OfflineFolderSyncUtils.decidePublication(
+                basis = basis.copy(digest = null),
+                localExists = true,
+                localSize = basis.size,
+                localModifiedSec = basis.modifiedAt,
+                existingDigest = "digest-1",
+                downloadDigest = "digest-1",
+            ),
+        )
+    }
+
+    //endregion
+
     //region Pass sequences (audit O4 regression shape, decision level)
 
     /**
@@ -167,7 +309,8 @@ class OfflineFolderSyncRulesTest {
                     detailsRequests++
                     when (OfflineFolderSyncUtils.decideFromDetails(serverMeta, basis)) {
                         DetailsDecision.METADATA_ONLY -> {
-                            // updatePublicationBasis: adopt the verified remote metadata, bytes kept.
+                            // updatePublicationBasis: adopt the verified remote metadata, bytes
+                            // kept; an unchanged file is a no-op (no per-pass row write).
                             basis = PublicationBasis(serverMeta.lastModifiedAt, serverMeta.size, basis?.digest, serverMeta.serverHash)
                         }
                         DetailsDecision.REDOWNLOAD -> publish()

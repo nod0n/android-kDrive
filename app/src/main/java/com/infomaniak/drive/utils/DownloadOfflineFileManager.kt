@@ -95,25 +95,32 @@ class DownloadOfflineFileManager(
             return ListenableWorker.Result.failure()
         }
 
+        // Root coverage is checked FIRST: the cache-move and intact branches below would
+        // replace existing bytes, and a covered copy's lifecycle belongs to the root
+        // contract — a stale queued download (initial bulk work, retry, or a download
+        // enqueued before an unmark) must never reach them. The root maintenance pass
+        // refreshes covered copies through the staged path instead.
+        val coveredByRoot = FileController.getRealmInstance(userDrive).use { realm ->
+            OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)
+        }
+        if (offlineFile.exists() && coveredByRoot) {
+            // The preserved bytes are NOT blessed with the new remote identity: no accepted
+            // transfer happened here, so no publication evidence may be recorded.
+            filesDownloaded += 1
+            lastDownloadedFile = offlineFile
+            return ListenableWorker.Result.success()
+        }
+
         if (moveCacheFileIfIntact(context, file, cacheFile, offlineFile)) return ListenableWorker.Result.success()
 
         if (file.isOfflineAndIntact(offlineFile)) {
             // We can have this case for example when we try to put a lot of files at once in offline mode
-            // and for some reason, the worker is cancelled after a long time, the worker is restarted
+            // and for some reason, the worker is cancelled after a long time, the worker is restarted.
+            // Metadata equality is NOT proof of equal content: the existing bytes are preserved
+            // untouched and no publication evidence is recorded for them — the root maintenance
+            // pass verifies copies against the accepted basis.
             filesDownloaded += 1
             lastDownloadedFile = offlineFile
-            OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
-            return ListenableWorker.Result.success()
-        }
-
-        if (offlineFile.exists() && OfflineFolderSyncUtils.isRootCoveredCopy(file)) {
-            // Root coverage owns this copy's lifecycle: a stale queued download (initial bulk
-            // work, retry, or a download enqueued before an unmark) must never reach the
-            // delete-then-transfer below — a locally edited or unknown copy would be lost.
-            // The root maintenance pass refreshes it through the staged path instead.
-            filesDownloaded += 1
-            lastDownloadedFile = offlineFile
-            OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
             return ListenableWorker.Result.success()
         }
 
@@ -139,7 +146,10 @@ class DownloadOfflineFileManager(
         val file = currentFile
         // A root-covered copy is never cleaned up here: its lifecycle belongs to the root
         // contract, which releases coverage without deleting bytes.
-        if (file != null && OfflineFolderSyncUtils.isRootCoveredCopy(file)) return
+        val coveredByRoot = file != null && FileController.getRealmInstance(userDrive).use { realm ->
+            OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)
+        }
+        if (coveredByRoot) return
         lastDownloadedFile?.let {
             if (it.exists() && currentFile?.isIntactFile(it) == false) it.delete()
         }
@@ -153,7 +163,11 @@ class DownloadOfflineFileManager(
     ): Boolean = withContext(Dispatchers.IO) {
         if (!file.isObsoleteOrNotIntact(cacheFile)) {
             Utils.moveCacheFileToOffline(file, cacheFile, offlineFile)
-            notifyCompleted(file, offlineFile, context)
+            // The moved bytes come from the cache, not from this transfer: their content is
+            // NOT proven to match the current remote identity (metadata equality is not proof
+            // of equal content), so the seam records the basis WITHOUT the server hash — the
+            // next maintenance pass then performs one verified body fetch and completes it.
+            notifyCompleted(file, offlineFile, context, acceptedServerHash = null)
             lastDownloadedFile = offlineFile
             return@withContext true
         }
@@ -234,7 +248,7 @@ class DownloadOfflineFileManager(
 
             if (remoteDataHasBeenSaved && offlineFile.exists()) {
                 onProgress(100, file.id)
-                notifyCompleted(file, offlineFile, context)
+                notifyCompleted(file, offlineFile, context, acceptedServerHash)
                 ListenableWorker.Result.success()
             } else {
                 ListenableWorker.Result.failure()
@@ -245,8 +259,18 @@ class DownloadOfflineFileManager(
         }
     }
 
-    private suspend fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
-        FileController.updateOfflineStatus(file.id, true)
+    /**
+     * The freshly accepted bytes are on disk: the publication seam records the basis (it also
+     * sets [File.isOffline], under its live-intent gate — an unpin or release that happened
+     * during the transfer is not overridden). The captured with=hash identity describes THESE
+     * bytes, because they were just fetched from the server.
+     */
+    private suspend fun notifyCompleted(
+        file: File,
+        offlineFile: java.io.File,
+        context: Context,
+        acceptedServerHash: String?,
+    ) {
         offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
         OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
         if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)

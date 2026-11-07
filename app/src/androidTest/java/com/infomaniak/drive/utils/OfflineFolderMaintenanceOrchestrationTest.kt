@@ -210,8 +210,10 @@ class OfflineFolderMaintenanceOrchestrationTest {
         lastAnswerBody.set(bodyV2)
 
         // The user edits the copy WITHOUT changing size or mtime (a same-stat edit): the basis
-        // digest no longer describes the bytes.
+        // digest no longer describes the bytes. The rewrite must restore the basis mtime, or
+        // the copy would merely classify as edited on metadata alone.
         offlineFile.writeBytes(editedBody)
+        check(offlineFile.setLastModified(1_700_000_000L * 1000)) { "fixture edit must keep the basis mtime" }
         check(offlineFile.length() == bodyV1.size.toLong()) { "fixture edit must keep the basis size" }
 
         stubDetails(hash = "hash-3", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
