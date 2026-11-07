@@ -320,11 +320,15 @@ object Utils {
      * preserved bytes (a released-then-re-marked row is pending with isOffline=false and
      * keeps its edited/unknown bytes at the offline path, so the row's flags alone cannot
      * tell the UI the destination is occupied). RESUME-9b3b item 3 (reviewer-confirmed):
-     * the guard, the destination delete and the final publication share ONE short authority
+     * the guard and the final publication share ONE short authority
      * hold on a certified-fresh read of the file's ACTUAL drive — the former shape's
      * uncoordinated check could not see an acquisition landing between it and the replace,
      * and its plain instance read did not advance a retained view. The whole-file copy is
      * STAGED outside the hold (a hold never copies), and only the atomic rename publishes.
+     * The publication is a bare rename(2) REPLACE — the destination is never deleted first
+     * (G2, FHNW-f094): a failed rename retains BOTH the previous destination bytes and the
+     * cache and reports the refusal; only this attempt's staging file is discarded. The
+     * target is never removed after success either — only the source cache is (below).
      * The refusal also covers a MISSING row (F3 sharpening: the former nullable lookup
      * authorized the replace on a row-miss — bytes nobody vouches for are never replaced)
      * and an unreadable view. The caller still records the pin intent on a refusal. Rows
@@ -358,7 +362,14 @@ object Utils {
                             // preserved bytes: refuse BEFORE the direct-pin commit.
                             offlineFile.exists() && OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, userDrive) -> return@withCommitAuthority
                             else -> {
-                                if (offlineFile.exists()) offlineFile.delete()
+                                // G2 (FHNW-f094): POSIX rename(2) replaces the occupant
+                                // atomically — the destination is NEVER deleted first, so a
+                                // failed rename retains both the previous destination bytes
+                                // and the cache (published stays false -> the caller records
+                                // the pin without flipping isOffline); only this attempt's
+                                // staging file is discarded (the finally). The target is
+                                // never removed in a post-rename cleanup either: after
+                                // success only the source cache is deleted (below).
                                 published = staging.renameTo(offlineFile)
                             }
                         }

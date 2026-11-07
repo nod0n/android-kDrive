@@ -304,13 +304,21 @@ object SyncOfflineUtils {
         val fileModifiedAt = Date(ioFile.lastModified())
 
         if (UploadFile.canUpload(uri, fileModifiedAt)) {
-            // RESUME-9b3b item 5: the upload REGISTERS local work and schedules it — both
-            // are the effect points the pass-head selection must be revalidated at: a
-            // root-owned copy's local edits are preserved locally and resolved by the user,
-            // never silently pushed by a stale baseline pass; a withdrawn intent's edits
-            // are not pushed either. Fresh authorization + the row-metadata write + the
-            // registration + the schedule share ONE hold (local DB work and a WorkManager
-            // enqueue — no network, no awaited dispatch under it).
+            // RESUME-9b3b item 5: the upload REGISTERS local work — the effect point the
+            // pass-head selection must be revalidated at: a root-owned copy's local edits
+            // are preserved locally and resolved by the user, never silently pushed by a
+            // stale baseline pass; a withdrawn intent's edits are not pushed either. Fresh
+            // authorization + the row-metadata write + the registration share ONE hold
+            // (local DB work only).
+            // G1 (FHNW-f094): the schedule is the TRIGGER, not the authorization effect,
+            // and it deliberately runs AFTER the hold releases — syncImmediately first
+            // performs a blocking WorkManager.getWorkInfos(...).get() (isSyncActive), a
+            // dispatch-and-await on WorkManager's own machinery that the hold contract
+            // never authorizes (no awaited dispatch under the lock). The trigger fires
+            // only on an accepted registration; the residual hold->enqueue gap is the
+            // pre-existing baseline scheduling exposure (a registered upload whose
+            // immediate trigger races a withdrawal) and never a byte decision.
+            var authorized = false
             OfflineCommitAuthority.withCommitAuthority {
                 OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
                     val freshRow = FileController.getFileProxyById(localFile.id, customRealm = freshRealm)
@@ -333,11 +341,11 @@ object SyncOfflineUtils {
                             type = UploadFile.Type.SYNC_OFFLINE.name,
                             userId = userDrive.userId,
                         ).store()
-
-                        context.syncImmediately(isAutomaticTrigger = false)
+                        authorized = true
                     }
                 }
             }
+            if (authorized) context.syncImmediately(isAutomaticTrigger = false)
         }
     }
 
