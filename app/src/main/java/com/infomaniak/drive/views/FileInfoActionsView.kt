@@ -414,13 +414,20 @@ class FileInfoActionsView @JvmOverloads constructor(
 
         if (cacheFile.exists() && path.isNotEmpty() && !isObsoleteOrNotIntact(cacheFile)) {
             getOfflineFile(context)?.let { offlineFile ->
-                Utils.moveCacheFileToOffline(file = this, cacheFile, offlineFile)
-                // Recorded synchronously BEFORE anything observes the file: the publication
-                // gate reads this intent, so it must already be committed when a worker (or
-                // the next sync pass) looks at the copy.
-                FileController.updateOfflineStatus(id, isOffline = true)
+                // FHNW-33dd ADDENDUM A4: the move refuses when an ACTIVE root covers this
+                // row and the destination holds the root contract's preserved bytes — the
+                // pin intent still commits, but the bytes are never deleted and isOffline
+                // stays under the root contract's control (the row is pending; the
+                // worker's early-return discipline does not flip it either).
+                val moved = Utils.moveCacheFileToOffline(file = this, cacheFile, offlineFile)
+                if (moved) {
+                    // Recorded synchronously BEFORE anything observes the file: the publication
+                    // gate reads this intent, so it must already be committed when a worker (or
+                    // the next sync pass) looks at the copy.
+                    FileController.updateOfflineStatus(id, isOffline = true)
+                    isOffline = true
+                }
                 FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
-                isOffline = true
                 onItemClickListener.onCacheAddedToOffline()
             }
         } else {

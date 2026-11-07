@@ -190,7 +190,26 @@ object SyncOfflineUtils {
         if (OfflineFolderSyncUtils.isRootOwnedCopy(localFile, realm, userDrive)) return
 
         when (fileAction.lastAction) {
-            FileActivityType.FILE_DELETE, FileActivityType.FILE_TRASH -> ioFile.delete()
+            FileActivityType.FILE_DELETE, FileActivityType.FILE_TRASH -> {
+                // FHNW-33dd item 4 (ADDENDUM A3): the guard above sits OUTSIDE this
+                // destructive effect, and the selection itself can be stale — a root
+                // acquisition between guard and delete must not let the baseline delete
+                // act on newly protected bytes, and a row whose intent was withdrawn
+                // since the selection is owned by the checked withdrawal paths, not by
+                // this blind delete. Fresh authorization and the delete share ONE
+                // authority hold (local IO only — no network under the hold).
+                OfflineCommitAuthority.withCommitAuthority {
+                    OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
+                        val freshRow = FileController.getFileProxyById(localFile.id, customRealm = freshRealm)
+                        if (freshRow != null &&
+                            OfflineFolderSyncUtils.hasLiveOfflineIntent(freshRow, freshRealm, userDrive) &&
+                            !OfflineFolderSyncUtils.isRootOwnedCopy(freshRow, freshRealm, userDrive)
+                        ) {
+                            ioFile.delete()
+                        }
+                    }
+                }
+            }
             else -> updateFile(context, ioFile, localFile, fileAction, userDrive, realm)
         }
     }

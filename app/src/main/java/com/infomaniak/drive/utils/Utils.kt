@@ -48,6 +48,7 @@ import com.infomaniak.core.common.utils.DownloadManagerUtils
 import com.infomaniak.core.legacy.utils.showKeyboard
 import com.infomaniak.core.legacy.utils.showToast
 import com.infomaniak.drive.R
+import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.BulkOperationType
 import com.infomaniak.drive.data.models.File
@@ -313,11 +314,31 @@ object Utils {
         return if (type == "application/pdf") applicationContext.intentExcludingPdfReader(openWithIntent) else openWithIntent
     }
 
-    fun moveCacheFileToOffline(file: File, cacheFile: IOFile, offlineFile: IOFile) {
-        if (offlineFile.exists()) offlineFile.delete()
+    /**
+     * Moves an intact cache copy to the offline path. Returns false when the move was
+     * REFUSED: FHNW-33dd ADDENDUM A4 — the destination may hold the ACTIVE root contract's
+     * preserved bytes (a released-then-re-marked row is pending with isOffline=false and
+     * keeps its edited/unknown bytes at the offline path, so the row's flags alone cannot
+     * tell the UI the destination is occupied). When a live root covers this row, the
+     * destination bytes are the root contract's and the destructive replace is refused
+     * BEFORE the direct-pin commit; the caller still records the pin intent. Rows outside
+     * every root keep the unconditional baseline (the pre-existing direct-pin semantics).
+     */
+    fun moveCacheFileToOffline(file: File, cacheFile: IOFile, offlineFile: IOFile): Boolean {
+        if (offlineFile.exists()) {
+            val activelyRootCovered = runCatching {
+                FileController.getRealmInstance().use { realm ->
+                    FileController.getFileProxyById(file.id, customRealm = realm)
+                        ?.let { row -> OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, UserDrive()) } == true
+                }
+            }.getOrDefault(true) // an unreadable cache view never authorizes the destructive replace
+            if (activelyRootCovered) return false
+            offlineFile.delete()
+        }
         cacheFile.copyTo(offlineFile)
         cacheFile.delete()
         offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
+        return true
     }
 
     fun downloadAsOfflineFile(context: Context, file: File, userDrive: UserDrive = UserDrive()) {

@@ -474,14 +474,19 @@ object FolderFilesProvider {
             if (actionType == FileActivityType.FILE_MOVE_OUT) {
                 FileController.updateFile(localFolder.id, realm) { it.children.remove(actionFile) }
             } else {
-                FileController.removeFile(fileId, customRealm = realm, recursive = false)
+                // FHNW-33dd item 2: the remote-activity FILE_DELETE/FILE_TRASH route is a
+                // REMOTE eviction — the root claim cohort's bytes and provenance are
+                // preserved through the guarded removeFile path.
+                FileController.removeFile(fileId, customRealm = realm, recursive = false, remoteEviction = true)
             }
         }
     }
 
     private fun FileAction.upsertAction(realm: Realm, currentFolder: File, actionFile: File?) {
         if (actionFile == null) {
-            FileController.removeFile(fileId, customRealm = realm, recursive = false)
+            // FHNW-33dd item 2: the actionFile-null upsert eviction is also a REMOTE
+            // eviction (the same guarded cohort as the delete/trash route).
+            FileController.removeFile(fileId, customRealm = realm, recursive = false, remoteEviction = true)
         } else {
             if (actionFile.isImporting()) MqttClientWrapper.start(actionFile.externalImport?.id)
             FileController.upsertActionFile(realm, currentFolder.id, actionFile)

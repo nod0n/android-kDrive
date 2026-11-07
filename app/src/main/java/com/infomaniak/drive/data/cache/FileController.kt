@@ -309,26 +309,62 @@ object FileController {
     }
     //endregion
 
+    /**
+     * Removes a row and its caches. The [remoteEviction] cohort (FHNW-33dd item 2) covers
+     * the callers that evict on REMOTE evidence — the folder provider's activity
+     * FILE_DELETE/FILE_TRASH route, the actionFile-null upsert eviction and the shares
+     * replacement — as opposed to explicit user deletion and the shared-with-me transplant,
+     * which keep the default baseline. For that cohort the byte delete and the row delete
+     * run in ONE authority hold on a FRESH in-hold row read (the caller's realm may be a
+     * retained stale view; a failed view refresh skips the destructive work entirely), and
+     * the ROOT CLAIM cohort (offlineOwnedByRoot without a standing pin) is preserved: its
+     * bytes and provenance belong to the root contract, whose complete-traversal releases
+     * retain bytes — a remote activity delete must not end them outside that contract.
+     * Never-root and directly pinned rows keep today's eviction semantics.
+     */
     fun removeFile(
         fileId: Int,
         keepFileCaches: ArrayList<Int> = arrayListOf(),
         keepFiles: ArrayList<Int> = arrayListOf(),
         customRealm: Realm? = null,
         recursive: Boolean = true,
+        remoteEviction: Boolean = false,
     ) {
         val block: (Realm) -> Unit? = { realm ->
             getFileById(realm, fileId)?.let { file ->
                 if (recursive) {
                     file.children.createSnapshot().forEach {
-                        if (!keepFiles.contains(it.id)) removeFile(it.id, keepFileCaches, keepFiles, realm)
+                        if (!keepFiles.contains(it.id)) {
+                            removeFile(it.id, keepFileCaches, keepFiles, realm, remoteEviction = remoteEviction)
+                        }
                     }
                 }
                 runCatching {
-                    if (!keepFileCaches.contains(fileId)) file.deleteCaches(Realm.getApplicationContext()!!)
-                    // Coordinated writer (row deletion — parent chains and coverage walks
-                    // read these links): joins the commit authority.
-                    if (!keepFiles.contains(fileId)) OfflineCommitAuthority.withCommitAuthority {
-                        realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                    if (remoteEviction) {
+                        OfflineCommitAuthority.withCommitAuthority {
+                            try {
+                                realm.refresh()
+                            } catch (refreshFailure: Throwable) {
+                                return@withCommitAuthority // a failed view refresh never authorizes destruction
+                            }
+                            val freshRow = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()
+                            if (freshRow != null) {
+                                val rootClaimCohort = freshRow.offlineOwnedByRoot && !freshRow.isDirectlyPinned
+                                if (!rootClaimCohort && !keepFileCaches.contains(fileId)) {
+                                    freshRow.deleteCaches(Realm.getApplicationContext()!!)
+                                }
+                                if (!rootClaimCohort && !keepFiles.contains(fileId) && freshRow.isValid) {
+                                    realm.executeTransaction { freshRow.deleteFromRealm() }
+                                }
+                            }
+                        }
+                    } else {
+                        if (!keepFileCaches.contains(fileId)) file.deleteCaches(Realm.getApplicationContext()!!)
+                        // Coordinated writer (row deletion — parent chains and coverage walks
+                        // read these links): joins the commit authority.
+                        if (!keepFiles.contains(fileId)) OfflineCommitAuthority.withCommitAuthority {
+                            realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                        }
                     }
                 }.onFailure { exception ->
                     Sentry.captureException(exception) { scope ->
@@ -584,16 +620,31 @@ object FileController {
                 if (offlineFile != null && file.isOfflineAndIntact(offlineFile)) {
                     files[index].isOffline = true
                     keepCaches.add(file.id)
-                } else if (oldFile != null && OfflineFolderSyncUtils.isRootOwnedCopy(oldFile, realm, userDrive)) {
-                    // A root-owned copy's lifecycle belongs to the root contract (its
-                    // release paths preserve or delete through the checked decisions): the
-                    // baseline shares refresh must not delete its bytes before root
-                    // maintenance — the same skip rule the offline sync applies.
-                    Unit
-                } else offlineFile?.delete()
+                } else {
+                    // FHNW-33dd item 3 (+ ADDENDUM A3): the root guard and the destructive
+                    // delete must participate TOGETHER in one authority hold on a fresh
+                    // in-hold read — the former guard ran outside the authority on a row
+                    // read before the loop, and a claim/coverage writer could commit
+                    // between the guard and the delete (or the retained realm was stale).
+                    // A row that has since vanished is skipped too: a fresh root check
+                    // returning false is not by itself permission to act on a stale
+                    // selection. Never-root rows keep the baseline delete.
+                    OfflineCommitAuthority.withCommitAuthority {
+                        OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
+                            val freshOld = freshRealm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
+                            if (freshOld != null && !OfflineFolderSyncUtils.isRootOwnedCopy(freshOld, freshRealm, userDrive)) {
+                                offlineFile?.delete()
+                            }
+                        }
+                    }
+                }
             }
 
-            if (replaceOldData) removeFile(MyShares.id, keepCaches, keepFiles, realm)
+            // FHNW-33dd item 2: the shares replacement is a remote cache eviction — the
+            // root claim cohort rides the guarded cohort (its rows are already in
+            // keepFiles; its bytes were previously reachable through deleteCaches because
+            // only INTACT copies entered keepCaches).
+            if (replaceOldData) removeFile(MyShares.id, keepCaches, keepFiles, realm, remoteEviction = true)
             saveFiles(MyShares.file, files, replaceOldData, realm)
         }
     }

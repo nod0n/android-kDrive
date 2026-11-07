@@ -204,6 +204,29 @@ class DownloadOfflineFileManager(
 
         onProgress(0, file.id)
 
+        // FHNW-33dd item 4 (ADDENDUM A3): the pre-transfer cleanup is destructive and its
+        // guards sat OUTSIDE it — a root acquisition after the gate/coverage reads above
+        // must not let it act on newly protected bytes, and a row whose intent was
+        // withdrawn since the gate is stale work. The fresh authorization (existence,
+        // live intent, root ownership) and the deletion participate in ONE authority
+        // hold — local reads only, no network and no awaited coroutine under it; the
+        // transfer starts after the hold releases.
+        val staleOrRootOwned = OfflineCommitAuthority.withCommitAuthority {
+            OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
+                val row = FileController.getFileProxyById(file.id, customRealm = realm)
+                when {
+                    row == null -> true // the selection is stale: nothing to act on
+                    !OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive) -> true // withdrawn since the gate
+                    OfflineFolderSyncUtils.isRootOwnedCopy(row, realm, userDrive) -> true // the root contract owns the copy: preserve, no isOffline flip
+                    else -> false
+                }
+            }
+        }
+        if (staleOrRootOwned) {
+            filesDownloaded += 1
+            lastDownloadedFile = offlineFile
+            return ListenableWorker.Result.success()
+        }
         if (offlineFile.exists()) offlineFile.delete()
         if (cacheFile.exists()) cacheFile.delete()
 
@@ -233,18 +256,24 @@ class DownloadOfflineFileManager(
         // the authority to delete the preserved edited bytes it just kept
         // ([File.isIntactFile] compares length only, so a different-length edit reaches the
         // delete branch exactly when the ownership protection is missing).
-        val liveState = OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
-            FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
-                OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive) to
-                    OfflineFolderSyncUtils.isRootOwnedCopy(row, realm, userDrive)
+        // FHNW-33dd item 4 (ADDENDUM A3): the guard read and the destructive effect now
+        // share ONE authority hold — a root acquisition (or an intent withdrawal) between
+        // the read and the delete can no longer act on newly protected or already-ended
+        // bytes; the reads are local, so the hold stays IO-sized.
+        OfflineCommitAuthority.withCommitAuthority {
+            val liveState = OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
+                FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
+                    OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive) to
+                        OfflineFolderSyncUtils.isRootOwnedCopy(row, realm, userDrive)
+                }
             }
-        }
-        if (liveState?.first != true) return
-        // A root-owned copy is never cleaned up here: its lifecycle belongs to the root
-        // contract, which releases coverage without deleting bytes.
-        if (liveState.second) return
-        lastDownloadedFile?.let {
-            if (it.exists() && currentFile?.isIntactFile(it) == false) it.delete()
+            if (liveState?.first != true) return@withCommitAuthority
+            // A root-owned copy is never cleaned up here: its lifecycle belongs to the root
+            // contract, which releases coverage without deleting bytes.
+            if (liveState.second) return@withCommitAuthority
+            lastDownloadedFile?.let {
+                if (it.exists() && currentFile?.isIntactFile(it) == false) it.delete()
+            }
         }
     }
 

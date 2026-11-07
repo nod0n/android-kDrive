@@ -58,6 +58,8 @@ import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.OfflineCommitAuthority
+import com.infomaniak.drive.utils.OfflineFolderSyncUtils
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.NotificationUtils.buildGeneralNotification
 import com.infomaniak.drive.utils.NotificationUtils.cancelNotification
@@ -646,7 +648,8 @@ class CloudStorageProvider : DocumentsProvider() {
         )
         ensureExternalAccessAllowed()
 
-        return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
+        val userDrive = createUserDrive(sourceDocumentId)
+        return FileController.getRealmInstance(userDrive).use { realm ->
 
             val fileNotFoundException = IllegalStateException("File not found")
 
@@ -660,7 +663,26 @@ class CloudStorageProvider : DocumentsProvider() {
             val apiResponse = ApiRepository.moveFile(file, targetParentFile)
 
             if (apiResponse.isSuccess()) {
-                realm.executeTransaction { file.deleteFromRealm() }
+                // FHNW-33dd item 1: the row delete is a PREDICATE writer — it must never
+                // commit inside another operation's check-to-effect span (a deletion can
+                // land after a publication's fresh gate and before the rename; discovering
+                // the missing row after the rename is not pre-effect exclusion). It joins
+                // the commit authority, re-reads the row identity FRESH inside the hold
+                // (the pre-network proxy is stale by delete time), and handles the root
+                // cohort conservatively: a root-owned row's records are ended only by the
+                // root contract's own checked releases, so the move LEAVES the row in
+                // place — the scheduled refresh and the maintenance chain then repair or
+                // release it through the normal move contract, and the preserved offline
+                // bytes stay tracked instead of orphaned. No network under the hold (the
+                // API move completed above).
+                OfflineCommitAuthority.withCommitAuthority {
+                    OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { freshRealm ->
+                        val freshRow = FileController.getFileProxyById(fileId, customRealm = freshRealm)
+                        if (freshRow != null && !OfflineFolderSyncUtils.isRootOwnedCopy(freshRow, freshRealm, userDrive)) {
+                            freshRealm.executeTransaction { freshRow.deleteFromRealm() }
+                        }
+                    }
+                }
 
                 // Refresh
                 scheduleRefresh(sourceParentDocumentId)
