@@ -124,14 +124,18 @@ class GalleryViewModelTest {
             } catch (_: InterruptedException) {
                 return@Thread
             }
-            val dump = StringBuilder("GalleryVMTest: SETUP WATCHDOG — setup did not finish in 45s; thread stacks:\n")
-            Thread.getAllStackTraces().forEach { (thread, frames) ->
-                dump.append("  [").append(thread.name).append("] state=").append(thread.state).append('\n')
-                frames.take(30).forEach { frame -> dump.append("    at ").append(frame).append('\n') }
+            // Owner-first, one bounded frame per log line: a single large Log string can be
+            // truncated by Android's log buffer and lose the owner stack, and the map's
+            // iteration order is arbitrary — the setup thread must always be the first and
+            // most complete trace.
+            val traces = Thread.getAllStackTraces()
+            mark("SETUP WATCHDOG — setup did not finish in 45s; threads=${traces.size}; owner=${owner.name}")
+            val ordered = listOf(owner) + traces.keys.filter { it !== owner }
+            for (thread in ordered) {
+                val frames = traces[thread] ?: emptyArray()
+                mark("WATCHDOG [${thread.name}] state=${thread.state} frames=${frames.size}")
+                frames.take(30).forEachIndexed { index, frame -> mark("WATCHDOG #$index ${thread.name}: $frame") }
             }
-            val line = dump.toString()
-            println(line)
-            Log.w("GalleryVMTest", line)
         }.apply {
             isDaemon = true
             start()
