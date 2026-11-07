@@ -35,6 +35,9 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.withContext
 import java.util.Date
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Orchestrates photo trash propagation (opt-in) on top of [PhotoTrashRules]. Only pairings
@@ -53,19 +56,83 @@ object PhotoTrashController {
     val pendingConsents = MutableSharedFlow<PhotoPairing>(extraBufferCapacity = 4)
 
     /**
-     * Main-readable mirror of the opt-in flag, for the dialog launch gate. Written on EVERY
-     * settings seam call ([UploadFile.setAppSyncSettings] — the only writer) and refreshed
-     * on every [UploadFile.getAppSyncSettings] read, so a Main-side gate (which must never
-     * open the settings realm on the UI thread) sees any opt-in change that happened before
-     * the gate runs. null = never observed: the gate treats it as fail-closed.
+     * Main-readable ACTIVATION AUTHORITY of the photo-trash feature, for the dialog launch
+     * gate: one immutable snapshot of (scope user, activation epoch, opt-in, revision).
+     *
+     * Revision protocol (a bare @Volatile Boolean is not one):
+     *  - A WRITE seam ([UploadFile.setAppSyncSettings] / [UploadFile.removeAppSyncSettings])
+     *    publishes with a freshly INCREMENTED revision after its commit — a writer is always
+     *    the freshest authority and can never be overwritten by any reader.
+     *  - A reader seam ([UploadFile.getAppSyncSettings]) captures the current revision BEFORE
+     *    it opens the realm and publishes its snapshot with that captured revision: a write
+     *    that lands during the read increments the revision, so the reader's older-revision
+     *    candidate is rejected and a stale observation can never overwrite newer
+     *    authoritative state (the interleaving "reader observes old true, writer commits
+     *    false, reader mirrors old true" is closed).
+     *  - A MISSING row (no settings at all) publishes a FAIL-CLOSED snapshot that overrides
+     *    even a newer stale true — absence is authoritative, it never preserves another
+     *    observation's enabled state. The next write restores the truth.
+     *  - Scope: the snapshot carries the user it was observed for; the launch gate compares
+     *    it with the current in-memory account.
      */
-    @Volatile
-    var optInMirror: Boolean? = null
-        private set
+    data class ActivationSnapshot(val userId: Int, val activationEpoch: Long, val optIn: Boolean, val revision: Long)
 
-    /** Records a freshly observed opt-in value for the Main-side launch gate. */
-    internal fun noteOptInValue(value: Boolean?) {
-        if (value != null) optInMirror = value
+    private val activationMirror = AtomicReference<ActivationSnapshot?>(null)
+    private val mirrorRevision = AtomicLong(0L)
+
+    /** The current activation authority snapshot (null = nothing observed yet: fail-closed). */
+    val currentActivationSnapshot: ActivationSnapshot?
+        get() = activationMirror.get()
+
+    /**
+     * Captures the revision a reader's snapshot will be published under. MUST be called
+     * BEFORE the reader opens the realm: a write landing during the read increments the
+     * revision, so the reader's older-revision candidate is then rejected and stale
+     * content can never overwrite the newer authoritative publish.
+     */
+    internal fun activationReadPermit(): Long = mirrorRevision.get()
+
+    /** Publishes a reader's observation under its pre-read revision permit (see class kDoc). */
+    internal fun noteActivationObserved(permit: Long, userId: Int, activationEpoch: Long, optIn: Boolean) {
+        publishActivation(ActivationSnapshot(userId, activationEpoch, optIn, permit))
+    }
+
+    /** Publishes a writer's post-commit state at a fresh revision: always wins. */
+    internal fun noteActivationWritten(userId: Int, activationEpoch: Long, optIn: Boolean) {
+        publishActivation(ActivationSnapshot(userId, activationEpoch, optIn, mirrorRevision.incrementAndGet()))
+    }
+
+    private fun publishActivation(candidate: ActivationSnapshot) {
+        activationMirror.updateAndGet { current ->
+            if (current == null ||
+                candidate.revision > current.revision ||
+                // Fail-closed evidence overrides a stale enabled state regardless of age;
+                // a later authoritative write restores the truth at a fresh revision.
+                (!candidate.optIn && current.optIn)
+            ) candidate else current
+        }
+    }
+
+    /**
+     * Process-local revision of one uri's BINDING. Every binding write ([recordPairing]'s
+     * replacement, [removeAllPairings]'s wipe) bumps it, so the Main-side launch gate can
+     * detect a pairing replacement that landed AFTER the IO validation — without any DB or
+     * network work on Main. A replacement is a NEW binding even when uri, user, file and
+     * metadata are all unchanged; the durable pairedAt identity remains the authoritative
+     * check at validation and result time (this registry covers only the launch window).
+     * Process-local by design: a restored (persisted) request is attributed through the
+     * row-level identity checks, never through this registry.
+     */
+    private val bindingGenerations = ConcurrentHashMap<String, Long>()
+
+    fun bindingGeneration(uri: String): Long = bindingGenerations[uri] ?: 0L
+
+    private fun noteBindingWritten(uri: String) {
+        bindingGenerations.merge(uri, 1L, Long::plus)
+    }
+
+    private fun invalidateAllBindings() {
+        bindingGenerations.clear()
     }
 
     /** All pairings of the current user, detached. */
@@ -143,6 +210,11 @@ object PhotoTrashController {
                 }
             else -> null
         }
+        // A new pairing belongs to the CURRENT activation generation (a replacement is a
+        // new binding, not a resurrection of the old one's activation evidence). Read
+        // BEFORE the transaction: the settings seam opens its own instance and must never
+        // run inside this write transaction.
+        val pairingEpoch = UploadFile.getAppSyncSettings()?.photoTrashActivationEpoch ?: 0L
         withPairingRealm(customRealmConfig) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java)
@@ -154,6 +226,7 @@ object PhotoTrashController {
                     driveId = uploadFile.driveId
                     this.remoteFileId = remoteFileId
                     fileName = uploadFile.fileName
+                    activationEpoch = pairingEpoch
                     // An UNOBSERVABLE row binds NO metadata (the -1 sentinel): the pass
                     // compares these against MediaStore's own values — falling back to the
                     // UploadFile's different-producer values would latch a false
@@ -171,6 +244,9 @@ object PhotoTrashController {
                 }
             }
         }
+        // The durable binding changed (a replacement is a new binding even when every other
+        // field is unchanged): the launch-window registry learns it for the Main-side gate.
+        noteBindingWritten(uploadFile.uri)
     }
 
     /** Drops pairings and any pending destructive state when the option is turned off. */
@@ -180,18 +256,27 @@ object PhotoTrashController {
                 mutableRealm.where(PhotoPairing::class.java).findAll().deleteAllFromRealm()
             }
         }
+        invalidateAllBindings()
     }
 
     /**
      * Captures a pairing's activation baseline from the CURRENT MediaStore trashed-state —
      * the retry/recovery path for rows left pending (their pairing-time observation was
-     * unavailable) and for pre-existing pairings at opt-in. An observation that arrives only
-     * LATE cannot tell a pre-activation trash from a post-activation delete: a TRUE baseline
-     * captured here is therefore recorded as a visible [PhotoPairing.State.INCONCLUSIVE]
-     * state, never silently relabeled as history. An unavailable observation stays pending
-     * and is retried on a later pass. Never call this on a blocking UI thread.
+     * unavailable) and for pre-existing pairings at opt-in. The row is stamped with
+     * [activationEpoch], the activation generation this capture belongs to: an activation
+     * re-baseline that changes NO field still invalidates every older observation through
+     * the epoch alone. An observation that arrives only LATE cannot tell a pre-activation
+     * trash from a post-activation delete: a TRUE baseline captured here is therefore
+     * recorded as a visible [PhotoPairing.State.INCONCLUSIVE] state, never silently
+     * relabeled as history. An unavailable observation stays pending and is retried on a
+     * later pass. Never call this on a blocking UI thread.
      */
-    fun captureActivationBaseline(context: Context, pairing: PhotoPairing, customRealmConfig: RealmConfiguration? = null): Boolean {
+    fun captureActivationBaseline(
+        context: Context,
+        pairing: PhotoPairing,
+        activationEpoch: Long,
+        customRealmConfig: RealmConfiguration? = null,
+    ): Boolean {
         val local = queryLocalMedia(context, pairing.uri)
         val baseline = when {
             // An ABSENT or unreadable row is UNKNOWN: the baseline is reset to PENDING
@@ -207,6 +292,7 @@ object PhotoTrashController {
                 mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, pairing.uri)
                     .findFirst()?.takeIf { it.stillIsSameBinding(pairing) }?.let { row ->
+                        row.activationEpoch = activationEpoch
                         row.baselineTrashed = baseline
                         if (baseline != null) {
                             row.lastObservedTrashed = baseline
@@ -225,16 +311,20 @@ object PhotoTrashController {
      * written, on its existing IO context — a pass can only start once the flag is on, so
      * no pass can race this capture into propagating against a stale baseline): captures the
      * real MediaStore trashed-state for EVERY pairing of the current user, INCLUDING rows
-     * whose pairing-time baseline predates this activation. An item trashed while the
+     * whose pairing-time baseline predates this activation, and stamps each row with
+     * [activationEpoch] — the generation the caller computed for THIS activation (the
+     * settings write seam stamps the same value into the persisted settings, so the next
+     * pass runs under it and every pre-activation observation is invalidated by the epoch
+     * even when all captured fields return to identical values). An item trashed while the
      * option was off must not reclassify as a new post-activation transition: its late-TRUE
      * capture at activation is a visible [PhotoPairing.State.INCONCLUSIVE], never silent
      * history and never propagation. Only THIS activation moment re-baselines populated
-     * rows; the regular pass still only fills null baselines. No blocking IO on the
-     * settings UI thread.
+     * rows; the regular pass still only fills null baselines (under its own current
+     * generation). No blocking IO on the settings UI thread.
      */
-    fun captureActivationBaselines(context: Context, customRealmConfig: RealmConfiguration? = null) {
+    fun captureActivationBaselines(context: Context, activationEpoch: Long, customRealmConfig: RealmConfiguration? = null) {
         getPairings(customRealmConfig).forEach { pairing ->
-            captureActivationBaseline(context, pairing, customRealmConfig)
+            captureActivationBaseline(context, pairing, activationEpoch, customRealmConfig)
         }
     }
 
@@ -244,14 +334,19 @@ object PhotoTrashController {
      * catch-up. Returns the number of propagated trashes.
      */
     suspend fun runLocalReconciliation(context: Context, customRealmConfig: RealmConfiguration? = null): Int = withContext(Dispatchers.IO) {
-        if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse()) return@withContext 0
+        val settingsAtStart = UploadFile.getAppSyncSettings()
+        if (settingsAtStart?.photoTrashSyncEnabled != true) return@withContext 0
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext 0
+        // The activation generation this pass runs under: the FINAL pre-destructive gate
+        // compares it with the live settings, so any activation cycle mid-pass (even one
+        // ending at the same enabled value) stops the pass as stale work.
+        val passEpoch = settingsAtStart.photoTrashActivationEpoch
 
         var propagated = 0
         val okHttpClient = AccountUtils.getHttpClient(AccountUtils.currentUserId, null)
         getPairings(customRealmConfig).forEach { pairing ->
             ensureActive()
-            ensurePairingBaseline(context, pairing, customRealmConfig)
+            ensurePairingBaseline(context, pairing, passEpoch, customRealmConfig)
 
             val local = queryLocalMedia(context, pairing.uri)
             val remote = queryRemoteState(pairing, okHttpClient)
@@ -281,12 +376,14 @@ object PhotoTrashController {
                             // FINAL boundary recheck, immediately before the destructive
                             // call: the pass captured its row list and ran network/digest
                             // IO since its top-of-pass gate — the option could have been
-                            // switched off or the account switched DURING the pass, and the
-                            // ROW itself could have moved on (a same-URI re-pairing is a
-                            // NEW binding; an OFF->ON re-baseline at activation rewrites
-                            // baseline/state). An unauthorized or stale pass stops WITHOUT
-                            // marking any state and WITHOUT calling the API; the next
-                            // authorized pass re-decides from fresh evidence.
+                            // switched off, an activation cycle could have re-baselined
+                            // everything (an OFF->ON cycle ends at the same Boolean but
+                            // increments the epoch), or the account switched DURING the
+                            // pass, and the ROW itself could have moved on (a same-URI
+                            // re-pairing is a NEW binding; an activation re-baseline
+                            // rewrites baseline/state/epoch). An unauthorized or stale pass
+                            // stops WITHOUT marking any state and WITHOUT calling the API;
+                            // the next authorized pass re-decides from fresh evidence.
                             //
                             // RESIDUAL EXTERNAL RACE (disclosed, not closable app-side and
                             // distinct from the stale-local-state gaps above): the remote
@@ -297,7 +394,9 @@ object PhotoTrashController {
                             // local digest and the live-row witness close every LOCAL side;
                             // the remote-side window is bounded only by the observation's
                             // freshness.
-                            val stillAuthorized = UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled == true &&
+                            val settingsNow = UploadFile.getAppSyncSettings()
+                            val stillAuthorized = settingsNow?.photoTrashSyncEnabled == true &&
+                                settingsNow.photoTrashActivationEpoch == passEpoch &&
                                 pairing.userId == AccountUtils.currentUserId
                             val liveRowUnchanged = withPairingRealm(customRealmConfig) { realm ->
                                 realm.where(PhotoPairing::class.java)
@@ -403,11 +502,13 @@ object PhotoTrashController {
     /**
      * THE SCOPED OPERATION IDENTITY of one cloud->device consent request: the pairing
      * (uri + owner account + drive + remote file + pairing moment) plus the consent stamp of
-     * the exact outstanding request. The identity is captured at the poll, carried through
-     * the pre-launch revalidation and persisted across activity recreation, and a dialog
-     * result applies only when the LIVE row still matches it in full — never to a newer
-     * re-arm, a replaced pairing (a same-URI re-pairing is a NEW binding with a new
-     * pairedAt), or another account's row.
+     * the exact outstanding request, the ACTIVATION generation the request belongs to, and
+     * the process-local binding generation at hand-out. The identity is captured at the
+     * poll, carried through the pre-launch revalidation and persisted across activity
+     * recreation, and a dialog result applies only when the LIVE row still matches it in
+     * full — never to a newer re-arm, a replaced pairing (a same-URI re-pairing is a NEW
+     * binding with a new pairedAt), a newer activation cycle (even one ending at identical
+     * values), or another account's row.
      */
     data class ConsentRequest(
         val uri: String,
@@ -416,13 +517,16 @@ object PhotoTrashController {
         val remoteFileId: Int,
         val pendingSince: Long,
         val pairedAt: Long,
+        val activationEpoch: Long,
+        val bindingGeneration: Long,
     )
 
     /**
      * The pre-launch revalidation of a captured [ConsentRequest] against the LIVE row and
      * gates, closing the APPLICATION-side window between a poll return and the dialog
-     * launch (a switch/disable that happens during this check is caught; the platform's
-     * own approval-time mutation race stays unclosable and disclosed).
+     * launch (a switch/disable, an activation cycle or a binding replacement that happens
+     * during this check is caught; the platform's own approval-time mutation race stays
+     * unclosable and disclosed).
      */
     fun isConsentStillPending(request: ConsentRequest, customRealmConfig: RealmConfiguration? = null): Boolean {
         if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse()) return false
@@ -435,6 +539,11 @@ object PhotoTrashController {
                         row.driveId == request.driveId &&
                         row.remoteFileId == request.remoteFileId &&
                         row.remoteTrashPendingSince == request.pendingSince &&
+                        // A replaced pairing is a NEW binding (new pairing moment); a
+                        // re-activation re-stamps the generation — an older request is
+                        // invalidated by either, even at identical flag/baseline values.
+                        row.pairedAt?.time == request.pairedAt &&
+                        row.activationEpoch == request.activationEpoch &&
                         row.state != PhotoPairing.State.DENIED.name
                 } ?: false
         }
@@ -465,7 +574,11 @@ object PhotoTrashController {
                             row.remoteTrashPendingSince != request.pendingSince ||
                             // A replaced pairing is a NEW binding: an answer belongs to the
                             // binding the dialog was shown for, never to its replacement.
-                            (row.pairedAt?.time ?: 0L) != request.pairedAt
+                            (row.pairedAt?.time ?: 0L) != request.pairedAt ||
+                            // Nor to a newer activation: an answer validated under an older
+                            // generation gains no authority in a re-activated world (even
+                            // when every captured value came back identical).
+                            row.activationEpoch != request.activationEpoch
                         ) {
                             return@let
                         }
@@ -568,6 +681,8 @@ object PhotoTrashController {
                                 remoteFileId = pairing.remoteFileId,
                                 pendingSince = pairing.remoteTrashPendingSince,
                                 pairedAt = pairing.pairedAt?.time ?: 0L,
+                                activationEpoch = pairing.activationEpoch,
+                                bindingGeneration = bindingGeneration(pairing.uri),
                             )
                         }
                     }
@@ -608,6 +723,7 @@ object PhotoTrashController {
             driveId == observed.driveId &&
             remoteFileId == observed.remoteFileId &&
             pairedAt == observed.pairedAt &&
+            activationEpoch == observed.activationEpoch &&
             localContentDigest == observed.localContentDigest &&
             remoteContentHash == observed.remoteContentHash &&
             localSizeAtPairing == observed.localSizeAtPairing &&
@@ -656,9 +772,10 @@ object PhotoTrashController {
         return pairing
     }
 
-    private fun ensurePairingBaseline(context: Context, pairing: PhotoPairing, customRealmConfig: RealmConfiguration? = null) {
+    private fun ensurePairingBaseline(context: Context, pairing: PhotoPairing, passEpoch: Long, customRealmConfig: RealmConfiguration? = null) {
         if (pairing.baselineTrashed != null) return
-        captureActivationBaseline(context, pairing, customRealmConfig)
+        // A late fill belongs to the CURRENT activation generation the pass runs under.
+        captureActivationBaseline(context, pairing, passEpoch, customRealmConfig)
     }
 
     private fun markLocalTrashReconciled(observed: PhotoPairing, observedTrashed: Boolean, customRealmConfig: RealmConfiguration? = null) {
@@ -783,7 +900,6 @@ object PhotoTrashController {
     //endregion
 
     //region Content binding
-
     /** Result of the destructive-boundary re-verification of the local source. */
     private enum class DigestBoundary {
         /** The current bytes equal the recorded upload digest. */

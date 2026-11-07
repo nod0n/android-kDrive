@@ -106,23 +106,36 @@ class PhotoTrashConsentUiQueue {
         /**
          * The final Main-side launch gate, evaluated synchronously in the SAME Main block
          * that launches the dialog — this closes the application-side window between the IO
-         * revalidation and the queued Main continuation, where the account or the opt-in
-         * flag could still change. The account check reads the in-memory current user; the
-         * opt-in check reads [PhotoTrashController.optInMirror] (in-memory, refreshed at
-         * every settings write and every settings read — never a realm open on Main, and
-         * exact for any change that landed before this gate runs). A lifecycle that is not
-         * at least STARTED cannot show a dialog. Unknown evidence and mismatched scope fail
-         * closed: nothing launches, nothing is erased, the durable row stays armed for the
-         * next drain. The platform's own approval-time mutation race stays unclosable and
-         * is disclosed in the controller — it is distinct from THIS closable gap.
+         * revalidation and the queued Main continuation. In-memory only (no realm open, no
+         * network, no hash work on Main):
+         *  - the account check reads the in-memory current user;
+         *  - [activationSnapshot] is the versioned activation authority
+         *    ([PhotoTrashController.ActivationSnapshot]): null (nothing observed) fails
+         *    closed, a mismatched scope user fails closed, a non-enabled snapshot fails
+         *    closed, and an EPOCH different from the request's invalidates the request —
+         *    an activation cycle that landed after the IO validation is caught here even
+         *    when it ended at identical Boolean values;
+         *  - [bindingGenerationCurrent] is the process-local revision of the request uri's
+         *    binding: a pairing replacement that landed after the IO validation (a NEW
+         *    binding even at identical metadata) is caught here;
+         *  - a lifecycle that is not at least STARTED cannot show a dialog.
+         * Unknown evidence and mismatched scope fail closed: nothing launches, nothing is
+         * erased, the durable row stays armed for the next drain. The platform's own
+         * approval-time mutation race stays unclosable and is disclosed in the controller —
+         * it is distinct from THIS closable gap.
          */
         fun launchAllowedNow(
             request: PhotoTrashController.ConsentRequest,
             currentUserId: Int,
-            optInMirrorValue: Boolean?,
+            activationSnapshot: PhotoTrashController.ActivationSnapshot?,
+            bindingGenerationCurrent: Long,
             lifecycleStarted: Boolean,
         ): Boolean = lifecycleStarted &&
             currentUserId == request.userId &&
-            optInMirrorValue == true
+            activationSnapshot != null &&
+            activationSnapshot.userId == currentUserId &&
+            activationSnapshot.optIn &&
+            activationSnapshot.activationEpoch == request.activationEpoch &&
+            bindingGenerationCurrent == request.bindingGeneration
     }
 }

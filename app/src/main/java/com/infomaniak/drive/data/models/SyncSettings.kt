@@ -34,6 +34,15 @@ open class SyncSettings(
     var deleteAfterSync: Boolean = false,
     var onlyWifiSyncMedia: Boolean = false,
     var photoTrashSyncEnabled: Boolean = false,
+    /**
+     * Per-user ACTIVATION GENERATION of the photo-trash option: incremented by the settings
+     * write seam on every not-enabled -> enabled transition, never reset. A stale Boolean
+     * cannot represent an activation cycle (OFF->ON re-arrives at the same `true`), so all
+     * in-flight observations, baselines and consent requests carry the epoch they were
+     * captured under and are invalidated by any later activation even when every field
+     * returns to the same value. 0 = never activated.
+     */
+    var photoTrashActivationEpoch: Long = 0,
 ) : RealmObject() {
 
     fun setIntervalType(intervalType: IntervalType) {

@@ -62,6 +62,13 @@ open class PhotoPairing(
      */
     var remoteContentHash: String? = null,
     var pairedAt: Date? = null,
+    /**
+     * The activation generation ([SyncSettings.photoTrashActivationEpoch]) under which this
+     * row's baseline was captured (pairing time, activation re-baseline, or late fill). A
+     * stale observation/answer whose epoch differs from the live row's is invalidated — even
+     * when every baseline/state Boolean returns to the same value across an OFF->ON cycle.
+     */
+    var activationEpoch: Long = 0L,
     /** Activation baseline: trashed-state of the local item when the feature was enabled; null = baseline not yet captured. */
     var baselineTrashed: Boolean? = null,
     var lastObservedTrashed: Boolean = false,

@@ -243,6 +243,8 @@ class MainActivity : BaseActivity() {
                     remoteFileId = savedInstanceState.getInt(SAVED_PHOTO_TRASH_REMOTE_FILE),
                     pendingSince = savedInstanceState.getLong(SAVED_PHOTO_TRASH_STAMP),
                     pairedAt = savedInstanceState.getLong(SAVED_PHOTO_TRASH_PAIRED_AT),
+                    activationEpoch = savedInstanceState.getLong(SAVED_PHOTO_TRASH_EPOCH),
+                    bindingGeneration = savedInstanceState.getLong(SAVED_PHOTO_TRASH_BINDING_GENERATION),
                 )
             )
         }
@@ -533,12 +535,14 @@ class MainActivity : BaseActivity() {
                 if (!PhotoTrashConsentUiQueue.launchAllowedNow(
                         request = request,
                         currentUserId = AccountUtils.currentUserId,
-                        optInMirrorValue = PhotoTrashController.optInMirror,
+                        activationSnapshot = PhotoTrashController.currentActivationSnapshot,
+                        bindingGenerationCurrent = PhotoTrashController.bindingGeneration(request.uri),
                         lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
                     )
                 ) {
-                    // Scope/opt-in/account changed after the IO verdict: nothing launches,
-                    // nothing is erased — the durable row stays armed for a later drain.
+                    // Scope/opt-in/activation/binding changed after the IO verdict: nothing
+                    // launches, nothing is erased — the durable row stays armed for a later
+                    // drain.
                     photoTrashConsentQueue.onValidationFailed()
                     return@withContext
                 }
@@ -572,6 +576,8 @@ class MainActivity : BaseActivity() {
             outState.putInt(SAVED_PHOTO_TRASH_REMOTE_FILE, request.remoteFileId)
             outState.putLong(SAVED_PHOTO_TRASH_STAMP, request.pendingSince)
             outState.putLong(SAVED_PHOTO_TRASH_PAIRED_AT, request.pairedAt)
+            outState.putLong(SAVED_PHOTO_TRASH_EPOCH, request.activationEpoch)
+            outState.putLong(SAVED_PHOTO_TRASH_BINDING_GENERATION, request.bindingGeneration)
         }
     }
 
@@ -950,5 +956,7 @@ class MainActivity : BaseActivity() {
         private const val SAVED_PHOTO_TRASH_REMOTE_FILE = "savedPhotoTrashConsentRemoteFileId"
         private const val SAVED_PHOTO_TRASH_STAMP = "savedPhotoTrashConsentPendingSince"
         private const val SAVED_PHOTO_TRASH_PAIRED_AT = "savedPhotoTrashConsentPairedAt"
+        private const val SAVED_PHOTO_TRASH_EPOCH = "savedPhotoTrashConsentActivationEpoch"
+        private const val SAVED_PHOTO_TRASH_BINDING_GENERATION = "savedPhotoTrashConsentBindingGeneration"
     }
 }

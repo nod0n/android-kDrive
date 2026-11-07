@@ -486,9 +486,16 @@ class SyncSettingsActivity : BaseActivity() {
                         // flag is on, so none can race this capture into propagating against
                         // a stale pairing-time baseline (an item trashed while the option was
                         // off becomes a visible INCONCLUSIVE at activation, never a new
-                        // post-activation transition). Off the UI thread.
+                        // post-activation transition). The capture stamps every row with the
+                        // NEXT activation epoch (read fresh here; the settings write seam
+                        // stamps the same next value into the persisted settings, since the
+                        // live row has not changed in between) — so an OFF->ON cycle
+                        // invalidates every in-flight observation even when it ends at
+                        // identical Boolean values. Off the UI thread.
                         if (oldSyncSettings?.photoTrashSyncEnabled != true && syncSettings.photoTrashSyncEnabled) {
-                            PhotoTrashController.captureActivationBaselines(applicationContext)
+                            val activationEpoch =
+                                (UploadFile.getAppSyncSettings()?.photoTrashActivationEpoch ?: 0L) + 1L
+                            PhotoTrashController.captureActivationBaselines(applicationContext, activationEpoch)
                         }
                         SentryLog.i(TAG, "start update appSettings")
                         UploadFile.setAppSyncSettings(syncSettings)

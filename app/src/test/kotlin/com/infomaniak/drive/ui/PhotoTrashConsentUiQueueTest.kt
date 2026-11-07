@@ -40,7 +40,15 @@ class PhotoTrashConsentUiQueueTest {
         remoteFileId = 900_501,
         pendingSince = stamp,
         pairedAt = 0L,
+        activationEpoch = 3L,
+        bindingGeneration = 7L,
     )
+
+    private fun snapshot(
+        userId: Int = 951,
+        epoch: Long = 3L,
+        optIn: Boolean = true,
+    ) = PhotoTrashController.ActivationSnapshot(userId = userId, activationEpoch = epoch, optIn = optIn, revision = 1L)
 
     @Test
     fun `a drain holds the guard exactly until it ends`() {
@@ -114,25 +122,57 @@ class PhotoTrashConsentUiQueueTest {
     fun `the final launch gate fails closed on every missing condition`() {
         val req = request()
 
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, optInMirrorValue = true, lifecycleStarted = false), "a stopped lifecycle shows no dialog")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 952, optInMirrorValue = true, lifecycleStarted = true), "another account's request never launches")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, optInMirrorValue = null, lifecycleStarted = true), "unknown opt-in evidence fails closed")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, optInMirrorValue = false, lifecycleStarted = true), "an opted-out account never launches")
-        assertTrue(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, optInMirrorValue = true, lifecycleStarted = true))
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), bindingGenerationCurrent = 7L, lifecycleStarted = false), "a stopped lifecycle shows no dialog")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 952, activationSnapshot = snapshot(), bindingGenerationCurrent = 7L, lifecycleStarted = true), "another account's request never launches")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = null, bindingGenerationCurrent = 7L, lifecycleStarted = true), "unknown activation evidence fails closed")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(optIn = false), bindingGenerationCurrent = 7L, lifecycleStarted = true), "an opted-out account never launches")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(userId = 952), bindingGenerationCurrent = 7L, lifecycleStarted = true), "an authority scoped to another user fails closed")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(epoch = 4L), bindingGenerationCurrent = 7L, lifecycleStarted = true), "a newer activation cycle invalidates the request even at the same enabled value")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), bindingGenerationCurrent = 8L, lifecycleStarted = true), "a replaced binding after the IO validation is caught at launch")
+        assertTrue(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), bindingGenerationCurrent = 7L, lifecycleStarted = true))
     }
 
     @Test
-    fun `the opt-in mirror keeps only real observations`() {
-        PhotoTrashController.noteOptInValue(null)
-        assertNull(PhotoTrashController.optInMirror, "an absent observation must not erase or invent a value")
+    fun `a stale reader snapshot cannot overwrite a newer authoritative write`() {
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = false)
 
-        PhotoTrashController.noteOptInValue(true)
-        assertEquals(true, PhotoTrashController.optInMirror)
+        // A reader that captured its revision BEFORE that write and observed the old
+        // enabled state publishes after it: the newer write must survive.
+        PhotoTrashController.noteActivationObserved(permit = 0L, userId = 951, activationEpoch = 0L, optIn = true)
 
-        PhotoTrashController.noteOptInValue(null)
-        assertEquals(true, PhotoTrashController.optInMirror, "null keeps the last observed value")
+        val authority = PhotoTrashController.currentActivationSnapshot
+        assertEquals(false, authority?.optIn, "a getter snapshot is never an authority over a newer write")
+        assertEquals(1L, authority?.activationEpoch)
+    }
 
-        PhotoTrashController.noteOptInValue(false)
-        assertEquals(false, PhotoTrashController.optInMirror, "a fresh observation replaces the stale one")
+    @Test
+    fun `a missing-row observation fails closed over a stale enabled state`() {
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true)
+
+        // The settings row is GONE (logout, restore wipe): a reader observing absence must
+        // invalidate the enabled state, not preserve it, whatever its revision was.
+        PhotoTrashController.noteActivationObserved(permit = 0L, userId = 951, activationEpoch = 0L, optIn = false)
+
+        assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn, "missing data fails closed; it never preserves another observation's true")
+    }
+
+    @Test
+    fun `a write landing during a read outranks the read and the read publishes under its permit`() {
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true)
+        val permit = PhotoTrashController.activationReadPermit()
+
+        // The write lands while the reader sits in its DB read; the reader then publishes
+        // its older observation under the pre-read permit: rejected.
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = false)
+        PhotoTrashController.noteActivationObserved(permit = permit, userId = 951, activationEpoch = 1L, optIn = true)
+
+        val authority = PhotoTrashController.currentActivationSnapshot
+        assertEquals(false, authority?.optIn, "the mid-read write stays authoritative")
+        assertEquals(2L, authority?.activationEpoch)
+
+        // With NO write landing during the read, the reader publishes normally.
+        val freshPermit = PhotoTrashController.activationReadPermit()
+        PhotoTrashController.noteActivationObserved(permit = freshPermit, userId = 951, activationEpoch = 2L, optIn = false)
+        assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn)
     }
 }

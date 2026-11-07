@@ -441,23 +441,74 @@ open class UploadFile(
                     it.where(SyncSettings::class.java).findFirst()?.deleteFromRealm()
                 }
             }
+            // A write seam: the deletion is authoritative fail-closed evidence (absence of
+            // the opt-in), published at a fresh revision so no stale getter observation can
+            // preserve an older enabled state over it.
+            PhotoTrashController.noteActivationWritten(
+                userId = AccountUtils.currentUserId,
+                activationEpoch = 0L,
+                optIn = false,
+            )
         }
 
         fun setAppSyncSettings(syncSettings: SyncSettings, customRealm: Realm? = null) {
+            // The activation epoch is a per-user MONOTONIC generation owned by THIS seam:
+            // every not-enabled -> enabled transition increments it (the live row, not a
+            // detached snapshot, is the authority), any other write keeps the live value.
+            // A stale writer object can therefore never rewind it, and every writer path
+            // (settings UI, backup restore, upload-worker refresh) increments coherently.
+            var activationEpoch = syncSettings.photoTrashActivationEpoch
             val block: (Realm) -> Unit = { realm ->
-                realm.executeTransaction { it.insertOrUpdate(syncSettings) }
+                realm.executeTransaction { mutableRealm ->
+                    val existing = mutableRealm.where(SyncSettings::class.java)
+                        .equalTo(SyncSettings::userId.name, syncSettings.userId)
+                        .findFirst()
+                    activationEpoch = when {
+                        existing == null -> if (syncSettings.photoTrashSyncEnabled) 1L else 0L
+                        !existing.photoTrashSyncEnabled && syncSettings.photoTrashSyncEnabled ->
+                            existing.photoTrashActivationEpoch + 1L
+                        else -> maxOf(existing.photoTrashActivationEpoch, syncSettings.photoTrashActivationEpoch)
+                    }
+                    syncSettings.photoTrashActivationEpoch = activationEpoch
+                    mutableRealm.insertOrUpdate(syncSettings)
+                }
             }
             customRealm?.let(block) ?: getRealmInstance().use(block)
-            // The single settings write seam refreshes the Main-readable opt-in mirror.
-            PhotoTrashController.noteOptInValue(syncSettings.photoTrashSyncEnabled)
+            // The single settings write seam refreshes the Main-readable activation
+            // authority at a fresh revision: a writer is always the freshest snapshot.
+            PhotoTrashController.noteActivationWritten(
+                userId = syncSettings.userId,
+                activationEpoch = activationEpoch,
+                optIn = syncSettings.photoTrashSyncEnabled,
+            )
         }
 
         fun getAppSyncSettings(): SyncSettings? {
+            // The reader captures the mirror revision BEFORE it opens the realm: a write
+            // landing during the read increments it, so this snapshot's older revision is
+            // rejected and a stale observation can never overwrite newer authoritative
+            // state (see PhotoTrashController.ActivationSnapshot).
+            val readPermit = PhotoTrashController.activationReadPermit()
             return getRealmInstance().use { realm ->
                 val realmObject = realm.where(SyncSettings::class.java).findFirst()
-                realmObject?.let {
-                    PhotoTrashController.noteOptInValue(it.photoTrashSyncEnabled)
-                    realm.copyFromRealm(it, 0)
+                if (realmObject == null) {
+                    // A missing row is authoritative fail-closed evidence: absence never
+                    // preserves another observation's enabled state.
+                    PhotoTrashController.noteActivationObserved(
+                        permit = readPermit,
+                        userId = AccountUtils.currentUserId,
+                        activationEpoch = 0L,
+                        optIn = false,
+                    )
+                    null
+                } else {
+                    PhotoTrashController.noteActivationObserved(
+                        permit = readPermit,
+                        userId = realmObject.userId,
+                        activationEpoch = realmObject.photoTrashActivationEpoch,
+                        optIn = realmObject.photoTrashSyncEnabled,
+                    )
+                    realm.copyFromRealm(realmObject, 0)
                 }
             }
         }

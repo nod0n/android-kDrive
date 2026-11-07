@@ -182,9 +182,25 @@ class UploadMigration : RealmMigration {
         }
         //endregion
 
+        //region Migrate to version 13: per-user photo-trash activation epoch.
+        // A stillIs tuple of state values is not an activation generation: OFF->ON can end
+        // with identical Booleans, so in-flight work could not tell a fresh activation from
+        // no change. The epoch is stamped by the settings write seam on every enable and
+        // carried by every pairing baseline; both columns default to 0 (the never-activated
+        // generation all existing rows implicitly belong to) — nothing is rewritten.
+        if (oldVersionTemp == 12L) {
+            schema.get(SyncSettings::class.java.simpleName)!!
+                .addField(SyncSettings::photoTrashActivationEpoch.name, Long::class.java, FieldAttribute.REQUIRED)
+            schema.get(PhotoPairing::class.java.simpleName)!!
+                .addField(PhotoPairing::activationEpoch.name, Long::class.java, FieldAttribute.REQUIRED)
+
+            oldVersionTemp = 13L
+        }
+        //endregion
+
     }
 
     companion object {
-        const val DB_VERSION = 12L // Must be bumped when the schema changes
+        const val DB_VERSION = 13L // Must be bumped when the schema changes
     }
 }
