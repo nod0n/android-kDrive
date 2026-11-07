@@ -37,7 +37,7 @@ import java.util.Date
 import java.util.UUID
 
 /**
- * THE REAL 10→12 UPLOAD MIGRATION FIXTURE (androidTest instrumentation — Realm Java is a
+ * THE REAL 10→13 UPLOAD MIGRATION FIXTURE (androidTest instrumentation — Realm Java is a
  * native engine and CANNOT open on the JVM; this is why the test lives here and not under
  * src/test).
  *
@@ -46,12 +46,13 @@ import java.util.UUID
  * checkout). Its true shape is reconstructed EXACTLY from those sources: UploadFile carries
  * originalFileId (Int REQUIRED), reconciliationDone (Boolean REQUIRED) and contentHash (String
  * nullable) — fields this branch's schema does not declare — and, as at v8, neither
- * SyncSettings.photoTrashSyncEnabled nor a PhotoPairing table exists. Following the T-0079
+ * SyncSettings.photoTrashSyncEnabled, SyncSettings.photoTrashActivationEpoch nor a PhotoPairing
+ * table exists. Following the T-0079
  * pattern: (A) typed realm at the full current module STAMPED 10, (B) DynamicRealm shape
  * correction to the TRUE v10 schema (remove this branch's additions, add the dev columns, seed
  * one row with dev values), verified by audit, (C) reopen at [UploadMigration.DB_VERSION]
- * (12) with the REAL [UploadMigration] and the FULL production module — exactly what a
- * production upgrade executes — and audit ONLY the 10→12 difference: the undeclared dev fields
+ * (13) with the REAL [UploadMigration] and the FULL production module — exactly what a
+ * production upgrade executes — and audit ONLY the 10→13 difference: the undeclared dev fields
  * are removed EXPLICITLY (never implicitly — the migration names each one), rows and pending
  * uploads are preserved, the opt-in reads false, and the pairing table is writable.
  *
@@ -64,14 +65,14 @@ class UploadMigration10to12Test {
     private val fixtureName = "uploadMigration10to12-${UUID.randomUUID()}"
     private val fixtureDir = ApplicationProvider.getApplicationContext<android.content.Context>().cacheDir
 
-    private val configAt20 = RealmConfiguration.Builder()
+    private val configAt10 = RealmConfiguration.Builder()
         .schemaVersion(10L)
         .modules(RealmModules.SyncFilesModule())
         .name(fixtureName)
         .directory(fixtureDir)
         .build()
 
-    private val configAt21 = RealmConfiguration.Builder()
+    private val configAtCurrent = RealmConfiguration.Builder()
         .schemaVersion(UploadMigration.DB_VERSION)
         .migration(UploadMigration())
         .modules(RealmModules.SyncFilesModule())
@@ -83,10 +84,10 @@ class UploadMigration10to12Test {
     private val devUploadFields = listOf("originalFileId", "reconciliationDone", "contentHash")
 
     @Test
-    @DisplayName("migration 10 to 11 removes the dev fields explicitly and preserves pending uploads")
+    @DisplayName("migration 10 to 13 removes the dev fields explicitly and preserves pending uploads")
     fun migration10to12RemovesDevFieldsExplicitlyAndPreservesRows() {
         // ---- PHASE A: a disposable typed realm at the full current module shape, stamped 10.
-        Realm.getInstance(configAt20).use { realm ->
+        Realm.getInstance(configAt10).use { realm ->
             realm.executeTransaction { transactionRealm ->
                 transactionRealm.createObject(UploadFile::class.java, "content://fixture/pending-10").apply {
                     driveId = 741
@@ -107,13 +108,19 @@ class UploadMigration10to12Test {
 
         // ---- PHASE B: the same file as a DynamicRealm at 10 — correct the shape to the TRUE
         // v10 schema (sources: the offline-folder development branch), then verify.
-        DynamicRealm.getInstance(configAt20).use { dynamic ->
+        DynamicRealm.getInstance(configAt10).use { dynamic ->
             dynamic.executeTransaction { transactionRealm ->
                 val uploadSchema = transactionRealm.schema.get("UploadFile")
                 check(uploadSchema != null)
                 val settingsSchema = transactionRealm.schema.get("SyncSettings")
                 check(settingsSchema != null && settingsSchema.hasField("photoTrashSyncEnabled"))
                 settingsSchema.removeField("photoTrashSyncEnabled")
+                // The v13 epoch column is part of TODAY'S typed module too: the true v10
+                // shape predates it, so the fixture must remove it as well — otherwise the
+                // real 12→13 migration's unconditional addField hits "field already
+                // exists" (device-62a3 evidence).
+                check(settingsSchema.hasField(SyncSettings::photoTrashActivationEpoch.name))
+                settingsSchema.removeField(SyncSettings::photoTrashActivationEpoch.name)
                 check(transactionRealm.schema.get("PhotoPairing") != null)
                 transactionRealm.schema.remove("PhotoPairing")
 
@@ -129,14 +136,20 @@ class UploadMigration10to12Test {
             val uploadSchema = dynamic.schema.get("UploadFile")
             check(uploadSchema != null)
             devUploadFields.forEach { field -> assertTrue(uploadSchema.hasField(field), "the true v10 shape carries $field") }
-            assertFalse(uploadSchema.hasField("photoTrashSyncEnabled"))
+            val settingsSchemaAfterRemoval = dynamic.schema.get("SyncSettings")
+            check(settingsSchemaAfterRemoval != null)
+            assertFalse(settingsSchemaAfterRemoval.hasField("photoTrashSyncEnabled"), "the true v10 shape has no opt-in column")
+            assertFalse(
+                settingsSchemaAfterRemoval.hasField(SyncSettings::photoTrashActivationEpoch.name),
+                "the true v10 shape has no activation-epoch column",
+            )
             assertFalse(dynamic.schema.contains("PhotoPairing"), "the true v10 shape has no pairing table")
             assertEquals(1L, dynamic.where("UploadFile").count())
         }
 
-        // ---- PHASE C: reopen at 11 with the REAL migration + the full module; audit ONLY
-        // the 10→12 difference.
-        Realm.getInstance(configAt21).use { realm ->
+        // ---- PHASE C: reopen at 13 with the REAL migration + the full module; audit ONLY
+        // the 10→13 difference.
+        Realm.getInstance(configAtCurrent).use { realm ->
             val uploadSchema = realm.schema.get("UploadFile")
             check(uploadSchema != null)
             devUploadFields.forEach { field ->
@@ -189,7 +202,7 @@ class UploadMigration10to12Test {
     fun cleanup() {
         // ONLY the random own-cache fixture is deleted — never any other realm, never any
         // owner data.
-        runCatching { Realm.deleteRealm(configAt21) }
-        runCatching { Realm.deleteRealm(configAt20) }
+        runCatching { Realm.deleteRealm(configAtCurrent) }
+        runCatching { Realm.deleteRealm(configAt10) }
     }
 }

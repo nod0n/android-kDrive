@@ -369,6 +369,58 @@ class PhotoTrashConsentQueueTest {
     }
 
     @Test
+    @DisplayName("a binding replacement DURING the drain surfaces nothing (generation/stamp certification)")
+    fun aBindingWriteDuringTheDrainSurfacesNothing() {
+        seedArmedRow(uriA, remoteFileIdA, stampA)
+        val pairedAtBefore = row(uriA).pairedAt
+
+        val surfaced = runBlocking {
+            parkAtRemoteQuery = true
+            val poll = async(Dispatchers.IO) { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
+            assertTrue(
+                remoteQueryCapture.await(15, TimeUnit.SECONDS),
+                "the poll must reach the remote-details seam before the binding write",
+            )
+            // The REAL writer path: a replacement pairing for the SAME uri commits while
+            // the poll is parked inside its remote IO. recordPairing bumps the binding
+            // generation and the global write stamp BEFORE its transaction (pre-commit
+            // invalidation), so the poll's read rows can no longer be certified against
+            // the registry.
+            PhotoTrashController.recordPairing(
+                context = mockContext,
+                uploadFile = UploadFile().apply {
+                    uri = uriA
+                    userId = userId
+                    driveId = driveId
+                    fileName = "fixture-queue.jpg"
+                },
+                remoteFile = File(id = remoteFileIdA, driveId = driveId).apply {
+                    serverContentHash = "xxh3:0123456789abcdef"
+                    lastModifiedAt = 1_700_000_000L
+                    size = contentA.size.toLong()
+                },
+                uploadedContentDigest = null,
+                customRealmConfig = config,
+            )
+            remoteQueryRelease.countDown()
+            poll.await()
+        }
+
+        assertNull(surfaced, "a binding write during the drain uncertifies the read rows: nothing is handed out")
+        assertTrue(remoteQueryEntered.get() >= 1, "the poll actually reached the gated mid-IO boundary")
+        // The replacement itself landed through the real writer path (a NEW binding, a
+        // strictly later pairing moment, starting unarmed); the drain surfaced nothing for
+        // the OLD binding it had read.
+        val replaced = row(uriA)
+        assertNotNull(replaced.pairedAt, "the replacement binding was recorded")
+        assertTrue(
+            (replaced.pairedAt?.time ?: 0L) > (pairedAtBefore?.time ?: 0L),
+            "the replacement's pairing moment is strictly past the previous binding's",
+        )
+        assertEquals(0L, replaced.remoteTrashPendingSince, "the replacement starts unarmed; no old request leaked through")
+    }
+
+    @Test
     @DisplayName("a remote restore while armed expires the request through the poll")
     fun remoteRestoreWhileArmedExpiresThroughThePoll() {
         seedArmedRow(uriA, remoteFileIdA, stampA)

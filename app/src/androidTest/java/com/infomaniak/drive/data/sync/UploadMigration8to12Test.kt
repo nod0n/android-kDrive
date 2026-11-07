@@ -36,20 +36,22 @@ import java.util.Date
 import java.util.UUID
 
 /**
- * THE REAL 8→21 UPLOAD MIGRATION FIXTURE (androidTest instrumentation — Realm Java is a
+ * THE REAL 8→13 UPLOAD MIGRATION FIXTURE (androidTest instrumentation — Realm Java is a
  * native engine and CANNOT open on the JVM; this is why the test lives here and not under
  * src/test).
  *
  * Version 8 is the PUBLIC BASELINE Sync.realm schema (origin/main), so the true v8 shape is
- * exactly the current [RealmModules.SyncFilesModule] classes MINUS this branch's additions:
- * SyncSettings.photoTrashSyncEnabled and the whole PhotoPairing table. Following the T-0079
- * pattern: (A) typed realm at the full current module STAMPED 8, (B) DynamicRealm shape
- * correction to the TRUE v8 schema (remove only this branch's additions, verified by audit),
- * (C) reopen at [UploadMigration.DB_VERSION] (12) with the REAL [UploadMigration] and the
- * FULL production module — exactly what a production upgrade executes — and audit ONLY the
- * 8→21 difference: the opt-in column exists (REQUIRED, reads false: nothing is auto-enabled),
- * the pairing table exists empty, pending and completed upload rows are preserved byte-equal,
- * and the pairing table is writable.
+ * exactly the current [RealmModules.SyncFilesModule] PERSISTED classes MINUS this branch's
+ * additions: SyncSettings.photoTrashSyncEnabled, SyncSettings.photoTrashActivationEpoch and
+ * the whole PhotoPairing table. @Ignore properties are schema-invisible at every version.
+ * Following the T-0079 pattern: (A) typed realm at the full current module STAMPED 8, (B)
+ * DynamicRealm shape correction to the TRUE v8 schema (remove ONLY this branch's additions,
+ * verified by audit), (C) reopen at [UploadMigration.DB_VERSION] (13) with the REAL
+ * [UploadMigration] and the FULL production module — exactly what a production upgrade
+ * executes — and audit ONLY the 8→13 difference: the opt-in column exists (REQUIRED, reads
+ * false: nothing is auto-enabled), the activation-epoch column exists (default 0: the
+ * never-activated generation), the pairing table exists empty, pending and completed upload
+ * rows are preserved byte-equal, and the pairing table is writable.
  *
  * THE FIXTURE IS FULLY DISPOSABLE AND ACCOUNT-FREE: a RANDOM file in the instrumentation
  * target's cacheDir; every row is a synthetic constant — NO owner data, NO account, NO network.
@@ -67,7 +69,7 @@ class UploadMigration8to12Test {
         .directory(fixtureDir)
         .build()
 
-    private val configAt21 = RealmConfiguration.Builder()
+    private val configAtCurrent = RealmConfiguration.Builder()
         .schemaVersion(UploadMigration.DB_VERSION)
         .migration(UploadMigration())
         .modules(RealmModules.SyncFilesModule())
@@ -76,7 +78,8 @@ class UploadMigration8to12Test {
         .build()
 
     private fun seedPending(uploadFile: UploadFile) = uploadFile.apply {
-        uri = "content://fixture/pending-8"
+        // NO uri here: the primary key belongs to createObject exactly once — assigning it
+        // on the ALREADY-MANAGED object afterwards is a RealmException (device-62a3).
         driveId = 731
         userId = 931
         fileName = "fixture-pending-8.jpg"
@@ -87,7 +90,6 @@ class UploadMigration8to12Test {
     }
 
     private fun seedCompleted(uploadFile: UploadFile) = uploadFile.apply {
-        uri = "content://fixture/completed-8"
         driveId = 731
         userId = 931
         fileName = "fixture-completed-8.jpg"
@@ -99,13 +101,13 @@ class UploadMigration8to12Test {
     }
 
     @Test
-    @DisplayName("migration 8 to 21 adds the opt-in flag and the empty pairing table and preserves rows")
+    @DisplayName("migration 8 to 13 adds the opt-in and epoch columns and the empty pairing table and preserves rows")
     fun migration8to12AddsOptInAndPairingTableAndPreservesRows() {
         // ---- PHASE A: a disposable typed realm at the full current module shape, stamped 8.
         Realm.getInstance(configAt8).use { realm ->
             realm.executeTransaction { transactionRealm ->
-                seedPending(transactionRealm.createObject(UploadFile::class.java, seedPending(UploadFile()).uri))
-                seedCompleted(transactionRealm.createObject(UploadFile::class.java, seedCompleted(UploadFile()).uri))
+                seedPending(transactionRealm.createObject(UploadFile::class.java, "content://fixture/pending-8"))
+                seedCompleted(transactionRealm.createObject(UploadFile::class.java, "content://fixture/completed-8"))
                 transactionRealm.createObject(SyncSettings::class.java, 931).apply {
                     driveId = 731
                     syncFolder = 42
@@ -124,6 +126,14 @@ class UploadMigration8to12Test {
                     "the phase-A module schema must carry photoTrashSyncEnabled"
                 }
                 settingsSchema.removeField("photoTrashSyncEnabled")
+                // The v13 epoch column is part of TODAY'S typed module too: the true v8
+                // shape predates it, so the fixture must remove it as well — otherwise the
+                // real 12→13 migration's unconditional addField hits "field already
+                // exists" (device-62a3 evidence).
+                check(settingsSchema.hasField(SyncSettings::photoTrashActivationEpoch.name)) {
+                    "the phase-A module schema must carry photoTrashActivationEpoch"
+                }
+                settingsSchema.removeField(SyncSettings::photoTrashActivationEpoch.name)
                 check(transactionRealm.schema.get("PhotoPairing") != null) {
                     "the phase-A module schema must carry PhotoPairing"
                 }
@@ -132,22 +142,28 @@ class UploadMigration8to12Test {
             val settingsSchema = dynamic.schema.get("SyncSettings")
             check(settingsSchema != null)
             assertFalse(settingsSchema.hasField("photoTrashSyncEnabled"), "the true v8 shape has no opt-in column")
+            assertFalse(
+                settingsSchema.hasField(SyncSettings::photoTrashActivationEpoch.name),
+                "the true v8 shape has no activation-epoch column",
+            )
             assertFalse(dynamic.schema.contains("PhotoPairing"), "the true v8 shape has no pairing table")
             assertEquals(2L, dynamic.where("UploadFile").count())
             assertEquals(1L, dynamic.where("SyncSettings").count())
         }
 
-        // ---- PHASE C: reopen at 11 with the REAL migration + the full module; audit ONLY
-        // the 8→21 difference.
-        Realm.getInstance(configAt21).use { realm ->
+        // ---- PHASE C: reopen at 13 with the REAL migration + the full module; audit ONLY
+        // the 8→13 difference.
+        Realm.getInstance(configAtCurrent).use { realm ->
             val settingsSchema = realm.schema.get("SyncSettings")
             check(settingsSchema != null)
             assertTrue(settingsSchema.hasField(SyncSettings::photoTrashSyncEnabled.name), "the migration adds the opt-in column")
+            assertTrue(settingsSchema.hasField(SyncSettings::photoTrashActivationEpoch.name), "the migration adds the activation-epoch column (v13)")
             assertTrue(realm.schema.contains("PhotoPairing"), "the migration creates the pairing table")
             assertEquals(0L, realm.where(com.infomaniak.drive.data.models.PhotoPairing::class.java).count())
 
             val settings = realm.where(SyncSettings::class.java).equalTo("userId", 931).findFirst()!!
             assertFalse(settings.photoTrashSyncEnabled, "the opt-in is NEVER auto-enabled by the migration")
+            assertEquals(0L, settings.photoTrashActivationEpoch, "migrated rows start in the never-activated generation")
             assertEquals(731, settings.driveId)
             assertEquals(42, settings.syncFolder)
             assertTrue(settings.syncVideo)
@@ -192,7 +208,7 @@ class UploadMigration8to12Test {
     fun cleanup() {
         // ONLY the random own-cache fixture is deleted — never any other realm, never any
         // owner data.
-        runCatching { Realm.deleteRealm(configAt21) }
+        runCatching { Realm.deleteRealm(configAtCurrent) }
         runCatching { Realm.deleteRealm(configAt8) }
     }
 }

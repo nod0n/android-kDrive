@@ -76,17 +76,30 @@ class FileMigration11to18Test {
         .directory(fixtureDir)
         .build()
 
-    /** The baseline v11 File field set, derived EXACTLY from the baseline sources
-     * (origin/main 8e41bcb57): the current class minus this branch's five additions. The
-     * fixture audits the WHOLE field set, not only the added columns. */
+    /**
+     * The baseline v11 File field set: the PERSISTED schema of the current
+     * [RealmModules.LocalFilesModule] classes minus this branch's six additions.
+     * @Ignore properties (driveColor, currentProgress, publicShareUuid, publicShareAuthToken)
+     * and non-property names (result — a hashCode() local) are schema-INVISIBLE at every
+     * version and belong to NO persisted field set. CHALLENGE-62a3 finding 4 / device-62a3:
+     * the first version of this list was derived from Kotlin-source names and wrongly
+     * included those five — the device run proved the persisted schema omits exactly them,
+     * so they are asserted absent explicitly ([neverPersistedNames]) instead of expected.
+     */
     private val baselineFileFields = setOf(
         "addedAt", "categories", "children", "color", "conversion", "createdAt", "createdBy",
-        "currentProgress", "cursor", "deletedAt", "deletedBy", "driveColor", "driveId", "dropbox",
-        "extensionType", "externalImport", "id", "isComplete", "isFavorite", "isFromUploads",
+        "cursor", "deletedAt", "deletedBy", "driveId", "dropbox", "extensionType",
+        "externalImport", "id", "isComplete", "isFavorite", "isFromUploads",
         "isMarkedAsOffline", "isOffline", "lastActionAt", "lastModifiedAt", "name", "parentId",
-        "path", "publicShareAuthToken", "publicShareUuid", "responseAt", "result", "revisedAt",
-        "rights", "shareLink", "size", "sortedName", "status", "supportedBy", "type", "uid",
-        "updatedAt", "users", "version", "versionCode", "visibility",
+        "path", "responseAt", "revisedAt", "rights", "shareLink", "size", "sortedName",
+        "status", "supportedBy", "type", "uid", "updatedAt", "users", "version", "versionCode",
+        "visibility",
+    )
+
+    /** Names that must NEVER appear in a persisted Realm schema at any version: @Ignore
+     *  properties of the current model and a Kotlin local that shares a source file. */
+    private val neverPersistedNames = listOf(
+        "currentProgress", "driveColor", "publicShareAuthToken", "publicShareUuid", "result",
     )
 
     private val newFileFields = listOf(
@@ -151,6 +164,9 @@ class FileMigration11to18Test {
             val fileSchema = dynamic.schema.get("File")
             check(fileSchema != null)
             newFileFields.forEach { field -> assertFalse(fileSchema.hasField(field), "the true v11 shape has no $field") }
+            neverPersistedNames.forEach { name ->
+                assertFalse(fileSchema.hasField(name), "$name is @Ignore/non-persisted and is schema-invisible at v11 too")
+            }
             assertEquals(
                 baselineFileFields,
                 fileSchema.fieldNames.toSet(),
@@ -185,6 +201,9 @@ class FileMigration11to18Test {
                 fileSchema.fieldNames.toSet(),
                 "the migrated schema must hold the WHOLE v18 File field set and nothing else",
             )
+            neverPersistedNames.forEach { name ->
+                assertFalse(fileSchema.hasField(name), "$name stays schema-invisible after the migration too")
+            }
             assertTrue(realm.schema.contains("OfflineFolderRoot"), "the migration creates the root registry")
             assertEquals(0L, realm.where(com.infomaniak.drive.data.models.OfflineFolderRoot::class.java).count())
 
