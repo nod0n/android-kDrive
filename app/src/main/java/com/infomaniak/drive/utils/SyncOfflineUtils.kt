@@ -149,9 +149,12 @@ object SyncOfflineUtils {
 
             migrateOfflineIfNeeded(context, file, ioFile, userDrive)
 
-            // A root-covered copy never uploads through the baseline path: local edits to it
-            // are preserved locally and resolved by the user, not silently pushed.
-            if (OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)) continue
+            // A root-covered or root-owned copy never uploads through the baseline path:
+            // local edits to it are preserved locally and resolved by the user, not silently
+            // pushed — the recorded ownership survives a cached tree update that moved the
+            // row out of the subtree, so the baseline pass cannot undo preservation before
+            // root maintenance.
+            if (OfflineFolderSyncUtils.isRootOwnedCopy(file, realm, userDrive)) continue
 
             if (ioFile.lastModified() > file.revisedAtInMillis) {
                 uploadFile(
@@ -178,11 +181,13 @@ object SyncOfflineUtils {
 
         migrateOfflineIfNeeded(context, localFile, ioFile, userDrive)
 
-        // Root coverage owns this copy's lifecycle and runs on the same cadence right after
+        // Root ownership owns this copy's lifecycle and runs on the same cadence right after
         // this pass: a remote deletion releases coverage there WITHOUT deleting bytes, and
         // remote changes refresh through the staged path. The baseline effects (delete on
-        // FILE_DELETE/FILE_TRASH, upload/download/rename) must not act first.
-        if (OfflineFolderSyncUtils.isRootCoveredCopy(localFile, realm, userDrive)) return
+        // FILE_DELETE/FILE_TRASH, upload/download/rename) must not act first. The recorded
+        // ownership provenance keeps the skip alive across a cached tree update that moved
+        // the row out of the subtree.
+        if (OfflineFolderSyncUtils.isRootOwnedCopy(localFile, realm, userDrive)) return
 
         when (fileAction.lastAction) {
             FileActivityType.FILE_DELETE, FileActivityType.FILE_TRASH -> ioFile.delete()
@@ -198,7 +203,7 @@ object SyncOfflineUtils {
         userDrive: UserDrive,
         realm: Realm,
     ) {
-        if (OfflineFolderSyncUtils.isRootCoveredCopy(localFile, realm, userDrive)) return // owned by the root pass
+        if (OfflineFolderSyncUtils.isRootOwnedCopy(localFile, realm, userDrive)) return // owned by the root pass
         val remoteFile = fileAction.file
         val ioFileLastModified = ioFile.lastModified()
         when {

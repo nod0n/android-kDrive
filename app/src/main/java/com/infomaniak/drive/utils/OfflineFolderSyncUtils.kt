@@ -246,6 +246,23 @@ object OfflineFolderSyncUtils {
     }
 
     /**
+     * The root contract's PERSISTENT claim on this copy: live subtree coverage, or recorded
+     * root ownership ([File.offlineOwnedByRoot]) that survives a cached tree/listing update
+     * moving the row (or an ancestor) out of the subtree while root work was queued or
+     * published. Live coverage alone cannot carry that interval: both of its reads would
+     * walk the already-updated parent chain and find nothing. A direct pin SUPPRESSES the
+     * recorded claim — explicit direct retention keeps the baseline (uncovered) semantics,
+     * and overlapping roots keep the claim until their own withdrawals release it.
+     * Ownership provenance is lifecycle evidence, not intent: [hasLiveOfflineIntent] still
+     * governs whether any transfer may run at all, and the baseline offline sync must keep
+     * skipping root-owned copies so it cannot undo preservation before root maintenance.
+     */
+    fun isRootOwnedCopy(file: File, realm: Realm, userDrive: UserDrive): Boolean {
+        if (file.isFolder()) return false
+        return isRootCoveredCopy(file, realm, userDrive) || (file.offlineOwnedByRoot && !file.isDirectlyPinned)
+    }
+
+    /**
      * Live offline ownership at a publication point: a pending download, a persistent offline
      * copy, a direct pin, or coverage by a live root. An explicit unmark or a remote-delete
      * release clears every signal — a transfer that started earlier must not resurrect offline
@@ -378,6 +395,7 @@ object OfflineFolderSyncUtils {
                             FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
                                 proxy.isMarkedAsOffline = false
                                 proxy.isOffline = false
+                                proxy.offlineOwnedByRoot = false
                                 proxy.offlineBasisModifiedAt = 0L
                                 proxy.offlineBasisSize = null
                                 proxy.offlineContentDigest = null
@@ -404,6 +422,7 @@ object OfflineFolderSyncUtils {
                         proxy.isMarkedAsOffline = false
                         proxy.isOffline = false
                         proxy.isDirectlyPinned = false
+                        proxy.offlineOwnedByRoot = false
                         proxy.offlineBasisModifiedAt = 0L
                         proxy.offlineBasisSize = null
                         proxy.offlineContentDigest = null
@@ -486,6 +505,7 @@ object OfflineFolderSyncUtils {
                                 FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
                                     proxy.isMarkedAsOffline = false
                                     proxy.isOffline = false
+                                    proxy.offlineOwnedByRoot = false
                                     proxy.offlineBasisModifiedAt = 0L
                                     proxy.offlineBasisSize = null
                                     proxy.offlineContentDigest = null
@@ -512,9 +532,12 @@ object OfflineFolderSyncUtils {
      * fields). The walk only marks PENDING downloads: [File.isMarkedAsOffline] is the baseline
      * transient marker the bulk worker selects on and clears afterwards — the persistent
      * publication basis is recorded from ACCEPTED bytes by the download seam
-     * ([recordAcceptedPublication]), never from a listing or an enqueued download. Root
-     * COVERAGE itself is never recorded here: it is derived live from the roots table
-     * ([isRootCoveredCopy]). Files that already keep an offline copy ([File.isOffline]) or a
+     * ([recordAcceptedPublication]), never from a listing or an enqueued download. Each
+     * marking also records ROOT OWNERSHIP ([File.offlineOwnedByRoot]): the queued work is
+     * the root contract's, and that provenance must survive a cached tree update moving the
+     * row (or an ancestor) out of the subtree before the worker runs ([isRootOwnedCopy]).
+     * Root COVERAGE itself stays derived live from the roots table ([isRootCoveredCopy]).
+     * Files that already keep an offline copy ([File.isOffline]) or a
      * direct pin ([File.isDirectlyPinned]) are not re-marked: their bytes are preserved and
      * maintained by their existing contract. Every visited non-folder file is reported
      * through [onFileVisited] (coverage bookkeeping includes pre-existing pins).
@@ -565,6 +588,7 @@ object OfflineFolderSyncUtils {
                             if (proxy.isTrashed() || proxy.isFolder()) return@forEach
                             if (!proxy.isMarkedAsOffline && !proxy.isOffline && !proxy.isDirectlyPinned) {
                                 proxy.isMarkedAsOffline = true
+                                proxy.offlineOwnedByRoot = true
                                 folderHasMarkedFiles = true
                             }
                             onFileVisited?.invoke(proxy.id)
@@ -917,18 +941,36 @@ object OfflineFolderSyncUtils {
             val publicationOutcome = withPublicationLock {
                 prePublicationGate?.invoke()
                 val inLockRead = FileController.getRealmInstance(userDrive).use { realm ->
-                    FileController.getFileProxyById(file.id, customRealm = realm)
-                        ?.let { realm.copyFromRealm(it, 0) to hasLiveOfflineIntent(it, realm, userDrive) }
+                    FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
+                        val detached = realm.copyFromRealm(row, 0)
+                        Triple(
+                            detached,
+                            hasLiveOfflineIntent(detached, realm, userDrive),
+                            isRootCoveredCopy(detached, realm, userDrive),
+                        )
+                    }
                 } ?: run {
                     SentryLog.w(TAG, "Row vanished at publication for file ${file.id}; staging discarded")
                     return@withPublicationLock StagedPublication.INTENT_WITHDRAWN
                 }
-                val (authoritativeRow, intentStillLiveAtPublication) = inLockRead
+                val (authoritativeRow, intentStillLiveAtPublication, coveredAtPublication) = inLockRead
                 if (!intentStillLiveAtPublication) {
                     SentryLog.w(TAG, "Offline intent withdrawn at publication for file ${file.id}; staging discarded")
                     // Only the OWNED staging artifact is removed (in the finally below); the
                     // copy already at the offline path is not provably this staging's and is
                     // never destroyed here.
+                    return@withPublicationLock StagedPublication.INTENT_WITHDRAWN
+                }
+                // Stale root ownership at the publication point: the copy the root contract
+                // queued or published is now outside every root and not directly pinned — the
+                // contract's reach ended (a real move during the transfer, or a cached tree
+                // update that moved the row out first). A fresh publication here would write
+                // isOffline at the moved-out location and fabricate retention the user never
+                // chose (a pending root file moving out mid-flight would republish itself as
+                // an accidental direct pin). The staging is discarded; any previously
+                // published bytes and state stand untouched.
+                if (authoritativeRow.offlineOwnedByRoot && !authoritativeRow.isDirectlyPinned && !coveredAtPublication) {
+                    SentryLog.w(TAG, "Root ownership stale at publication for file ${file.id}; staging discarded")
                     return@withPublicationLock StagedPublication.INTENT_WITHDRAWN
                 }
 
@@ -1005,6 +1047,10 @@ object OfflineFolderSyncUtils {
                             proxy.offlineBasisSize = file.size
                             proxy.offlineContentDigest = digest
                             proxy.offlinePublishedPath = offlineFile.path
+                            // A publication under live root coverage records the root contract
+                            // as the owner: the provenance survives later cached tree updates
+                            // that move the row out of the subtree ([isRootOwnedCopy]).
+                            if (isRootCoveredCopy(proxy, mutableRealm, userDrive)) proxy.offlineOwnedByRoot = true
                             proxy.isOffline = true
                             recorded = true
                         }
@@ -1102,6 +1148,9 @@ object OfflineFolderSyncUtils {
                         row.offlineBasisSize = remoteFile.size
                         row.offlineContentDigest = digest
                         row.offlinePublishedPath = offlineFile.path
+                        // A publication under live root coverage records the root contract as
+                        // the owner (see the staged record above).
+                        if (isRootCoveredCopy(row, mutableRealm, userDrive)) row.offlineOwnedByRoot = true
                         row.isOffline = true
                         recorded = true
                     }

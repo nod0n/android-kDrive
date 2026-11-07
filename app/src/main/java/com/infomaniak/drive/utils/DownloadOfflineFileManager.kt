@@ -80,8 +80,13 @@ class DownloadOfflineFileManager(
 
     private var lastUpdateProgressMillis = System.currentTimeMillis()
 
-    /** The row's validation-gate state: live offline intent and root coverage at one read. */
-    private data class GateState(val liveIntent: Boolean, val rootCovered: Boolean)
+    /**
+     * The row's validation-gate state: live offline intent and the root contract's claim at
+     * one read. The claim is [OfflineFolderSyncUtils.isRootOwnedCopy] — live subtree coverage
+     * OR recorded root ownership ([File.offlineOwnedByRoot]) surviving a cached tree update
+     * that moved the row out before this worker ran.
+     */
+    private data class GateState(val liveIntent: Boolean, val rootOwned: Boolean)
 
     suspend fun execute(
         context: Context,
@@ -94,17 +99,19 @@ class DownloadOfflineFileManager(
         // unmarked, the pin withdrawn, a release applied — any queued work (initial bulk
         // chain, retry, a download enqueued before an unmark) is stale: no cache move, no
         // delete-then-transfer, no resurrection of a preserved copy.
-        // ROOT COVERAGE IS CAPTURED HERE, at the validation gate: a real remote move (or
+        // ROOT OWNERSHIP IS CAPTURED HERE, at the validation gate: a real remote move (or
         // unknown parent metadata) during the details refresh below rewrites the row's
-        // parent, so coverage recomputed AFTER the refresh can silently vanish — queued
-        // root-owned work must then keep the root contract (the staged preservation path),
-        // never fall to the destructive baseline. Direct pins have no root coverage here and
-        // keep their baseline behavior unchanged.
+        // parent, and a cached tree update can move the row out of the root's subtree before
+        // this worker even runs — in both cases coverage recomputed from the parent chain
+        // silently vanishes, while the recorded ownership provenance survives. Queued
+        // root-owned work keeps the root contract (the staged preservation path), never the
+        // destructive baseline. Direct pins suppress the recorded claim and keep their
+        // baseline behavior unchanged.
         val gate = FileController.getRealmInstance(userDrive).use { realm ->
             FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
                 GateState(
                     liveIntent = OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive),
-                    rootCovered = OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, userDrive),
+                    rootOwned = OfflineFolderSyncUtils.isRootOwnedCopy(row, realm, userDrive),
                 )
             }
         }
@@ -122,16 +129,18 @@ class DownloadOfflineFileManager(
             return ListenableWorker.Result.failure()
         }
 
-        // Root coverage is checked FIRST: the cache-move and intact branches below would
+        // Root ownership is checked FIRST: the cache-move and intact branches below would
         // replace existing bytes, and a covered copy's lifecycle belongs to the root
         // contract — a stale queued download (initial bulk work, retry, or a download
         // enqueued before an unmark) must never reach them. The root maintenance pass
-        // refreshes covered copies through the staged path instead. Coverage honored here is
-        // the UNION of the refresh-time walk and the gate-time capture: the gate capture is
-        // what survives a real remote move that rewrote the row's parent mid-flight.
+        // refreshes covered copies through the staged path instead. Ownership honored here is
+        // the UNION of the refresh-time coverage walk and the gate-time capture (which
+        // includes the recorded provenance): the gate capture is what survives a real remote
+        // move that rewrote the row's parent mid-flight, and the provenance is what survives
+        // a cached tree update that moved the row out before this worker ran.
         val coveredByRoot = FileController.getRealmInstance(userDrive).use { realm ->
             OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)
-        } || gate.rootCovered
+        } || gate.rootOwned
         if (offlineFile.exists() && coveredByRoot) {
             // The preserved bytes are NOT blessed with the new remote identity: no accepted
             // transfer happened here, so no publication evidence may be recorded.
@@ -163,8 +172,9 @@ class DownloadOfflineFileManager(
             // progress parity is not kept here (the maintenance pass has none either); the
             // bulk chain's onFinish finalizes pending markers and the notification. The
             // gate-captured coverage keeps a root-owned copy here even when a real remote
-            // move rewrote its parent during the details refresh: an edited or unknown
-            // copy is then preserved by the staged decision, never destroyed.
+            // move rewrote its parent during the details refresh, and the recorded
+            // provenance keeps one whose row moved out before this worker ran: an edited or
+            // unknown copy is then preserved by the staged decision, never destroyed.
             val outcome = runCatching {
                 OfflineFolderSyncUtils.stagedRedownload(context, userDrive, file, establishedServerHash = acceptedServerHash)
             }.cancellable().onFailure { exception ->
@@ -210,17 +220,22 @@ class DownloadOfflineFileManager(
         // path belongs to the user contract — preserved edited/unknown bytes — or was already
         // cleaned by the publication seam: the worker must not delete anything then, even
         // when a bulk chain's onFinish cleared the pending marker first.
-        val liveIntent = FileController.getRealmInstance(userDrive).use { realm ->
-            FileController.getFileProxyById(file.id, customRealm = realm)
-                ?.let { OfflineFolderSyncUtils.hasLiveOfflineIntent(it, realm, userDrive) } == true
+        // The root contract's claim is read from the LIVE row and includes the recorded
+        // ownership provenance: a refresh that moved the row out of the root's subtree
+        // (unknown parent metadata, a real move) must not hand this chain's finish-cleanup
+        // the authority to delete the preserved edited bytes it just kept
+        // ([File.isIntactFile] compares length only, so a different-length edit reaches the
+        // delete branch exactly when the ownership protection is missing).
+        val liveState = FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
+                OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive) to
+                    OfflineFolderSyncUtils.isRootOwnedCopy(row, realm, userDrive)
+            }
         }
-        if (!liveIntent) return
-        // A root-covered copy is never cleaned up here: its lifecycle belongs to the root
+        if (liveState?.first != true) return
+        // A root-owned copy is never cleaned up here: its lifecycle belongs to the root
         // contract, which releases coverage without deleting bytes.
-        val coveredByRoot = FileController.getRealmInstance(userDrive).use { realm ->
-            OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)
-        }
-        if (coveredByRoot) return
+        if (liveState.second) return
         lastDownloadedFile?.let {
             if (it.exists() && currentFile?.isIntactFile(it) == false) it.delete()
         }

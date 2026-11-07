@@ -140,6 +140,7 @@ open class File(
     var offlineBasisModifiedAt: Long = 0, // remote lastModifiedAt (s) the offline copy was published under; 0 = unpublished
     var offlineBasisSize: Long? = null, // remote size at publication; null = unpublished
     var offlineContentDigest: String? = null, // sha-256 of the exact downloaded bytes, computed once on IO at publication
+    var offlineOwnedByRoot: Boolean = false, // root-ownership provenance: the offline-folder contract queued/published this copy and no withdrawal released it
     var offlinePublishedPath: String? = null, // local path where the accepted bytes live; survives renames so copies relocate instead of re-downloading
     var responseAt: Long = 0,
     @SerializedName("hash")

@@ -444,6 +444,64 @@ class FileMigration : RealmMigration {
 
             oldVersionTemp = 18L
         }
+
+        // Migrated to version 19:
+        // - Root-ownership provenance: File.offlineOwnedByRoot records that the offline-folder
+        //   root contract QUEUED this copy (the subtree walk marked it pending) or PUBLISHED
+        //   it while it was root-covered, and that no withdrawal (unmark, remote-delete
+        //   release) has released it yet. The provenance survives cached tree updates that
+        //   move the row (or an ancestor) out of the root's subtree, so queued/published root
+        //   work keeps the root contract across that interval (staged preservation, cleanup
+        //   protection); a direct pin suppresses it.
+        //   DATA-PRESERVING derivation: every existing row keeps every value; rows are never
+        //   deleted. Rows carrying an offline signal (isOffline or the transient pending
+        //   marker) whose cached parent chain reaches a live root folder of the same drive
+        //   derive offlineOwnedByRoot = true (the same evidence isRootCoveredCopy derives
+        //   live today); every other row defaults to false, so never-root work and direct
+        //   pins outside roots keep their baseline semantics unchanged.
+        if (oldVersionTemp == 18L) {
+            schema[File::class.java.simpleName]?.apply {
+                if (!hasField(File::offlineOwnedByRoot.name)) {
+                    addField(File::offlineOwnedByRoot.name, Boolean::class.java, FieldAttribute.REQUIRED)
+                }
+            }
+
+            val rootFolderIdsByDrive = realm.where(OfflineFolderRoot::class.java.simpleName)
+                .findAll()
+                .groupBy(
+                    keySelector = { it.getInt(OfflineFolderRoot::driveId.name) },
+                    valueTransform = { it.getInt(OfflineFolderRoot::folderId.name) },
+                )
+            if (rootFolderIdsByDrive.isNotEmpty()) {
+                realm.where(File::class.java.simpleName)
+                    .beginGroup()
+                    .equalTo(File::isOffline.name, true)
+                    .or()
+                    .equalTo(File::isMarkedAsOffline.name, true)
+                    .endGroup()
+                    .findAll()
+                    .forEach { row ->
+                        val rootIds = rootFolderIdsByDrive[row.getInt(File::driveId.name)]?.toSet().orEmpty()
+                        if (rootIds.isEmpty()) return@forEach
+                        var parentId: Int? = row.getInt(File::parentId.name)
+                        val visited = mutableSetOf<Int>()
+                        while (parentId != null && visited.add(parentId)) {
+                            if (parentId in rootIds) {
+                                row.setBoolean(File::offlineOwnedByRoot.name, true)
+                                break
+                            }
+                            val parent = realm.where(File::class.java.simpleName)
+                                .equalTo(File::id.name, parentId)
+                                .findFirst() ?: break
+                            // parentId is a REQUIRED Int column: an absent parent holds the
+                            // 0 default, whose lookup below finds no row and ends the walk.
+                            parentId = parent.getInt(File::parentId.name)
+                        }
+                    }
+            }
+
+            oldVersionTemp = 19L
+        }
     }
 
     /**
@@ -504,7 +562,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 18L // Must be bumped when the schema changes
+        const val DB_VERSION = 19L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }

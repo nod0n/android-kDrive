@@ -1022,6 +1022,10 @@ object FileController {
         offlineBasisModifiedAt = oldFile.offlineBasisModifiedAt
         offlineBasisSize = oldFile.offlineBasisSize
         offlineContentDigest = oldFile.offlineContentDigest
+        // Root-ownership provenance is LOCAL state the server never sends: a details/listing
+        // refresh must not silently release the root contract's claim (a moved-out row would
+        // otherwise lose its recorded ownership exactly when the refresh rewrites its parent).
+        offlineOwnedByRoot = oldFile.offlineOwnedByRoot
         offlinePublishedPath = oldFile.offlinePublishedPath
         // serverContentHash is the identity OF THE ACCEPTED BYTES (the publication basis), not
         // the current remote metadata: it must survive every listing/details refresh unchanged
