@@ -33,6 +33,7 @@ open class SyncSettings(
     var syncVideo: Boolean = false,
     var deleteAfterSync: Boolean = false,
     var onlyWifiSyncMedia: Boolean = false,
+    var photoTrashSyncEnabled: Boolean = false,
 ) : RealmObject() {
 
     fun setIntervalType(intervalType: IntervalType) {

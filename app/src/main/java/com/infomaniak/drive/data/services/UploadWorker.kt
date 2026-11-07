@@ -55,6 +55,7 @@ import com.infomaniak.drive.data.models.SyncSettings
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UploadFile.Companion.getRealmInstance
 import com.infomaniak.drive.data.services.UploadWorkerErrorHandling.runUploadCatching
+import com.infomaniak.drive.data.sync.PhotoTrashController
 import com.infomaniak.drive.data.sync.UploadNotifications
 import com.infomaniak.drive.data.sync.UploadNotifications.appendBigDescription
 import com.infomaniak.drive.data.sync.UploadNotifications.showUploadedFilesNotification
@@ -147,6 +148,15 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 lastUploadFileName = currentUploadFile?.fileName ?: ""
 
             } while (syncNewPendingUploads && retryError < MAX_RETRY_COUNT)
+
+            // Photo trash propagation rides the existing upload pass (opt-in, API 30+,
+            // full media permissions only — the controller fails closed otherwise).
+            if (applicationContext.hasPermissions(readMediaPermissions)) {
+                runCatching { PhotoTrashController.runLocalReconciliation(applicationContext) }
+                    .onFailure { exception ->
+                        SentryLog.e(TAG, "Photo trash reconciliation failed", exception)
+                    }
+            }
 
             if (retryError == MAX_RETRY_COUNT) {
                 SentryLog.e(TAG, "A file has been restarted several times") { scope ->

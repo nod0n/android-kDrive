@@ -210,9 +210,13 @@ object ApiRepository : ApiRepositoryCore() {
         return callApiWithCursor(url, GET)
     }
 
-    fun getLastGallery(driveId: Int, cursor: String?): CursorApiResponse<ArrayList<File>> {
-        val types = "&types[]=${ExtensionType.IMAGE.value}&types[]=${ExtensionType.VIDEO.value}"
-        val url = "${ApiRoutes.searchFiles(driveId, SortType.RECENT)}$types&${loadCursor(cursor)}"
+    fun getLastGallery(
+        driveId: Int,
+        types: List<String> = listOf(ExtensionType.IMAGE.value, ExtensionType.VIDEO.value),
+        cursor: String?,
+    ): CursorApiResponse<ArrayList<File>> {
+        val typesQuery = types.joinToString("") { "&types[]=$it" }
+        val url = "${ApiRoutes.searchFiles(driveId, SortType.RECENT)}$typesQuery&${loadCursor(cursor)}"
         return callApiWithCursor(url, GET)
     }
 
@@ -336,6 +340,10 @@ object ApiRepository : ApiRepositoryCore() {
 
     fun getFileDetails(file: File, okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient): ApiResponse<File> {
         return callApi(ApiRoutes.getFileDetails(file), GET, okHttpClient = okHttpClient)
+    }
+
+    fun getFileDetailsWithHash(file: File, okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient): ApiResponse<File> {
+        return callApi(ApiRoutes.getFileDetailsWithHash(file), GET, okHttpClient = okHttpClient)
     }
 
     fun getFileCount(file: File): ApiResponse<FileCount> {

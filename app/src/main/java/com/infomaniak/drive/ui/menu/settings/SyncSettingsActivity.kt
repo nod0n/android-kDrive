@@ -56,6 +56,7 @@ import com.infomaniak.drive.data.models.MediaFolder
 import com.infomaniak.drive.data.models.SyncSettings
 import com.infomaniak.drive.data.models.SyncSettings.IntervalType
 import com.infomaniak.drive.data.models.SyncSettings.SavePicturesDate
+import com.infomaniak.drive.data.sync.PhotoTrashController
 import com.infomaniak.drive.data.models.UiSettings
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
@@ -122,6 +123,7 @@ class SyncSettingsActivity : BaseActivity() {
         val oldDeleteAfterSyncValue = oldSyncSettings?.deleteAfterSync == true
         val oldSaveOldPicturesValue = SavePicturesDate.SINCE_NOW
         val oldOnlyWifiSyncMedia = oldSyncSettings?.onlyWifiSyncMedia == true
+        val oldPhotoTrashSyncValue = oldSyncSettings?.photoTrashSyncEnabled == true
 
         syncSettingsViewModel.init(
             intervalTypeValue = oldIntervalTypeValue,
@@ -135,6 +137,7 @@ class SyncSettingsActivity : BaseActivity() {
         syncVideo.isChecked = oldSyncVideoValue
         createDatedSubFolders.isChecked = oldCreateDatedSubFoldersValue
         deletePicturesAfterSync.isChecked = oldDeleteAfterSyncValue
+        photoTrashSync.isChecked = oldPhotoTrashSyncValue
 
         observeAllUsers()
         observeCustomDate()
@@ -448,6 +451,11 @@ class SyncSettingsActivity : BaseActivity() {
                     trackPhotoSyncEvents(syncSettings)
                     syncSettings.setIntervalType(syncSettingsViewModel.syncIntervalType.value!!)
                     Dispatchers.IO {
+                        // Turning the option off invalidates pairings and pending destructive
+                        // actions from this feature; ordinary uploads are unaffected.
+                        if (oldSyncSettings?.photoTrashSyncEnabled == true && !syncSettings.photoTrashSyncEnabled) {
+                            PhotoTrashController.removeAllPairings()
+                        }
                         SentryLog.i(TAG, "start update appSettings")
                         UploadFile.setAppSyncSettings(syncSettings)
                         SentryLog.i(TAG, "appSettings updated")
@@ -496,6 +504,7 @@ class SyncSettingsActivity : BaseActivity() {
             createDatedSubFolders = createDatedSubFolders.isChecked,
             deleteAfterSync = deletePicturesAfterSync.isChecked,
             onlyWifiSyncMedia = syncSettingsViewModel.onlyWifiSyncMedia.value ?: false,
+            photoTrashSyncEnabled = photoTrashSync.isChecked,
         )
     }
 

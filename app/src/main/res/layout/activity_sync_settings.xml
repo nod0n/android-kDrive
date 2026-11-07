@@ -244,6 +244,14 @@
                                 app:itemAction="toggle"
                                 app:title="@string/deletePicturesTitle" />
 
+                            <com.infomaniak.drive.ui.menu.settings.ItemSettingView
+                                android:id="@+id/photoTrashSync"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                app:description="@string/photoTrashSyncDescription"
+                                app:itemAction="toggle"
+                                app:title="@string/photoTrashSyncTitle" />
+
                             <androidx.constraintlayout.widget.ConstraintLayout
                                 android:id="@+id/syncDate"
                                 android:layout_width="match_parent"

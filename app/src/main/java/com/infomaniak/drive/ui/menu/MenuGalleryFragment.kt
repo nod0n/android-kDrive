@@ -71,20 +71,33 @@ class MenuGalleryFragment : Fragment() {
         swipeRefreshLayout.setOnRefreshListener(galleryFragment::onRefreshGallery)
 
         toolbar.setOnMenuItemClickListener { menuItem ->
-            if (menuItem.itemId == R.id.selectGalleryPeriod) {
-                safeNavigate(
-                    MenuGalleryFragmentDirections.actionMenuGalleryFragmentToGalleryPeriodBottomSheetDialog(
-                        galleryViewModel.period.value,
+            when (menuItem.itemId) {
+                R.id.selectGalleryPeriod -> {
+                    safeNavigate(
+                        MenuGalleryFragmentDirections.actionMenuGalleryFragmentToGalleryPeriodBottomSheetDialog(
+                            galleryViewModel.period.value,
+                        )
                     )
-                )
-                true
-            } else {
-                false
+                    true
+                }
+                R.id.selectGalleryMediaFilter -> {
+                    safeNavigate(
+                        MenuGalleryFragmentDirections.actionMenuGalleryFragmentToGalleryMediaFilterBottomSheetDialog(
+                            galleryViewModel.mediaFilter.value,
+                        )
+                    )
+                    true
+                }
+                else -> false
             }
         }
 
         getBackNavigationResult<GalleryPeriod>(GalleryPeriodBottomSheetDialog.GALLERY_PERIOD_KEY) {
             galleryViewModel.period.value = it
+        }
+
+        getBackNavigationResult<GalleryMediaFilter>(GalleryMediaFilterBottomSheetDialog.GALLERY_MEDIA_FILTER_KEY) { filter ->
+            galleryViewModel.setMediaFilter(filter)
         }
 
         multiSelectLayout.apply {

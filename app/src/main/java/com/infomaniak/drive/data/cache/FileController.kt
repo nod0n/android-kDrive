@@ -992,7 +992,15 @@ object FileController {
         children = oldFile.children
         cursor = oldFile.cursor
         isComplete = oldFile.isComplete
+        isDirectlyPinned = oldFile.isDirectlyPinned
         isOffline = oldFile.isOffline
+        offlineBasisModifiedAt = oldFile.offlineBasisModifiedAt
+        offlineBasisSize = oldFile.offlineBasisSize
+        offlineContentDigest = oldFile.offlineContentDigest
+        // Server content hash is server-side identity: a response that carries it always wins
+        // (identity refresh); listings and plain details carry no hash, so absence keeps the
+        // preserved value instead of erasing the recorded publication basis.
+        if (serverContentHash == null) serverContentHash = oldFile.serverContentHash
         responseAt = oldFile.responseAt
         if (path.isEmpty() && oldFile.path.isNotEmpty()) path = oldFile.path
         if (oldFile.revisedAt > revisedAt) revisedAt = oldFile.revisedAt

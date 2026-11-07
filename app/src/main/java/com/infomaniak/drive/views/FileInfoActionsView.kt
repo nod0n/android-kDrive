@@ -41,6 +41,7 @@ import com.infomaniak.core.network.networking.HttpUtils
 import com.infomaniak.core.network.networking.ManualAuthorizationRequired
 import com.infomaniak.core.network.utils.ApiErrorCode.Companion.translateError
 import com.infomaniak.core.sentry.SentryLog
+import com.infomaniak.drive.data.models.OfflineFolderRoot
 import com.infomaniak.core.ui.showToast
 import com.infomaniak.drive.MatomoDrive.MatomoCategory
 import com.infomaniak.drive.MatomoDrive.MatomoName
@@ -70,6 +71,7 @@ import com.infomaniak.drive.ui.fileList.ShareLinkViewModel
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DrivePermissions
 import com.infomaniak.drive.utils.IOFile
+import com.infomaniak.drive.utils.OfflineFolderSyncUtils
 import com.infomaniak.drive.utils.SingleOperation
 import com.infomaniak.drive.utils.Utils
 import com.infomaniak.drive.utils.Utils.duplicateFilesClicked
@@ -236,9 +238,45 @@ class FileInfoActionsView @JvmOverloads constructor(
         if (currentFile.isFolder()) {
             sendCopyIcon.setImageResource(R.drawable.ic_add)
             sendCopyText.setText(R.string.buttonAdd)
-            availableOffline.isGone = true
             openWith.isGone = true
             setupColoredFolderVisibility(drive)
+            setupFolderOfflineState(currentFile)
+        }
+    }
+
+    /**
+     * Recursive persistent offline folders: a folder's offline switch reflects the durable
+     * root record instead of the per-file pin used for files.
+     */
+    private fun setupFolderOfflineState(folder: File) {
+        binding.availableOffline.isGone = folder.isSharedWithMe()
+        CoroutineScope(Dispatchers.IO).launch {
+            val hasRoot = FileController.getRealmInstance(UserDrive(driveId = folder.driveId)).use { realm ->
+                realm.where(OfflineFolderRoot::class.java)
+                    .equalTo(OfflineFolderRoot::folderId.name, folder.id)
+                    .count() > 0
+            }
+            CoroutineScope(Dispatchers.Main).launch {
+                if (currentFile?.id == folder.id) binding.availableOfflineSwitch.isChecked = hasRoot
+            }
+        }
+    }
+
+    /**
+     * Marks/unmarks [folder] as a persistent recursive offline root. Downloads ride the
+     * existing bulk worker; updates ride the existing offline sync cadence.
+     */
+    fun toggleFolderOfflineRoot(folder: File, isChecked: Boolean) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val userDrive = UserDrive(driveId = folder.driveId)
+            val confirmed = if (isChecked) {
+                OfflineFolderSyncUtils.markFolderOffline(context, folder, userDrive)
+            } else {
+                OfflineFolderSyncUtils.unmarkFolderOffline(context, folder, userDrive)
+            }
+            if (!confirmed) {
+                SentryLog.w(TAG, "Offline folder operation incomplete for root ${folder.id}_${folder.driveId}")
+            }
         }
     }
 
@@ -640,6 +678,11 @@ class FileInfoActionsView @JvmOverloads constructor(
         fun availableOfflineSwitched(fileInfoActionsView: FileInfoActionsView, isChecked: Boolean): Boolean {
             currentFile?.apply {
                 when {
+                    isFolder() -> {
+                        // Recursive persistent offline folder: the switch owns a durable root record
+                        trackFileActionEvent(MatomoName.Offline, isChecked)
+                        fileInfoActionsView.toggleFolderOfflineRoot(this, isChecked)
+                    }
                     isOffline && isChecked -> Unit
                     !isOffline && !isChecked -> Unit
                     isChecked -> {
@@ -770,6 +813,7 @@ class FileInfoActionsView @JvmOverloads constructor(
 
     companion object {
         const val SINGLE_OPERATION_CUSTOM_TAG = "single_operation"
+        private const val TAG = "FileInfoActionsView"
 
         private const val ENABLED_ALPHA = 1f
         private const val DISABLED_ALPHA = 0.5f

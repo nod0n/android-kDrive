@@ -18,12 +18,14 @@
 package com.infomaniak.drive.data.sync
 
 import com.infomaniak.drive.data.models.MediaFolder
+import com.infomaniak.drive.data.models.PhotoPairing
 import com.infomaniak.drive.data.models.SyncSettings
 import com.infomaniak.drive.data.models.UploadFile
 import io.realm.DynamicRealm
 import io.realm.FieldAttribute
 import io.realm.RealmMigration
 import java.net.URLEncoder
+import java.util.Date
 
 class UploadMigration : RealmMigration {
 
@@ -116,9 +118,50 @@ class UploadMigration : RealmMigration {
                 ?.addField("onlyWifiSyncMedia", Boolean::class.java, FieldAttribute.REQUIRED)
         }
 
+        // Migrate to version 11: photo trash propagation opt-in and pairing table.
+        // Versions 9/10 only ever existed on development branches with different meanings
+        // (photo-deletion / offline-folder experiments); the one actually installed source
+        // above 8 is the T-0079 device test build at version 10. That schema's undeclared
+        // development fields are removed explicitly (never implicitly); rows and pending
+        // uploads are preserved, nothing is deleted.
+        if (oldVersionTemp in 8L..10L) {
+            schema.get(SyncSettings::class.java.simpleName)
+                ?.addField(SyncSettings::photoTrashSyncEnabled.name, Boolean::class.java, FieldAttribute.REQUIRED)
+
+            if (schema.get(PhotoPairing::class.java.simpleName) == null) {
+                schema.create(PhotoPairing::class.java.simpleName)!!.apply {
+                    addField(PhotoPairing::uri.name, String::class.java, FieldAttribute.REQUIRED)
+                    addPrimaryKey(PhotoPairing::uri.name)
+                    addField(PhotoPairing::userId.name, Int::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::driveId.name, Int::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::remoteFileId.name, Int::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::fileName.name, String::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::localSizeAtPairing.name, Long::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::localModifiedAtPairing.name, Long::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::pairedAt.name, Date::class.java)
+                    addField(PhotoPairing::baselineTrashed.name, Boolean::class.java) // boxed -> nullable
+                    addField(PhotoPairing::lastObservedTrashed.name, Boolean::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::lastLocalTrashReconciledAt.name, Long::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::remoteTrashPendingSince.name, Long::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::lastRemoteTrashAppliedAt.name, Long::class.java, FieldAttribute.REQUIRED)
+                    addField(PhotoPairing::state.name, String::class.java, FieldAttribute.REQUIRED)
+                }
+            }
+
+            if (oldVersionTemp == 10L) {
+                schema.get(UploadFile::class.java.simpleName)?.apply {
+                    if (hasField("originalFileId")) removeField("originalFileId")
+                    if (hasField("reconciliationDone")) removeField("reconciliationDone")
+                    if (hasField("contentHash")) removeField("contentHash")
+                }
+            }
+
+            oldVersionTemp = 11L
+        }
+
     }
 
     companion object {
-        const val DB_VERSION = 8L // Must be bumped when the schema changes
+        const val DB_VERSION = 11L // Must be bumped when the schema changes
     }
 }

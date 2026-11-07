@@ -29,6 +29,7 @@ import android.graphics.Paint
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.StateListDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Build.VERSION.SDK_INT
 import android.os.Bundle
 import android.os.FileObserver
@@ -46,6 +47,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.toBitmap
 import androidx.core.graphics.drawable.toDrawable
+import androidx.core.net.toUri
 import androidx.core.view.get
 import androidx.core.view.isGone
 import androidx.core.view.isVisible
@@ -103,9 +105,12 @@ import com.infomaniak.drive.R
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.File.VisibilityType
+import com.infomaniak.drive.data.models.MqttAction
+import com.infomaniak.drive.data.models.PhotoPairing
 import com.infomaniak.drive.data.models.UiSettings
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.deeplink.DeeplinkType.DeeplinkAction
+import com.infomaniak.drive.data.sync.PhotoTrashController
 import com.infomaniak.drive.data.services.BaseDownloadWorker
 import com.infomaniak.drive.data.services.BaseDownloadWorker.Companion.HAS_SPACE_LEFT_AFTER_DOWNLOAD_KEY
 import com.infomaniak.drive.data.services.MqttClientWrapper
@@ -166,6 +171,14 @@ class MainActivity : BaseActivity() {
         }
     }
 
+    private var pendingPhotoTrashUri: String? = null
+    private val photoTrashConsentResult = registerForActivityResult(StartIntentSenderForResult()) { result ->
+        val uri = pendingPhotoTrashUri ?: return@registerForActivityResult
+        pendingPhotoTrashUri = null
+        val granted = result.resultCode == RESULT_OK
+        lifecycleScope.launch(Dispatchers.IO) { PhotoTrashController.onRemoteTrashConsentResult(uri, granted) }
+    }
+
     private val fileObserver: FileObserver by lazy {
         fun onEvent() {
             mainViewModel.syncOfflineFiles()
@@ -222,6 +235,7 @@ class MainActivity : BaseActivity() {
         observeFailureDownloadWorkerOffline()
         observeCurrentUserAvatar()
         observeCopyToDriveResult()
+        observePhotoTrashConsents()
 
         AppLockManager.scheduleLockIfNeeded(
             targetActivity = this,
@@ -374,6 +388,48 @@ class MainActivity : BaseActivity() {
             mainViewModel.resolveCopyToDriveNotification(notification)?.let { result ->
                 showSnackbar(title = copyToDriveResultMessage(result.isSuccess, result.fileName), anchor = getMainFab())
             }
+        }
+    }
+
+    /**
+     * Photo trash propagation (opt-in): a paired file trashed in kDrive asks for Android's
+     * trash consent before anything happens on the device. Pending consents survive process
+     * death in the pairing state and are also (re)armed by the upload pass catch-up.
+     */
+    private fun observePhotoTrashConsents() {
+        MqttClientWrapper.observe(this) { notification ->
+            with(notification) {
+                if (!isFileActionNotification()) return@observe
+                if (action != MqttAction.FILE_TRASH) return@observe
+                if (driveId != AccountUtils.getCurrentDrive()?.id) return@observe
+
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val pairing = PhotoTrashController.onRemoteTrashEvent(
+                        context = applicationContext,
+                        remoteFileId = fileId ?: return@launch,
+                        driveId = driveId,
+                    ) ?: return@launch
+                    withContext(Dispatchers.Main) { requestPhotoTrashConsent(pairing) }
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            PhotoTrashController.pendingConsents.collect { pairing ->
+                requestPhotoTrashConsent(pairing)
+            }
+        }
+    }
+
+    private fun requestPhotoTrashConsent(pairing: PhotoPairing) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        pendingPhotoTrashUri = pairing.uri
+        runCatching {
+            val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(pairing.uri.toUri()), true)
+            photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
+        }.onFailure { exception ->
+            pendingPhotoTrashUri = null
+            SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
         }
     }
 

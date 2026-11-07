@@ -22,6 +22,7 @@ import com.infomaniak.drive.data.models.DropBox
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.FileActivity
 import com.infomaniak.drive.data.models.FileCategory
+import com.infomaniak.drive.data.models.OfflineFolderRoot
 import com.infomaniak.drive.data.models.Rights
 import com.infomaniak.drive.data.models.ShareLink
 import com.infomaniak.drive.data.models.file.FileConversion
@@ -384,6 +385,93 @@ class FileMigration : RealmMigration {
             schema[File::class.java.simpleName]?.removeField("isFromSearch")
             oldVersionTemp++
         }
+
+        // Migrated to version 18:
+        // - Recursive offline folders: new OfflineFolderRoot table; File.isDirectlyPinned
+        //   (pin provenance), File.serverContentHash (official with=hash identity) and the
+        //   publication basis fields (offlineBasisModifiedAt/offlineBasisSize/
+        //   offlineContentDigest) used for local-edit and change classification.
+        // Versions 12..17 only ever existed on the uninstalled offline-folder development
+        // branch. The one actually installed source above 11 is the T-0079 device test build
+        // at version 17; this block migrates it too: existing pins are preserved as direct
+        // pins and that schema's undeclared development fields are removed explicitly
+        // (never implicitly). Rows are never deleted.
+        if (oldVersionTemp in 11L..17L) {
+            schema[File::class.java.simpleName]?.apply {
+                if (!hasField(File::isDirectlyPinned.name)) {
+                    addField(File::isDirectlyPinned.name, Boolean::class.java, FieldAttribute.REQUIRED)
+                }
+                if (!hasField(File::offlineBasisModifiedAt.name)) {
+                    addField(File::offlineBasisModifiedAt.name, Long::class.java, FieldAttribute.REQUIRED)
+                }
+                if (!hasField(File::offlineBasisSize.name)) {
+                    addField(File::offlineBasisSize.name, Long::class.javaObjectType) // boxed -> nullable
+                }
+                if (!hasField(File::offlineContentDigest.name)) {
+                    addField(File::offlineContentDigest.name, String::class.java)
+                }
+                if (!hasField(File::serverContentHash.name)) {
+                    addField(File::serverContentHash.name, String::class.java)
+                }
+            }
+
+            if (schema[OfflineFolderRoot::class.java.simpleName] == null) {
+                schema.create(OfflineFolderRoot::class.java.simpleName)!!.apply {
+                    addField(OfflineFolderRoot::uid.name, String::class.java, FieldAttribute.REQUIRED)
+                    addPrimaryKey(OfflineFolderRoot::uid.name)
+                    addField(OfflineFolderRoot::folderId.name, Int::class.java, FieldAttribute.REQUIRED)
+                    addField(OfflineFolderRoot::driveId.name, Int::class.java, FieldAttribute.REQUIRED)
+                    addField(OfflineFolderRoot::userId.name, Int::class.java, FieldAttribute.REQUIRED)
+                    addField(OfflineFolderRoot::markedAt.name, Date::class.java, FieldAttribute.REQUIRED)
+                }
+            }
+
+            // Every pre-existing pin keeps its provenance as a direct pin (over-preserving is
+            // harmless: an extra direct pin can always be cleared by the user). In the baseline
+            // the persistent pin state is isOffline; isMarkedAsOffline is only the transient
+            // pending-download marker the bulk worker clears on finish.
+            realm.where(File::class.java.simpleName)
+                .equalTo(File::isOffline.name, true)
+                .findAll()
+                .forEach { pinnedRow -> pinnedRow.setBoolean(File::isDirectlyPinned.name, true) }
+
+            if (oldVersionTemp == 17L) migrateOfflineBranchShapes(realm, schema)
+
+            oldVersionTemp = 18L
+        }
+    }
+
+    /**
+     * T-0079 device shape (File17 of the offline-folder development branch): transform its
+     * OfflineRoot registrations into OfflineFolderRoot rows, then explicitly remove the fields
+     * that this schema does not declare. serverContentHash is kept (same name and shape).
+     * Runs inside the migration transaction; rows are preserved.
+     */
+    private fun migrateOfflineBranchShapes(realm: DynamicRealm, schema: RealmSchema) {
+        val legacyRootsName = "OfflineRoot"
+        if (schema[legacyRootsName] != null) {
+            realm.where(legacyRootsName).findAll().forEach { legacyRoot ->
+                val folderId = legacyRoot.getInt("folderId")
+                val driveId = legacyRoot.getInt("driveId")
+                val userId = legacyRoot.getInt("userId")
+                val newRoot = realm.createObject(
+                    OfflineFolderRoot::class.java.simpleName,
+                    OfflineFolderRoot.buildUid(folderId, driveId, userId),
+                )
+                newRoot.setInt(OfflineFolderRoot::folderId.name, folderId)
+                newRoot.setInt(OfflineFolderRoot::driveId.name, driveId)
+                newRoot.setInt(OfflineFolderRoot::userId.name, userId)
+                // markedAt is REQUIRED: a legacy row without createdAt keeps its epoch default.
+                newRoot.setDate(OfflineFolderRoot::markedAt.name, legacyRoot.getDate("createdAt") ?: Date(0))
+            }
+            schema.remove(legacyRootsName)
+        }
+
+        schema[File::class.java.simpleName]?.apply {
+            if (hasField("isInOfflineFolder")) removeField("isInOfflineFolder")
+            if (hasField("publishedCleanBaseline")) removeField("publishedCleanBaseline")
+            if (hasField("offlineIntentStamp")) removeField("offlineIntentStamp")
+        }
     }
 
     override fun equals(other: Any?): Boolean {
@@ -411,7 +499,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 11L // Must be bumped when the schema changes
+        const val DB_VERSION = 18L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }

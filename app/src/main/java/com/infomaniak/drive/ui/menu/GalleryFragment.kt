@@ -157,6 +157,7 @@ class GalleryFragment : MultiSelectFragment(
 
         observeApiResultPagination()
         observePeriod()
+        observeMediaFilter()
 
         mainViewModel.deleteFilesFromGallery.observe(viewLifecycleOwner) { filesId ->
             filesId.forEach(galleryAdapter::deleteByFileId)
@@ -183,17 +184,25 @@ class GalleryFragment : MultiSelectFragment(
             dataAlreadyLoaded = false
         }
 
-        galleryViewModel.galleryApiResult.observe(viewLifecycleOwner) {
-            it?.let { (galleryFiles, isComplete) ->
+        galleryViewModel.galleryApiResult.observe(viewLifecycleOwner) { page ->
+            // Empty state for a filtered query points out the filter instead of implying an empty gallery
+            binding.noGalleryLayout.description =
+                if (galleryViewModel.mediaFilter.value.writesSharedCache) null
+                else R.string.galleryFilterEmptyMediaDescription
+
+            page?.let {
+                // A queued result of a superseded request must not reach the UI
+                if (it.generation != galleryViewModel.currentLoadGeneration) return@observe
+
                 galleryAdapter.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.PREVENT_WHEN_EMPTY
                 if (dataAlreadyLoaded) {
                     // When the data is still available after the fragment is recreated, there's no need to reload it again.
                     dataAlreadyLoaded = false
                     return@observe
                 }
-                galleryAdapter.isComplete = isComplete
-                val galleryList = galleryAdapter.formatList(galleryFiles)
-                if (galleryFiles.isNotEmpty()) galleryAdapter.addAll(galleryList)
+                galleryAdapter.isComplete = it.isComplete
+                val galleryList = galleryAdapter.formatList(it.files)
+                if (it.files.isNotEmpty()) galleryAdapter.addAll(galleryList)
                 binding.noGalleryLayout.toggleVisibility(galleryAdapter.galleryList.isEmpty())
             } ?: run {
                 galleryAdapter.isComplete = true
@@ -279,6 +288,26 @@ class GalleryFragment : MultiSelectFragment(
                 galleryViewModel.period.collect(galleryAdapter::updatePeriod)
             }
         }
+    }
+
+    private fun observeMediaFilter() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                var lastSeenFilter = galleryViewModel.mediaFilter.value
+                galleryViewModel.mediaFilter.collect { filter ->
+                    // The initial emission is the state onViewCreated already loaded with
+                    if (filter != lastSeenFilter) {
+                        lastSeenFilter = filter
+                        onMediaFilterChanged()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun onMediaFilterChanged() {
+        galleryAdapter.clearGallery()
+        loadGallery(AccountUtils.currentDriveId, isRefresh = true)
     }
 
     fun onRefreshGallery() {

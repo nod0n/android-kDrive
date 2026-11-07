@@ -17,107 +17,195 @@
  */
 package com.infomaniak.drive.ui.menu
 
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.infomaniak.drive.data.api.ApiRepository
-import com.infomaniak.drive.data.api.CursorApiResponse
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
+import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IsComplete
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+
+/** A gallery page stamped with the request scope it was computed for. */
+data class GalleryPage(
+    val files: ArrayList<File>,
+    val isComplete: IsComplete,
+    val generation: Int,
+)
 
 class GalleryViewModel : ViewModel() {
 
     val period = MutableStateFlow(GalleryPeriod.MONTH)
 
+    /** In-memory only, like [period]: never persisted, so it cannot leak between users and always resets to All. */
+    val mediaFilter = MutableStateFlow(GalleryMediaFilter.ALL)
+
     private var getGalleryJob: Job? = null
 
-    private var currentCursor: String? = null
+    // Internal (not private) for orchestration tests only: superseded-scope assertions must
+    // observe that a dropped response left the cursor untouched. Volatile: written on the IO
+    // load coroutine, read by loadMoreGallery on the caller thread.
+    @Volatile
+    @VisibleForTesting
+    internal var currentCursor: String? = null
 
     private var lastGalleryFiles = arrayListOf<File>()
 
-    val galleryApiResult = MutableLiveData<Pair<ArrayList<File>, IsComplete>>()
+    /** Bumped on every request and scope change; responses of a superseded scope are dropped. */
+    private var loadGeneration = 0
+
+    val currentLoadGeneration: Int get() = loadGeneration
+
+    val galleryApiResult = MutableLiveData<GalleryPage?>()
     val needToRestoreFiles get() = galleryApiResult.isInitialized
+
+    /**
+     * A detached load result: computed fully off the shared state and stamped with the scope of
+     * its request. Nothing (cursor, cache, accumulated list, UI) is touched until [applyLoad]
+     * re-validates that this scope is still the current one.
+     */
+    private data class GalleryLoad(
+        val generation: Int,
+        val filter: GalleryMediaFilter,
+        val userId: Int,
+        val driveId: Int,
+        val files: ArrayList<File>,
+        val isComplete: Boolean,
+        val nextCursor: String?,
+        val isFirstPage: Boolean,
+    )
 
     fun loadLastGallery(driveId: Int, ignoreCloud: Boolean) {
         lastGalleryFiles = arrayListOf()
-        loadLastGallery(driveId, ignoreCloud, isFirstPage = true)
+        loadGallery(driveId, ignoreCloud, isFirstPage = true)
     }
 
     fun loadMoreGallery(driveId: Int, ignoreCloud: Boolean) {
-        currentCursor?.let {
-            loadLastGallery(driveId, ignoreCloud, isFirstPage = false, currentCursor)
-        }
+        currentCursor?.let { loadGallery(driveId, ignoreCloud, isFirstPage = false, cursor = it) }
+    }
+
+    /**
+     * Switching the filter drops the accumulated files and cursor (they belong to the previous
+     * query) together with any in-flight load, then updates [mediaFilter]. The UI observes the
+     * filter and triggers the actual reload.
+     */
+    fun setMediaFilter(filter: GalleryMediaFilter) {
+        if (filter == mediaFilter.value) return
+        loadGeneration++
+        getGalleryJob?.cancel()
+        currentCursor = null
+        lastGalleryFiles = arrayListOf()
+        mediaFilter.value = filter
     }
 
     fun restoreGalleryFiles() {
         if (needToRestoreFiles) {
-            val isComplete = galleryApiResult.value?.second ?: true
-            galleryApiResult.value = lastGalleryFiles to isComplete
+            val isComplete = galleryApiResult.value?.isComplete ?: true
+            galleryApiResult.value = GalleryPage(ArrayList(lastGalleryFiles), isComplete, loadGeneration)
         }
     }
 
-    private fun loadLastGallery(
+    private fun loadGallery(
         driveId: Int,
         ignoreCloud: Boolean,
         isFirstPage: Boolean,
         cursor: String? = null,
     ) {
+        val generation = ++loadGeneration
+        val filter = mediaFilter.value
+        val userId = AccountUtils.currentUserId
         getGalleryJob?.cancel()
         getGalleryJob = viewModelScope.launch(Dispatchers.IO) {
-            val result = getLastGallery(driveId, ignoreCloud, isFirstPage, cursor)
-            galleryApiResult.postValue(result)
-            lastGalleryFiles.addAll(result.first)
+            val load = if (ignoreCloud) {
+                buildRealmLoad(generation, filter, userId, driveId)
+            } else {
+                fetchApiLoad(generation, filter, userId, driveId, isFirstPage, cursor)
+            }
+            applyLoad(load)
         }
     }
 
-    private fun getLastGallery(
+    private fun buildRealmLoad(
+        generation: Int,
+        filter: GalleryMediaFilter,
+        userId: Int,
         driveId: Int,
-        ignoreCloud: Boolean,
+    ): GalleryLoad {
+        val allFiles = FileController.getGalleryDrive()
+        val files = if (filter.writesSharedCache) {
+            allFiles
+        } else {
+            ArrayList(allFiles.filter { it.matchesMediaFilter(filter) })
+        }
+        return GalleryLoad(generation, filter, userId, driveId, files, isComplete = true, nextCursor = null, isFirstPage = true)
+    }
+
+    private fun fetchApiLoad(
+        generation: Int,
+        filter: GalleryMediaFilter,
+        userId: Int,
+        driveId: Int,
         isFirstPage: Boolean,
         cursor: String?,
-    ): Pair<ArrayList<File>, IsComplete> {
-        getGalleryJob?.cancel()
-        getGalleryJob = Job()
+    ): GalleryLoad {
+        val apiResponse = ApiRepository.getLastGallery(
+            driveId = driveId,
+            types = filter.apiTypes.map { it.value },
+            cursor = cursor,
+        )
+        if (!apiResponse.isSuccess()) return buildRealmLoad(generation, filter, userId, driveId)
 
-        return if (ignoreCloud) emitRealmGallery() else fetchApiGallery(driveId, isFirstPage, cursor)
-    }
-
-    private fun emitRealmGallery(): Pair<ArrayList<File>, Boolean> {
-        currentCursor = null
-        return FileController.getGalleryDrive() to true
-    }
-
-    private fun fetchApiGallery(driveId: Int, isFirstPage: Boolean, cursor: String?): Pair<ArrayList<File>, Boolean> {
-        val apiResponse = ApiRepository.getLastGallery(driveId = driveId, cursor = cursor)
-        return if (apiResponse.isSuccess()) {
-            currentCursor = apiResponse.cursor
-            emitApiGallery(apiResponse, isFirstPage)
-        } else {
-            emitRealmGallery()
-        }
-    }
-
-    private fun emitApiGallery(
-        apiResponse: CursorApiResponse<ArrayList<File>>,
-        isFirstPage: Boolean,
-    ): Pair<ArrayList<File>, Boolean> {
         val data = apiResponse.data
+        val files = when {
+            data.isNullOrEmpty() -> arrayListOf()
+            // Filtered results are matched locally too, so a response outside the requested
+            // types can never be presented as filtered; only ALL may fill the shared cache.
+            filter.writesSharedCache -> ArrayList(data)
+            else -> ArrayList(data.filter { it.matchesMediaFilter(filter) })
+        }
+        return GalleryLoad(
+            generation = generation,
+            filter = filter,
+            userId = userId,
+            driveId = driveId,
+            files = files,
+            isComplete = !apiResponse.hasMore,
+            nextCursor = apiResponse.cursor,
+            isFirstPage = isFirstPage,
+        )
+    }
 
-        val results = if (data.isNullOrEmpty()) {
-            arrayListOf<File>() to true
-        } else {
-            FileController.storeGalleryDrive(data, isFirstPage)
-            val isComplete = !apiResponse.hasMore
-            data to isComplete
+    /**
+     * Applies a detached load only if its scope still matches the current request. Every side
+     * effect (cursor, accumulated list, shared cache writes, orphan cleanup, UI event) happens
+     * after — and only after — this validation.
+     */
+    private suspend fun applyLoad(load: GalleryLoad) {
+        currentCoroutineContext().ensureActive()
+
+        val scopeIsCurrent = load.generation == loadGeneration
+                && load.filter == mediaFilter.value
+                && load.userId == AccountUtils.currentUserId
+                && load.driveId == AccountUtils.currentDriveId
+        if (!scopeIsCurrent) return
+
+        currentCursor = load.nextCursor
+        if (load.isFirstPage) lastGalleryFiles = arrayListOf()
+        lastGalleryFiles.addAll(load.files)
+
+        if (load.filter.writesSharedCache && load.files.isNotEmpty()) {
+            FileController.storeGalleryDrive(load.files, load.isFirstPage)
+            if (load.isFirstPage) FileController.removeOrphanFiles()
         }
 
-        if (isFirstPage) FileController.removeOrphanFiles()
-        return results
+        galleryApiResult.postValue(GalleryPage(load.files, load.isComplete, load.generation))
     }
 
     override fun onCleared() {

@@ -95,6 +95,7 @@ class DownloadOfflineFileManager(
             // and for some reason, the worker is cancelled after a long time, the worker is restarted
             filesDownloaded += 1
             lastDownloadedFile = offlineFile
+            OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile)
             return ListenableWorker.Result.success()
         }
 
@@ -142,8 +143,10 @@ class DownloadOfflineFileManager(
         fileId: Int,
         userDrive: UserDrive = UserDrive(),
     ): File {
+        // with=hash is requested on the details call that drives the download, so the
+        // publication seam can record the server content identity at no extra request.
         val fileDetails = Dispatchers.IO {
-            ApiRepository.getFileDetails(File(id = fileId, driveId = userDrive.driveId))
+            ApiRepository.getFileDetailsWithHash(File(id = fileId, driveId = userDrive.driveId))
         }
         val remoteFile = fileDetails.data
         val file = if (fileDetails.isSuccess() && remoteFile != null) {
@@ -217,9 +220,10 @@ class DownloadOfflineFileManager(
         }
     }
 
-    private fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
+    private suspend fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
         FileController.updateOfflineStatus(file.id, true)
         offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
+        OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile)
         if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
         fileDownloaded(context, file.id)
     }

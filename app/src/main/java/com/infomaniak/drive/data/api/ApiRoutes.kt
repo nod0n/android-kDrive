@@ -275,6 +275,9 @@ object ApiRoutes {
 
     fun getFileDetails(file: File) = "${fileURL(file)}?$fileExtraWithQuery"
 
+    /** Official hash extension on the details route; the only response the app treats as authorized to store a server content hash. */
+    fun getFileDetailsWithHash(file: File) = "${fileURL(file)}?$fileExtraWithQuery,hash"
+
     fun createFolder(driveId: Int, parentId: Int) = "${fileURL(driveId, parentId)}/directory?$fileWithQuery"
 
     fun createOfficeFile(driveId: Int, folderId: Int) = "${fileURL(driveId, folderId)}/file?$fileWithQuery"

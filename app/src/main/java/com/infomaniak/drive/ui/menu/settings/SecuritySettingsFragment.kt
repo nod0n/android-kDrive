@@ -59,7 +59,9 @@ class SecuritySettingsFragment : Fragment() {
         }
 
         appLock.apply {
-            if (AppLockManager.hasBiometrics()) {
+            // Keep an enabled lock discoverable even when device authentication became
+            // unavailable: that is the only path to turn it off again.
+            if (AppLockManager.hasBiometrics() || AppSettings.appSecurityLock) {
                 isVisible = true
                 setOnClickListener {
                     trackSettingsEvent(MatomoName.LockApp)
@@ -69,6 +71,8 @@ class SecuritySettingsFragment : Fragment() {
                 isGone = true
             }
         }
+
+        updateContentProviderDescription()
 
         contentProviderSwitch.apply {
             isChecked = !CloudStorageProvider.isDisabled(appCtx)
@@ -87,10 +91,24 @@ class SecuritySettingsFragment : Fragment() {
     override fun onResume() = with(binding) {
         super.onResume()
         appLock.endText = getString(if (AppSettings.appSecurityLock) R.string.allActivated else R.string.allDisabled)
+        updateContentProviderDescription()
         val isContentProviderEnabled = !CloudStorageProvider.isDisabled(appCtx)
         if (contentProviderSwitch.isChecked != isContentProviderEnabled) {
             contentProviderSwitch.isChecked = isContentProviderEnabled
         }
+    }
+
+    /**
+     * While app lock is enabled, external file access is blocked no matter how this switch is
+     * set; make that boundary visible instead of letting the switch silently appear ineffective.
+     */
+    private fun updateContentProviderDescription() {
+        val descriptionRes = if (AppSettings.appSecurityLock) {
+            R.string.fileProviderExtensionAppLockDescription
+        } else {
+            R.string.fileProviderExtensionDescription
+        }
+        binding.contentProviderSwitch.description = getString(descriptionRes)
     }
 
 }

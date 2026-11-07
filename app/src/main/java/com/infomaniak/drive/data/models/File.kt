@@ -133,10 +133,16 @@ open class File(
      */
     var children: @WriteWith<FileRealmListParceler> RealmList<File> = RealmList(),
     var isComplete: Boolean = false,
+    var isDirectlyPinned: Boolean = false,
     var isFromUploads: Boolean = false,
     var isMarkedAsOffline: Boolean = false,
     var isOffline: Boolean = false,
+    var offlineBasisModifiedAt: Long = 0, // remote lastModifiedAt (s) the offline copy was published under; 0 = unpublished
+    var offlineBasisSize: Long? = null, // remote size at publication; null = unpublished
+    var offlineContentDigest: String? = null, // sha-256 of the exact downloaded bytes, computed once on IO at publication
     var responseAt: Long = 0,
+    @SerializedName("hash")
+    var serverContentHash: String? = null, // official with=hash server content identity
     var versionCode: Int = 0,
     var lastActionAt: Long = 0,
 

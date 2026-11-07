@@ -45,7 +45,7 @@ import io.realm.annotations.Ignore
 import io.realm.annotations.PrimaryKey
 import io.realm.kotlin.oneOf
 import io.realm.kotlin.toFlow
-import io.sentry.Sentry
+import com.infomaniak.core.sentry.SentryLog
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -180,6 +180,7 @@ open class UploadFile(
     }
 
     companion object {
+        private const val TAG = "UploadFile"
         private const val DB_NAME = "Sync.realm"
         private const val ONE_DAY = SECONDS_IN_A_DAY * 1_000L
         private var realmConfiguration: RealmConfiguration = RealmConfiguration.Builder().name(DB_NAME)
@@ -191,15 +192,14 @@ open class UploadFile(
         private inline val Realm.uploadTable get() = where(UploadFile::class.java)
 
         fun getRealmInstance(): Realm {
-            return runCatching {
-                Realm.getInstance(realmConfiguration)
-            }.getOrElse { exception ->
-                // Temporary fix, Issue https://github.com/realm/realm-java/issues/7706
-                Sentry.captureException(exception)
-                // Delete the database because it could be corrupted
-                Realm.deleteRealm(realmConfiguration)
-                // Create a new database
-                Realm.getInstance(realmConfiguration)
+            try {
+                return Realm.getInstance(realmConfiguration)
+            } catch (exception: Exception) {
+                // Never delete the database on open failure (the former realm-java#7706
+                // workaround wiped Sync.realm here): rows, pending uploads and settings must
+                // survive a transient or schema problem.
+                SentryLog.e(TAG, "Failed to open Sync.realm; keeping the database intact", exception)
+                throw exception
             }
         }
 

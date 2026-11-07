@@ -52,6 +52,7 @@ import com.infomaniak.drive.data.api.UploadTask.Companion.ConflictOption
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FolderFilesProvider
+import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.UserDrive
@@ -99,6 +100,39 @@ class CloudStorageProvider : DocumentsProvider() {
     }
 
     /**
+     * Durable app-lock value, read lazily inside each provider call (never at class-load: the
+     * settings Realm is only usable after onCreate has initialized Realm). Null fails closed
+     * through [ProviderAccessPolicy].
+     */
+    private fun readAppLockEnabled(): Boolean? {
+        return runCatching { AppSettings.getAppSettings()._appSecurityEnabled }.getOrNull()
+    }
+
+    private fun accessDecision(): ProviderAccessPolicy.Reason = ProviderAccessPolicy.evaluate(
+        appLockEnabled = readAppLockEnabled(),
+        providerDisabledByUser = isProviderDisabled(),
+    )
+
+    private fun blockedReasonMessage(decision: ProviderAccessPolicy.Reason): String? = when (decision) {
+        ProviderAccessPolicy.Reason.BLOCKED_BY_APP_LOCK -> context?.getString(R.string.cloudStorageAppLockError)
+        ProviderAccessPolicy.Reason.BLOCKED_BY_SETTING -> context?.getString(R.string.fileProviderExtensionError)
+        ProviderAccessPolicy.Reason.ALLOWED -> null
+    }
+
+    /**
+     * Denies external access while app lock is enabled (even if the app itself was just
+     * unlocked) or while the user disabled the provider. Thrown as SecurityException for
+     * single-document entry points; cursor-based entry points report the same reason through
+     * the cursor extras.
+     */
+    private fun ensureExternalAccessAllowed() {
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            throw SecurityException(blockedReasonMessage(decision) ?: "kDrive external access is disabled")
+        }
+    }
+
+    /**
      * Indicates whether the current platform is Chrome OS.
      *
      * ### Why this matters:
@@ -129,9 +163,11 @@ class CloudStorageProvider : DocumentsProvider() {
     override fun queryRoots(projection: Array<out String>?): Cursor = withLaxStrictMode {
         SentryLog.d(TAG, "queryRoots")
         val cursor = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
+        val isAccessBlocked = accessDecision() != ProviderAccessPolicy.Reason.ALLOWED
 
         AccountUtils.getAllUsersSync().forEach { user ->
-            cursor.addRoot(user.id.toString(), user.id.toString(), user.email)
+            // While access is blocked, account emails stay undisclosed
+            cursor.addRoot(user.id.toString(), user.id.toString(), if (isAccessBlocked) "" else user.email)
 
             if (!isProviderDisabled()) {
                 cloudScope.launch {
@@ -150,6 +186,7 @@ class CloudStorageProvider : DocumentsProvider() {
         projection: Array<out String>?
     ): Cursor = withLaxStrictMode {
         SentryLog.d(TAG, "queryDocument(), documentId=$documentId")
+        ensureExternalAccessAllowed()
 
         return MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION).apply {
             val userId = getUserId(documentId)
@@ -192,8 +229,9 @@ class CloudStorageProvider : DocumentsProvider() {
     ): Cursor = withLaxStrictMode {
         val cursor = DocumentCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION, isAutoCloseableJob = false)
 
-        if (isProviderDisabled()) {
-            cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to (context?.getString(R.string.fileProviderExtensionError)))
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to blockedReasonMessage(decision))
             return cursor
         }
 
@@ -288,6 +326,8 @@ class CloudStorageProvider : DocumentsProvider() {
     }
 
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+        if (accessDecision() != ProviderAccessPolicy.Reason.ALLOWED) return false
+
         // Roots and other virtual containers must only match documents that are actually
         // inside their subtree; otherwise SAF relationship checks can be bypassed.
         val parentDocumentType = computeDocumentType(parentDocumentId)
@@ -346,9 +386,7 @@ class CloudStorageProvider : DocumentsProvider() {
         signal: CancellationSignal?
     ): ParcelFileDescriptor? = withLaxStrictMode {
         SentryLog.d(TAG, "openDocument(), id=$documentId, mode=$mode, signalIsCancelled: ${signal?.isCanceled}")
-        if (isProviderDisabled()) {
-            throw SecurityException(context?.getString(R.string.fileProviderExtensionError))
-        }
+        ensureExternalAccessAllowed()
         val context = context ?: return null
 
         fun getRemoteFile(localFile: File?, fileId: Int, driveId: Int): File? {
@@ -383,6 +421,12 @@ class CloudStorageProvider : DocumentsProvider() {
         SentryLog.d(TAG, "querySearchDocuments(), rootId=$rootId, projectionSize=${projection?.size}, $currentParentDocumentId")
 
         val cursor = DocumentCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION, isAutoCloseableJob = false)
+
+        val decision = accessDecision()
+        if (decision != ProviderAccessPolicy.Reason.ALLOWED) {
+            cursor.extras = bundleOf(DocumentsContract.EXTRA_ERROR to blockedReasonMessage(decision))
+            return cursor
+        }
 
         if (currentParentDocumentId == null ||
             currentParentDocumentId == getUserId(currentParentDocumentId!!) ||
@@ -436,6 +480,7 @@ class CloudStorageProvider : DocumentsProvider() {
         signal: CancellationSignal?
     ): AssetFileDescriptor = withLaxStrictMode {
         SentryLog.d(TAG, "openDocumentThumbnail(), id=$documentId, signalIsCancelled: ${signal?.isCanceled}")
+        ensureExternalAccessAllowed()
 
         val fileId = getFileIdFromDocumentId(documentId)
         val userId = getUserId(documentId)
@@ -495,6 +540,7 @@ class CloudStorageProvider : DocumentsProvider() {
         displayName: String
     ): String = withLaxStrictMode {
         SentryLog.d(TAG, "createDocument(), parentId=$parentDocumentId, mimeType=$mimeType")
+        ensureExternalAccessAllowed()
 
         return if (mimeType.equals(DocumentsContract.Document.MIME_TYPE_DIR, true)) {
             createNewFolder(parentDocumentId, displayName) // If we want to create a new folder
@@ -505,6 +551,7 @@ class CloudStorageProvider : DocumentsProvider() {
 
     override fun deleteDocument(documentId: String): Unit = withLaxStrictMode {
         SentryLog.d(TAG, "deleteDocument(), id=$documentId")
+        ensureExternalAccessAllowed()
 
         val context = context ?: throw IllegalStateException("Delete document failed: missing Android Context")
 
@@ -534,6 +581,7 @@ class CloudStorageProvider : DocumentsProvider() {
         displayName: String
     ): String? = withLaxStrictMode {
         SentryLog.d(TAG, "renameDocument(), id=$documentId")
+        ensureExternalAccessAllowed()
 
         FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
@@ -559,6 +607,7 @@ class CloudStorageProvider : DocumentsProvider() {
         targetParentDocumentId: String
     ): String = withLaxStrictMode {
         SentryLog.d(TAG, "copyDocument(), sourceId=$sourceDocumentId, targetParentId=$targetParentDocumentId")
+        ensureExternalAccessAllowed()
 
         return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
 
@@ -592,6 +641,7 @@ class CloudStorageProvider : DocumentsProvider() {
                     "sourceParentId=$sourceParentDocumentId, " +
                     "targetParentId=$targetParentDocumentId"
         )
+        ensureExternalAccessAllowed()
 
         return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
 

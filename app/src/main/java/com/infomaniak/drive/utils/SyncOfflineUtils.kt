@@ -78,6 +78,8 @@ object SyncOfflineUtils {
                 }
             }
         }
+        // Recursive offline folder roots ride the same cadence as per-file offline maintenance.
+        OfflineFolderSyncUtils.syncOfflineFolderRoots(context)
     }
 
     /**

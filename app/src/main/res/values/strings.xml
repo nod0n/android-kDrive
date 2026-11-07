@@ -451,7 +451,9 @@
     </plurals>
     <string name="fileListTitle">Files</string>
     <string name="filePermissionTitle">Select the right</string>
+    <string name="fileProviderExtensionAppLockDescription">Files are hidden in the Files application while App lock is enabled. To restore them, turn App lock off in the security settings; if it cannot be turned off, restore your device screen lock first.</string>
     <string name="fileProviderExtensionDescription">If this option is disabled, kDrive will no longer be available in the Files application and in third-party applications.</string>
+    <string name="cloudStorageAppLockError">kDrive files are hidden while App lock is enabled. Open kDrive and turn App lock off in its security settings; if App lock cannot be turned off, restore your device screen lock first.</string>
     <string name="fileProviderExtensionError">You have disabled file display from kDrive. You can re-enable it in the app settings.</string>
     <string name="fileProviderExtensionTitle">Show in Files</string>
     <string name="fileShareAddMessage">Add a message for guests (optional)</string>
@@ -465,6 +467,9 @@
     <string name="fileTypeFilterTitle">File type</string>
     <string name="filtersTitle">Filters</string>
     <string name="folderDescription">Private or shared folder</string>
+    <string name="galleryFilterEmptyMediaDescription">No media matches this filter. Refresh to check for more files, or select All.</string>
+    <string name="galleryMediaFilterAll">All</string>
+    <string name="galleryMediaFilterTitle">Media type</string>
     <string name="galleryTitle">Gallery</string>
     <string name="hintInputDirName">Folder name</string>
     <string name="hintInputFileName">File name</string>
@@ -569,6 +574,8 @@
     <string name="onBoardingTitle2">Work together in one place and become more efficient</string>
     <string name="onBoardingTitle3">Save your memories securely</string>
     <string name="pdfIsLocked">Your PDF is locked</string>
+    <string name="photoTrashSyncDescription">When a synced photo is trashed in kDrive or on this phone, the trash is propagated to the other side after confirmation. Trashed photos stay recoverable; nothing is permanently deleted.</string>
+    <string name="photoTrashSyncTitle">Sync photo trash</string>
     <string name="picturesNoFile">No photo at this time</string>
     <plurals name="preparingToUpload">
         <item quantity="one">Preparing to upload %d file</item>

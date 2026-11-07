@@ -27,6 +27,7 @@ import androidx.core.net.toFile
 import androidx.work.Data
 import androidx.work.workDataOf
 import com.google.gson.annotations.SerializedName
+import com.google.gson.reflect.TypeToken
 import com.infomaniak.core.common.io.skipExactly
 import com.infomaniak.core.common.rateLimit
 import com.infomaniak.core.ktor.toOutgoingContent
@@ -39,11 +40,13 @@ import com.infomaniak.core.notifications.notifyCompat
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.data.api.ApiRepository.uploadEmptyFile
 import com.infomaniak.drive.data.api.ApiRoutes.uploadChunkUrl
+import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.data.models.drive.Drive.MaintenanceReason
 import com.infomaniak.drive.data.models.upload.UploadSession
 import com.infomaniak.drive.data.models.upload.ValidChunks
 import com.infomaniak.drive.data.services.UploadWorker
+import com.infomaniak.drive.data.sync.PhotoTrashController
 import com.infomaniak.drive.data.sync.UploadNotifications.progressPendingIntent
 import com.infomaniak.drive.utils.NotificationUtils.CURRENT_UPLOAD_ID
 import com.infomaniak.drive.utils.NotificationUtils.ELAPSED_TIME
@@ -99,6 +102,9 @@ class UploadTask(
 
     private var currentProgress = 0
 
+    /** The server file created by the last successful upload response, when it was parsed. */
+    private var createdRemoteFile: File? = null
+
     private val uploadedBytes = AtomicLong(value = 0L)
     private val uploadedBytesUpdates = MutableSharedFlow<Unit>(extraBufferCapacity = 1, replay = 1).also {
         it.tryEmit(Unit)
@@ -122,7 +128,7 @@ class UploadTask(
                 engine { preconfigured = uploadFile.okHttpClient }
             }
             when {
-                uploadFile.fileSize == 0L -> uploadEmptyFile(uploadFile)
+                uploadFile.fileSize == 0L -> createdRemoteFile = ApiRepository.uploadEmptyFile(uploadFile).data
                 uploadFile.fileSize <= MIN_FILE_SIZE_FOR_CHUNKING -> uploadDirectly(httpClient)
                 else -> uploadInChunks(httpClient)
             }
@@ -223,7 +229,11 @@ class UploadTask(
                 uploadToken = uploadFile.uploadToken!!,
                 okHttpClient = uploadFile.okHttpClient
             )
-            if (!closedSessionResponse.isSuccess()) closedSessionResponse.manageUploadErrors()
+            if (closedSessionResponse.isSuccess()) {
+                createdRemoteFile = closedSessionResponse.data?.file
+            } else {
+                closedSessionResponse.manageUploadErrors()
+            }
         }
     }
 
@@ -292,6 +302,13 @@ class UploadTask(
         }
         shareProgress(100, true)
         UploadFile.uploadFinished(uri)
+        // Photo trash propagation pairs only from an authoritative upload response: bind the
+        // uploaded source to the server file the upload actually created.
+        if (uploadFile.isSync()) {
+            createdRemoteFile?.id?.takeIf { it > 0 }?.let { remoteFileId ->
+                PhotoTrashController.recordPairing(uploadFile, remoteFileId)
+            }
+        }
     }
 
     private suspend fun uploadChunk(
@@ -406,6 +423,16 @@ class UploadTask(
                 ApiResponse<Any>(error = ApiError(description = bodyResponse))
             }
             apiResponse.manageUploadErrors()
+        } else {
+            // Keep the created server file: it is the authoritative pairing identity for
+            // photo trash propagation.
+            runCatching {
+                val bodyResponse = String(response.bodyAsChannel().toByteArray())
+                createdRemoteFile = gson.fromJson<ApiResponse<File>>(
+                    bodyResponse,
+                    object : TypeToken<ApiResponse<File>>() {}.type,
+                ).data
+            }
         }
     }
 
