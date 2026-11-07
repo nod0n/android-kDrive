@@ -33,6 +33,8 @@ import io.mockk.unmockkAll
 import io.mockk.verify
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -58,18 +60,27 @@ import java.util.concurrent.atomic.AtomicInteger
  * (cursor, shared cache, orphan cleanup, UI event) and that filtered queries never write the
  * shared all-media cache.
  *
- * Deterministic discipline (SOFTCHECK-1924): every wait is a bounded, ASSERTED latch or
+ * Deterministic discipline (RESUME-2d4d-1942): every wait is a bounded, ASSERTED latch or
  * completion-poll — a timeout fails the case, it is never ignored, and a harness-side latch
- * timeout is RECORDED and asserted not to have fired (it must never manufacture an ordering).
+ * timeout is RECORDED and asserted not to have fired AFTER the loads have actually finished.
  * An old request's arrival at the network seam is proven by an ENTRY latch asserted BEFORE the
- * supersession. A drop branch's execution is proven at a production boundary the branch itself
- * must cross (test 3: the scope check's account read, held and released by the test), never by
- * a timer and never by the absence of an assertion failure. Superseded-by-cancellation cases
- * (1, 2) claim only what the guards make true — the released response cannot apply, by
- * cancellation or by the scope check; they do not claim the scope-mismatch branch. Finally,
- * every case releases its parked responses and CANCELS AND JOINS the ViewModel's load
- * coroutines (bounded) BEFORE tearDown unmocks and restores production implementations — no
- * late coroutine runs into unmocked code, and no IO thread outlives a failed case.
+ * supersession. The completion proof is a JOIN, not a value check: each case captures the
+ * parked request's actual Job from the ViewModel scope while its response is parked, releases
+ * the response, JOINS that Job to completion, and only then asserts side effects — a broken
+ * ensureActive/scope guard would have applied its stale data before the join returned, so the
+ * zero-effect claims underneath are sensitive to the guards' removal. A drop branch's REACH
+ * is proven at a production boundary the branch itself must cross (case 3: the scope check's
+ * account read, held and released by the test), never by a timer and never by the absence of
+ * an assertion failure; its DECISION is the guard's own — superseded-by-cancellation cases
+ * (1, 2) claim only what the guards make true, never the scope-mismatch branch. Cleanup
+ * cancellation is separate and never the mechanism a claim rests on: every parked latch is
+ * hoisted and released in finally BEFORE the bounded cancel+join, and the last assertions run
+ * after the released loads have actually finished.
+ *
+ * Evidence level: JVM orchestration guarantees only. The earlier 240 s device timeout of this
+ * class is NOT explained by these cases — its cause stays open until a completed device run
+ * records one, and a passing device run alone would not close the completion-proof gaps the
+ * join discipline above closes. ActivityResult/lifecycle wiring is out of scope here.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GalleryViewModelTest {
@@ -125,6 +136,33 @@ class GalleryViewModelTest {
         }
     }
 
+    /**
+     * The load coroutines currently live in the ViewModel's scope: [GalleryViewModel] launches
+     * every load as a child of viewModelScope (the launch attaches its child synchronously), so
+     * a capture taken while a response is parked in the network seam IS that request's Job.
+     */
+    private fun capturedLoadJobs(vm: GalleryViewModel): List<Job> =
+        vm.viewModelScope.coroutineContext.job.children.toList()
+
+    /**
+     * Joins released load Jobs to COMPLETION before the case asserts side effects: after the
+     * parked response is released, a superseded coroutine either drops by its guards or applies
+     * its stale data — and only a completed Job makes that outcome final and observable. Fails
+     * instead of hanging.
+     */
+    private fun joinReleasedLoads(label: String, jobs: List<Job>) {
+        assertTrue(jobs.isNotEmpty(), "$label: no load Job was captured — the completion proof would be vacuous")
+        try {
+            runBlocking {
+                withTimeout(5_000) {
+                    jobs.forEach { it.join() }
+                }
+            }
+        } catch (timeout: TimeoutCancellationException) {
+            throw AssertionError("$label: a released load did not finish within 5s — a parked thread never returned", timeout)
+        }
+    }
+
     private fun apiPage(files: List<File>, cursor: String?, hasMore: Boolean) = CursorApiResponse(
         result = ApiResponseStatus.SUCCESS,
         data = ArrayList(files),
@@ -176,6 +214,7 @@ class GalleryViewModelTest {
         try {
             vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
             assertTrue(oldRequestEntered.await(5, TimeUnit.SECONDS), "the old request reached the network seam")
+            val staleLoadJobs = capturedLoadJobs(vm)
 
             // Switch the filter while the first response is still parked in the seam: the
             // superseding load cancels the parked job (it can apply only via the guards).
@@ -191,16 +230,19 @@ class GalleryViewModelTest {
             assertTrue(awaitTrue { vm.galleryApiResult.value?.generation == 3 }, "the fresh request applied (generation 3)")
             assertTrue(awaitTrue { vm.currentCursor == "fresh-cursor" }, "the fresh cursor is the live one")
 
-            // Release the parked stale response. The superseded coroutine resumes into a
-            // CANCELLED job (or, at most, into a failing scope check): by either guard it
-            // cannot apply — this case claims exactly that, not the scope-mismatch branch.
+            // Release the parked stale response, then join the stale load to COMPLETION before
+            // any side-effect assertion. The resumed coroutine runs into a CANCELLED job (or,
+            // at most, into a failing scope check) — this case claims exactly that, not the
+            // scope-mismatch branch — and the join makes the outcome final: a broken guard
+            // would have applied the stale page before the join returned.
             blockedResponse.countDown()
-            assertTrue(awaitTrue(2_000) { vm.galleryApiResult.value?.generation == 3 && vm.currentCursor == "fresh-cursor" }, "the world is quiescent after the release")
+            joinReleasedLoads("the stale all-media load", staleLoadJobs)
 
             assertFalse(answerTimedOut.get(), "the harness released the parked response only via timeout: the ordering claims above are void")
             verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) } // VIDEOS never writes; stale ALL was dropped
             verify(exactly = 0) { FileController.removeOrphanFiles() }
             assertEquals("fresh-cursor", vm.currentCursor)
+            assertEquals(3, vm.galleryApiResult.value?.generation)
             assertTrue(
                 vm.galleryApiResult.value?.files?.all { it.matchesMediaFilter(GalleryMediaFilter.VIDEOS) } == true,
                 "the presented files match the switched filter",
@@ -234,18 +276,23 @@ class GalleryViewModelTest {
         try {
             vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
             assertTrue(oldRequestEntered.await(5, TimeUnit.SECONDS), "the older request reached the seam before supersession")
+            val staleLoadJobs = capturedLoadJobs(vm)
             vm.loadLastGallery(DRIVE_ID, ignoreCloud = false) // supersedes (cancels) the first request
 
             assertTrue(awaitTrue { vm.galleryApiResult.value?.generation == 2 }, "the newer request applied (generation 2)")
 
-            // Release the parked older response: a reordered response of a cancelled,
-            // superseded request cannot apply (the guards above).
+            // Release the parked older response, then join the older load to COMPLETION before
+            // any assertion: a reordered response of a cancelled, superseded request cannot
+            // apply (the guards above), and the join makes that outcome final — if both guards
+            // were removed, the stale page would have applied before the join returned and the
+            // value checks underneath would fail.
             blockedOld.countDown()
-            assertTrue(awaitTrue(2_000) { vm.galleryApiResult.value?.generation == 2 && vm.currentCursor == "newer-cursor" }, "the world is quiescent after the release")
+            joinReleasedLoads("the older reordered load", staleLoadJobs)
 
             assertFalse(answerTimedOut.get(), "the harness released the parked response only via timeout: the ordering claims above are void")
             assertEquals("newer-cursor", vm.currentCursor)
             assertEquals(2, vm.galleryApiResult.value?.files?.singleOrNull()?.id)
+            assertEquals(2, vm.galleryApiResult.value?.generation)
             verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 1 && it.first().id == 2 }, isFirstPage = true) }
         } finally {
             blockedOld.countDown()
@@ -259,6 +306,8 @@ class GalleryViewModelTest {
         val vm = GalleryViewModel()
         val oldRequestEntered = CountDownLatch(1)
         val blockedResponse = CountDownLatch(1)
+        val branchReachedScopeCheck = CountDownLatch(1)
+        val branchMayDecide = CountDownLatch(1)
         val answerTimedOut = AtomicBoolean(false)
         val staleUserPage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE)), cursor = "other-user", hasMore = false)
 
@@ -271,14 +320,13 @@ class GalleryViewModelTest {
         try {
             vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
             assertTrue(oldRequestEntered.await(5, TimeUnit.SECONDS), "the old request reached the seam before the account switch")
+            val staleLoadJobs = capturedLoadJobs(vm)
 
             // Account switches while the response is in flight. The post-switch account stub
             // is a HANDSHAKE, not a timer: the drop branch's scope check must READ the
             // account here; the test observes the read, then lets the branch decide. The
             // decision value is fixed (USER_ID + 1 -> mismatch), so the zero-effect asserts
             // below cannot race a side effect that the branch can never produce.
-            val branchReachedScopeCheck = CountDownLatch(1)
-            val branchMayDecide = CountDownLatch(1)
             every { AccountUtils.currentUserId } answers {
                 branchReachedScopeCheck.countDown()
                 if (!branchMayDecide.await(5, TimeUnit.SECONDS)) answerTimedOut.set(true)
@@ -288,12 +336,19 @@ class GalleryViewModelTest {
             assertTrue(branchReachedScopeCheck.await(5, TimeUnit.SECONDS), "the stale branch reached the production scope check (the drop ran)")
             branchMayDecide.countDown()
 
+            // The load is NOT cancelled here — the drop is decided by the scope guard alone.
+            // Joining it to completion is what makes the zero-effect claims below sensitive to
+            // the guard's removal: without the account check, the stale page would have been
+            // applied (cache write, cursor, UI event) before the join returned.
+            joinReleasedLoads("the stale-account load", staleLoadJobs)
+
             assertFalse(answerTimedOut.get(), "the harness released a handshake only via timeout: the ordering claims above are void")
             assertTrue(vm.galleryApiResult.value == null, "the stale response was never applied")
             assertNull(vm.currentCursor, "the stale cursor was never taken")
             verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) }
             verify(exactly = 0) { FileController.removeOrphanFiles() }
         } finally {
+            branchMayDecide.countDown()
             blockedResponse.countDown()
             cancelAndJoinLoads(vm)
         }
