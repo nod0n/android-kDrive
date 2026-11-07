@@ -144,7 +144,10 @@ class FileMigration17to18Test {
 
                 fileSchema.addField("isInOfflineFolder", Boolean::class.java, FieldAttribute.REQUIRED)
                 fileSchema.addField("offlineIntentStamp", Long::class.java, FieldAttribute.REQUIRED)
-                fileSchema.addField("publishedCleanBaseline", Long::class.java)
+                // The true v17 column is NULLABLE (the dev branch declared publishedCleanBaseline
+                // as Long?): a primitive Long here would make the setNull calls below throw and
+                // would mis-state the schema the migration migrates FROM.
+                fileSchema.addField("publishedCleanBaseline", Long::class.javaObjectType)
 
                 val covered = transactionRealm.where("File").equalTo("uid", "900202_721").findFirst()!!
                 covered.setBoolean("isInOfflineFolder", true)
@@ -189,6 +192,7 @@ class FileMigration17to18Test {
             check(fileSchema != null)
             branchOnlyFileFields.forEach { field -> assertFalse(fileSchema.hasField(field), "the true v17 shape has no $field") }
             devFileFields.forEach { field -> assertTrue(fileSchema.hasField(field), "the true v17 shape carries $field") }
+            assertFalse(fileSchema.isRequired("publishedCleanBaseline"), "the true v17 baseline column is nullable")
             assertFalse(dynamic.schema.contains("OfflineFolderRoot"), "the true v17 shape has no OfflineFolderRoot table")
             assertTrue(dynamic.schema.contains("OfflineRoot"), "the true v17 shape carries the dev OfflineRoot table")
             assertEquals(1L, dynamic.where("OfflineRoot").count())

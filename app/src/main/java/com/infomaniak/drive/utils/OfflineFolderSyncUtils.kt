@@ -58,6 +58,12 @@ import java.security.MessageDigest
  *  - replacements download to a staging file and atomically replace the previous copy only
  *    after a verified transfer — failure, cancellation or a locally-edited or unknown copy
  *    always preserves the previous bytes;
+ *  - a covered copy's INITIAL download publishes through that same staged path (never a
+ *    direct write to the final path): a cancellation discards owned staging, and a
+ *    withdrawal mid-transfer skips the atomic rename instead of deleting bytes at the
+ *    final path after the fact;
+ *  - a rename relocation never overwrites an occupied target (rename(2) replaces
+ *    silently): an occupied target refuses the move and both copies stay preserved;
  *  - a failed or incomplete traversal never proves absence: coverage is released only after a
  *    complete walk, remote deletion inside a root stops coverage without deleting bytes, and
  *    only an explicit user unmark deletes copies, through the checked path (delete first,
@@ -623,7 +629,12 @@ object OfflineFolderSyncUtils {
      * MISSING. If the accepted bytes still live at the recorded publication path and no other
      * row claims it, they are RELOCATED with one rename — never re-downloaded over — so a
      * clean copy stays intact and a locally edited copy stays preserved (and classified) at
-     * the renamed location. Any refusal keeps the old bytes where they are, preserved.
+     * the renamed location. An occupied target refuses the move: rename(2) replaces
+     * silently, so bytes this row cannot claim are never overwritten, and any refusal keeps
+     * the old bytes where they are, preserved. The existence check immediately before the
+     * rename narrows the exposure; POSIX offers no portable no-replace rename, so a
+     * byte-appearance inside that last window stays an unclosable platform race (disclosed),
+     * like every Java relocation.
      */
     private suspend fun relocatePublishedCopy(userDrive: UserDrive, snapshot: File, offlineFile: JavaFile?): JavaFile? = withContext(Dispatchers.IO) {
         val target = offlineFile ?: return@withContext null
@@ -638,6 +649,15 @@ object OfflineFolderSyncUtils {
                 .count() > 0
         }
         if (claimedByAnotherRow) return@withContext null // another file legitimately lives there now
+        if (target.exists()) {
+            // rename(2) would silently REPLACE these bytes. They are provably not this row's
+            // accepted copy (the current path classified as MISSING, which is what led here),
+            // so they belong to nobody this code may destroy: the old copy stays at its
+            // recorded path (recoverable) and the foreign bytes stay put. The staged
+            // replacement path preserves them too: unproven bytes never authorize destruction.
+            SentryLog.w(TAG, "Relocation target already holds bytes for file ${snapshot.id}; both copies preserved")
+            return@withContext null
+        }
         val parent = target.parentFile ?: return@withContext null
         if (!parent.exists() && !parent.mkdirs()) return@withContext null
         if (!previous.renameTo(target)) {
@@ -705,6 +725,20 @@ object OfflineFolderSyncUtils {
         }
     }
 
+    /** Outcome of a staged publication attempt (shared by maintenance and the download seam). */
+    enum class StagedPublication {
+        /** The staged body was published with one atomic rename and the basis recorded. */
+        PUBLISHED,
+        /** The downloaded body equals the preserved publication: metadata-only adoption. */
+        ADOPTED_METADATA_ONLY,
+        /** No live offline intent (or row) at the publication point: nothing was mutated. */
+        INTENT_WITHDRAWN,
+        /** The existing copy is edited, unknown or unverifiable and was preserved untouched. */
+        PRESERVED_EXISTING,
+        /** The transfer or the publication step failed; previous bytes preserved. */
+        FAILED,
+    }
+
     /**
      * Downloads the current remote body to a staging file and PUBLISHES it with one atomic
      * rename over the previous copy (this storage's rename(2) replaces atomically: a crash or
@@ -721,31 +755,32 @@ object OfflineFolderSyncUtils {
      * identity the driving response established for THIS body, or null when nothing
      * established it (a listing snapshot) — the record then clears rather than binding an
      * old identity to new content. Every refusal preserves the previous bytes and state.
-     * The response is closed on every return path.
+     * Returns the [StagedPublication] outcome; every non-PUBLISHED outcome leaves the
+     * previous bytes and state untouched. The response is closed on every return path.
      */
-    private suspend fun stagedRedownload(
+    suspend fun stagedRedownload(
         context: Context,
         userDrive: UserDrive,
         file: File,
         establishedServerHash: String?,
-    ): Boolean = withContext(Dispatchers.IO) {
+    ): StagedPublication = withContext(Dispatchers.IO) {
         val okHttpClient = AccountUtils.getHttpClient(userDrive.userId, null)
-        val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return@withContext false
-        val parentDir = offlineFile.parentFile ?: return@withContext false
+        val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return@withContext StagedPublication.FAILED
+        val parentDir = offlineFile.parentFile ?: return@withContext StagedPublication.FAILED
         if (!parentDir.exists()) parentDir.mkdirs() // newly discovered nested files
-        if (!parentDir.isDirectory) return@withContext false
+        if (!parentDir.isDirectory) return@withContext StagedPublication.FAILED
         val staging = JavaFile.createTempFile("offline_staging_", null, parentDir)
 
         try {
             val response = DownloadOfflineFileManager.downloadFileResponseAsync(ApiRoutes.downloadFile(file), okHttpClient)
             val saved = response.use { resp ->
-                if (!resp.isSuccessful) return@withContext false
+                if (!resp.isSuccessful) return@withContext StagedPublication.FAILED
                 DownloadOfflineFileManager.saveRemoteData(TAG, resp, staging)
             }
-            if (!saved) return@withContext false
+            if (!saved) return@withContext StagedPublication.FAILED
             // Exact-byte guard against the server's own length when available
-            if (file.size != null && staging.length() != file.size) return@withContext false
-            val digest = computeDigest(staging) ?: return@withContext false
+            if (file.size != null && staging.length() != file.size) return@withContext StagedPublication.FAILED
+            val digest = computeDigest(staging) ?: return@withContext StagedPublication.FAILED
 
             val rowRead = FileController.getRealmInstance(userDrive).use { realm ->
                 FileController.getFileProxyById(file.id, customRealm = realm)
@@ -753,12 +788,14 @@ object OfflineFolderSyncUtils {
                     ?.let { it to hasLiveOfflineIntent(it, realm, userDrive) }
             } ?: run {
                 SentryLog.w(TAG, "Row vanished during staged download for file ${file.id}; replacement aborted")
-                return@withContext false
+                // No row means no authority to publish anything — same as a withdrawn intent:
+                // stale work must not retry-loop, it completes without mutating.
+                return@withContext StagedPublication.INTENT_WITHDRAWN
             }
             val (currentRow, authorized) = rowRead
             if (!authorized) {
                 SentryLog.w(TAG, "Offline intent withdrawn during staged download for file ${file.id}; publication skipped")
-                return@withContext false
+                return@withContext StagedPublication.INTENT_WITHDRAWN
             }
 
             // ---- Guards immediately before any mutation (all preserve) ----
@@ -780,14 +817,14 @@ object OfflineFolderSyncUtils {
             )) {
                 PublicationDecision.PRESERVE_EXISTING -> {
                     SentryLog.w(TAG, "Existing copy edited, unknown or unverifiable for file ${file.id}; replacement aborted")
-                    return@withContext false
+                    return@withContext StagedPublication.PRESERVED_EXISTING
                 }
                 PublicationDecision.ADOPT_METADATA_ONLY -> {
                     // Body identical to the preserved publication: metadata-only adoption on
                     // the verified clean copy (timestamp and basis move together in
                     // [updatePublicationBasis]; the bytes are never touched).
                     updatePublicationBasis(userDrive, file.id, file, offlineFile)
-                    return@withContext true
+                    return@withContext StagedPublication.ADOPTED_METADATA_ONLY
                 }
                 PublicationDecision.REPLACE_BYTES -> Unit
             }
@@ -797,14 +834,14 @@ object OfflineFolderSyncUtils {
             // basis that would misdescribe the new ones.
             if (!staging.setLastModified(file.getLastModifiedInMilliSecond())) {
                 SentryLog.w(TAG, "Staging timestamp refused for file ${file.id}; publication aborted, previous copy preserved")
-                return@withContext false
+                return@withContext StagedPublication.FAILED
             }
 
             // One atomic publication step: rename(2) over the existing file (rename keeps the
             // staging mtime). Failure keeps the old bytes (staging is removed in finally).
             if (!staging.renameTo(offlineFile)) {
                 SentryLog.w(TAG, "Atomic replace refused for file ${file.id}; previous copy preserved")
-                return@withContext false
+                return@withContext StagedPublication.FAILED
             }
 
             FileController.getRealmInstance(userDrive).use { realm ->
@@ -824,7 +861,7 @@ object OfflineFolderSyncUtils {
                 }
             }
             if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
-            true
+            StagedPublication.PUBLISHED
         } finally {
             if (staging.exists()) staging.delete()
         }

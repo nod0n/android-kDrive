@@ -138,6 +138,35 @@ class DownloadOfflineFileManager(
             return ListenableWorker.Result.success()
         }
 
+        if (coveredByRoot) {
+            // A covered copy never reaches the destructive path below (delete the bytes at
+            // the final path, then stream a replacement in place): its initial download
+            // publishes through the staged path instead — a cancellation discards owned
+            // staging, and a withdrawal mid-transfer skips the atomic rename entirely
+            // instead of deleting bytes at the final path after the fact. The captured
+            // details identity describes the body this transfer fetches. Notification
+            // progress parity is not kept here (the maintenance pass has none either); the
+            // bulk chain's onFinish finalizes pending markers and the notification.
+            val outcome = runCatching {
+                OfflineFolderSyncUtils.stagedRedownload(context, userDrive, file, establishedServerHash = acceptedServerHash)
+            }.cancellable().onFailure { exception ->
+                SentryLog.e(TAG, "Staged covered download failed for ${file.id}", exception)
+            }.getOrDefault(OfflineFolderSyncUtils.StagedPublication.FAILED)
+            return when (outcome) {
+                OfflineFolderSyncUtils.StagedPublication.FAILED -> ListenableWorker.Result.failure()
+                OfflineFolderSyncUtils.StagedPublication.PUBLISHED,
+                OfflineFolderSyncUtils.StagedPublication.ADOPTED_METADATA_ONLY -> {
+                    fileDownloaded(context, file.id)
+                    ListenableWorker.Result.success()
+                }
+                OfflineFolderSyncUtils.StagedPublication.INTENT_WITHDRAWN,
+                OfflineFolderSyncUtils.StagedPublication.PRESERVED_EXISTING -> {
+                    filesDownloaded += 1
+                    ListenableWorker.Result.success()
+                }
+            }
+        }
+
         onProgress(0, file.id)
 
         if (offlineFile.exists()) offlineFile.delete()
@@ -157,10 +186,20 @@ class DownloadOfflineFileManager(
     }
 
     fun cleanLastDownloadedFile() {
-        val file = currentFile
+        val file = currentFile ?: return
+        // The worker's cleanup may only dispose of bytes from its own unaccepted transfer.
+        // With no live offline intent left (unmark, release, unpin), the copy at the offline
+        // path belongs to the user contract — preserved edited/unknown bytes — or was already
+        // cleaned by the publication seam: the worker must not delete anything then, even
+        // when a bulk chain's onFinish cleared the pending marker first.
+        val liveIntent = FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.getFileProxyById(file.id, customRealm = realm)
+                ?.let { OfflineFolderSyncUtils.hasLiveOfflineIntent(it, realm, userDrive) } == true
+        }
+        if (!liveIntent) return
         // A root-covered copy is never cleaned up here: its lifecycle belongs to the root
         // contract, which releases coverage without deleting bytes.
-        val coveredByRoot = file != null && FileController.getRealmInstance(userDrive).use { realm ->
+        val coveredByRoot = FileController.getRealmInstance(userDrive).use { realm ->
             OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)
         }
         if (coveredByRoot) return
