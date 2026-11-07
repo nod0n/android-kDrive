@@ -1126,37 +1126,44 @@ object OfflineFolderSyncUtils {
         if (recordedPath.isNullOrBlank() || recordedPath == target.path) return@withContext null
         val previous = JavaFile(recordedPath)
         if (!previous.exists()) return@withContext null
-        val claimedByAnotherRow = FileController.getRealmInstance(userDrive).use { realm ->
-            realm.where(File::class.java)
-                .equalTo(File::offlinePublishedPath.name, recordedPath)
-                .notEqualTo(File::id.name, snapshot.id)
-                .count() > 0
-        }
-        if (claimedByAnotherRow) return@withContext null // another file legitimately lives there now
-        if (target.exists()) {
-            // rename(2) would silently REPLACE these bytes. They are provably not this row's
-            // accepted copy (the current path classified as MISSING, which is what led here),
-            // so they belong to nobody this code may destroy: the old copy stays at its
-            // recorded path (recoverable) and the foreign bytes stay put. The staged
-            // replacement path preserves them too: unproven bytes never authorize destruction.
-            SentryLog.w(TAG, "Relocation target already holds bytes for file ${snapshot.id}; both copies preserved")
-            return@withContext null
-        }
-        val parent = target.parentFile ?: return@withContext null
-        if (!parent.exists() && !parent.mkdirs()) return@withContext null
-        if (!previous.renameTo(target)) {
-            SentryLog.w(TAG, "Relocation refused for file ${snapshot.id}; previous copy kept at its recorded path")
-            return@withContext null
-        }
-        FileController.getRealmInstance(userDrive).use { realm ->
-            realm.executeTransaction { mutableRealm ->
-                FileController.getFileProxyById(snapshot.id, customRealm = mutableRealm)?.let { proxy ->
-                    proxy.offlinePublishedPath = target.path
+        // The relocation is a publication-adjacent filesystem effect (the accepted bytes
+        // move and the recorded path is repointed): its checks, the rename and the record
+        // run INSIDE the commit authority, so a coordinated tree writer can neither move
+        // the row between the checks and the rename nor observe a half-relocated pair.
+        // The rename is instantaneous (no byte copy), so the hold stays local-IO sized.
+        OfflineCommitAuthority.withCommitAuthority {
+            val claimedByAnotherRow = FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(File::class.java)
+                    .equalTo(File::offlinePublishedPath.name, recordedPath)
+                    .notEqualTo(File::id.name, snapshot.id)
+                    .count() > 0
+            }
+            if (claimedByAnotherRow) return@withCommitAuthority null // another file legitimately lives there now
+            if (target.exists()) {
+                // rename(2) would silently REPLACE these bytes. They are provably not this row's
+                // accepted copy (the current path classified as MISSING, which is what led here),
+                // so they belong to nobody this code may destroy: the old copy stays at its
+                // recorded path (recoverable) and the foreign bytes stay put. The staged
+                // replacement path preserves them too: unproven bytes never authorize destruction.
+                SentryLog.w(TAG, "Relocation target already holds bytes for file ${snapshot.id}; both copies preserved")
+                return@withCommitAuthority null
+            }
+            val parent = target.parentFile ?: return@withCommitAuthority null
+            if (!parent.exists() && !parent.mkdirs()) return@withCommitAuthority null
+            if (!previous.renameTo(target)) {
+                SentryLog.w(TAG, "Relocation refused for file ${snapshot.id}; previous copy kept at its recorded path")
+                return@withCommitAuthority null
+            }
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.executeTransaction { mutableRealm ->
+                    FileController.getFileProxyById(snapshot.id, customRealm = mutableRealm)?.let { proxy ->
+                        proxy.offlinePublishedPath = target.path
+                    }
                 }
             }
+            SentryLog.d(TAG, "Relocated the offline copy of ${snapshot.id} to its renamed location")
+            target
         }
-        SentryLog.d(TAG, "Relocated the offline copy of ${snapshot.id} to its renamed location")
-        target
     }
 
     /**
