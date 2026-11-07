@@ -115,14 +115,13 @@ class PhotoTrashConsentUiQueue {
          *    closed, and an EPOCH different from the request's invalidates the request —
          *    an activation cycle that landed after the IO validation is caught here even
          *    when it ended at identical Boolean values;
-         *  - FRESHNESS: [activationWatermark] is the activation authority's COMMIT watermark
-         *    ([PhotoTrashController.activationCommitWatermark]) — a snapshot OLDER than the
-         *    latest commit fails closed. Between a settings write's commit and its publish
-         *    the mirror still holds the previous committed state; comparing freshness
-         *    against the revision COUNTER instead would pass in exactly that window (the
-         *    counter is bumped inside the transaction, before the commit), so the watermark
-         *    is the only sound reference. Refusing here never erases anything: the durable
-         *    row stays armed and the next drain re-surfaces the request;
+         *  - SETTLEDNESS: [activationAuthoritySettled] reports that NO activation write is
+         *    unsettled (begun but not yet published or abandoned). A write is unavailable
+         *    to destructive launch from BEFORE it can commit (its in-transaction marking)
+         *    until its committed authority is published — refusing here covers the
+         *    commit->publish interval AND the open-transaction interval, and a rolled-back
+         *    write releases the gate without stranding it. Refusing never erases anything:
+         *    the durable row stays armed and the next drain re-surfaces the request;
          *  - [bindingGenerationCurrent] is the process-local revision of the request uri's
          *    binding: a pairing replacement that landed after the IO validation (a NEW
          *    binding even at identical metadata) is caught here;
@@ -136,7 +135,7 @@ class PhotoTrashConsentUiQueue {
             request: PhotoTrashController.ConsentRequest,
             currentUserId: Int,
             activationSnapshot: PhotoTrashController.ActivationSnapshot?,
-            activationWatermark: Long,
+            activationAuthoritySettled: Boolean,
             bindingGenerationCurrent: Long,
             lifecycleStarted: Boolean,
         ): Boolean = lifecycleStarted &&
@@ -145,9 +144,9 @@ class PhotoTrashConsentUiQueue {
             activationSnapshot.userId == currentUserId &&
             activationSnapshot.optIn &&
             activationSnapshot.activationEpoch == request.activationEpoch &&
-            // The mirror is valid only at the latest commit (published revision <= commit
-            // watermark always holds, so this is an equality in practice; >= is defensive).
-            activationSnapshot.revision >= activationWatermark &&
+            // No activation write may be unsettled (begun, not yet published or abandoned):
+            // the mirror is only authoritative at a settled state.
+            activationAuthoritySettled &&
             bindingGenerationCurrent == request.bindingGeneration
     }
 }

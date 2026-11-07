@@ -436,28 +436,36 @@ open class UploadFile(
         }
 
         fun removeAppSyncSettings() {
-            // The revision is assigned INSIDE the transaction (commit-ordered): a later
-            // commit always publishes at a higher revision, whatever order the post-commit
-            // publishes run in.
             var writeRevision = 0L
-            getRealmInstance().use { realm ->
-                realm.executeTransaction {
-                    writeRevision = PhotoTrashController.assignActivationRevision()
-                    it.where(SyncSettings::class.java).findFirst()?.deleteFromRealm()
+            var began = false
+            try {
+                getRealmInstance().use { realm ->
+                    realm.executeTransaction {
+                        // Commit-ordered revision, marked UNSETTLED before any mutation:
+                        // from this instant — before the write can commit — the authority is
+                        // unavailable to destructive launch until the publish below lands
+                        // (or the write is abandoned and settled without one).
+                        writeRevision = PhotoTrashController.beginActivationWrite()
+                        began = true
+                        it.where(SyncSettings::class.java).findFirst()?.deleteFromRealm()
+                    }
                 }
+                // A write seam: the deletion is authoritative fail-closed evidence (absence
+                // of the opt-in), published at its commit-assigned revision — BEFORE
+                // settling: the publish must lead the settle, never trail it.
+                PhotoTrashController.noteActivationWritten(
+                    userId = AccountUtils.currentUserId,
+                    activationEpoch = 0L,
+                    optIn = false,
+                    revision = writeRevision,
+                )
+            } finally {
+                // Settles the write whatever happened: after the publish on success; on a
+                // rollback/exception without one — the last published mirror remains the
+                // committed truth and no assigned revision is stranded (certified reads
+                // resume immediately, without requiring another write).
+                if (began) PhotoTrashController.endActivationWrite()
             }
-            // The commit leads its publish: the watermark lets consumers refuse the mirror
-            // from the commit instant until this publish lands (or a certified read
-            // republishes the committed state).
-            PhotoTrashController.noteActivationCommitted(writeRevision)
-            // A write seam: the deletion is authoritative fail-closed evidence (absence of
-            // the opt-in), published at its commit-assigned revision.
-            PhotoTrashController.noteActivationWritten(
-                userId = AccountUtils.currentUserId,
-                activationEpoch = 0L,
-                optIn = false,
-                revision = writeRevision,
-            )
         }
 
         fun setAppSyncSettings(syncSettings: SyncSettings, customRealm: Realm? = null) {
@@ -468,51 +476,61 @@ open class UploadFile(
             // (settings UI, backup restore, upload-worker refresh) increments coherently.
             var activationEpoch = syncSettings.photoTrashActivationEpoch
             var writeRevision = 0L
-            val block: (Realm) -> Unit = { realm ->
-                realm.executeTransaction { mutableRealm ->
-                    val existing = mutableRealm.where(SyncSettings::class.java)
-                        .equalTo(SyncSettings::userId.name, syncSettings.userId)
-                        .findFirst()
-                    activationEpoch = when {
-                        existing == null -> if (syncSettings.photoTrashSyncEnabled) 1L else 0L
-                        !existing.photoTrashSyncEnabled && syncSettings.photoTrashSyncEnabled ->
-                            existing.photoTrashActivationEpoch + 1L
-                        else -> maxOf(existing.photoTrashActivationEpoch, syncSettings.photoTrashActivationEpoch)
+            var began = false
+            try {
+                val block: (Realm) -> Unit = { realm ->
+                    realm.executeTransaction { mutableRealm ->
+                        val existing = mutableRealm.where(SyncSettings::class.java)
+                            .equalTo(SyncSettings::userId.name, syncSettings.userId)
+                            .findFirst()
+                        activationEpoch = when {
+                            existing == null -> if (syncSettings.photoTrashSyncEnabled) 1L else 0L
+                            !existing.photoTrashSyncEnabled && syncSettings.photoTrashSyncEnabled ->
+                                existing.photoTrashActivationEpoch + 1L
+                            else -> maxOf(existing.photoTrashActivationEpoch, syncSettings.photoTrashActivationEpoch)
+                        }
+                        syncSettings.photoTrashActivationEpoch = activationEpoch
+                        // Commit-ordered revision, marked UNSETTLED before any mutation (see
+                        // removeAppSyncSettings).
+                        writeRevision = PhotoTrashController.beginActivationWrite()
+                        began = true
+                        mutableRealm.insertOrUpdate(syncSettings)
                     }
-                    syncSettings.photoTrashActivationEpoch = activationEpoch
-                    // Commit-ordered revision: assigned with the write, so writers publish
-                    // in commit order.
-                    writeRevision = PhotoTrashController.assignActivationRevision()
-                    mutableRealm.insertOrUpdate(syncSettings)
                 }
+                customRealm?.let(block) ?: getRealmInstance().use(block)
+                // The single settings write seam refreshes the Main-readable activation
+                // authority under its commit-assigned revision — BEFORE settling: the
+                // publish must lead the settle, never trail it.
+                PhotoTrashController.noteActivationWritten(
+                    userId = syncSettings.userId,
+                    activationEpoch = activationEpoch,
+                    optIn = syncSettings.photoTrashSyncEnabled,
+                    revision = writeRevision,
+                )
+            } finally {
+                // Settles the write whatever happened (see removeAppSyncSettings).
+                if (began) PhotoTrashController.endActivationWrite()
             }
-            customRealm?.let(block) ?: getRealmInstance().use(block)
-            // The commit leads its publish (see removeAppSyncSettings): consumers refuse a
-            // stale mirror from the commit instant until the publish below lands.
-            PhotoTrashController.noteActivationCommitted(writeRevision)
-            // The single settings write seam refreshes the Main-readable activation
-            // authority under its commit-assigned revision.
-            PhotoTrashController.noteActivationWritten(
-                userId = syncSettings.userId,
-                activationEpoch = activationEpoch,
-                optIn = syncSettings.photoTrashSyncEnabled,
-                revision = writeRevision,
-            )
         }
 
-        fun getAppSyncSettings(): SyncSettings? {
-            // A reader publishes an observation ONLY from a CERTIFIED read slot: the slot
-            // begins BEFORE the realm opens (null while a write is assigned-but-uncommitted
-            // — the row about to be read may predate that write) and is certified only if
-            // neither the counter nor the commit watermark moved during the read. An
+        fun getAppSyncSettings(customRealmConfig: RealmConfiguration? = null): SyncSettings? {
+            // A reader publishes an observation ONLY from a CERTIFIED read slot: BEGIN
+            // before the realm opens (null while an activation write is unsettled — the row
+            // about to be read may predate that write's commit), ENFORCE a fresh snapshot
+            // (realm.refresh(): a long-lived thread-local instance may otherwise pin an old
+            // version, and matching process counters alone would not prove a freshly read
+            // committed database version), then FINISH-check AFTER the row read and publish
+            // only if neither the revision counter nor the unsettled marker moved. An
             // uncertified read still RETURNS the row it read (the caller's decision
             // evidence); it only skips the mirror publication, so a pre-commit row can
             // never be published at its writer's own revision and block that writer's real
             // publish (see PhotoTrashController's revision protocol).
             val readPermit = PhotoTrashController.beginActivationRead()
-            val certifiedPermit = readPermit?.takeIf { PhotoTrashController.isActivationReadCertified(it) }
-            return getRealmInstance().use { realm ->
+            return (customRealmConfig?.let { Realm.getInstance(it) } ?: getRealmInstance()).use { realm ->
+                if (readPermit != null) realm.refresh()
                 val realmObject = realm.where(SyncSettings::class.java).findFirst()
+                // FINISH of the certified read: evaluated AFTER the row read, never before.
+                val certifiedPermit = readPermit?.takeIf { PhotoTrashController.isActivationReadCertified(it) }
                 if (realmObject == null) {
                     // A missing row is authoritative fail-closed evidence: absence never
                     // preserves another observation's enabled state.

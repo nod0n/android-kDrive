@@ -509,8 +509,8 @@ class MainActivity : BaseActivity() {
      * launch-time revalidation on IO (the poll returned it earlier; opt-in/scope/pending
      * identity must still match the LIVE row immediately before the launch), then the FINAL
      * Main-side gates — current account, STARTED lifecycle, and the activation mirror checked
-     * for freshness against the COMMIT watermark (a settings write that committed after the
-     * IO verdict refuses the still-stale mirror here, with no realm open on Main) —
+     * for SETTLEDNESS (no activation write begun-but-unsettled: a settings write in flight
+     * or committed-but-unpublished refuses the launch here, with no realm open on Main) —
      * evaluated synchronously in this same Main block. That closes the application-side
      * window between the IO verdict and this queued continuation (a change landing there is
      * caught HERE, without any realm open on Main); the platform's own approval-time
@@ -538,7 +538,7 @@ class MainActivity : BaseActivity() {
                         request = request,
                         currentUserId = AccountUtils.currentUserId,
                         activationSnapshot = PhotoTrashController.currentActivationSnapshot,
-                        activationWatermark = PhotoTrashController.activationCommitWatermark(),
+                        activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
                         bindingGenerationCurrent = PhotoTrashController.bindingGeneration(request.uri),
                         lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
                     )

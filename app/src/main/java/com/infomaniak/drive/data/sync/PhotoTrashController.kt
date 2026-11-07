@@ -36,6 +36,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.withContext
 import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -59,40 +60,44 @@ object PhotoTrashController {
      * Main-readable ACTIVATION AUTHORITY of the photo-trash feature, for the dialog launch
      * gate: one immutable snapshot of (scope user, activation epoch, opt-in, revision).
      *
-     * Revision protocol (a bare @Volatile Boolean is not one). Two monotone counters and a
-     * strict high-water mirror; the standing invariant is
-     * `published revision <= commit watermark <= assigned counter`:
-     *  - The ASSIGNED counter ([assignActivationRevision]) is incremented INSIDE the write
-     *    transaction. Realm serializes write transactions, so assignment order IS commit
-     *    order: a later commit always holds a higher revision, and a late publish of an
-     *    earlier commit is rejected.
-     *  - The COMMIT WATERMARK ([noteActivationCommitted]) is raised to a write's revision
-     *    immediately after that transaction commits and before its publish. It is this
-     *    process's estimate of the highest revision whose effect is committed. A rolled-back
-     *    transaction never raises it; a commit whose publish never ran still raises it.
-     *  - A WRITE seam publishes post-commit at its commit-assigned revision
-     *    ([noteActivationWritten]).
+     * Revision protocol (a bare @Volatile Boolean is not one). One monotone revision
+     * counter, one unsettled-write marker, one strict high-water mirror:
+     *  - A write seam calls [beginActivationWrite] INSIDE its transaction, BEFORE any
+     *    mutation: the revision is assigned (commit-ordered — Realm serializes write
+     *    transactions, so a later commit always holds a higher revision) and the write is
+     *    marked UNSETTLED. From that instant — before the write can commit — the authority
+     *    is UNAVAILABLE TO DESTRUCTIVE LAUNCH ([activationWritesUnsettled] > 0), and it
+     *    stays unavailable until the write SETTLES: its publish lands (the seam publishes
+     *    FIRST, then settles) or the write is abandoned (rollback/exception: the seam
+     *    settles in a `finally` WITHOUT a publish — the last published mirror remains the
+     *    committed truth, and no assigned revision is stranded; certified reads resume
+     *    immediately, without requiring another write).
+     *  - The write seam publishes post-commit at its commit-assigned revision
+     *    ([noteActivationWritten]); acceptance is a STRICT high-water mark (first
+     *    observation or strictly newer revision) — invalidating snapshots follow the SAME
+     *    ordering, so a stale fail-closed candidate can never rewind the authority, and a
+     *    late publish of an earlier commit loses to a later commit's publish.
+     *  - THE SERIALIZATION POINT for an app-controlled write vs the final launch is the
+     *    Main-thread gate evaluation itself: [PhotoTrashConsentUiQueue.launchAllowedNow]
+     *    refuses while writes are unsettled, so the mirror it reads is the latest COMMITTED
+     *    AND PUBLISHED state. Two independent atomic reads followed by a launch do not
+     *    serialize with a writer that begins after the check — that residue is the same
+     *    platform class as the disclosed approval-time race (the system applies the trash
+     *    at approval; no app-side lock spans the system dialog), and it is disclosed as
+     *    such in the controller's poll kDoc.
      *  - A READER publishes ONLY a CERTIFIED observation ([beginActivationRead] /
-     *    [isActivationReadCertified], applied by [UploadFile.getAppSyncSettings]): the read
-     *    slot must BEGIN with no write in flight (assigned counter == watermark) and FINISH
-     *    with neither counter nor watermark moved (both == the captured permit). Only then
-     *    did the reader observe exactly the fully-committed state of that revision. A reader
-     *    that began while a write was assigned-but-uncommitted would read the PRE-commit row
-     *    and could publish it at the writer's own revision — the strict high-water treats
-     *    equal revisions as first-come, so that poisoned publish would block the writer's
-     *    real publish indefinitely. Uncertified reads still RETURN the row they read (the
-     *    caller's decision evidence); they only skip the mirror publication — the writer's
-     *    own publish or a later certified read supplies the truth.
-     *  - Acceptance is a STRICT high-water mark (first observation or strictly newer
-     *    revision) — invalidating snapshots follow the SAME ordering, so a stale
-     *    fail-closed candidate can never rewind the authority and re-authorize an older
-     *    request's epoch.
-     *  - CONSUMERS MUST CHECK FRESHNESS AGAINST THE WATERMARK, NOT THE COUNTER
-     *    ([PhotoTrashConsentUiQueue.launchAllowedNow] refuses when snapshot.revision <
-     *    [activationCommitWatermark]): between a commit and its publish the mirror still
-     *    holds the previous committed state while the watermark already leads it — the
-     *    counter (already bumped inside the uncommitted-to-committed transaction) would
-     *    pass the gate in exactly that window, and a counter comparison cannot see it.
+     *    [isActivationReadCertified], applied by [UploadFile.getAppSyncSettings]): the
+     *    read slot must BEGIN quiescent (no unsettled writes), read a FRESH snapshot (the
+     *    getter calls [io.realm.Realm.refresh] — a long-lived thread-local instance may
+     *    otherwise pin an old version, and matching process counters alone would not prove
+     *    a freshly read committed database version), and FINISH with the counter unmoved
+     *    and still no unsettled writes. Only then did the reader observe exactly the
+     *    settled committed state of that revision. A reader that began while a write was
+     *    in flight would read the PRE-commit row and could publish it at the writer's own
+     *    revision — the strict high-water treats equal revisions as first-come, so that
+     *    poisoned publish would block the writer's real publish indefinitely. Uncertified
+     *    reads still RETURN the row they read (the caller's decision evidence); they only
+     *    skip the mirror publication.
      *  - Scope: the snapshot carries the user it was observed for; the launch gate compares
      *    it with the current in-memory account.
      */
@@ -100,48 +105,53 @@ object PhotoTrashController {
 
     private val activationMirror = AtomicReference<ActivationSnapshot?>(null)
     private val mirrorRevision = AtomicLong(0L)
-    private val commitWatermark = AtomicLong(0L)
+    private val unsettledActivationWrites = AtomicInteger(0)
 
     /** The current activation authority snapshot (null = nothing observed yet: fail-closed). */
     val currentActivationSnapshot: ActivationSnapshot?
         get() = activationMirror.get()
 
     /**
-     * Assigns the revision a WRITE will publish under. MUST be called inside the write
-     * transaction (commit-ordered): Realm serializes write transactions, so writers publish
-     * in commit order regardless of when their post-commit publishes run.
+     * Marks an activation write UNSETTLED and assigns its revision. MUST be called by the
+     * write seam INSIDE its transaction, BEFORE any mutation: from this instant (before the
+     * write can commit) the authority is unavailable to destructive launch until the write
+     * settles — its publish lands, or the write is abandoned and [endActivationWrite] runs.
      */
-    internal fun assignActivationRevision(): Long = mirrorRevision.incrementAndGet()
-
-    /**
-     * Raises the commit watermark to [revision]. MUST be called by the write seam
-     * immediately after its transaction committed and BEFORE its publish: consumers compare
-     * the mirror's freshness against this watermark, so a committed-but-unpublished write
-     * must lead the mirror the moment it commits (see the class kDoc).
-     */
-    internal fun noteActivationCommitted(revision: Long) {
-        commitWatermark.updateAndGet { current -> maxOf(current, revision) }
+    internal fun beginActivationWrite(): Long {
+        unsettledActivationWrites.incrementAndGet()
+        return mirrorRevision.incrementAndGet()
     }
 
-    /** The highest revision known to have committed (see the class kDoc protocol). */
-    internal fun activationCommitWatermark(): Long = commitWatermark.get()
+    /**
+     * Settles an activation write. MUST be called by the write seam in a `finally`, exactly
+     * once per [beginActivationWrite] — AFTER its publish when the transaction committed
+     * (the publish must lead the settle, never trail it), and WITHOUT a publish when the
+     * transaction was abandoned (rollback/exception: the last published mirror remains the
+     * committed truth and no assigned revision is stranded).
+     */
+    internal fun endActivationWrite() {
+        unsettledActivationWrites.decrementAndGet()
+    }
+
+    /** Activation writes begun but not yet settled (see [beginActivationWrite]). */
+    internal fun activationWritesUnsettled(): Int = unsettledActivationWrites.get()
 
     /**
-     * Opens a CERTIFIABLE read slot: the revision permit to publish under, or null while a
-     * write is assigned-but-uncommitted (the row a reader is about to see may predate that
-     * write, so no observation from this read may be published). MUST be called BEFORE the
-     * reader opens the realm.
+     * Opens a CERTIFIABLE read slot: the revision permit to publish under, or null while an
+     * activation write is unsettled (the row a reader is about to see may predate that
+     * write's commit). MUST be called BEFORE the reader opens the realm.
      */
     internal fun beginActivationRead(): Long? =
-        mirrorRevision.get().takeIf { it == commitWatermark.get() }
+        mirrorRevision.get().takeIf { unsettledActivationWrites.get() == 0 }
 
     /**
-     * Whether the read that began at [permit] observed exactly the fully-committed state of
-     * [permit]: neither the counter nor the watermark moved during the read. Only a
-     * certified read may publish an observation.
+     * The FINISH check of the read that began at [permit]: the counter is unmoved and no
+     * write is unsettled, so the row just read is exactly the settled committed state of
+     * [permit]. MUST be evaluated AFTER the row read, never before it; only a certified
+     * read may publish an observation.
      */
     internal fun isActivationReadCertified(permit: Long?): Boolean =
-        permit != null && mirrorRevision.get() == permit && commitWatermark.get() == permit
+        permit != null && mirrorRevision.get() == permit && unsettledActivationWrites.get() == 0
 
     /** Publishes a CERTIFIED reader's observation under its read-slot permit (see class kDoc). */
     internal fun noteActivationObserved(permit: Long, userId: Int, activationEpoch: Long, optIn: Boolean) {
@@ -189,6 +199,15 @@ object PhotoTrashController {
      * handed out (see [pollNextPendingConsent]).
      */
     private val bindingWrites = AtomicLong(0L)
+
+    /**
+     * Binding writes begun but not yet settled (pre-commit bump done, transaction still
+     * open or its post-commit work pending). A write ALREADY IN FLIGHT before the drain
+     * starts must make the registry uncertifiable too: its bump is already visible in
+     * [bindingWrites] and [bindingGeneration], but its row is not committed — a hand-out
+     * in that state would bless the OLD row with the NEW generation.
+     */
+    private val bindingWritesInFlight = AtomicInteger(0)
 
     fun bindingGeneration(uri: String): Long = bindingEpoch + (bindingGenerations[uri] ?: 0L)
 
@@ -286,56 +305,70 @@ object PhotoTrashController {
         val pairingEpoch = UploadFile.getAppSyncSettings()?.photoTrashActivationEpoch ?: 0L
         // The launch-window binding invalidation lands BEFORE the transaction: from the
         // moment the new binding can become authoritative (its commit), no Main-side launch
-        // may still read the previous generation.
-        noteBindingWritten(uploadFile.uri)
-        withPairingRealm(customRealmConfig) { realm ->
-            realm.executeTransaction { mutableRealm ->
-                val previous = mutableRealm.where(PhotoPairing::class.java)
-                    .equalTo(PhotoPairing::uri.name, uploadFile.uri)
-                    .findFirst()
-                // A replacement is a NEW binding with a STRICTLY LATER pairing moment: a
-                // same-millisecond Date() is not a guaranteed unique identity when every
-                // other field is identical, so the moment is forced past the previous
-                // binding's (pairing writes are in-process and serialized per uri).
-                val pairedAtMs = maxOf(System.currentTimeMillis(), (previous?.pairedAt?.time ?: 0L) + 1L)
-                previous?.deleteFromRealm()
-                mutableRealm.createObject(PhotoPairing::class.java, uploadFile.uri)?.apply {
-                    userId = uploadFile.userId
-                    driveId = uploadFile.driveId
-                    this.remoteFileId = remoteFileId
-                    fileName = uploadFile.fileName
-                    activationEpoch = pairingEpoch
-                    // An UNOBSERVABLE row binds NO metadata (the -1 sentinel): the pass
-                    // compares these against MediaStore's own values — falling back to the
-                    // UploadFile's different-producer values would latch a false
-                    // CONFLICT_LOCAL_CHANGED the moment the row became visible. When the
-                    // metadata is unbound the rules skip the metadata comparison entirely
-                    // and rely on the content binding (or stay inconclusive without one).
-                    localSizeAtPairing = local?.takeIf { it.exists }?.size ?: -1L
-                    localModifiedAtPairing = local?.takeIf { it.exists }?.lastModified ?: -1L
-                    localContentDigest = localDigest
-                    remoteContentHash = remoteFile?.serverContentHash
-                    baselineTrashed = baseline
-                    lastObservedTrashed = baseline ?: false
-                    pairedAt = Date(pairedAtMs)
-                    state = PhotoPairing.State.ACTIVE.name
+        // may still read the previous generation. The write is marked UNSETTLED before its
+        // pre-commit bump and settled in a finally: a poll that starts while this write is
+        // in flight must hand out nothing (its bump is already visible in the registry but
+        // its row is not committed — the old row must not be blessed with the new
+        // generation).
+        bindingWritesInFlight.incrementAndGet()
+        try {
+            noteBindingWritten(uploadFile.uri)
+            withPairingRealm(customRealmConfig) { realm ->
+                realm.executeTransaction { mutableRealm ->
+                    val previous = mutableRealm.where(PhotoPairing::class.java)
+                        .equalTo(PhotoPairing::uri.name, uploadFile.uri)
+                        .findFirst()
+                    // A replacement is a NEW binding with a STRICTLY LATER pairing moment: a
+                    // same-millisecond Date() is not a guaranteed unique identity when every
+                    // other field is identical, so the moment is forced past the previous
+                    // binding's (pairing writes are in-process and serialized per uri).
+                    val pairedAtMs = maxOf(System.currentTimeMillis(), (previous?.pairedAt?.time ?: 0L) + 1L)
+                    previous?.deleteFromRealm()
+                    mutableRealm.createObject(PhotoPairing::class.java, uploadFile.uri)?.apply {
+                        userId = uploadFile.userId
+                        driveId = uploadFile.driveId
+                        this.remoteFileId = remoteFileId
+                        fileName = uploadFile.fileName
+                        activationEpoch = pairingEpoch
+                        // An UNOBSERVABLE row binds NO metadata (the -1 sentinel): the pass
+                        // compares these against MediaStore's own values — falling back to the
+                        // UploadFile's different-producer values would latch a false
+                        // CONFLICT_LOCAL_CHANGED the moment the row became visible. When the
+                        // metadata is unbound the rules skip the metadata comparison entirely
+                        // and rely on the content binding (or stay inconclusive without one).
+                        localSizeAtPairing = local?.takeIf { it.exists }?.size ?: -1L
+                        localModifiedAtPairing = local?.takeIf { it.exists }?.lastModified ?: -1L
+                        localContentDigest = localDigest
+                        remoteContentHash = remoteFile?.serverContentHash
+                        baselineTrashed = baseline
+                        lastObservedTrashed = baseline ?: false
+                        pairedAt = Date(pairedAtMs)
+                        state = PhotoPairing.State.ACTIVE.name
+                    }
                 }
             }
+        } finally {
+            bindingWritesInFlight.decrementAndGet()
         }
     }
 
     /** Drops pairings and any pending destructive state when the option is turned off. */
     fun removeAllPairings(customRealmConfig: RealmConfiguration? = null) {
-        // Pre-invalidation, matching recordPairing's pre-commit bump: from the moment the
-        // wipe CAN become authoritative (its commit), no Main-side launch may still read the
-        // previous generation. Invalidating after the commit would leave a [commit, bump)
-        // window in which the launch gate still compares an in-flight request against the
-        // old generation and accepts a binding that no longer exists.
-        invalidateAllBindings()
-        withPairingRealm(customRealmConfig) { realm ->
-            realm.executeTransaction { mutableRealm ->
-                mutableRealm.where(PhotoPairing::class.java).findAll().deleteAllFromRealm()
+        // Pre-invalidation, matching recordPairing's pre-commit bump, and UNSETTLED marking
+        // like every binding write: from the moment the wipe CAN become authoritative (its
+        // commit) — and from the moment it has begun — no Main-side launch may still read
+        // the previous generation, and a drain that starts or hands out while the wipe is
+        // in flight must surface nothing.
+        bindingWritesInFlight.incrementAndGet()
+        try {
+            invalidateAllBindings()
+            withPairingRealm(customRealmConfig) { realm ->
+                realm.executeTransaction { mutableRealm ->
+                    mutableRealm.where(PhotoPairing::class.java).findAll().deleteAllFromRealm()
+                }
             }
+        } finally {
+            bindingWritesInFlight.decrementAndGet()
         }
     }
 
@@ -704,9 +737,13 @@ object PhotoTrashController {
      * pre-commit invalidation — see the registry) would otherwise be invisible to the
      * hand-out, and a replacement that bumps the generation BEFORE its commit could hand
      * the OLD binding's request out under the ALREADY-BUMPED generation. The drain
-     * therefore captures the process-global binding-write stamp BEFORE the row read and
-     * re-checks it at the hand-out point: any binding write in between ends the drain with
-     * NOTHING surfaced (the read rows' binding identities are no longer certifiable; the
+     * therefore refuses to start while a binding write is IN FLIGHT (its bump is already
+     * in the registry but its row is not committed), captures the process-global
+     * binding-write stamp BEFORE the row read, and at the hand-out captures the uri's
+     * generation FIRST and re-verifies the registry AFTER it: a write bumping between the
+     * earlier stamp comparison and the generation read would otherwise bless the old row
+     * with the new generation, and a write still unsettled makes the whole witness
+     * uncertifiable. Any failed verification ends the drain with NOTHING surfaced (the
      * durable row state re-surfaces on the next entry). This is deliberately conservative:
      * the stamp is global, so a write to a DIFFERENT uri also ends the drain — binding
      * writes are rare (completed uploads, an opt-out wipe) and fail-closed retried.
@@ -717,6 +754,9 @@ object PhotoTrashController {
             if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse()) return@withContext null
 
             val okHttpClient = runCatching { AccountUtils.getHttpClient(AccountUtils.currentUserId, null) }.getOrNull()
+            // A binding write already in flight makes the registry uncertifiable before the
+            // drain even reads: refuse to start.
+            if (bindingWritesInFlight.get() != 0) return@withContext null
             // The binding-write stamp of the moment the rows are read (see the kDoc above).
             val bindingStampAtRead = bindingWrites.get()
             val armedRows = getPairings(customRealmConfig)
@@ -768,14 +808,16 @@ object PhotoTrashController {
                             ) {
                                 return@withContext null
                             }
-                            // The binding identity of the READ rows is certifiable only if
-                            // no binding write happened since they were read: a replacement
-                            // bumps its generation BEFORE its commit, so a capture at
-                            // hand-out time could otherwise carry the NEW generation while
-                            // still validating the OLD binding (the Main gate would then
-                            // compare equal generations and launch a replaced binding's
-                            // request).
-                            if (bindingWrites.get() != bindingStampAtRead) return@withContext null
+                            // THE BINDING WITNESS: the generation is captured FIRST, then
+                            // the registry is re-verified — a write bumping between the
+                            // earlier stamp comparison and the generation read would
+                            // otherwise bless the old row with the new generation, and a
+                            // write still unsettled (before OR after its commit) makes the
+                            // whole witness uncertifiable.
+                            val requestBindingGeneration = bindingGeneration(pairing.uri)
+                            if (bindingWritesInFlight.get() != 0 || bindingWrites.get() != bindingStampAtRead) {
+                                return@withContext null
+                            }
                             return@withContext ConsentRequest(
                                 uri = pairing.uri,
                                 userId = pairing.userId,
@@ -784,7 +826,7 @@ object PhotoTrashController {
                                 pendingSince = pairing.remoteTrashPendingSince,
                                 pairedAt = pairing.pairedAt?.time ?: 0L,
                                 activationEpoch = pairing.activationEpoch,
-                                bindingGeneration = bindingGeneration(pairing.uri),
+                                bindingGeneration = requestBindingGeneration,
                             )
                         }
                     }

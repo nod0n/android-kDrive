@@ -122,15 +122,15 @@ class PhotoTrashConsentUiQueueTest {
     fun `the final launch gate fails closed on every missing condition`() {
         val req = request()
 
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationWatermark = 1L, bindingGenerationCurrent = 7L, lifecycleStarted = false), "a stopped lifecycle shows no dialog")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 952, activationSnapshot = snapshot(), activationWatermark = 1L, bindingGenerationCurrent = 7L, lifecycleStarted = true), "another account's request never launches")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = null, activationWatermark = 1L, bindingGenerationCurrent = 7L, lifecycleStarted = true), "unknown activation evidence fails closed")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(optIn = false), activationWatermark = 1L, bindingGenerationCurrent = 7L, lifecycleStarted = true), "an opted-out account never launches")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(userId = 952), activationWatermark = 1L, bindingGenerationCurrent = 7L, lifecycleStarted = true), "an authority scoped to another user fails closed")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(epoch = 4L), activationWatermark = 1L, bindingGenerationCurrent = 7L, lifecycleStarted = true), "a newer activation cycle invalidates the request even at the same enabled value")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationWatermark = 1L, bindingGenerationCurrent = 8L, lifecycleStarted = true), "a replaced binding after the IO validation is caught at launch")
-        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationWatermark = 2L, bindingGenerationCurrent = 7L, lifecycleStarted = true), "a mirror older than the latest commit (the commit-to-publish window) fails closed")
-        assertTrue(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationWatermark = 1L, bindingGenerationCurrent = 7L, lifecycleStarted = true))
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = false), "a stopped lifecycle shows no dialog")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 952, activationSnapshot = snapshot(), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "another account's request never launches")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = null, activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "unknown activation evidence fails closed")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(optIn = false), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "an opted-out account never launches")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(userId = 952), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "an authority scoped to another user fails closed")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(epoch = 4L), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true), "a newer activation cycle invalidates the request even at the same enabled value")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationAuthoritySettled = true, bindingGenerationCurrent = 8L, lifecycleStarted = true), "a replaced binding after the IO validation is caught at launch")
+        assertFalse(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationAuthoritySettled = false, bindingGenerationCurrent = 7L, lifecycleStarted = true), "an unsettled activation write (in flight or committed-unpublished) fails closed")
+        assertTrue(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), activationAuthoritySettled = true, bindingGenerationCurrent = 7L, lifecycleStarted = true))
     }
 
     /**
@@ -141,11 +141,12 @@ class PhotoTrashConsentUiQueueTest {
      */
     private fun revisionBase(): Long {
         var last = 0L
-        repeat(20) { last = PhotoTrashController.assignActivationRevision() }
-        // Leave the world QUIESCENT (assigned counter == commit watermark): the certified
-        // read-slot tests below need beginActivationRead() to succeed from a deterministic
-        // fresh base whatever earlier tests did to the singleton state.
-        PhotoTrashController.noteActivationCommitted(last)
+        repeat(20) {
+            last = PhotoTrashController.beginActivationWrite()
+            PhotoTrashController.endActivationWrite()
+        }
+        // Every write is settled: the world is quiescent and the certified read-slot tests
+        // below start from a deterministic fresh base whatever earlier tests did.
         return last
     }
 
@@ -216,82 +217,57 @@ class PhotoTrashConsentUiQueueTest {
     }
 
     @Test
-    fun `a reader starting after a write's commit outranks the still-pending publish`() {
-        val base = revisionBase()
-        // A legitimately published (earlier-commit) enabled state, and the counter advanced
-        // past it (two later commits nobody mirrored) so the disable below commits strictly
-        // after it.
-        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true, revision = base + 1L)
-        repeat(2) { PhotoTrashController.assignActivationRevision() }
-
-        // The disable commits (revision assigned INSIDE its transaction, watermark raised
-        // at the commit) but has not published yet; a reader capturing its read slot NOW is
-        // quiescent AT the committed revision — the committed-to-publish visibility gap
-        // cannot keep showing the pre-commit enabled state.
-        val writerRevision = PhotoTrashController.assignActivationRevision()
-        PhotoTrashController.noteActivationCommitted(writerRevision)
-        val permit = PhotoTrashController.beginActivationRead()
-        assertEquals(writerRevision, permit, "the watermark leads the publish, so the committed revision is readable")
-
-        // The reader reads the COMMITTED (disabled) row and publishes it first:
-        PhotoTrashController.noteActivationObserved(permit = permit!!, userId = 951, activationEpoch = 0L, optIn = false)
-        with(PhotoTrashController.currentActivationSnapshot) {
-            assertEquals(false, this?.optIn, "the post-commit observation outranks the pending pre-commit publish")
-            assertEquals(writerRevision, this?.revision)
-        }
-
-        // The writer's own pending publish lands (equal revision, same committed content:
-        // first publisher wins, content identical).
-        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 0L, optIn = false, revision = writerRevision)
-        with(PhotoTrashController.currentActivationSnapshot) {
-            assertEquals(false, this?.optIn)
-            assertEquals(writerRevision, this?.revision)
-        }
-    }
-
-    @Test
-    fun `a read begun while a write is in flight is never certifiable`() {
+    fun `a read begun while a write is unsettled is never certifiable`() {
         val base = revisionBase()
         PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true, revision = base)
 
-        // The writer has ASSIGNED its revision but not committed: the counter leads the
-        // watermark. A reader starting now gets NO certifiable slot — the row it is about
-        // to read is the PRE-commit one, and publishing it at the writer's own revision
-        // would block that writer's publish forever (the pre-commit poisoning schedule).
-        val inFlight = PhotoTrashController.assignActivationRevision()
-        assertNull(PhotoTrashController.beginActivationRead(), "no certifiable read slot while a write is in flight")
+        // The writer has BEGUN (marked unsettled, revision assigned) but not settled: the
+        // authority is unavailable — to the launch gate AND to certified reads. A reader
+        // starting now gets NO certifiable slot: the row it is about to read is the
+        // PRE-commit one, and publishing it at the writer's own revision would block that
+        // writer's publish forever (the pre-commit poisoning schedule).
+        val writeRevision = PhotoTrashController.beginActivationWrite()
+        assertEquals(1, PhotoTrashController.activationWritesUnsettled())
+        assertNull(PhotoTrashController.beginActivationRead(), "no certifiable read slot while a write is unsettled")
         assertFalse(PhotoTrashController.isActivationReadCertified(base), "an observation from an uncertified slot is never publishable")
 
-        // The mirror keeps its last certified value; nothing about the in-flight write
+        // The mirror keeps its last certified value; nothing about the unsettled write
         // leaks into it either way.
         with(PhotoTrashController.currentActivationSnapshot) {
             assertEquals(true, this?.optIn)
             assertEquals(base, this?.revision)
         }
 
-        // Once the write commits, certifiable slots resume — at the committed revision.
-        PhotoTrashController.noteActivationCommitted(inFlight)
-        assertEquals(inFlight, PhotoTrashController.beginActivationRead())
+        // The write publishes its committed authority and settles: certifiable slots
+        // resume at the settled revision, and the gate reopens.
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = false, revision = writeRevision)
+        PhotoTrashController.endActivationWrite()
+        assertEquals(0, PhotoTrashController.activationWritesUnsettled())
+        assertEquals(writeRevision, PhotoTrashController.beginActivationRead())
+        with(PhotoTrashController.currentActivationSnapshot) {
+            assertEquals(false, this?.optIn)
+            assertEquals(writeRevision, this?.revision)
+        }
     }
 
     @Test
-    fun `an observation whose read a commit overtook is never published`() {
+    fun `an observation whose read a write overtook is never published`() {
         val base = revisionBase()
         PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = false, revision = base)
 
-        // A certified slot opens (quiescent), then the writer commits DURING the read:
+        // A certified slot opens (quiescent), then a write BEGINS during the read:
         val permit = PhotoTrashController.beginActivationRead()
-        val writeRevision = PhotoTrashController.assignActivationRevision()
-        PhotoTrashController.noteActivationCommitted(writeRevision)
-        assertFalse(PhotoTrashController.isActivationReadCertified(permit), "a commit during the read uncertifies the slot")
+        val writeRevision = PhotoTrashController.beginActivationWrite()
+        assertFalse(PhotoTrashController.isActivationReadCertified(permit), "a write begun during the read uncertifies the slot")
 
         // The uncertified observation is skipped — the mirror keeps the pre-read state:
         with(PhotoTrashController.currentActivationSnapshot) {
             assertEquals(base, this?.revision)
         }
 
-        // The writer's own publish supplies the truth:
+        // The writer commits, publishes its authority, and settles — the truth lands:
         PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true, revision = writeRevision)
+        PhotoTrashController.endActivationWrite()
         with(PhotoTrashController.currentActivationSnapshot) {
             assertEquals(true, this?.optIn)
             assertEquals(writeRevision, this?.revision)
@@ -299,43 +275,52 @@ class PhotoTrashConsentUiQueueTest {
     }
 
     @Test
-    fun `a certified read closes a commit-to-publish gap and the gate accepts it`() {
+    fun `a certified read publishes exactly what it read and a settled gate accepts it`() {
         val base = revisionBase()
-        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = false, revision = base)
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true, revision = base)
 
-        // The writer commits an enable but has not published: the watermark leads the mirror.
-        val writeRevision = PhotoTrashController.assignActivationRevision()
-        PhotoTrashController.noteActivationCommitted(writeRevision)
-
-        // A reader begins (quiescent at the committed revision), reads the committed ENABLED
-        // row, and publishes it under its permit:
+        // A quiescent slot opens, reads the committed row, and finishes certified: the
+        // observation carries the same revision the writer published — equal revision,
+        // identical content, first publisher wins (a certified read never flips content at
+        // a revision it did not read).
         val permit = PhotoTrashController.beginActivationRead()
-        assertEquals(writeRevision, permit)
+        assertTrue(PhotoTrashController.isActivationReadCertified(permit))
         PhotoTrashController.noteActivationObserved(permit = permit!!, userId = 951, activationEpoch = 1L, optIn = true)
         with(PhotoTrashController.currentActivationSnapshot) {
-            assertEquals(true, this?.optIn, "a certified read publishes exactly the committed state it observed")
-            assertEquals(writeRevision, this?.revision)
+            assertEquals(true, this?.optIn)
+            assertEquals(permit, this?.revision, "the certified observation stands at its own revision")
         }
 
-        // The Main launch gate accepts the now-fresh mirror:
+        // The Main launch gate accepts the settled mirror:
+        val req = request().copy(activationEpoch = 1L)
         assertTrue(
             PhotoTrashConsentUiQueue.launchAllowedNow(
-                request().copy(activationEpoch = 1L),
+                request = req,
                 currentUserId = 951,
                 activationSnapshot = PhotoTrashController.currentActivationSnapshot,
-                activationWatermark = PhotoTrashController.activationCommitWatermark(),
+                activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
                 bindingGenerationCurrent = 7L,
                 lifecycleStarted = true,
             ),
         )
-
-        // The writer's own late publish lands at the equal revision and changes nothing.
-        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true, revision = writeRevision)
-        assertEquals(writeRevision, PhotoTrashController.currentActivationSnapshot?.revision)
+        // And refuses the very same mirror while any write is unsettled:
+        PhotoTrashController.beginActivationWrite()
+        assertFalse(
+            PhotoTrashConsentUiQueue.launchAllowedNow(
+                request = req,
+                currentUserId = 951,
+                activationSnapshot = PhotoTrashController.currentActivationSnapshot,
+                activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
+                bindingGenerationCurrent = 7L,
+                lifecycleStarted = true,
+            ),
+            "an unsettled write refuses the launch even with a fresh mirror",
+        )
+        PhotoTrashController.endActivationWrite()
     }
 
     @Test
-    fun `the gate refuses the mirror the moment a disable commits and reopens at its publish`() {
+    fun `the gate refuses from the moment a write begins until its publish lands`() {
         val base = revisionBase()
         PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true, revision = base)
         val req = request().copy(activationEpoch = 2L)
@@ -344,27 +329,57 @@ class PhotoTrashConsentUiQueueTest {
             request = req,
             currentUserId = 951,
             activationSnapshot = PhotoTrashController.currentActivationSnapshot,
-            activationWatermark = PhotoTrashController.activationCommitWatermark(),
+            activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
             bindingGenerationCurrent = 7L,
             lifecycleStarted = true,
         )
 
-        assertTrue(gate(), "the published mirror is fresh at its commit watermark")
+        assertTrue(gate(), "the settled published mirror launches")
 
-        // In-flight disable: assigned but NOT committed. The last committed state stays
-        // launchable — an uncommitted write is not yet truth.
-        val writeRevision = PhotoTrashController.assignActivationRevision()
-        assertTrue(gate())
+        // The write BEGINS (in its transaction, before it can commit): refused — this is
+        // the whole [begin -> publish] span, covering both the open-transaction and the
+        // commit-before-publish intervals.
+        val writeRevision = PhotoTrashController.beginActivationWrite()
+        assertFalse(gate(), "an unsettled write is unavailable to destructive launch from before it can commit")
+        assertFalse(PhotoTrashController.isActivationReadCertified(base), "reads are uncertified for the same span")
 
-        // The disable COMMITS: the watermark leads the still-stale mirror; the gate refuses.
-        // (This is the commit-to-publish window that the counter-based freshness check
-        // could not see — the counter was already bumped inside the transaction.)
-        PhotoTrashController.noteActivationCommitted(writeRevision)
-        assertFalse(gate(), "a committed disable refuses the stale enabled mirror before its publish")
-
-        // The publish (or any certified read) closes the gap:
+        // The commit lands and the publish follows; only then does the gate reopen:
         PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = false, revision = writeRevision)
+        PhotoTrashController.endActivationWrite()
         assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn)
-        assertFalse(gate(), "now refused on the opt-in itself, not on staleness")
+        assertFalse(gate(), "now refused on the opt-in itself, not on settledness")
+    }
+
+    @Test
+    fun `an abandoned write never strands the authority or the certified reads`() {
+        val base = revisionBase()
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true, revision = base)
+        val req = request().copy(activationEpoch = 2L)
+
+        fun gate() = PhotoTrashConsentUiQueue.launchAllowedNow(
+            request = req,
+            currentUserId = 951,
+            activationSnapshot = PhotoTrashController.currentActivationSnapshot,
+            activationAuthoritySettled = PhotoTrashController.activationWritesUnsettled() == 0,
+            bindingGenerationCurrent = 7L,
+            lifecycleStarted = true,
+        )
+
+        // A write begins and is ABANDONED (rollback/exception): it settles without a
+        // publish — the last published mirror remains the committed truth.
+        PhotoTrashController.beginActivationWrite()
+        assertFalse(gate())
+        assertNull(PhotoTrashController.beginActivationRead())
+        PhotoTrashController.endActivationWrite()
+
+        // Recovery WITHOUT requiring another write: the gate reopens on the old (still
+        // committed) mirror and certified reads resume at the current revision.
+        assertTrue(gate(), "an abandoned write releases the gate; the old committed state is still the truth")
+        assertEquals(0, PhotoTrashController.activationWritesUnsettled())
+        assertTrue(PhotoTrashController.isActivationReadCertified(PhotoTrashController.beginActivationRead()))
+        with(PhotoTrashController.currentActivationSnapshot) {
+            assertEquals(true, this?.optIn)
+            assertEquals(base, this?.revision)
+        }
     }
 }
