@@ -525,6 +525,58 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     @Test
+    @DisplayName("a withdrawal after the LAST pre-publication read publishes nothing and preserves a late local edit")
+    fun withdrawalAtPublicationPreservesTheUnmarkPostconditionAndALateLocalEdit() {
+        // Published covered copy, intact. The server moved on (new hash, unchanged
+        // metadata): the maintenance chain reaches stagedRedownload and decides REPLACE_BYTES.
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_100L, hash = "hash-v1")
+        stubDetails(hash = "hash-v2", modifiedAtSec = 1_700_000_100L, size = bodyV2.size.toLong())
+        lastAnswerBody.set(bodyV2)
+
+        // Gate placed AFTER the last pre-publication read (live row + existing-file digest)
+        // and BEFORE the first mutation: the offline intent is withdrawn THERE, and a late
+        // local edit lands at the final path — bytes nobody this code may destroy.
+        var publicationWindowReached = false
+        OfflineFolderSyncUtils.prePublicationGate = {
+            publicationWindowReached = true
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.executeTransaction { transactionRealm ->
+                    transactionRealm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()?.apply {
+                        isOffline = false
+                        isMarkedAsOffline = false
+                        isDirectlyPinned = false
+                        offlineBasisModifiedAt = 0L
+                        offlineBasisSize = null
+                        offlineContentDigest = null
+                        serverContentHash = null
+                        offlinePublishedPath = null
+                    }
+                }
+            }
+            getOfflineFixtureFile().writeBytes(editedBody)
+        }
+        try {
+            refresh()
+        } finally {
+            OfflineFolderSyncUtils.prePublicationGate = null
+        }
+
+        assertTrue(publicationWindowReached, "the publication window was actually reached (the gate is not a silent no-op)")
+        val offlineFile = getOfflineFixtureFile()
+        assertTrue(offlineFile.exists(), "the final path keeps the late local edit")
+        assertTrue(offlineFile.readBytes().contentEquals(editedBody), "the late edit was never replaced by the staged body")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(!row.isOffline, "no offline flag resurrection at publication")
+            assertTrue(!row.isMarkedAsOffline, "no pending-marker resurrection at publication")
+            assertEquals(0L, row.offlineBasisModifiedAt, "no basis resurrection at publication")
+            assertNull(row.offlineContentDigest, "no digest resurrection at publication")
+            assertNull(row.serverContentHash, "no identity resurrection at publication")
+        }
+    }
+
+    /** The publication window was actually reached (the gate is not a silent no-op). */
+    @Test
     @DisplayName("a mid-transfer failure discards the owned staging and publishes nothing")
     fun midTransferFailureDiscardsTheOwnedStaging() {
         seedCoveredPendingRow()

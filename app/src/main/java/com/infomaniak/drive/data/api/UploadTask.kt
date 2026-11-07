@@ -339,8 +339,15 @@ class UploadTask(
         // uploaded source to the server file the upload actually created, with the digest of
         // the actual transfer when one was captured (null for chunked/resumed uploads —
         // recordPairing then validates against the response's server hash or stays unbound).
+        // The upload already succeeded: a pairing-recording failure must neither fail the
+        // worker run nor erase that success (the pairing re-binds on the next successful
+        // upload of the same URI); cancellation still propagates.
         if (uploadFile.isSync()) {
-            PhotoTrashController.recordPairing(context, uploadFile, createdRemoteFile, uploadedContentDigest)
+            runCatching { PhotoTrashController.recordPairing(context, uploadFile, createdRemoteFile, uploadedContentDigest) }
+                .onFailure { exception ->
+                    if (exception is CancellationException) throw exception
+                    SentryLog.e(TAG, "Photo trash pairing failed after a successful upload of ${uploadFile.uri}", exception)
+                }
         }
     }
 

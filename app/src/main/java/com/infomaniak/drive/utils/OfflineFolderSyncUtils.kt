@@ -18,6 +18,7 @@
 package com.infomaniak.drive.utils
 
 import android.content.Context
+import androidx.annotation.VisibleForTesting
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.ApiRoutes
@@ -70,6 +71,15 @@ import java.security.MessageDigest
  *    clear state only on confirmed success).
  */
 object OfflineFolderSyncUtils {
+
+    /**
+     * Test seam: invoked at the narrow publication point of [stagedRedownload] — AFTER the
+     * last pre-publication read (the live-row re-read and the existing-file digest), BEFORE
+     * the first mutation — so a regression can withdraw the offline intent exactly inside
+     * the publication window. Production never sets it.
+     */
+    @VisibleForTesting
+    internal var prePublicationGate: (() -> Unit)? = null
 
     private const val TAG = "OfflineFolderSync"
 
@@ -711,6 +721,12 @@ object OfflineFolderSyncUtils {
             }
             realm.executeTransaction { mutableRealm ->
                 FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { row ->
+                    // Same contract as every publication write: the intent is re-checked
+                    // INSIDE the transaction, not only before the digest/timestamp reads.
+                    if (!hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
+                        SentryLog.w(TAG, "Offline intent withdrawn before the metadata adoption for file $fileId; nothing recorded")
+                        return@executeTransaction
+                    }
                     row.lastModifiedAt = remoteFile.lastModifiedAt
                     row.size = remoteFile.size
                     // The accepted identity advances ONLY here, on a digest-verified adoption
@@ -829,6 +845,23 @@ object OfflineFolderSyncUtils {
                 PublicationDecision.REPLACE_BYTES -> Unit
             }
 
+            // PUBLICATION POINT: the last pre-publication reads are done (live row, existing
+            // file digest); BEFORE the first mutation the live intent is RE-CHECKED — a
+            // withdrawal during the transfer/digest window must not publish bytes the user
+            // just released (a successful unmark keeps its postcondition).
+            prePublicationGate?.invoke()
+            val intentStillLiveAtPublication = FileController.getRealmInstance(userDrive).use { realm ->
+                FileController.getFileProxyById(file.id, customRealm = realm)
+                    ?.let { hasLiveOfflineIntent(it, realm, userDrive) } == true
+            }
+            if (!intentStillLiveAtPublication) {
+                SentryLog.w(TAG, "Offline intent withdrawn at publication for file ${file.id}; staging discarded")
+                // Only the OWNED staging artifact is removed (in the finally below); the copy
+                // already at the offline path is not provably this staging's and is never
+                // destroyed here.
+                return@withContext StagedPublication.INTENT_WITHDRAWN
+            }
+
             // The publication timestamp is set on the STAGING file, before the atomic step:
             // a refusal aborts here, so the previous good bytes are never sacrificed for a
             // basis that would misdescribe the new ones.
@@ -847,6 +880,15 @@ object OfflineFolderSyncUtils {
             FileController.getRealmInstance(userDrive).use { realm ->
                 realm.executeTransaction { mutableRealm ->
                     FileController.getFileProxyById(file.id, customRealm = mutableRealm)?.let { proxy ->
+                        // The intent is re-checked INSIDE the transaction: a withdrawal that
+                        // landed between the pre-publication check and here records NOTHING
+                        // (no basis, no isOffline) — flag/contract resurrection by a stale
+                        // publication is impossible; the just-published path's bytes are not
+                        // provably this staging's anymore and are left to ownership rules.
+                        if (!hasLiveOfflineIntent(proxy, mutableRealm, userDrive)) {
+                            SentryLog.w(TAG, "Offline intent withdrawn before the basis record for file ${file.id}; nothing recorded")
+                            return@executeTransaction
+                        }
                         proxy.lastModifiedAt = file.lastModifiedAt
                         proxy.size = file.size
                         // Only an identity established for THIS accepted body is recorded;
@@ -923,6 +965,13 @@ object OfflineFolderSyncUtils {
             }
             realm.executeTransaction { mutableRealm ->
                 FileController.getFileProxyById(remoteFile.id, customRealm = mutableRealm)?.let { row ->
+                    // The intent is re-checked INSIDE the transaction: the check at the seam
+                    // entry ran BEFORE the digest pass, and the publication contract is that
+                    // a withdrawal landing anywhere in between resurrects nothing.
+                    if (!hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
+                        SentryLog.w(TAG, "Offline intent withdrawn before the accepted basis record for file ${remoteFile.id}; nothing recorded")
+                        return@executeTransaction
+                    }
                     row.lastModifiedAt = remoteFile.lastModifiedAt
                     row.size = remoteFile.size
                     // Only an identity established for THIS accepted body is recorded; a
