@@ -45,6 +45,7 @@ import com.infomaniak.drive.data.models.file.SpecialFolder.SharedWithMe
 import com.infomaniak.drive.data.services.MqttClientWrapper
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.OfflineCommitAuthority
+import com.infomaniak.drive.utils.OfflineFolderSyncUtils
 import com.infomaniak.drive.utils.RealmModules
 import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
@@ -134,8 +135,13 @@ object FileController {
     private fun savePath(userDrive: UserDrive, fileId: Int, generatedPath: String) {
         getRealmInstance(userDrive).use { realm ->
             getFileById(realm, fileId)?.let { file ->
-                realm.executeTransaction {
-                    if (file.isValid) file.path = generatedPath
+                // Coordinated writer (path persistence — getRemotePath's lazy write fires from
+                // anywhere, including inside publication/withdrawal holds): the recorded path
+                // is an offline decision predicate, so the write joins the commit authority.
+                OfflineCommitAuthority.withCommitAuthority {
+                    realm.executeTransaction {
+                        if (file.isValid) file.path = generatedPath
+                    }
                 }
             }
         }
@@ -525,17 +531,29 @@ object FileController {
         getRealmInstance(userDrive).use { realm ->
             files.forEachIndexed { index, file ->
                 val offlineFile = file.getOfflineFile(Realm.getApplicationContext()!!)
+                val oldFile = realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
 
-                realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()?.let { oldFile ->
-                    realm.executeTransaction {
-                        file.children = oldFile.children
-                        keepFiles.add(file.id)
+                if (oldFile != null) {
+                    // Coordinated writer (tree link write: the shares refresh reparents the
+                    // live row's children onto the refreshed object): joins the commit
+                    // authority like every other cached tree writer.
+                    OfflineCommitAuthority.withCommitAuthority {
+                        realm.executeTransaction {
+                            file.children = oldFile.children
+                            keepFiles.add(file.id)
+                        }
                     }
                 }
 
                 if (offlineFile != null && file.isOfflineAndIntact(offlineFile)) {
                     files[index].isOffline = true
                     keepCaches.add(file.id)
+                } else if (oldFile != null && OfflineFolderSyncUtils.isRootOwnedCopy(oldFile, realm, userDrive)) {
+                    // A root-owned copy's lifecycle belongs to the root contract (its
+                    // release paths preserve or delete through the checked decisions): the
+                    // baseline shares refresh must not delete its bytes before root
+                    // maintenance — the same skip rule the offline sync applies.
+                    Unit
                 } else offlineFile?.delete()
             }
 
@@ -594,17 +612,23 @@ object FileController {
      * @param driveId Drive Id (null if all user drive)
      */
     fun deleteUserDriveFiles(userId: Int, driveId: Int? = null) {
-        val filesDir = Realm.getApplicationContext()!!.filesDir
-        filesDir.listFiles()?.forEach { file ->
-            val match = Regex("(\\d+)-(\\d+)").find(file.name)
-            match?.destructured?.let {
-                val (fileUserId, fileDriveId) = it
-                if (fileUserId.toInt() == userId && (driveId == null || fileDriveId.toInt() == driveId)) {
-                    if (file.isDirectory) file.deleteRecursively() else file.delete()
+        // Coordinated writer (whole-database removal for an account/drive): joins the
+        // commit authority so an in-flight publication or withdrawal for the same
+        // user/drive serializes against the deletion of its realm files instead of
+        // committing into (or recreating) a database that is being removed.
+        OfflineCommitAuthority.withCommitAuthority {
+            val filesDir = Realm.getApplicationContext()!!.filesDir
+            filesDir.listFiles()?.forEach { file ->
+                val match = Regex("(\\d+)-(\\d+)").find(file.name)
+                match?.destructured?.let {
+                    val (fileUserId, fileDriveId) = it
+                    if (fileUserId.toInt() == userId && (driveId == null || fileDriveId.toInt() == driveId)) {
+                        if (file.isDirectory) file.deleteRecursively() else file.delete()
+                    }
                 }
             }
+            DriveInfosController.deleteDrives(userId)
         }
-        DriveInfosController.deleteDrives(userId)
     }
 
     fun getFilesFromCache(folderId: Int, userDrive: UserDrive? = null, order: SortType = SortType.NAME_AZ): ArrayList<File> {
@@ -750,17 +774,22 @@ object FileController {
 
     fun storeRecentChanges(files: ArrayList<File>, isFirstPage: Boolean = false) {
         getRealmInstance().use {
-            it.executeTransaction { realm ->
-                val folder = realm.where(File::class.java).equalTo(File::id.name, RecentChanges.id).findFirst()
-                    ?: realm.copyToRealm(RecentChanges.file)
-                if (isFirstPage) {
-                    folder.children = RealmList()
-                }
-                files.forEach { file ->
-                    realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()?.let { realmFile ->
-                        file.keepOldLocalFilesData(realmFile)
+            // Coordinated writer (FHNW-1189 A1): the children write UPDATES the real File
+            // rows (same ids — path/parent/name/size are offline decision predicates), so
+            // the store joins the commit authority like every other listing writer.
+            OfflineCommitAuthority.withCommitAuthority {
+                it.executeTransaction { realm ->
+                    val folder = realm.where(File::class.java).equalTo(File::id.name, RecentChanges.id).findFirst()
+                        ?: realm.copyToRealm(RecentChanges.file)
+                    if (isFirstPage) {
+                        folder.children = RealmList()
                     }
-                    folder.children.add(file)
+                    files.forEach { file ->
+                        realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()?.let { realmFile ->
+                            file.keepOldLocalFilesData(realmFile)
+                        }
+                        folder.children.add(file)
+                    }
                 }
             }
         }
@@ -768,27 +797,35 @@ object FileController {
 
     fun storeFileActivities(fileActivities: ArrayList<FileActivity>) {
         getRealmInstance().use { realm ->
-            realm.beginTransaction()
-            fileActivities.forEach { fileActivity ->
-                fileActivity.userId = fileActivity.user?.id
-                fileActivity.file?.let { file ->
-                    realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
-                }?.let { localFile ->
-                    fileActivity.file?.keepOldLocalFilesData(localFile)
+            // Coordinated writer (FHNW-1189 A1): insertOrUpdate cascades the linked File row
+            // (keepOldLocalFilesData feeds it the live row) — a predicate mutation.
+            OfflineCommitAuthority.withCommitAuthority {
+                realm.beginTransaction()
+                fileActivities.forEach { fileActivity ->
+                    fileActivity.userId = fileActivity.user?.id
+                    fileActivity.file?.let { file ->
+                        realm.where(File::class.java).equalTo(File::id.name, file.id).findFirst()
+                    }?.let { localFile ->
+                        fileActivity.file?.keepOldLocalFilesData(localFile)
+                    }
+                    realm.insertOrUpdate(fileActivity)
                 }
-                realm.insertOrUpdate(fileActivity)
+                realm.commitTransaction()
             }
-            realm.commitTransaction()
         }
     }
 
     fun storeGalleryDrive(mediaList: List<File>, isFirstPage: Boolean = false, customRealm: Realm? = null) {
         val block: (Realm) -> Unit = {
-            it.executeTransaction { realm ->
-                val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
-                    ?: realm.copyToRealm(Gallery.file)
-                if (isFirstPage) galleryFolder.children = RealmList()
-                galleryFolder.children.addAll(realm, mediaList)
+            // Coordinated writer (FHNW-1189 A1): children.addAll updates every gallery media
+            // row IN PLACE (live rows of the same File table) — a predicate mutation.
+            OfflineCommitAuthority.withCommitAuthority {
+                it.executeTransaction { realm ->
+                    val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
+                        ?: realm.copyToRealm(Gallery.file)
+                    if (isFirstPage) galleryFolder.children = RealmList()
+                    galleryFolder.children.addAll(realm, mediaList)
+                }
             }
         }
         customRealm?.let(block) ?: getRealmInstance().use(block)
@@ -805,8 +842,12 @@ object FileController {
 
     fun removeOrphanAndActivityFiles(customRealm: Realm? = null) {
         val block: (Realm) -> Unit = { realm ->
-            realm.executeTransaction {
-                realm.where(FileActivity::class.java).findAll().deleteAllFromRealm()
+            // Coordinated writer (row deletion): joins the commit authority (the inner
+            // removeOrphanFiles participates through its own wrap — reentrant).
+            OfflineCommitAuthority.withCommitAuthority {
+                realm.executeTransaction {
+                    realm.where(FileActivity::class.java).findAll().deleteAllFromRealm()
+                }
             }
             removeOrphanFiles(realm)
         }
@@ -815,11 +856,16 @@ object FileController {
 
     fun removeOrphanFiles(customRealm: Realm? = null) {
         val block: (Realm) -> Unit = { realm ->
-            realm.executeTransaction {
-                realm.where(File::class.java)
-                    .greaterThan(File::id.name, ROOT_ID)
-                    .isEmpty(File::localParent.name)
-                    .findAll().deleteAllFromRealm()
+            // Coordinated writer (FHNW-1189 A1): orphan deletion REMOVES File rows — row
+            // existence is an offline decision predicate (vanishing rows drive
+            // INTENT_WITHDRAWN paths and the coverage walks).
+            OfflineCommitAuthority.withCommitAuthority {
+                realm.executeTransaction {
+                    realm.where(File::class.java)
+                        .greaterThan(File::id.name, ROOT_ID)
+                        .isEmpty(File::localParent.name)
+                        .findAll().deleteAllFromRealm()
+                }
             }
         }
         customRealm?.let(block) ?: getRealmInstance().use(block)

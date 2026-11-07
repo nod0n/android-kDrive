@@ -19,6 +19,7 @@ package com.infomaniak.drive.utils
 
 import android.content.Context
 import android.os.ParcelFileDescriptor
+import androidx.annotation.VisibleForTesting
 import androidx.concurrent.futures.await
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -107,7 +108,7 @@ class DownloadOfflineFileManager(
         // root-owned work keeps the root contract (the staged preservation path), never the
         // destructive baseline. Direct pins suppress the recorded claim and keep their
         // baseline behavior unchanged.
-        val gate = FileController.getRealmInstance(userDrive).use { realm ->
+        val gate = OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
             FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
                 GateState(
                     liveIntent = OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive),
@@ -138,7 +139,7 @@ class DownloadOfflineFileManager(
         // includes the recorded provenance): the gate capture is what survives a real remote
         // move that rewrote the row's parent mid-flight, and the provenance is what survives
         // a cached tree update that moved the row out before this worker ran.
-        val coveredByRoot = FileController.getRealmInstance(userDrive).use { realm ->
+        val coveredByRoot = OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
             OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)
         } || gate.rootOwned
         if (offlineFile.exists() && coveredByRoot) {
@@ -232,7 +233,7 @@ class DownloadOfflineFileManager(
         // the authority to delete the preserved edited bytes it just kept
         // ([File.isIntactFile] compares length only, so a different-length edit reaches the
         // delete branch exactly when the ownership protection is missing).
-        val liveState = FileController.getRealmInstance(userDrive).use { realm ->
+        val liveState = OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
             FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
                 OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive) to
                     OfflineFolderSyncUtils.isRootOwnedCopy(row, realm, userDrive)
@@ -260,14 +261,17 @@ class DownloadOfflineFileManager(
     ): CacheMoveOutcome = withContext(Dispatchers.IO) {
         if (file.isObsoleteOrNotIntact(cacheFile)) return@withContext CacheMoveOutcome.NOT_INTACT
 
+        // The mutation generation is captured BEFORE the staging copy: any participating
+        // mutation that commits while the copy runs (a competing publication completing, an
+        // unmark, a tree move) advances it, and the hold below refuses on the change — the
+        // pre-effect refusal covers the WHOLE copy span, not just the in-hold window.
+        val generationAtStart = OfflineCommitAuthority.withCommitAuthority {
+            OfflineCommitAuthority.currentGenerationUnderAuthority()
+        }
+
         // STAGING SHAPE (RESUME-b528-2212 item 1): the cache bytes are copied to a staging
         // temp in the offline directory OUTSIDE the commit authority — a full byte copy
-        // never runs inside a hold (UI-thread writers wait on it). The hold then performs
-        // the narrow publication: the fresh stale-ownership authority check, the atomic
-        // rename over the destination, the timestamp and the record (all coordinated — no
-        // predicate writer can commit between the check and the effect). On ANY decline the
-        // cache bytes are PRESERVED where they are and the staging is removed; the cache
-        // original is deleted only after a successful publish.
+        // never runs inside a hold (UI-thread writers wait on it).
         val parentDir = offlineFile.parentFile
         if (parentDir == null || (!parentDir.exists() && !parentDir.mkdirs())) {
             return@withContext CacheMoveOutcome.NOT_INTACT
@@ -275,45 +279,104 @@ class DownloadOfflineFileManager(
         val staging = java.io.File.createTempFile("offline_staging_", null, parentDir)
         try {
             cacheFile.copyTo(staging, overwrite = true)
+            // Test seam (FHNW-1189 A2/E4): a regression can complete a REAL unmark or land
+            // a real publication right here — after the copy, before the hold — and prove
+            // the publication refuses BEFORE its first filesystem effect. Production never
+            // sets it.
+            preCacheMovePublicationGate?.invoke()
+
             // Digest evidence for the record, computed OUTSIDE the hold (of the staged
             // bytes — the rename makes them identical to the published ones).
             val stagedLength = staging.length()
             val stagedDigest = OfflineFolderSyncUtils.computeDigestForEvidence(staging)
 
             val published = OfflineCommitAuthority.withCommitAuthority {
-                // R1 (FHNW-caf1 addendum C): the stale-ownership authority is re-derived
-                // inside THIS hold, immediately before the first irreversible effect (the
-                // rename). A moved-out root-owned row (recorded ownership without live
-                // coverage, not directly pinned) has no root contract reach left: nothing
-                // is published, the cache bytes stay in the cache.
-                val staleOwnership = FileController.getRealmInstance(userDrive).use { realm ->
-                    FileController.getFileProxyById(file.id, customRealm = realm)?.let { row ->
+                // EVIDENCE CERTIFICATION (generation) FIRST: a participating mutation
+                // committed while the staging copy ran (FHNW-1189 A2 schedule 2: a
+                // competing publication completing mid-copy) — whatever it wrote at the
+                // destination owns it now; this stale cache body must not replace it.
+                if (OfflineCommitAuthority.currentGenerationUnderAuthority() != generationAtStart) {
+                    SentryLog.w(TAG, "App state changed during the cache copy for ${file.id}; cache bytes preserved, nothing published")
+                    return@withCommitAuthority null
+                }
+                // PRE-EFFECT AUTHORITY GATE (FHNW-1189 A2 schedule 1): the row must EXIST
+                // and carry FULL live offline intent, and the root contract's reach must
+                // not have ended — a row fully unmarked by a coordinated writer reads
+                // offlineOwnedByRoot=false and a vanished row read false before; both
+                // schedules now decline BEFORE the rename instead of being discovered by
+                // the record afterwards (the forbidden move-then-delete repair).
+                OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
+                    val row = FileController.getFileProxyById(file.id, customRealm = realm)
+                    when {
+                        row == null -> {
+                            SentryLog.w(TAG, "Row vanished before the cache move for ${file.id}; cache bytes preserved, nothing published")
+                            return@withCommitAuthority null
+                        }
+                        !OfflineFolderSyncUtils.hasLiveOfflineIntent(row, realm, userDrive) -> {
+                            SentryLog.w(TAG, "Offline intent withdrawn before the cache move for ${file.id}; cache bytes preserved, nothing published")
+                            return@withCommitAuthority null
+                        }
                         row.offlineOwnedByRoot && !row.isDirectlyPinned &&
-                            !OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, userDrive)
-                    } ?: false
+                            !OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, userDrive) -> {
+                            SentryLog.w(TAG, "Root ownership stale before the cache move for ${file.id}; cache bytes preserved, nothing published")
+                            return@withCommitAuthority null
+                        }
+                    }
+
+                    // DESTINATION AUTHORITY: rename(2) replaces silently, so the
+                    // destination is judged before the effect. An occupied destination is
+                    // refused UNLESS it is provably THIS row's own intact accepted
+                    // publication (the recorded path plus a matching basis stat) — the
+                    // baseline refresh of the row's own copy; an edited, unknown, stray or
+                    // competing publication's bytes are NEVER replaced (both sides
+                    // preserved; no move-then-delete repair).
+                    if (offlineFile.exists()) {
+                        val basisIntact = row.offlineBasisModifiedAt > 0L &&
+                            row.offlinePublishedPath == offlineFile.path &&
+                            offlineFile.lastModified().div(1_000L) == row.offlineBasisModifiedAt &&
+                            (row.offlineBasisSize == null || offlineFile.length() == row.offlineBasisSize)
+                        if (!basisIntact) {
+                            SentryLog.w(TAG, "The cache move's destination holds bytes this row does not own for ${file.id}; both sides preserved")
+                            return@withCommitAuthority null
+                        }
+                    }
+
+                    // STAGED-COPY EVIDENCE: the staged bytes must still be exactly what the
+                    // digest described, and the digest must exist — every record-decline
+                    // condition is checked BEFORE the first effect, never discovered after.
+                    if (stagedDigest == null || !staging.exists() || staging.length() != stagedLength) {
+                        SentryLog.w(TAG, "The staged cache copy's evidence is unusable for ${file.id}; cache bytes preserved, nothing published")
+                        return@withCommitAuthority null
+                    }
+
+                    // The publication mtime is set and CHECKED on the STAGING file BEFORE
+                    // the rename: a refused mtime used to be ignored AFTER the replacement,
+                    // publishing bytes whose mtime could never match the recorded basis
+                    // (frozen as locally edited forever).
+                    if (!staging.setLastModified(file.getLastModifiedInMilliSecond())) {
+                        SentryLog.w(TAG, "Staging timestamp refused for ${file.id}; cache bytes preserved, nothing published")
+                        return@withCommitAuthority null
+                    }
+
+                    if (!staging.renameTo(offlineFile)) {
+                        SentryLog.w(TAG, "Cache-move publication refused for ${file.id}; cache bytes preserved")
+                        return@withCommitAuthority null
+                    }
+                    // The moved bytes come from the cache, not from this transfer: their
+                    // content is NOT proven to match the current remote identity (metadata
+                    // equality is not proof of equal content), so the seam records the basis
+                    // WITHOUT the server hash — the next maintenance pass then performs one
+                    // verified body fetch and completes it. Reentrant-safe: the record joins
+                    // this same hold.
+                    OfflineFolderSyncUtils.recordAcceptedPublicationInHold(
+                        userDrive = userDrive,
+                        remoteFile = file,
+                        offlineFile = offlineFile,
+                        acceptedServerHash = null,
+                        acceptedDigest = stagedDigest,
+                        acceptedLength = stagedLength,
+                    )
                 }
-                if (staleOwnership) {
-                    SentryLog.w(TAG, "Root ownership stale before the cache move for ${file.id}; cache bytes preserved, nothing published")
-                    return@withCommitAuthority null
-                }
-                if (!staging.renameTo(offlineFile)) {
-                    SentryLog.w(TAG, "Cache-move publication refused for ${file.id}; cache bytes preserved")
-                    return@withCommitAuthority null
-                }
-                offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
-                // The moved bytes come from the cache, not from this transfer: their content
-                // is NOT proven to match the current remote identity (metadata equality is
-                // not proof of equal content), so the seam records the basis WITHOUT the
-                // server hash — the next maintenance pass then performs one verified body
-                // fetch and completes it. Reentrant-safe: the record joins this same hold.
-                OfflineFolderSyncUtils.recordAcceptedPublicationInHold(
-                    userDrive = userDrive,
-                    remoteFile = file,
-                    offlineFile = offlineFile,
-                    acceptedServerHash = null,
-                    acceptedDigest = stagedDigest,
-                    acceptedLength = stagedLength,
-                )
             }
 
             if (published == OfflineFolderSyncUtils.PublicationOutcome.PUBLISHED) {
@@ -522,6 +585,14 @@ class DownloadOfflineFileManager(
     }
 
     companion object {
+        /**
+         * Test seam (FHNW-1189 A2/E4): invoked after the staging copy, before the
+         * publication hold — a regression completes a real withdrawal or lands a real
+         * publication in exactly that span. Production never sets it.
+         */
+        @VisibleForTesting
+        internal var preCacheMovePublicationGate: (() -> Unit)? = null
+
         private const val MAX_INTERVAL_BETWEEN_PROGRESS_UPDATE_MS = 1000L
         private val TAG = DownloadOfflineFileManager::class.java.simpleName
 
