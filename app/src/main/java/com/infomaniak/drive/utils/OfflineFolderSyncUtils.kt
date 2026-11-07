@@ -763,18 +763,28 @@ object OfflineFolderSyncUtils {
                 // Recording it here (only an established, non-blank hash, only when the row
                 // does not already carry it) is what makes the adoption converge — otherwise
                 // every later pass repeats the same unchanged body download, which the
-                // maintenance policy forbids.
+                // maintenance policy forbids. This branch is only ever entered with byte
+                // evidence for the identity: the details route requires the basis hash to
+                // already equal the remote hash (so no write is needed), and the staged route
+                // has just proven download-digest == preserved-digest inside this same lock —
+                // an established identity is never overwritten without that evidence.
                 val establishedHash = remoteFile.serverContentHash
+                var recorded = true
                 if (!establishedHash.isNullOrBlank() && proxy.serverContentHash != establishedHash) {
+                    recorded = false
                     realm.executeTransaction { mutableRealm ->
                         FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { row ->
                             if (hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
                                 row.serverContentHash = establishedHash
+                                recorded = true
                             }
                         }
                     }
                 }
-                return true // already consistent — a no-op, not a withdrawal
+                // A decline inside the transaction (row vanished or intent withdrawn by a
+                // mutation outside the coordination) is a DECLINE, reported as one — never
+                // as a successful adoption (same discipline as the basis record below).
+                return recorded
             }
 
             if (offlineFile?.exists() == true) {
