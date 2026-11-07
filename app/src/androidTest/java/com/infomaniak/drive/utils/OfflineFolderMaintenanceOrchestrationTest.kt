@@ -2437,8 +2437,17 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // the very production omission it claimed to exclude. The production entries are now
         // exercised DIRECTLY on the stale retained thread — no test-level certification in
         // between — and the premise (the retained view predates the writer's commit) stays a
-        // separate helper-only check. The adoption's pre-effect freshness is asserted by the
-        // ABSENCE of its effect: the accepted copy's timestamp is never touched.
+        // separate helper-only check.
+        // COVERAGE QUALIFICATION (RESUME-33dd item 3): the STALE-SEAM exercise is the RECORD
+        // leg (step 4) — recordAcceptedPublicationInHold is called on the thread whose
+        // retained view is stale, and the production certification is what observes the
+        // post-commit state. The ADOPTION leg (step 5) CANNOT reach a stale retained view by
+        // construction: refreshOfflineFile's own certified snapshot at entry refreshes any
+        // retained instance on the calling thread before anything else, and the adoption's
+        // decision read runs on Dispatchers.IO, where a fresh instance is served — so that
+        // leg pins the OBSERVABLE decline through the real maintenance entry (writer-wins,
+        // the setLastModified effect never runs), NOT stale-seam exclusion; the decision
+        // read's own certification there is uniform-discipline defense-in-depth.
         seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_100L, hash = "hash-v1")
         val offlineFile = getOfflineFixtureFile()
         val retained = java.util.concurrent.atomic.AtomicReference<Realm>()
@@ -2481,10 +2490,12 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 }
             }.get(15, java.util.concurrent.TimeUnit.SECONDS)
 
-            // 5. THE PRODUCTION MAINTENANCE ENTRY on the same thread: a hash-identical
-            //    timestamp change routes to the METADATA_ONLY adoption — the certified chain
-            //    observes the withdrawal and declines BEFORE the setLastModified effect (the
-            //    pre-effect read freshness the former test never checked).
+            // 5. THE PRODUCTION MAINTENANCE ENTRY (submitted on the same executor thread,
+            //    though its decision read runs on Dispatchers.IO — see the qualification
+            //    above): a hash-identical timestamp change routes to the METADATA_ONLY
+            //    adoption — the certified chain observes the withdrawal and declines BEFORE
+            //    the setLastModified effect. This pins the decline-path control through the
+            //    real entry, not a stale-seam exercise.
             stubDetails(hash = "hash-v1", modifiedAtSec = 1_700_000_500L, size = bodyV1.size.toLong())
             executor.submit {
                 runBlocking { OfflineFolderSyncUtils.refreshOfflineFile(context, userDrive, fileId) }
@@ -2648,6 +2659,211 @@ class OfflineFolderMaintenanceOrchestrationTest {
             assertFalse(row.isMarkedAsOffline, "the released row's marker stands cleared")
         }
         assertEquals(0L, bodyRequests.get(), "a release preserves: nothing was re-downloaded")
+    }
+
+    @Test
+    @DisplayName("a listing writer racing the recovery preserves the NEWER row: the in-transaction absence recheck")
+    fun aListingWriterRacingTheRecoveryPreservesTheNewerRow() {
+        // RESUME-33dd item 1: the absence premise is established BEFORE the remote details
+        // request, outside any hold — while the recovery waits, a real listing writer may
+        // recreate the row with newer cache state and child links. The former lever wrote
+        // insertOrUpdate unconditionally: the detached details snapshot would have
+        // overwritten that newer row app-writer-wins. Now the insert RECHECKS absence
+        // inside the authoritative write transaction and preserves the row that appeared.
+        // (The absent-row positive control is the case above.)
+        seedCoveredPendingRow()
+        val rootBFolder = 800_403
+        seedRootRegistry(rootBFolder) // registry row WITHOUT a cached folder row (cache loss)
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+
+        // THE RACING LISTING WRITER, on the real seam that recreates a missing folder row
+        // (saveRemoteFiles with no local proxy copies the folder row in and links its
+        // children): it runs INSIDE the details request, BEFORE the detached (older)
+        // answer returns, so the recovery's hold opens on a row that already exists with
+        // NEWER state.
+        val racingChildRow = File(id = 800_404, driveId = userDrive.driveId).apply {
+            initUid()
+            name = "child-of-b.bin"
+            path = "Private/fixture-root-b/child-of-b.bin"
+            type = "file"
+            parentId = rootBFolder
+            lastModifiedAt = 1_700_000_050L
+            size = bodyV1.size.toLong()
+        }
+        val listingRenamedRoot = File(id = rootBFolder, driveId = userDrive.driveId).apply {
+            initUid()
+            name = "fixture-root-b-renamed"
+            path = "Private/fixture-root-b-renamed"
+            type = "dir"
+        }
+        mockkObject(DriveInfosController)
+        every { DriveInfosController.getDrives(any(), any(), any(), any()) } answers {
+            arrayListOf(Drive(objectId = "fixture-drive").apply { id = userDrive.driveId })
+        }
+        val walkedFolderIds = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
+            walkedFolderIds.add(thirdArg())
+            CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = emptyList<File>(), cursor = null, hasMore = false)
+        }
+        every { ApiRepository.getFileDetails(any(), any()) } answers {
+            FileController.getRealmInstance(userDrive).use { realm ->
+                FileController.saveRemoteFiles(
+                    realm = realm,
+                    localFolderProxy = null,
+                    remoteFolder = listingRenamedRoot,
+                    apiResponse = CursorApiResponse(
+                        result = ApiResponseStatus.SUCCESS,
+                        data = arrayListOf(racingChildRow),
+                        cursor = null,
+                        hasMore = false,
+                    ),
+                    isFirstPage = true,
+                    isCompleteFolder = true,
+                )
+            }
+            ApiResponse(
+                result = ApiResponseStatus.SUCCESS,
+                data = File(id = rootBFolder, driveId = userDrive.driveId).apply {
+                    initUid()
+                    name = "fixture-root-b"
+                    path = "Private/fixture-root-b"
+                    type = "dir"
+                },
+            )
+        }
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val preserved = realm.where(File::class.java).equalTo(File::id.name, rootBFolder).findFirst()!!
+            assertEquals(
+                "fixture-root-b-renamed",
+                preserved.name,
+                "the racing listing writer's NEWER row survived: the detached details snapshot never overwrote it",
+            )
+            assertTrue(preserved.children.any { it.id == 800_404 }, "the racing writer's child link survived")
+            assertNotNull(realm.where(File::class.java).equalTo(File::id.name, 800_404).findFirst(), "the racing writer's child row exists")
+        }
+        assertNotNull(
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(OfflineFolderRoot::class.java).equalTo(OfflineFolderRoot::folderId.name, rootBFolder).findFirst()
+            },
+            "the registration stands",
+        )
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(row.offlineOwnedByRoot, "the release DEFERRED while the preserved root is unproven (the all-complete gate)")
+        }
+        assertEquals(0L, bodyRequests.get(), "a deferral preserves: nothing was re-downloaded")
+
+        // PASS 2: the preserved row is really WALKED and the deferred release converges —
+        // the preserved cache state is fully functional, not merely present.
+        walkedFolderIds.clear()
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+        assertTrue(walkedFolderIds.contains(rootBFolder), "the following pass walks the PRESERVED row")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertFalse(row.offlineOwnedByRoot, "the deferred release converged once both walks completed")
+        }
+        assertEquals(0L, bodyRequests.get(), "a release preserves: nothing was re-downloaded")
+    }
+
+    @Test
+    @DisplayName("an OLD pass parked across a same-id re-registration defers: the successor's own evidence completes the churn")
+    fun anOldPassParkedAcrossASameIdReregistrationDefersTheRelease() {
+        // RESUME-33dd item 2, the ACTUAL old-pass/new-registration ABA — the serial
+        // unmark -> re-mark -> pass control is the ordinary lifecycle, not this schedule.
+        // The old pass captures the registration and X's claim; while it is parked in its
+        // refresh span (a real suspension window), a REAL unmark+re-mark replaces the
+        // registration with the SAME folder id and re-acquires X through the successor's
+        // own marking walk; the old pass's completed listing omits X and predates that
+        // walk. The former gate compared folder-id SETS: the successor's identical set
+        // passed, and the stale union would have discharged a claim the successor had just
+        // re-acquired. The gate now compares REGISTRATION LIFETIMES (markedAt is stamped
+        // at every mark): pass 1 defers; the successor's OWN pass judges X from current
+        // evidence. The listing schedule below IS the remote churn (X away, X back, X
+        // away again) — every answer a real listing at that moment.
+        seedCoveredPendingRow()
+        stubDetails(
+            hash = "hash-1",
+            modifiedAtSec = 1_700_000_050L,
+            size = bodyV1.size.toLong(),
+            responseFileId = 800_405,
+            name = "fixture-y.bin",
+            path = "Private/fixture-orch-folder/fixture-y.bin",
+        )
+
+        val remoteXRow = File(id = fileId, driveId = userDrive.driveId).apply {
+            initUid()
+            name = "fixture-orch.bin"
+            path = "Private/fixture-orch.bin"
+            type = "file"
+            parentId = coveredFolderId
+            lastModifiedAt = 1_700_000_000L
+            size = bodyV1.size.toLong()
+        }
+        val remoteYRow = File(id = 800_405, driveId = userDrive.driveId).apply {
+            initUid()
+            name = "fixture-y.bin"
+            path = "Private/fixture-orch-folder/fixture-y.bin"
+            type = "file"
+            parentId = coveredFolderId
+            lastModifiedAt = 1_700_000_050L
+            size = bodyV1.size.toLong()
+        }
+        lastAnswerBody.set(bodyV1)
+        mockkObject(DriveInfosController)
+        every { DriveInfosController.getDrives(any(), any(), any(), any()) } answers {
+            arrayListOf(Drive(objectId = "fixture-drive").apply { id = userDrive.driveId })
+        }
+        val walkCalls = java.util.concurrent.atomic.AtomicInteger()
+        coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
+            when (walkCalls.incrementAndGet()) {
+                1 -> CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = arrayListOf(remoteYRow), cursor = null, hasMore = false)
+                2 -> CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = arrayListOf(remoteXRow, remoteYRow), cursor = null, hasMore = false)
+                else -> CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = arrayListOf(remoteYRow), cursor = null, hasMore = false)
+            }
+        }
+        // THE PARKED SPAN: pass 1 refreshes its one listed file (Y) — a basis-less pending
+        // row routes straight to the staged redownload, whose body transport is a real
+        // suspension window (the deliverBodyAfterUnmark precedent). INSIDE it, the real
+        // unmark+re-mark replace the registration and re-acquire X.
+        val raced = java.util.concurrent.atomic.AtomicBoolean()
+        coEvery { DownloadOfflineFileManager.downloadFileResponseAsync(any(), any(), any()) } coAnswers {
+            if (raced.compareAndSet(false, true)) {
+                assertTrue(OfflineFolderSyncUtils.unmarkFolderOffline(context, folderRow(coveredFolderId), userDrive), "the unmark confirmed")
+                assertTrue(OfflineFolderSyncUtils.markFolderOffline(context, folderRow(coveredFolderId), userDrive), "the re-mark confirmed")
+            }
+            bodyRequests.incrementAndGet()
+            fakeBodyResponse(lastAnswerBody.get())
+        }
+
+        // PASS 1: the old pass walks A (omits X), publishes Y across the raced
+        // re-registration, then reaches the discharge hold. The lifetime map now DIFFERS
+        // (the successor's markedAt) — the whole release defers, and X's re-acquired
+        // claim STANDS (the former id-set gate would have discharged it here).
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val xRow = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(xRow.offlineOwnedByRoot, "the stale-union ABA discharge never ran: X's re-acquired claim stands (the lifetime gate deferred)")
+            assertTrue(xRow.isMarkedAsOffline, "X's pending intent stands through the deferral")
+            assertEquals(1L, realm.where(OfflineFolderRoot::class.java).count(), "the successor registration stands")
+        }
+        assertTrue(bodyRequests.get() >= 1, "Y's publication crossed the parked span (the race actually ran)")
+
+        // PASS 2: the successor is captured at ITS start; its own walk omits X again —
+        // with CURRENT evidence the discharge applies: the bounded churn completes (claim
+        // and marker clear; no bytes ever existed to decide about), the deferral was not
+        // immortal. Y — the mid-pass claim the successor's own walk owns — is kept.
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val xRow = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertFalse(xRow.offlineOwnedByRoot, "the successor's own current evidence completes the churn: the deferral was bounded, not immortal")
+            assertFalse(xRow.isMarkedAsOffline, "the pending marker stands cleared")
+            assertEquals(1L, realm.where(OfflineFolderRoot::class.java).count(), "the successor registration stands")
+            val yRow = realm.where(File::class.java).equalTo(File::id.name, 800_405).findFirst()!!
+            assertTrue(yRow.offlineOwnedByRoot, "the mid-pass claim the successor's walk owns was never judged by the old pass (kept)")
+            assertTrue(yRow.isOffline, "Y published across the race and stands")
+        }
     }
 
     @Test
@@ -2856,7 +3072,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     @Test
-    @DisplayName("the SAME row's claim survives a real release and re-acquisition (unmark -> re-mark -> pass): the ABA schedule pinned")
+    @DisplayName("the SAME row's claim survives a real release and re-acquisition (unmark -> re-mark -> pass): the serial lifecycle control")
     fun sameRowClaimSurvivesReleaseAndReacquisitionThroughRealEntryPoints() {
         // FHNW-962c P3-6: previousClaimedIds cannot distinguish releasing and re-acquiring
         // the SAME id under a replaced registration, and the former case inserted a NEW
@@ -2866,7 +3082,11 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // and the maintenance pass KEEPS the re-acquired claim — the row is listed by the
         // very walk that owns it, so the discharge never judges it from the old evidence
         // (the all-complete gate closes the mid-pass variant: an incomplete re-marking walk
-        // defers the whole release).
+        // defers the whole release). SCOPE (RESUME-33dd item 2): this is the ORDINARY
+        // serial lifecycle control — its last pass starts with the NEW registration and
+        // lists the row. The actual old-pass/new-registration MID-PASS schedule (the old
+        // pass parked across a same-id re-registration, its union predating the successor's
+        // marking walk) is pinned by anOldPassParkedAcrossASameIdReregistrationDefersTheRelease.
         seedCoveredPendingRow()
         stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
         val remoteRow = File(id = fileId, driveId = userDrive.driveId).apply {
