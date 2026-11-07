@@ -53,6 +53,7 @@ import com.infomaniak.drive.R
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.MediaFolder
+import com.infomaniak.drive.data.models.PhotoPairing
 import com.infomaniak.drive.data.models.SyncSettings
 import com.infomaniak.drive.data.models.SyncSettings.IntervalType
 import com.infomaniak.drive.data.models.SyncSettings.SavePicturesDate
@@ -77,6 +78,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.invoke
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Date
 import java.util.TimeZone
 
@@ -138,6 +140,7 @@ class SyncSettingsActivity : BaseActivity() {
         createDatedSubFolders.isChecked = oldCreateDatedSubFoldersValue
         deletePicturesAfterSync.isChecked = oldDeleteAfterSyncValue
         photoTrashSync.isChecked = oldPhotoTrashSyncValue
+        if (oldPhotoTrashSyncValue) displayPhotoTrashPairingStatus()
 
         observeAllUsers()
         observeCustomDate()
@@ -440,6 +443,28 @@ class SyncSettingsActivity : BaseActivity() {
         trackPhotoSyncEvent(dateName)
     }
 
+    /**
+     * Minimal status surface for the pairing states the maintenance passes record: when any
+     * pairing needs attention, the existing photo-trash item's description carries the
+     * counts (item-6). Strings are local to this app — the Loco mirroring obligation for
+     * user-facing strings is tracked in the handoff notes, no external Loco write.
+     */
+    private fun displayPhotoTrashPairingStatus() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val pairings = runCatching { PhotoTrashController.getPairings() }.getOrDefault(emptyList())
+            val conflicts = pairings.count {
+                it.state == PhotoPairing.State.CONFLICT_LOCAL_CHANGED.name || it.state == PhotoPairing.State.CONFLICT_REMOTE_CHANGED.name
+            }
+            val inconclusive = pairings.count { it.state == PhotoPairing.State.INCONCLUSIVE.name }
+            val denied = pairings.count { it.state == PhotoPairing.State.DENIED.name }
+            if (conflicts + inconclusive + denied > 0) {
+                withContext(Dispatchers.Main) {
+                    binding.photoTrashSync.description = getString(R.string.photoTrashSyncStatus, conflicts, inconclusive, denied)
+                }
+            }
+        }
+    }
+
     private fun saveSettings() = with(binding) {
         saveButton.showProgressCatching()
 
@@ -456,16 +481,18 @@ class SyncSettingsActivity : BaseActivity() {
                         if (oldSyncSettings?.photoTrashSyncEnabled == true && !syncSettings.photoTrashSyncEnabled) {
                             PhotoTrashController.removeAllPairings()
                         }
+                        // Activation point: the opt-in baseline for EVERY pairing is captured
+                        // BEFORE the enabled flag is written — a pass only starts once the
+                        // flag is on, so none can race this capture into propagating against
+                        // a stale pairing-time baseline (an item trashed while the option was
+                        // off becomes a visible INCONCLUSIVE at activation, never a new
+                        // post-activation transition). Off the UI thread.
+                        if (oldSyncSettings?.photoTrashSyncEnabled != true && syncSettings.photoTrashSyncEnabled) {
+                            PhotoTrashController.captureActivationBaselines(applicationContext)
+                        }
                         SentryLog.i(TAG, "start update appSettings")
                         UploadFile.setAppSyncSettings(syncSettings)
                         SentryLog.i(TAG, "appSettings updated")
-                        // Activation point for pairings that predate this enable (a previous
-                        // opt-out normally removed them; these are recovery cases): their
-                        // real MediaStore trashed-state is captured NOW, off the UI thread —
-                        // a trash after activation must become a transition, never a baseline.
-                        if (oldSyncSettings?.photoTrashSyncEnabled != true && syncSettings.photoTrashSyncEnabled) {
-                            PhotoTrashController.capturePendingActivationBaselines(applicationContext)
-                        }
                         if (oldSyncSettings?.driveId != syncSettings.driveId) {
                             UploadFile.deleteAllSyncFile()
                             cancelPeriodicSync()

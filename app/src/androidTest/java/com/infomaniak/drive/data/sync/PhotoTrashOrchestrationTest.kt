@@ -201,8 +201,8 @@ class PhotoTrashOrchestrationTest {
             .let { realm.copyFromRealm(it, 0) }
     }
 
-    private fun uploadFile() = UploadFile(
-        uri = pairingUri,
+    private fun uploadFile(uri: String = pairingUri) = UploadFile(
+        uri = uri,
         userId = userId,
         driveId = driveId,
         fileName = "fixture-orch.jpg",
@@ -214,15 +214,13 @@ class PhotoTrashOrchestrationTest {
     @DisplayName("a trash after pairing and before the first pass is a transition, not a baseline")
     fun trashAfterPairingBeforeTheFirstPassPropagates() {
         // Pairing binds the activation baseline and the content digest at the upload moment.
-        realm().use { pairingRealm ->
-            PhotoTrashController.recordPairing(
-                context = mockContext,
-                uploadFile = uploadFile(),
-                remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = pairingHash },
-                uploadedContentDigest = sha256Hex(contentA),
-                customRealm = pairingRealm,
-            )
-        }
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = uploadFile(),
+            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = pairingHash },
+            uploadedContentDigest = sha256Hex(contentA),
+            customRealmConfig = config,
+        )
         val seeded = row()
         assertEquals(false, seeded.baselineTrashed, "the baseline was captured at pairing, not lazily")
         assertEquals(false, seeded.lastObservedTrashed)
@@ -234,7 +232,7 @@ class PhotoTrashOrchestrationTest {
         // The user trashes the photo AFTER pairing and BEFORE the first maintenance pass:
         // content and metadata are unchanged (a MediaStore trash moves no bytes).
         mediaTrashed.set(true)
-        val propagated = runBlocking { realm().use { PhotoTrashController.runLocalReconciliation(mockContext, it) } }
+        val propagated = runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }
 
         assertEquals(1, propagated, "the transition propagated exactly once")
         assertEquals(1L, deleteRequests.get(), "the server trash was called exactly once")
@@ -245,26 +243,103 @@ class PhotoTrashOrchestrationTest {
     }
 
     @Test
-    @DisplayName("a stored DENIED row becomes eligible after a remote restore and re-arms on re-delete")
-    fun deniedRowBecomesEligibleAfterRestoreAndReDelete() {
+    @DisplayName("a stored DENIED row expires on the pass's own restore observation and re-arms on re-delete")
+    fun deniedRowExpiresThroughTheRealCatchUpPathAndReArms() {
         seedPairing(state = PhotoPairing.State.DENIED.name)
 
-        // The denial is respected while the remote stays trashed.
+        // The denial is respected while the remote stays trashed: the pass neither re-asks
+        // nor clears it.
         remoteTrashed.set(true)
-        assertNull(runBlocking { realm().use { PhotoTrashController.onRemoteTrashEvent(mockContext, remoteFileId, driveId, it) } })
+        assertEquals(0, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) })
         assertEquals(PhotoPairing.State.DENIED.name, row().state, "the denial stands")
 
-        // The remote restore EXPIRES the denial: the row is eligible again.
+        // The remote restore has NO MQTT event (the app only ever receives FILE_TRASH): the
+        // EXPIRY happens on the pass's own observation that the remote is no longer trashed.
         remoteTrashed.set(false)
-        assertNull(runBlocking { realm().use { PhotoTrashController.onRemoteTrashEvent(mockContext, remoteFileId, driveId, it) } })
-        assertEquals(PhotoPairing.State.ACTIVE.name, row().state, "ClearPending expired the stored denial")
+        assertEquals(0, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) })
+        assertEquals(PhotoPairing.State.ACTIVE.name, row().state, "the pass expired the stored denial")
         assertEquals(0L, row().remoteTrashPendingSince)
 
-        // A re-delete then arms a FRESH consent.
+        // A re-delete (delivered through the REAL FILE_TRASH event path) arms a FRESH consent.
         remoteTrashed.set(true)
-        val armed = runBlocking { realm().use { PhotoTrashController.onRemoteTrashEvent(mockContext, remoteFileId, driveId, it) } }
+        val armed = runBlocking { PhotoTrashController.onRemoteTrashEvent(mockContext, remoteFileId, driveId, config) }
         assertNotNull(armed, "the re-delete arms a consent again")
         assertTrue(row().remoteTrashPendingSince > 0L)
+    }
+
+    @Test
+    @DisplayName("a pairing binds through validated server-to-source evidence, never an unconditional sample")
+    fun pairingBindsThroughValidatedServerToSourceEvidence() {
+        // Chunked upload (no stream digest): the created file's server hash is over the
+        // bytes the server assembled; a matching local read binds the source.
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = uploadFile(),
+            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = sha256Hex(contentA) },
+            uploadedContentDigest = null,
+            customRealmConfig = config,
+        )
+        assertEquals(sha256Hex(contentA), row().localContentDigest, "the matching local read binds the server-to-source identity")
+        assertEquals(sha256Hex(contentA), row().remoteContentHash)
+
+        // A same-metadata URI replacement BEFORE pairing: the fresh local read no longer
+        // matches the server hash — unknown evidence, NEVER a binding (the rejected sample
+        // fallback would have recorded the replacement's digest as the uploaded identity).
+        val replacedUri = "content://fixture/photo-trash-orch-replaced"
+        resolverContent.set(contentB)
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = uploadFile(uri = replacedUri),
+            remoteFile = File(id = remoteFileId, driveId = driveId).apply { serverContentHash = sha256Hex(contentA) },
+            uploadedContentDigest = null,
+            customRealmConfig = config,
+        )
+        assertNull(
+            realm().use { realm ->
+                realm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, replacedUri).findFirst()!!.localContentDigest
+            },
+            "a replaced source records NO digest: unknown preserves",
+        )
+    }
+
+    @Test
+    @DisplayName("an item trashed while the option was off is inconclusive at activation, never a new transition")
+    fun itemTrashedWhileOffIsInconclusiveAtActivation() {
+        // Paired while the option was OFF (recordPairing runs for every sync upload):
+        // baseline captured as not-trashed at pairing time.
+        seedPairing(baselineTrashed = false, lastObservedTrashed = false)
+
+        // The item is trashed while the option is still off; the user then enables the
+        // option: the activation capture re-baselines EVERY row off the REAL MediaStore.
+        mediaTrashed.set(true)
+        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        val activated = row()
+        assertEquals(true, activated.baselineTrashed, "the activation baseline is the real opt-in state")
+        assertEquals(PhotoPairing.State.INCONCLUSIVE.name, activated.state, "a pre-activation trash is visibly inconclusive")
+
+        // The first pass after enabling propagates NOTHING for it.
+        val propagated = runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+        assertEquals(0, propagated, "pre-activation history never becomes a post-activation transition")
+        assertEquals(0L, deleteRequests.get(), "the destructive API was never called")
+        assertEquals(PhotoPairing.State.INCONCLUSIVE.name, row().state)
+    }
+
+    @Test
+    @DisplayName("an option enabled before a trash still propagates it after activation")
+    fun enabledOptionBeforeTrashStillPropagatesAfterActivation() {
+        seedPairing(baselineTrashed = false, lastObservedTrashed = false)
+
+        // Activation re-baseline observes the item NOT trashed: no state change.
+        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        assertEquals(PhotoPairing.State.ACTIVE.name, row().state)
+        assertEquals(false, row().baselineTrashed)
+
+        // A trash AFTER activation is a transition: the first pass propagates it.
+        mediaTrashed.set(true)
+        val propagated = runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+        assertEquals(1, propagated, "a transition after activation propagates exactly once")
+        assertEquals(1L, deleteRequests.get())
+        assertTrue(row().lastLocalTrashReconciledAt > 0L)
     }
 
     @Test
@@ -275,9 +350,7 @@ class PhotoTrashOrchestrationTest {
         val pending = seedPairing(baselineTrashed = null)
         mediaTrashed.set(true)
 
-        val baseline = realm().use { pairingRealm ->
-            PhotoTrashController.captureActivationBaseline(mockContext, pending, pairingRealm)
-        }
+        val baseline = PhotoTrashController.captureActivationBaseline(mockContext, pending, config)
 
         assertTrue(baseline)
         val captured = row()
@@ -293,7 +366,7 @@ class PhotoTrashOrchestrationTest {
         seedPairing(localDigest = null)
         mediaTrashed.set(true)
 
-        val propagated = runBlocking { realm().use { PhotoTrashController.runLocalReconciliation(mockContext, it) } }
+        val propagated = runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }
 
         assertEquals(0, propagated, "unknown evidence preserves: nothing propagated")
         assertEquals(0L, deleteRequests.get(), "the destructive API was never called")
@@ -309,7 +382,7 @@ class PhotoTrashOrchestrationTest {
         mediaTrashed.set(true)
         resolverContent.set(contentB)
 
-        val propagated = runBlocking { realm().use { PhotoTrashController.runLocalReconciliation(mockContext, it) } }
+        val propagated = runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }
 
         assertEquals(0, propagated, "replaced content never gained trash authority")
         assertEquals(0L, deleteRequests.get(), "the destructive API was never called")

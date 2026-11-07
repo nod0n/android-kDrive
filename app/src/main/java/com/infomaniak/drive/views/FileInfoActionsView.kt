@@ -264,7 +264,10 @@ class FileInfoActionsView @JvmOverloads constructor(
 
     /**
      * Marks/unmarks [folder] as a persistent recursive offline root. Downloads ride the
-     * existing bulk worker; updates ride the existing offline sync cadence.
+     * existing bulk worker; updates ride the existing offline sync cadence. When the
+     * operation is refused or completes incompletely, the durable root state is re-read and
+     * the switch resynced to it — the switch never keeps a position the root record does
+     * not hold.
      */
     fun toggleFolderOfflineRoot(folder: File, isChecked: Boolean) {
         CoroutineScope(Dispatchers.IO).launch {
@@ -276,6 +279,9 @@ class FileInfoActionsView @JvmOverloads constructor(
             }
             if (!confirmed) {
                 SentryLog.w(TAG, "Offline folder operation incomplete for root ${folder.id}_${folder.driveId}")
+                CoroutineScope(Dispatchers.Main).launch {
+                    if (currentFile?.id == folder.id) setupFolderOfflineState(folder)
+                }
             }
         }
     }

@@ -575,6 +575,7 @@
     <string name="onBoardingTitle3">Save your memories securely</string>
     <string name="pdfIsLocked">Your PDF is locked</string>
     <string name="photoTrashSyncDescription">When a synced photo is trashed in kDrive or on this phone, the trash is propagated to the other side after confirmation. Trashed photos stay recoverable; nothing is permanently deleted.</string>
+    <string name="photoTrashSyncStatus">Some paired photos need attention: %1$d with detected changes, %2$d uncertain, %3$d declined.</string>
     <string name="photoTrashSyncTitle">Sync photo trash</string>
     <string name="picturesNoFile">No photo at this time</string>
     <plurals name="preparingToUpload">

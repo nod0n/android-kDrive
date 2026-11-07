@@ -169,7 +169,10 @@ class CloudStorageProvider : DocumentsProvider() {
             // While access is blocked, account emails stay undisclosed
             cursor.addRoot(user.id.toString(), user.id.toString(), if (isAccessBlocked) "" else user.email)
 
-            if (!isProviderDisabled()) {
+            // The account/drive refresh obeys the SAME effective access policy as every
+            // other entry point: no network refresh happens while app lock is enabled or
+            // the user disabled the provider — not on the provider-disabled switch alone.
+            if (!isAccessBlocked) {
                 cloudScope.launch {
                     context?.let {
                         val okHttpClient = AccountUtils.getHttpClient(user.id)

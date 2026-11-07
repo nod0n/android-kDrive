@@ -108,9 +108,13 @@ class UploadTask(
     private var createdRemoteFile: File? = null
 
     /**
-     * sha-256 of the bytes this upload actually transferred, captured from the direct-upload
-     * stream (null for chunked/empty uploads — [PhotoTrashController.recordPairing] then takes
-     * a disclosed pairing-time sample instead).
+     * sha-256 of the bytes this upload actually transferred, captured while the upload read
+     * them: the direct-upload stream digest, or the empty-body identity for an empty upload.
+     * Chunked/resumed uploads read PARALLEL per-chunk streams whose digests cannot be
+     * composed into a whole-body identity, so this stays null there — [PhotoTrashController.
+     * recordPairing] then binds the pairing only through equivalent validated
+     * server-to-source evidence (the created file's server hash vs a fresh local read), or
+     * leaves it unbound when the response established no hash.
      */
     private var uploadedContentDigest: String? = null
 
@@ -137,7 +141,12 @@ class UploadTask(
                 engine { preconfigured = uploadFile.okHttpClient }
             }
             when {
-                uploadFile.fileSize == 0L -> createdRemoteFile = ApiRepository.uploadEmptyFile(uploadFile).data
+                uploadFile.fileSize == 0L -> {
+                    createdRemoteFile = ApiRepository.uploadEmptyFile(uploadFile).data
+                    // The transfer provably carried zero bytes: the empty-body identity IS
+                    // the uploaded content identity, known at transfer time.
+                    if (uploadFile.isSync()) uploadedContentDigest = EMPTY_BODY_SHA256
+                }
                 uploadFile.fileSize <= MIN_FILE_SIZE_FOR_CHUNKING -> uploadDirectly(httpClient)
                 else -> uploadInChunks(httpClient)
             }
@@ -176,11 +185,11 @@ class UploadTask(
     private suspend fun uploadDirectly(httpClient: HttpClient) {
         SentryLog.i(TAG, "upload ${uploadFile.uri} directly with ${uploadFile.fileSize}")
         // The digest is computed from the EXACT stream the upload reads — this is the local
-        // content binding for photo trash propagation (direct uploads are the dominant case;
-        // chunked/empty uploads fall back to a pairing-time sample, see recordPairing).
-        val messageDigest = MessageDigest.getInstance("SHA-256")
+        // content binding for photo trash propagation. The digest work is scoped to the
+        // participating sync uploads; unrelated manual uploads read their stream unwrapped.
+        val messageDigest = if (uploadFile.isSync()) MessageDigest.getInstance("SHA-256") else null
         getInputStream().buffered().use { source ->
-            val digestingStream = DigestInputStream(source, messageDigest)
+            val body: InputStream = messageDigest?.let { DigestInputStream(source, it) } ?: source
             val url = ApiRoutes.uploadFileDirectlyUrl(
                 driveId = uploadFile.driveId,
                 directoryId = uploadFile.remoteFolder,
@@ -191,13 +200,21 @@ class UploadTask(
                 createdAt = uploadFile.fileCreatedAt,
                 lastModifiedAt = Date(uploadFile.getLastModified()),
             )
-            uploadChunkUnchecked(digestingStream, httpClient, url = url, length = uploadFile.fileSize)
+            uploadChunkUnchecked(body, httpClient, url = url, length = uploadFile.fileSize)
             // The transfer read the whole body: bind the digest of the uploaded bytes.
-            uploadedContentDigest = messageDigest.digest().joinToString("") { "%02x".format(it) }
+            if (messageDigest != null) {
+                uploadedContentDigest = messageDigest.digest().joinToString("") { "%02x".format(it) }
+            }
         }
     }
 
     private suspend fun uploadInChunks(httpClient: HttpClient) = coroutineScope {
+        // NO whole-body stream digest exists for chunked uploads: chunks upload in PARALLEL
+        // (each opens its own source stream and skips ahead), so per-chunk digests cannot be
+        // composed into one whole-body identity, and a resumed run never re-reads the chunks
+        // a previous process transferred. uploadedContentDigest stays null here; the pairing
+        // binds (or stays unbound) through recordPairing's validated server-to-source
+        // comparison against the finish-session response's hash.
         var uploadedChunks = uploadFile.getValidChunks()
         val chunkConfig = getChunkConfig(uploadedChunks)
         val totalChunks = chunkConfig.totalChunks
@@ -319,8 +336,9 @@ class UploadTask(
         shareProgress(100, true)
         UploadFile.uploadFinished(uri)
         // Photo trash propagation pairs only from an authoritative upload response: bind the
-        // uploaded source to the server file the upload actually created, with the content
-        // digest of the actual transfer (or a pairing-time sample when none was captured).
+        // uploaded source to the server file the upload actually created, with the digest of
+        // the actual transfer when one was captured (null for chunked/resumed uploads —
+        // recordPairing then validates against the response's server hash or stays unbound).
         if (uploadFile.isSync()) {
             PhotoTrashController.recordPairing(context, uploadFile, createdRemoteFile, uploadedContentDigest)
         }
@@ -588,6 +606,10 @@ class UploadTask(
         const val LIMIT_EXCEEDED_ERROR_CODE = "limit_exceeded_error"
 
         private const val MIN_FILE_SIZE_FOR_CHUNKING = 5 * 1024 * 1024 // Mb
+
+        /** sha-256 of zero bytes: the identity of an upload whose transfer carried no body. */
+        private val EMPTY_BODY_SHA256 = MessageDigest.getInstance("SHA-256").digest(ByteArray(0))
+            .joinToString("") { "%02x".format(it) }
 
         enum class ConflictOption {
             @SerializedName("error")

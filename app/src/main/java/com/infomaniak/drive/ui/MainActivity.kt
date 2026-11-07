@@ -171,12 +171,24 @@ class MainActivity : BaseActivity() {
         }
     }
 
-    private var pendingPhotoTrashUri: String? = null
+    /**
+     * The cloud->device consent request currently shown to the user: uri + the pending stamp
+     * it was launched with. One system dialog at a time; the stamp keys the result to the
+     * same request across recreation (a stale or duplicate result is dropped controller-side).
+     */
+    private var pendingPhotoTrashRequest: Pair<String, Long>? = null
+
+    /** True while a drain is polling: keeps concurrent wakes from double-launching a dialog. */
+    private var drainingPhotoTrashConsents = false
+
     private val photoTrashConsentResult = registerForActivityResult(StartIntentSenderForResult()) { result ->
-        val uri = pendingPhotoTrashUri ?: return@registerForActivityResult
-        pendingPhotoTrashUri = null
+        val (uri, stamp) = pendingPhotoTrashRequest ?: return@registerForActivityResult
+        pendingPhotoTrashRequest = null
         val granted = result.resultCode == RESULT_OK
-        lifecycleScope.launch(Dispatchers.IO) { PhotoTrashController.onRemoteTrashConsentResult(uri, granted) }
+        lifecycleScope.launch(Dispatchers.IO) {
+            PhotoTrashController.onRemoteTrashConsentResult(uri, granted, expectedPendingSince = stamp)
+            drainPhotoTrashConsents()
+        }
     }
 
     private val fileObserver: FileObserver by lazy {
@@ -256,6 +268,9 @@ class MainActivity : BaseActivity() {
         mainViewModel.loadRootFiles()
         myKSuiteViewModel.refreshMyKSuite()
         handleDeletionOfUploadedPhotos()
+        // The durable consent queue is rebuilt on every app entry: armed requests that no
+        // in-memory collector saw (process death, closed app) are revalidated and surfaced.
+        drainPhotoTrashConsents()
         deeplinkHandler.handle(navigationArgs?.deeplinkType, this)
     }
 
@@ -393,8 +408,11 @@ class MainActivity : BaseActivity() {
 
     /**
      * Photo trash propagation (opt-in): a paired file trashed in kDrive asks for Android's
-     * trash consent before anything happens on the device. Pending consents survive process
-     * death in the pairing state and are also (re)armed by the upload pass catch-up.
+     * trash consent before anything happens on the device. The pending row state IS the
+     * durable queue — armed requests survive process death, are revalidated and re-surfaced
+     * on every app entry ([drainPhotoTrashConsents]), and every event path (MQTT, upload-pass
+     * catch-up) only WAKES the same serialized drain, so exactly one revalidated dialog is
+     * ever outstanding.
      */
     private fun observePhotoTrashConsents() {
         MqttClientWrapper.observe(this) { notification ->
@@ -404,31 +422,56 @@ class MainActivity : BaseActivity() {
                 if (driveId != AccountUtils.getCurrentDrive()?.id) return@observe
 
                 lifecycleScope.launch(Dispatchers.IO) {
-                    val pairing = PhotoTrashController.onRemoteTrashEvent(
+                    // Validates and arms (or clears) the pairing; the dialog itself is only
+                    // ever launched through the drain's launch-time revalidation.
+                    PhotoTrashController.onRemoteTrashEvent(
                         context = applicationContext,
                         remoteFileId = fileId ?: return@launch,
                         driveId = driveId,
-                    ) ?: return@launch
-                    withContext(Dispatchers.Main) { requestPhotoTrashConsent(pairing) }
+                    )
+                    drainPhotoTrashConsents()
                 }
             }
         }
 
         lifecycleScope.launch {
-            PhotoTrashController.pendingConsents.collect { pairing ->
-                requestPhotoTrashConsent(pairing)
+            PhotoTrashController.pendingConsents.collect { _ ->
+                drainPhotoTrashConsents()
+            }
+        }
+    }
+
+    /**
+     * Serialized consent drain: polls the durable pending queue for the next STILL-valid
+     * request (fully revalidated at launch: opt-in, fresh remote trash with unchanged bound
+     * identity, unchanged local digest) and shows its system dialog. The Android approval
+     * applies the trash itself at the moment the user approves — no app pre-apply callback
+     * exists, so these launch-time checks are the last app-controlled gate (the residual
+     * same-metadata window is disclosed in the controller, not closable).
+     */
+    private fun drainPhotoTrashConsents() {
+        if (pendingPhotoTrashRequest != null || drainingPhotoTrashConsents) return
+        drainingPhotoTrashConsents = true
+        lifecycleScope.launch(Dispatchers.IO) {
+            val next = runCatching { PhotoTrashController.pollNextPendingConsent(applicationContext) }
+                .onFailure { exception -> SentryLog.e("PhotoTrash", "consent drain failed", exception) }
+                .getOrNull()
+            withContext(Dispatchers.Main) {
+                drainingPhotoTrashConsents = false
+                next?.let { requestPhotoTrashConsent(it) }
             }
         }
     }
 
     private fun requestPhotoTrashConsent(pairing: PhotoPairing) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-        pendingPhotoTrashUri = pairing.uri
+        if (pendingPhotoTrashRequest != null) return
+        pendingPhotoTrashRequest = pairing.uri to pairing.remoteTrashPendingSince
         runCatching {
             val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(pairing.uri.toUri()), true)
             photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
         }.onFailure { exception ->
-            pendingPhotoTrashUri = null
+            pendingPhotoTrashRequest = null
             SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
         }
     }
