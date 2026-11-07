@@ -37,9 +37,12 @@ import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import java.util.Date
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -74,12 +77,13 @@ import java.util.concurrent.atomic.AtomicReference
  * SCOPE HONESTY: the launch sections here are helper-driven (the controller's
  * tryBeginLaunchSection/capture/gate plus the REAL settings seam) — they do NOT exercise
  * MainActivity's ActivityResult/lifecycle wiring or any system dialog; that wiring remains a
- * declared device case. The in-transaction ROLLBACK injection (a failure after the mutation
- * inside the open transaction) needs intercepting Realm's own transaction frame, which the
- * device evidence forbids; it stays covered by the JVM suite, and this suite proves the
- * post-commit publication-failure variant of the same abandoned-write rule. Fully disposable
- * and account-free: random fixture files in the instrumentation target's cacheDir, synthetic
- * rows only — NO owner data, NO account, NO network.
+ * declared device case. The in-transaction ROLLBACK is exercised for REAL through a
+ * supported, narrow seam: the generated SyncSettings marshal writes its primitive columns
+ * BEFORE calling lastSync.getTime(), so an ordinary Date subclass faulting there lands
+ * INSIDE the production executeTransaction after real column writes — no Realm spying and
+ * no production hook. Fully disposable and account-free: random fixture files in the
+ * instrumentation target's cacheDir, synthetic rows only — NO owner data, NO account, NO
+ * network.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class PhotoTrashActivationSeamTest {
@@ -370,6 +374,85 @@ class PhotoTrashActivationSeamTest {
         assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn)
         assertTrue(
             PhotoTrashController.captureLaunchWitness("content://fixture/seam-failure").activationSettled,
+            "a certified read rebuilt the authority",
+        )
+    }
+
+    @Test
+    @DisplayName("a real marshal fault AFTER in-transaction column writes rolls back, settles, and recovers by certified read")
+    fun realRollbackAfterInTransactionWritesSettlesAndRecovers() {
+        val config = freshConfig()
+        seedSettings(config, userId = 983, driveId = 773, enabled = true)
+        UploadFile.getAppSyncSettings(config) // warm/publish the enabled state through the real getter
+        val warmed = PhotoTrashController.currentActivationSnapshot
+        assertNotNull(warmed)
+        val seededRow = committedRow(config, userId = 983)
+
+        // THE NARROW SUPPORTED SEAM (no Realm spying, no production hook): the generated
+        // SyncSettings marshal writes createDatedSubFolders then driveId BEFORE marshalling
+        // lastSync via getTime() — so this ordinary Date subclass faults INSIDE the
+        // production executeTransaction after REAL column writes. Its read of the writer's
+        // own in-transaction state is the positive evidence that a real mutation was in
+        // flight when the transaction cancelled.
+        val inTransactionDriveId = AtomicInteger(Int.MIN_VALUE)
+        val inTransactionStillEnabled = AtomicBoolean(false)
+        class FaultingDate : Date() {
+            override fun getTime(): Long {
+                val row = Realm.getInstance(config).where(SyncSettings::class.java)
+                    .equalTo(SyncSettings::userId.name, 983).findFirst()
+                inTransactionDriveId.set(row?.driveId ?: Int.MIN_VALUE)
+                inTransactionStillEnabled.set(row?.photoTrashSyncEnabled ?: false)
+                throw IllegalStateException("injected marshal fault after real in-transaction column writes")
+            }
+        }
+        val faultingSettings = SyncSettings(
+            userId = 983,
+            driveId = 773_001, // changed: the in-transaction read must see the NEW value
+            photoTrashSyncEnabled = false,
+        ).apply { lastSync = FaultingDate() }
+
+        val failure = AtomicReference<Throwable?>(null)
+        val writer = writerThread(faultingSettings, config, failure)
+        writer.start()
+        writer.join(15_000)
+        assertFalse(writer.isAlive, "the faulting writer finished")
+        assertTrue(failure.get() is IllegalStateException, "the marshal fault surfaced through the real seam: ${failureText(failure)}")
+        assertEquals(0, PhotoTrashController.activationWritesUnsettled(), "the rolled-back write settled in its finally: nothing stranded")
+
+        // POSITIVE in-transaction evidence: the marshal had already written the NEW driveId
+        // while the row was still the seeded enabled row (photoTrashSyncEnabled is written
+        // AFTER lastSync in the generated order) — a real mutation was in flight inside the
+        // open transaction when the fault landed.
+        assertEquals(773_001, inTransactionDriveId.get(), "the first column write was live inside the transaction")
+        assertTrue(inTransactionStillEnabled.get(), "the not-yet-written column still held the committed value")
+
+        // REAL ROLLBACK: nothing committed — the row is exactly the seeded state.
+        val rolledBack = committedRow(config, userId = 983)
+        assertEquals(773, rolledBack.driveId, "the in-transaction driveId write was rolled back")
+        assertEquals(true, rolledBack.photoTrashSyncEnabled, "the seeded enable survived the rollback")
+        assertEquals(seededRow.photoTrashActivationEpoch, rolledBack.photoTrashActivationEpoch, "the epoch never advanced")
+        assertEquals(seededRow.lastSync.time, rolledBack.lastSync.time, "the faulting timestamp was never written")
+
+        // NOTHING PUBLISHED: the mirror is unchanged, and the begin's revision bump leads it
+        // — the authority is INCOHERENT, the launch gate refuses it until a certified read.
+        assertEquals(warmed, PhotoTrashController.currentActivationSnapshot, "a rollback publishes nothing")
+        assertFalse(
+            PhotoTrashController.captureLaunchWitness("content://fixture/seam-rollback").activationSettled,
+            "the revisions leading the mirror is an incoherent capture",
+        )
+
+        // Certified reads rebuild WITHOUT another write: the getter republishes the committed
+        // (enabled) state and coherence returns.
+        val read = UploadFile.getAppSyncSettings(config)
+        assertNotNull(read)
+        assertEquals(true, read!!.photoTrashSyncEnabled)
+        assertEquals(
+            warmed?.activationEpoch,
+            PhotoTrashController.currentActivationSnapshot?.activationEpoch,
+            "the committed epoch is the published truth",
+        )
+        assertTrue(
+            PhotoTrashController.captureLaunchWitness("content://fixture/seam-rollback").activationSettled,
             "a certified read rebuilt the authority",
         )
     }

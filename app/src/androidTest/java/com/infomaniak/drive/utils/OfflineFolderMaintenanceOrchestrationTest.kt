@@ -618,6 +618,63 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     @Test
+    @DisplayName("a real parent loss during the details refresh keeps a root-published edited copy out of the destructive path")
+    fun parentLossDuringDetailsRefreshPreservesARootPublishedEditedCopy() {
+        // A root-published, locally edited copy (changed mtime, same length). The details
+        // response carries NO parent (the unknown-parent-metadata variant): updateExistingFile
+        // writes the default parentId 0 over the row, so the refresh-time coverage walk ends.
+        // The gate-time coverage capture must keep the copy on the staged preservation path —
+        // runtime-analysis evidence (RESUME-6f85): without it the destructive branch deleted
+        // exactly these edited bytes and streamed a replacement over them.
+        seedCoveredPendingRow()
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()?.apply {
+                    isOffline = true
+                    offlineBasisModifiedAt = 1_700_000_000L
+                    offlineBasisSize = bodyV1.size.toLong()
+                    offlineContentDigest = sha256Hex(bodyV1)
+                    serverContentHash = "hash-1"
+                }
+            }
+        }
+        val offlineFile = getOfflineFixtureFile()
+        offlineFile.parentFile?.mkdirs()
+        offlineFile.writeBytes(editedBody)
+        // The edit's mtime differs from BOTH the basis (1_700_000_000) and the refreshed
+        // remote metadata (1_700_100_000): a stale-looking edited copy the destructive path
+        // would have deleted.
+        check(offlineFile.setLastModified(1_700_050_000L * 1000)) { "the fixture edit must carry its own mtime" }
+        lastAnswerBody.set(bodyV1)
+
+        stubDetails(hash = "hash-2", modifiedAtSec = 1_700_100_000L, size = bodyV1.size.toLong())
+        val manager = coveredManager()
+        val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
+
+        assertTrue(
+            result.toString().contains("Success"),
+            "the preserved copy completes silently (result=$result, bodyRequests=${bodyRequests.get()}, " +
+                "detailsRequests=${detailsRequests.get()}, offlineDir=${offlineFile.parentFile?.list()?.sorted()}, " +
+                "row=${offlineRowDiagnostics()})",
+        )
+        assertEquals(1L, bodyRequests.get(), "the staged path fetched the body once before preserving")
+        assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(editedBody), "the edited bytes were never destroyed")
+        assertEquals(1_700_050_000L, offlineFile.lastModified().div(1000L), "the edit's own mtime is untouched")
+        assertEquals(
+            listOf(offlineFile.name),
+            offlineFile.parentFile?.list()?.sorted(),
+            "no staging leftover remains next to the preserved copy",
+        )
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertEquals(0, row.parentId, "the refresh really clobbered the parent: the gate capture is what preserved the copy")
+            assertEquals("hash-1", row.serverContentHash, "a preserved copy records nothing: the accepted identity stands")
+            assertEquals(sha256Hex(bodyV1), row.offlineContentDigest, "the recorded basis is intact")
+            assertEquals(1_700_000_000L, row.offlineBasisModifiedAt, "the basis metadata is intact")
+        }
+    }
+
+    @Test
     @DisplayName("a withdrawal after the LAST pre-publication read publishes nothing and preserves a late local edit")
     fun withdrawalAtPublicationPreservesTheUnmarkPostconditionAndALateLocalEdit() {
         // Published covered copy, intact. The server moved on (new hash, unchanged
