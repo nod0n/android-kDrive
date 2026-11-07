@@ -2867,6 +2867,249 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     @Test
+    @DisplayName("a remote eviction preserves the root cohort's bytes, claim and row; the never-root and explicit-default cohorts keep their baselines")
+    fun remoteEvictionPreservesTheRootCohortAndKeepsTheOtherBaselines() {
+        // FHNW-33dd item 2: the provider's remote FILE_DELETE/FILE_TRASH route, the
+        // actionFile-null upsert eviction and the shares replacement all funnel into
+        // removeFile — the former helper ran deleteCaches (which deletes the OFFLINE
+        // path for any isOffline row) BEFORE its row hold, so an already root-owned
+        // offline copy lost its bytes without any concurrency. The guarded
+        // remote-eviction cohort preserves the root claim cohort (bytes + provenance:
+        // the root contract's complete-traversal releases own them); the never-root and
+        // explicit-default cohorts keep today's semantics.
+        seedCoveredPendingRow()
+        publishSeededRow(hash = "hash-v1")
+        val offlineFile = getOfflineFixtureFile()
+
+        // THE REMOTE COHORT: a root-owned published copy survives the eviction whole.
+        FileController.removeFile(fileId, recursive = false, remoteEviction = true)
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(row.offlineOwnedByRoot, "the claim stands: the root contract owns the lifecycle")
+            assertTrue(row.isOffline, "the offline intent stands")
+            assertEquals(sha256Hex(bodyV1), row.offlineContentDigest, "the basis evidence stands")
+        }
+        assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(bodyV1), "the accepted bytes were not deleted by the remote eviction")
+
+        // THE NEVER-ROOT CONTROL: a plain offline row (no claim, no root coverage) is
+        // evicted exactly as before — bytes and row.
+        val plainRowId = 900_402
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.createObject(File::class.java, "${plainRowId}_${userDrive.driveId}").apply {
+                    id = plainRowId
+                    driveId = userDrive.driveId
+                    name = "fixture-plain.bin"
+                    path = "Private/fixture-plain.bin"
+                    type = "file"
+                    isOffline = true
+                    isFromUploads = false
+                }
+            }
+        }
+        val plainOfflineFile = JavaFile(File.getOfflineFolder(context), "${userDrive.userId}/${userDrive.driveId}/Private/fixture-plain.bin")
+        plainOfflineFile.parentFile?.mkdirs()
+        plainOfflineFile.writeBytes(bodyV2)
+        FileController.removeFile(plainRowId, recursive = false, remoteEviction = true)
+        assertNull(
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(File::class.java).equalTo(File::id.name, plainRowId).findFirst()
+            },
+            "the never-root row is evicted as before",
+        )
+        assertFalse(plainOfflineFile.exists(), "the never-root row's offline bytes are evicted as before (the baseline is retained)")
+
+        // THE EXPLICIT-DEFAULT CONTROL: the unguarded cohort (explicit user deletion, the
+        // shared-with-me transplant) keeps today's semantics — the remoteEviction flag did
+        // not silently redefine them.
+        FileController.removeFile(fileId)
+        assertNull(
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()
+            },
+            "the explicit/default cohort still deletes the row",
+        )
+        assertFalse(offlineFile.exists(), "the explicit/default cohort still deletes the offline bytes (pre-existing semantics, unchanged)")
+    }
+
+    @Test
+    @DisplayName("the re-marked pending row's preserved bytes survive the UI cache move: an actively root-covered destination is refused")
+    fun cacheMoveRefusesAnActivelyRootCoveredDestination() {
+        // FHNW-33dd ADDENDUM A4, the concrete route: the maintenance release preserves
+        // the bytes while clearing isOffline/claim/basis; a REAL re-mark re-acquires the
+        // SAME row as pending (isOffline=false) under the STILL-ACTIVE root; the worker's
+        // early return preserves the destination without flipping isOffline; the UI then
+        // sees isOffline=false and its cache move deleted the preserved bytes BEFORE the
+        // pin committed. moveCacheFileToOffline now refuses the destructive replace when
+        // a live root covers the row; the never-root baseline still moves.
+        seedCoveredPendingRow()
+        publishSeededRow(hash = "hash-v1")
+        stubDetails(hash = "hash-v1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+        val offlineFile = getOfflineFixtureFile()
+        mockkObject(DriveInfosController)
+        every { DriveInfosController.getDrives(any(), any(), any(), any()) } answers {
+            arrayListOf(Drive(objectId = "fixture-drive").apply { id = userDrive.driveId })
+        }
+        coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
+            CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = emptyList<File>(), cursor = null, hasMore = false)
+        }
+
+        // Step 1: the maintenance release clears isOffline/claim/basis and KEEPS the bytes.
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertFalse(row.isOffline, "the release cleared the intent")
+            assertFalse(row.offlineOwnedByRoot, "the release cleared the claim")
+        }
+        assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(bodyV1), "the release preserved the bytes")
+
+        // Step 2: the REAL re-mark re-acquires the SAME row as pending, bytes untouched.
+        runBlocking { OfflineFolderSyncUtils.markFolderOffline(context, folderRow(coveredFolderId), userDrive) }
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(row.isMarkedAsOffline, "the re-marked row is pending")
+            assertFalse(row.isOffline, "with isOffline=false — the A4 route's premise")
+            assertTrue(row.offlineOwnedByRoot, "the claim is re-acquired under the active root")
+        }
+        assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(bodyV1), "the re-mark left the existing bytes untouched")
+
+        // Step 3: the UI cache move with an intact cache copy — refused for the covered
+        // row; the bytes stand and no state is flipped.
+        val uiFile = File(id = fileId, driveId = userDrive.driveId).apply {
+            initUid()
+            name = "fixture-orch.bin"
+            path = "Private/fixture-orch.bin"
+            type = "file"
+            lastModifiedAt = 1_700_000_000L
+        }
+        val cacheFile = uiFile.getCacheFile(context)
+        cacheFile.parentFile?.mkdirs()
+        cacheFile.writeBytes(bodyV2)
+        assertFalse(
+            Utils.moveCacheFileToOffline(file = uiFile, cacheFile = cacheFile, offlineFile = offlineFile),
+            "the actively root-covered destination was refused before the pin commit",
+        )
+        assertTrue(offlineFile.readBytes().contentEquals(bodyV1), "the preserved bytes were NOT deleted by the cache move")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(row.isMarkedAsOffline && row.offlineOwnedByRoot, "the row's pending state under the active root stands")
+            assertFalse(row.isOffline, "isOffline was not flipped (the worker early-return discipline)")
+        }
+
+        // Step 4: the never-root baseline — a row outside every root still moves.
+        val plainRowId = 900_402
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.createObject(File::class.java, "${plainRowId}_${userDrive.driveId}").apply {
+                    id = plainRowId
+                    driveId = userDrive.driveId
+                    name = "fixture-plain.bin"
+                    path = "Private/fixture-plain.bin"
+                    type = "file"
+                    isOffline = true
+                    isFromUploads = false
+                }
+            }
+        }
+        val plainOfflineFile = JavaFile(File.getOfflineFolder(context), "${userDrive.userId}/${userDrive.driveId}/Private/fixture-plain.bin")
+        plainOfflineFile.parentFile?.mkdirs()
+        plainOfflineFile.writeBytes(bodyV1)
+        val plainUiFile = File(id = plainRowId, driveId = userDrive.driveId).apply {
+            initUid()
+            name = "fixture-plain.bin"
+            path = "Private/fixture-plain.bin"
+            type = "file"
+            lastModifiedAt = 1_700_000_050L
+        }
+        val plainCacheFile = plainUiFile.getCacheFile(context)
+        plainCacheFile.parentFile?.mkdirs()
+        plainCacheFile.writeBytes(bodyV2)
+        assertTrue(
+            Utils.moveCacheFileToOffline(file = plainUiFile, cacheFile = plainCacheFile, offlineFile = plainOfflineFile),
+            "a row outside every root keeps the unconditional baseline move",
+        )
+        assertTrue(plainOfflineFile.readBytes().contentEquals(bodyV2), "the baseline move replaced the never-root destination as before")
+        assertFalse(plainCacheFile.exists(), "the baseline move consumed the cache copy as before")
+    }
+
+    @Test
+    @DisplayName("the worker's pre-transfer cleanup is coordinated: the never-root baseline re-downloads, an acquisition mid-refresh preserves")
+    fun workerPreTransferCleanupIsCoordinatedWithFreshAuthorization() {
+        // FHNW-33dd item 4: the worker's destructive cleanup sat after guards read
+        // OUTSIDE any hold. Baseline control: a never-root stale copy is cleaned and
+        // re-downloaded as before. Acquisition route: a REAL markFolderOffline landing
+        // inside the details refresh is caught by the coverage re-read (the coordinated
+        // hold at the cleanup backstops the residual window) — the destination bytes are
+        // preserved and nothing transfers.
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_000L, hash = "hash-v1")
+        val offlineFile = getOfflineFixtureFile()
+        // Detach the destination from the basis (a different-length occupant) so the
+        // intact branches skip and the destructive cleanup is the next step.
+        offlineFile.writeBytes(bodyV1 + 0x00)
+
+        lastAnswerBody.set(bodyV2)
+        mockkObject(DriveInfosController)
+        every { DriveInfosController.getDrives(any(), any(), any(), any()) } answers {
+            arrayListOf(Drive(objectId = "fixture-drive").apply { id = userDrive.driveId })
+        }
+        stubDetails(hash = "hash-2", modifiedAtSec = 1_700_000_100L, size = bodyV2.size.toLong())
+
+        // BASELINE CONTROL: no root — the cleanup + transfer run as before.
+        runBlocking {
+            coveredManager().execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> }
+        }
+        assertTrue(bodyRequests.get() >= 1, "the never-root baseline re-downloaded")
+        assertTrue(offlineFile.readBytes().contentEquals(bodyV2), "the stale destination was cleaned and re-published as before")
+
+        // ACQUISITION ROUTE: the row now sits under a folder row; a REAL root
+        // acquisition runs INSIDE the details refresh — before the coverage re-read.
+        val folderBId = 800_406
+        seedFolderRow(id = folderBId, name = "fixture-root-f", path = "Private/fixture-root-f")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction {
+                realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()?.parentId = folderBId
+            }
+        }
+        val remoteListedRow = File(id = fileId, driveId = userDrive.driveId).apply {
+            initUid()
+            name = "fixture-orch.bin"
+            path = "Private/fixture-root-f/fixture-orch.bin"
+            type = "file"
+            parentId = folderBId
+            lastModifiedAt = 1_700_000_100L
+            size = bodyV2.size.toLong()
+        }
+        val acquired = java.util.concurrent.atomic.AtomicBoolean()
+        coEvery { ApiRepository.getFileDetailsWithHash(any(), any()) } coAnswers {
+            if (acquired.compareAndSet(false, true)) {
+                OfflineFolderSyncUtils.markFolderOffline(context, folderRow(folderBId), userDrive)
+            }
+            detailsPayload("hash-2", 1_700_000_100L, bodyV2.size.toLong())
+        }
+        coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
+            CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = arrayListOf(remoteListedRow), cursor = null, hasMore = false)
+        }
+        bodyRequests.set(0)
+        runBlocking {
+            coveredManager().execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> }
+        }
+        assertEquals(0L, bodyRequests.get(), "nothing transferred: the acquisition was caught before any destructive step")
+        assertTrue(offlineFile.readBytes().contentEquals(bodyV2), "the destination bytes were preserved across the acquisition")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(row.offlineOwnedByRoot, "the acquisition's claim stands")
+            assertTrue(row.isOffline, "the already-offline copy keeps its state (the walk does not re-mark it)")
+        }
+        assertEquals(
+            1L,
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(OfflineFolderRoot::class.java).count()
+            },
+            "the acquisition registered the root",
+        )
+    }
+
+    @Test
     @DisplayName("an inconclusive missing-root answer defers the release; the definitive answer converges on the subsequent passes")
     fun inconclusiveMissingRootDoesNotFreezeTheCompletedRootsRemoteDeleteRelease() {
         // FHNW-1189 A3 + RESUME-962c item 5 (FHNW-962c P2-5): an inconclusive answer keeps
