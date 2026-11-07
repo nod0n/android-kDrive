@@ -508,7 +508,9 @@ class MainActivity : BaseActivity() {
      * Launches the system trash-consent dialog for a surfaced [request]: first the
      * launch-time revalidation on IO (the poll returned it earlier; opt-in/scope/pending
      * identity must still match the LIVE row immediately before the launch), then the FINAL
-     * Main-side gates — current account, STARTED lifecycle, and the fresh opt-in mirror —
+     * Main-side gates — current account, STARTED lifecycle, and the activation mirror checked
+     * for freshness against the COMMIT watermark (a settings write that committed after the
+     * IO verdict refuses the still-stale mirror here, with no realm open on Main) —
      * evaluated synchronously in this same Main block. That closes the application-side
      * window between the IO verdict and this queued continuation (a change landing there is
      * caught HERE, without any realm open on Main); the platform's own approval-time
@@ -536,6 +538,7 @@ class MainActivity : BaseActivity() {
                         request = request,
                         currentUserId = AccountUtils.currentUserId,
                         activationSnapshot = PhotoTrashController.currentActivationSnapshot,
+                        activationWatermark = PhotoTrashController.activationCommitWatermark(),
                         bindingGenerationCurrent = PhotoTrashController.bindingGeneration(request.uri),
                         lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
                     )

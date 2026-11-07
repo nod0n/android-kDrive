@@ -115,6 +115,14 @@ class PhotoTrashConsentUiQueue {
          *    closed, and an EPOCH different from the request's invalidates the request —
          *    an activation cycle that landed after the IO validation is caught here even
          *    when it ended at identical Boolean values;
+         *  - FRESHNESS: [activationWatermark] is the activation authority's COMMIT watermark
+         *    ([PhotoTrashController.activationCommitWatermark]) — a snapshot OLDER than the
+         *    latest commit fails closed. Between a settings write's commit and its publish
+         *    the mirror still holds the previous committed state; comparing freshness
+         *    against the revision COUNTER instead would pass in exactly that window (the
+         *    counter is bumped inside the transaction, before the commit), so the watermark
+         *    is the only sound reference. Refusing here never erases anything: the durable
+         *    row stays armed and the next drain re-surfaces the request;
          *  - [bindingGenerationCurrent] is the process-local revision of the request uri's
          *    binding: a pairing replacement that landed after the IO validation (a NEW
          *    binding even at identical metadata) is caught here;
@@ -128,6 +136,7 @@ class PhotoTrashConsentUiQueue {
             request: PhotoTrashController.ConsentRequest,
             currentUserId: Int,
             activationSnapshot: PhotoTrashController.ActivationSnapshot?,
+            activationWatermark: Long,
             bindingGenerationCurrent: Long,
             lifecycleStarted: Boolean,
         ): Boolean = lifecycleStarted &&
@@ -136,6 +145,9 @@ class PhotoTrashConsentUiQueue {
             activationSnapshot.userId == currentUserId &&
             activationSnapshot.optIn &&
             activationSnapshot.activationEpoch == request.activationEpoch &&
+            // The mirror is valid only at the latest commit (published revision <= commit
+            // watermark always holds, so this is an equality in practice; >= is defensive).
+            activationSnapshot.revision >= activationWatermark &&
             bindingGenerationCurrent == request.bindingGeneration
     }
 }

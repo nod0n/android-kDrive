@@ -446,6 +446,10 @@ open class UploadFile(
                     it.where(SyncSettings::class.java).findFirst()?.deleteFromRealm()
                 }
             }
+            // The commit leads its publish: the watermark lets consumers refuse the mirror
+            // from the commit instant until this publish lands (or a certified read
+            // republishes the committed state).
+            PhotoTrashController.noteActivationCommitted(writeRevision)
             // A write seam: the deletion is authoritative fail-closed evidence (absence of
             // the opt-in), published at its commit-assigned revision.
             PhotoTrashController.noteActivationWritten(
@@ -477,13 +481,15 @@ open class UploadFile(
                     }
                     syncSettings.photoTrashActivationEpoch = activationEpoch
                     // Commit-ordered revision: assigned with the write, so writers publish
-                    // in commit order and readers that started after this commit outrank
-                    // the still-pending publish.
+                    // in commit order.
                     writeRevision = PhotoTrashController.assignActivationRevision()
                     mutableRealm.insertOrUpdate(syncSettings)
                 }
             }
             customRealm?.let(block) ?: getRealmInstance().use(block)
+            // The commit leads its publish (see removeAppSyncSettings): consumers refuse a
+            // stale mirror from the commit instant until the publish below lands.
+            PhotoTrashController.noteActivationCommitted(writeRevision)
             // The single settings write seam refreshes the Main-readable activation
             // authority under its commit-assigned revision.
             PhotoTrashController.noteActivationWritten(
@@ -495,30 +501,39 @@ open class UploadFile(
         }
 
         fun getAppSyncSettings(): SyncSettings? {
-            // The reader captures the mirror revision BEFORE it opens the realm: a write
-            // landing during the read increments it, so this snapshot's older revision is
-            // rejected and a stale observation can never overwrite newer authoritative
-            // state (see PhotoTrashController.ActivationSnapshot).
-            val readPermit = PhotoTrashController.activationReadPermit()
+            // A reader publishes an observation ONLY from a CERTIFIED read slot: the slot
+            // begins BEFORE the realm opens (null while a write is assigned-but-uncommitted
+            // — the row about to be read may predate that write) and is certified only if
+            // neither the counter nor the commit watermark moved during the read. An
+            // uncertified read still RETURNS the row it read (the caller's decision
+            // evidence); it only skips the mirror publication, so a pre-commit row can
+            // never be published at its writer's own revision and block that writer's real
+            // publish (see PhotoTrashController's revision protocol).
+            val readPermit = PhotoTrashController.beginActivationRead()
+            val certifiedPermit = readPermit?.takeIf { PhotoTrashController.isActivationReadCertified(it) }
             return getRealmInstance().use { realm ->
                 val realmObject = realm.where(SyncSettings::class.java).findFirst()
                 if (realmObject == null) {
                     // A missing row is authoritative fail-closed evidence: absence never
                     // preserves another observation's enabled state.
-                    PhotoTrashController.noteActivationObserved(
-                        permit = readPermit,
-                        userId = AccountUtils.currentUserId,
-                        activationEpoch = 0L,
-                        optIn = false,
-                    )
+                    certifiedPermit?.let { certified ->
+                        PhotoTrashController.noteActivationObserved(
+                            permit = certified,
+                            userId = AccountUtils.currentUserId,
+                            activationEpoch = 0L,
+                            optIn = false,
+                        )
+                    }
                     null
                 } else {
-                    PhotoTrashController.noteActivationObserved(
-                        permit = readPermit,
-                        userId = realmObject.userId,
-                        activationEpoch = realmObject.photoTrashActivationEpoch,
-                        optIn = realmObject.photoTrashSyncEnabled,
-                    )
+                    certifiedPermit?.let { certified ->
+                        PhotoTrashController.noteActivationObserved(
+                            permit = certified,
+                            userId = realmObject.userId,
+                            activationEpoch = realmObject.photoTrashActivationEpoch,
+                            optIn = realmObject.photoTrashSyncEnabled,
+                        )
+                    }
                     realm.copyFromRealm(realmObject, 0)
                 }
             }
