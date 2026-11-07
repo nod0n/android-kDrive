@@ -44,6 +44,7 @@ import com.infomaniak.drive.data.models.file.SpecialFolder.Favorites
 import com.infomaniak.drive.ui.fileList.FileListFragment.FolderFilesResult
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.FileId
+import com.infomaniak.drive.utils.OfflineCommitAuthority
 import com.infomaniak.drive.utils.Position
 import com.infomaniak.drive.utils.Utils
 import io.realm.Realm
@@ -268,10 +269,15 @@ class FileListViewModel(application: Application) : AndroidViewModel(application
 
             viewModelScope.launch(Dispatchers.IO + checkOfflineFilesJob) {
                 FileController.getRealmInstance().use {
-                    it.executeTransaction { realm ->
-                        files.filterNot { file -> file.isFolder() }.forEach { file ->
-                            if (!file.isOffline && file.getOfflineFile(context)?.exists() == true && isActive) {
-                                FileController.getFileProxyById(file.id, customRealm = realm)?.isOffline = true
+                    // Coordinated writer (offline intent adoption for locally-present
+                    // copies): joins the commit authority so it cannot resurrect intent
+                    // inside a withdrawal's hold.
+                    OfflineCommitAuthority.withCommitAuthority {
+                        it.executeTransaction { realm ->
+                            files.filterNot { file -> file.isFolder() }.forEach { file ->
+                                if (!file.isOffline && file.getOfflineFile(context)?.exists() == true && isActive) {
+                                    FileController.getFileProxyById(file.id, customRealm = realm)?.isOffline = true
+                                }
                             }
                         }
                     }

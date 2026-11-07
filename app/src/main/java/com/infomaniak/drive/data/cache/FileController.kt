@@ -44,6 +44,7 @@ import com.infomaniak.drive.data.models.file.SpecialFolder.RecentChanges
 import com.infomaniak.drive.data.models.file.SpecialFolder.SharedWithMe
 import com.infomaniak.drive.data.services.MqttClientWrapper
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.OfflineCommitAuthority
 import com.infomaniak.drive.utils.RealmModules
 import com.infomaniak.drive.utils.Utils.ROOT_ID
 import io.realm.Realm
@@ -255,8 +256,12 @@ object FileController {
 
     fun markFilesAsOffline(customRealm: Realm? = null, filesId: List<Int>, isMarkedAsOffline: Boolean) {
         val block: (Realm) -> Unit? = { realm ->
-            realm.executeTransaction {
-                filesId.forEach { fileId -> markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline) }
+            // Coordinated writer (pending-marker intent): joins the commit authority so the
+            // write cannot commit inside a publication/withdrawal hold.
+            OfflineCommitAuthority.withCommitAuthority {
+                realm.executeTransaction {
+                    filesId.forEach { fileId -> markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline) }
+                }
             }
         }
 
@@ -265,8 +270,10 @@ object FileController {
 
     fun markFileAsOffline(customRealm: Realm? = null, fileId: Int, isMarkedAsOffline: Boolean) {
         val block: (Realm) -> Unit? = { realm ->
-            realm.executeTransaction {
-                markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline)
+            OfflineCommitAuthority.withCommitAuthority {
+                realm.executeTransaction {
+                    markFileAsOfflineQuery(realm, fileId, isMarkedAsOffline)
+                }
             }
         }
         customRealm?.let(block) ?: getRealmInstance().use(block)
@@ -276,13 +283,20 @@ object FileController {
      * Records INDEPENDENT pin intent (the user pinned this file itself, as opposed to a copy
      * covered by an offline folder root): set by the direct-pin actions, cleared by the direct
      * unpin. Root walks never write it.
+     *
+     * Coordinated writer (R4's pin): joins the commit authority so a pin can neither commit
+     * inside a withdrawal's hold (its copy would be deleted behind the pin's own contract)
+     * nor inside a publication's hold (the publication observes the completed pin, or — when
+     * the pin commits first — the fresh in-hold reads decline before any filesystem effect).
      */
     fun setDirectlyPinned(customRealm: Realm? = null, fileId: Int, isDirectlyPinned: Boolean) {
         val block: (Realm) -> Unit? = { realm ->
-            realm.executeTransaction {
-                realm.where(File::class.java)
-                    .equalTo(File::id.name, fileId)
-                    .findFirst()?.isDirectlyPinned = isDirectlyPinned
+            OfflineCommitAuthority.withCommitAuthority {
+                realm.executeTransaction {
+                    realm.where(File::class.java)
+                        .equalTo(File::id.name, fileId)
+                        .findFirst()?.isDirectlyPinned = isDirectlyPinned
+                }
             }
         }
         customRealm?.let(block) ?: getRealmInstance().use(block)
@@ -305,7 +319,11 @@ object FileController {
                 }
                 runCatching {
                     if (!keepFileCaches.contains(fileId)) file.deleteCaches(Realm.getApplicationContext()!!)
-                    if (!keepFiles.contains(fileId)) realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                    // Coordinated writer (row deletion — parent chains and coverage walks
+                    // read these links): joins the commit authority.
+                    if (!keepFiles.contains(fileId)) OfflineCommitAuthority.withCommitAuthority {
+                        realm.executeTransaction { if (file.isValid) file.deleteFromRealm() }
+                    }
                 }.onFailure { exception ->
                     Sentry.captureException(exception) { scope ->
                         scope.setExtra("with custom realm", "${customRealm != null}")
@@ -375,17 +393,21 @@ object FileController {
     ) {
         val block: (Realm) -> Unit? = { currentRealm ->
             fileIds.forEach { fileId ->
-                currentRealm.executeTransaction {
-                    getFileById(currentRealm, fileId)?.let { file ->
-                        file.isOffline = isOffline
-                        if (!isOffline) {
-                            // Withdrawn offline intent must clear EVERY intent signal — a
-                            // surviving pending marker or direct pin would authorize stale
-                            // queued work and resurrect the copy the user just removed. The
-                            // publication basis is deliberately kept: it is evidence for
-                            // preserved-byte decisions, not an intent signal.
-                            file.isMarkedAsOffline = false
-                            file.isDirectlyPinned = false
+                // Coordinated writer (offline intent withdrawal — also clears the pending
+                // marker and the direct pin): joins the commit authority.
+                OfflineCommitAuthority.withCommitAuthority {
+                    currentRealm.executeTransaction {
+                        getFileById(currentRealm, fileId)?.let { file ->
+                            file.isOffline = isOffline
+                            if (!isOffline) {
+                                // Withdrawn offline intent must clear EVERY intent signal — a
+                                // surviving pending marker or direct pin would authorize stale
+                                // queued work and resurrect the copy the user just removed. The
+                                // publication basis is deliberately kept: it is evidence for
+                                // preserved-byte decisions, not an intent signal.
+                                file.isMarkedAsOffline = false
+                                file.isDirectlyPinned = false
+                            }
                         }
                     }
                 }
@@ -398,8 +420,14 @@ object FileController {
         try {
             val block: (Realm) -> Unit? = { currentRealm ->
                 getFileById(currentRealm, fileId)?.let { file ->
-                    currentRealm.executeTransaction {
-                        if (file.isValid) transaction(file)
+                    // Coordinated writer: updateFile's closures mutate tree links, names,
+                    // offline status and other decision predicates (rename/color/favorite/
+                    // share/tree-child callers) — the write joins the commit authority so it
+                    // cannot commit inside a publication or withdrawal hold.
+                    OfflineCommitAuthority.withCommitAuthority {
+                        currentRealm.executeTransaction {
+                            if (file.isValid) transaction(file)
+                        }
                     }
                 }
             }
@@ -413,7 +441,9 @@ object FileController {
     fun upsertActionFile(realm: Realm, folderId: Int, actionFile: File) {
         realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.let { realmFolder ->
             if (!realmFolder.children.contains(actionFile)) {
-                realm.executeTransaction { realmFolder.children.add(actionFile) }
+                OfflineCommitAuthority.withCommitAuthority {
+                    realm.executeTransaction { realmFolder.children.add(actionFile) }
+                }
             } else {
                 updateFileFromActivity(realm, actionFile, realmFolder.id)
             }
@@ -457,17 +487,24 @@ object FileController {
         oldFile: File? = null,
         moreTransaction: (() -> Unit)? = null
     ) {
-        realm.executeTransaction {
-            if (oldFile?.isUsable() == true) newFile.keepOldLocalFilesData(oldFile)
-            moreTransaction?.invoke()
-            it.insertOrUpdate(newFile)
+        // Coordinated writer (the row-refresh lever — details refreshes, listing writes and
+        // activity updates all land here): the row's parent links, offline markers and pin
+        // flag can change, so the write joins the commit authority.
+        OfflineCommitAuthority.withCommitAuthority {
+            realm.executeTransaction {
+                if (oldFile?.isUsable() == true) newFile.keepOldLocalFilesData(oldFile)
+                moreTransaction?.invoke()
+                it.insertOrUpdate(newFile)
+            }
         }
     }
 
     fun addChild(localFolderId: Int, newFile: File, realm: Realm) {
         getFileById(realm, localFolderId)?.let { localFolder ->
             if (!localFolder.children.contains(newFile)) {
-                realm.executeTransaction { runCatching { localFolder.children.add(newFile) } }
+                OfflineCommitAuthority.withCommitAuthority {
+                    realm.executeTransaction { runCatching { localFolder.children.add(newFile) } }
+                }
             }
         }
     }
@@ -514,14 +551,17 @@ object FileController {
         realm: Realm? = null
     ) {
         val block: (Realm) -> Unit = { currentRealm ->
-            currentRealm.executeTransaction { realm ->
-                val newMySharesFolder = if (replaceOldData) {
-                    realm.copyToRealmOrUpdate(folder)
-                } else {
-                    currentRealm.where(File::class.java).equalTo(File::id.name, folder.id).findFirst()
-                        ?: realm.copyToRealmOrUpdate(folder)
+            // Coordinated writer (tree write): joins the commit authority.
+            OfflineCommitAuthority.withCommitAuthority {
+                currentRealm.executeTransaction { realm ->
+                    val newMySharesFolder = if (replaceOldData) {
+                        realm.copyToRealmOrUpdate(folder)
+                    } else {
+                        currentRealm.where(File::class.java).equalTo(File::id.name, folder.id).findFirst()
+                            ?: realm.copyToRealmOrUpdate(folder)
+                    }
+                    newMySharesFolder?.children?.addAll(realm, files)
                 }
-                newMySharesFolder?.children?.addAll(realm, files)
             }
         }
 
@@ -818,7 +858,9 @@ object FileController {
         var newLocalFolderProxy: File? = null
         if (localFolderProxy == null && remoteFolder != null) {
             runCatching {
-                realm.executeTransaction { newLocalFolderProxy = it.copyToRealm(remoteFolder) }
+                OfflineCommitAuthority.withCommitAuthority {
+                    realm.executeTransaction { newLocalFolderProxy = it.copyToRealm(remoteFolder) }
+                }
             }.onFailure { exception ->
                 if (exception is RealmPrimaryKeyConstraintException) {
                     SentryLog.i("FileController", "Exception while adding a folder to Realm", exception)
@@ -827,20 +869,26 @@ object FileController {
                 }
             }
         }
-        realm.executeTransaction {
-            // Restore same children data
-            keepSubFolderChildren(realm, localFolderProxy?.children, remoteFiles)
-            // Save to realm
-            (localFolderProxy ?: newLocalFolderProxy)?.let { folderProxy ->
-                // Remove old children
-                if (isFirstPage) folderProxy.children.clear()
-                // Add children
-                folderProxy.children.addAll(remoteFiles)
-                // Update folder properties
-                folderProxy.isComplete = isCompleteFolder
-                folderProxy.responseAt = apiResponse.responseAt
-                folderProxy.cursor = apiResponse.cursor
-                folderProxy.versionCode = BuildConfig.VERSION_CODE
+        // Coordinated writer (the listing tree update — parent links, row fields and
+        // preserved offline/pin/ownership fields can all change here): joins the commit
+        // authority so a cached tree move can never commit inside a publication or
+        // withdrawal hold.
+        OfflineCommitAuthority.withCommitAuthority {
+            realm.executeTransaction {
+                // Restore same children data
+                keepSubFolderChildren(realm, localFolderProxy?.children, remoteFiles)
+                // Save to realm
+                (localFolderProxy ?: newLocalFolderProxy)?.let { folderProxy ->
+                    // Remove old children
+                    if (isFirstPage) folderProxy.children.clear()
+                    // Add children
+                    folderProxy.children.addAll(remoteFiles)
+                    // Update folder properties
+                    folderProxy.isComplete = isCompleteFolder
+                    folderProxy.responseAt = apiResponse.responseAt
+                    folderProxy.cursor = apiResponse.cursor
+                    folderProxy.versionCode = BuildConfig.VERSION_CODE
+                }
             }
         }
     }
@@ -927,8 +975,10 @@ object FileController {
         getFileProxyById(remoteFile.id, customRealm = realm)?.let { localFile ->
             insertOrUpdateFile(realm, remoteFile, localFile)
         } ?: also {
-            realm.executeTransaction {
-                realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
+            OfflineCommitAuthority.withCommitAuthority {
+                realm.executeTransaction {
+                    realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()?.children?.add(remoteFile)
+                }
             }
         }
     }
@@ -937,8 +987,10 @@ object FileController {
         getRealmInstance(userDrive).use { realm ->
             val localFolder = realm.where(File::class.java).equalTo(File::id.name, parentFolderId).findFirst()
             if (localFolder != null) {
-                realm.executeTransaction {
-                    localFolder.children.add(file)
+                OfflineCommitAuthority.withCommitAuthority {
+                    realm.executeTransaction {
+                        localFolder.children.add(file)
+                    }
                 }
             }
         }

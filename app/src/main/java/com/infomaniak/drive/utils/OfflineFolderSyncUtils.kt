@@ -32,11 +32,10 @@ import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import io.realm.Realm
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.invoke
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File as JavaFile
 import java.security.MessageDigest
@@ -75,42 +74,46 @@ import java.security.MessageDigest
 object OfflineFolderSyncUtils {
 
     /**
-     * The publication critical section: ONE process-local lock ordering every final
-     * live-intent/current-content validation plus publication against every
-     * intent-withdrawal mutation (explicit unmark, direct unpin, remote-delete release).
-     * Without it, an unmark completing between the last live-intent read and the atomic
-     * rename could still be followed by bytes being re-published at the final path.
+     * The publication critical section shim: dispatches to IO and runs [block] inside the
+     * process-local commit authority ([OfflineCommitAuthority]) that orders the final
+     * live-intent/current-content validation plus publication against EVERY coordinated
+     * predicate mutation — the intent-withdrawal mutations (explicit unmark, direct unpin,
+     * remote-delete release) AND the tree/pin/intent writers (cached parent-chain updates,
+     * row refreshes and deletions, pin changes, registry changes) that previously bypassed
+     * the coordination. Without the exclusion, a writer committing between the section's
+     * last fresh read and the atomic rename could still invalidate the decision the rename
+     * was about to execute.
      *
-     * The NETWORK TRANSFER stays outside the critical section — only the narrow
-     * check-to-publish interval (final intent read, timestamp, rename, basis record) and
-     * the equally narrow withdrawal mutations are serialized; the sections are local-IO
-     * sized (metadata, digest, one rename, one Realm transaction). All covered callers
-     * participate: [stagedRedownload], [updatePublicationBasis], [recordAcceptedPublication],
-     * [unmarkFolderOffline] and the remote-delete release of [syncOfflineFolderRoots], plus
-     * the unmark entry points in MainViewModel. A pending-marker clear that keeps
-     * [File.isOffline] (bulk download completion) does NOT withdraw persistent intent and
-     * needs no participation.
+     * The block is a PLAIN (non-suspending) function: the authority is thread-owned and no
+     * hold may span a suspension. The NETWORK TRANSFER and every whole-file digest stay
+     * outside the critical section — the hold is local-IO sized (metadata, stat, one
+     * rename/one checked deletion, one Realm transaction). All covered callers participate:
+     * [stagedRedownload], [updatePublicationBasis], [recordAcceptedPublication],
+     * [unmarkFolderOffline], the maintenance pass's union discharge of [syncOfflineFolderRoots]
+     * and the cache-move publication seam in DownloadOfflineFileManager, plus the unmark
+     * entry points in MainViewModel. A pending-marker clear that keeps [File.isOffline]
+     * (bulk download completion) participates anyway (it is a coordinated writer) although
+     * it does not withdraw persistent intent.
      *
      * REAL LIMITS (documented, not claimed away): this orders MUTATIONS inside one process
      * — the filesystem and Realm are NOT one atomic resource, and a crash mid-section can
      * still leave renamed bytes whose basis write never happened (such bytes classify as
-     * UNKNOWN and are preserved by every later decision) or vice versa. EXTERNAL writers
-     * that do not participate (other processes, adb, unsynchronized code paths that bypass
-     * the covered entry points) are outside any in-process mutex's reach: a non-covered
-     * byte edit between the in-section evidence reads and the rename remains a disclosed
-     * platform-level window, and power loss is outside any app-side lock.
+     * UNKNOWN and are preserved by every later decision) or vice versa. Writers OUTSIDE the
+     * process (other apps editing the offline bytes, adb, other processes) do not
+     * participate — exactly as they never participated in any in-process lock; a
+     * non-participating byte edit between the in-hold evidence reads and the effect remains
+     * a disclosed platform-level window, and power loss is outside any app-side lock.
      */
-    private val publicationLock = Mutex()
-
-    /** Runs [block] inside the publication critical section (see class-level kDoc). */
-    internal suspend fun <T> withPublicationLock(block: suspend () -> T): T = publicationLock.withLock { block() }
+    internal suspend fun <T> withPublicationLock(block: () -> T): T = withContext(Dispatchers.IO) {
+        OfflineCommitAuthority.withCommitAuthority(block)
+    }
 
     /**
      * Test seam: invoked at the narrow publication point of [stagedRedownload] — inside the
-     * publication critical section, BEFORE the final live-intent read, so a regression can
-     * withdraw the offline intent (through direct row writes or a concurrent unmark, which
-     * suspends on the same lock) exactly inside the publication window. Production never
-     * sets it.
+     * commit authority's hold, BEFORE the final live-intent read, so a regression can launch
+     * positive-contention probes (a coordinated writer that must block until the section
+     * completes) exactly inside the publication window. The block must not suspend. Production
+     * never sets it.
      */
     @VisibleForTesting
     internal var prePublicationGate: (() -> Unit)? = null
@@ -222,6 +225,15 @@ object OfflineFolderSyncUtils {
 
     enum class PublicationDecision { PRESERVE_EXISTING, ADOPT_METADATA_ONLY, REPLACE_BYTES }
 
+    /**
+     * Pre-hold byte evidence for a local copy: the stat values the digest was computed from
+     * plus the digest itself. A hold re-stats the copy and keeps the evidence authoritative
+     * only while the stat is unchanged (coordinated writers are excluded for the whole hold;
+     * a stat change means a non-participating writer touched the bytes — the evidence is
+     * stale and the copy is preserved, never mutated on stale evidence).
+     */
+    private data class VerifiedLocalCopy(val length: Long, val modifiedSec: Long, val digest: String?)
+
     //endregion
 
     /**
@@ -322,8 +334,13 @@ object OfflineFolderSyncUtils {
     /** Marks a folder (and its whole subtree) as persistently available offline. */
     suspend fun markFolderOffline(context: Context, folder: File, userDrive: UserDrive): Boolean {
         val root = OfflineFolderRoot(folderId = folder.id, driveId = userDrive.driveId, userId = userDrive.userId).apply { initUid() }
-        FileController.getRealmInstance(userDrive).use { realm ->
-            realm.executeTransaction { mutableRealm -> mutableRealm.insertOrUpdate(root) }
+        // The registry mutation is a coordinated writer: it joins the commit authority so a
+        // concurrent unmark of the same root (or a publication's registry reads) serializes
+        // against it.
+        OfflineCommitAuthority.withCommitAuthority {
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.executeTransaction { mutableRealm -> mutableRealm.insertOrUpdate(root) }
+            }
         }
 
         val foldersWithMarkedFiles = mutableListOf<Int>()
@@ -367,99 +384,20 @@ object OfflineFolderSyncUtils {
         var allDeletionsConfirmed = true
         subtreeIds.forEach { fileId ->
             currentCoroutineContext().ensureActive()
-            // The whole per-file withdrawal (classification, digest evidence, checked
-            // deletion, state clear) runs inside the publication critical section: it is
-            // serialized against every publication's final check-to-publish interval, so
-            // neither can interleave into the other's defined order.
-            val keptAgainstRefusal = withPublicationLock {
-                FileController.getRealmInstance(userDrive).use { realm ->
-                val file = FileController.getFileProxyById(fileId, customRealm = realm) ?: return@use false
-                val keepCopy = file.isFolder() || file.isDirectlyPinned || file.id in otherRootSubtreeIds
-                if (keepCopy) return@use false
-
-                val offlineFile = file.getOfflineFile(context, userDrive.userId)
-                val localExists = offlineFile?.exists() == true
-
-                // Classify against the accepted basis BEFORE any destructive step: changed and
-                // unknown bytes belong to the user — release coverage, keep the bytes. Missing
-                // evidence preserves too: an unreadable digest, or an accepted identity that was
-                // never recorded, can never authorize deletion.
-                if (localExists) {
-                    val basis = if (file.offlineBasisModifiedAt > 0L) PublicationBasis(
-                        modifiedAt = file.offlineBasisModifiedAt,
-                        size = file.offlineBasisSize,
-                        digest = file.offlineContentDigest,
-                        serverHash = file.serverContentHash,
-                    ) else null
-                    val localState = classifyLocalCopy(
-                        basis = basis,
-                        localExists = localExists,
-                        localSize = offlineFile?.takeIf { localExists }?.length(),
-                        localModifiedSec = offlineFile?.takeIf { localExists }?.lastModified()?.div(1_000L),
-                    )
-                    // A same-size/same-mtime edit still diverges from the accepted digest:
-                    // verify the accepted identity before the destructive step. An unreadable
-                    // digest (null) or a digest-less basis is preservation, not authority.
-                    val digestVerifies = basis?.digest != null &&
-                        withContext(Dispatchers.IO) { computeDigest(offlineFile) } == basis.digest
-                    val preservesBytes = localState == LocalCopyState.LOCALLY_EDITED ||
-                        localState == LocalCopyState.UNKNOWN ||
-                        !digestVerifies
-                    if (preservesBytes) {
-                        SentryLog.w(TAG, "Unmark keeps edited/unknown/unverifiable bytes for file ${file.id}")
-                        realm.executeTransaction { mutableRealm ->
-                            FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
-                                proxy.isMarkedAsOffline = false
-                                proxy.isOffline = false
-                                proxy.offlineOwnedByRoot = false
-                                proxy.offlineBasisModifiedAt = 0L
-                                proxy.offlineBasisSize = null
-                                proxy.offlineContentDigest = null
-                                proxy.serverContentHash = null
-                            }
-                        }
-                        return@use false
-                    }
-                }
-
-                // Checked deletion: clear the offline state only once the bytes are really gone.
-                // R4 (FHNW-caf1): the pin decision was read at the section's start; a user pin
-                // landing inside this span (setDirectlyPinned does not participate in this
-                // coordination) must not have its copy deleted by the withdrawal. The flag is
-                // re-read at the LAST point before the destructive step: a newly pinned row is
-                // skipped like any keepCopy row — the pin's own contract retains the copy.
-                val pinnedSinceRead = FileController.getFileProxyById(fileId, customRealm = realm)
-                    ?.isDirectlyPinned ?: return@use false
-                if (pinnedSinceRead) return@use false
-                val copyGone = if (localExists) {
-                    withContext(Dispatchers.IO) { offlineFile.delete() }
-                } else {
-                    true
-                }
-                if (!copyGone) {
-                    SentryLog.w(TAG, "Offline copy deletion refused, keeping pin for file ${file.id}")
-                    return@use true
-                }
-                if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
-                realm.executeTransaction { mutableRealm ->
-                    FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
-                        proxy.isMarkedAsOffline = false
-                        proxy.isOffline = false
-                        // R4 defense-in-depth: a pin that landed after the pre-deletion
-                        // re-check keeps its FLAG (the user's choice is not clobbered by
-                        // the withdrawal); the rest of the offline state is still released.
-                        if (!proxy.isDirectlyPinned) proxy.isDirectlyPinned = false
-                        proxy.offlineOwnedByRoot = false
-                        proxy.offlineBasisModifiedAt = 0L
-                        proxy.offlineBasisSize = null
-                        proxy.offlineContentDigest = null
-                        proxy.serverContentHash = null
-                    }
-                }
-                false
-                }
-            }
-            if (keptAgainstRefusal) allDeletionsConfirmed = false
+            // The whole per-file withdrawal (classification evidence OUTSIDE the authority,
+            // then the fresh in-hold re-reads, the checked deletion and the state clear
+            // INSIDE it) is serialized against every publication's final check-to-effect
+            // interval AND every coordinated predicate writer, so neither can interleave
+            // into the other's defined order.
+            val refusal = withdrawSingleCopyInHold(
+                context = context,
+                userDrive = userDrive,
+                fileId = fileId,
+                otherRootSubtreeIds = otherRootSubtreeIds,
+                excludedRootFolderId = null,
+                atRecordedPath = false,
+            )
+            if (refusal) allDeletionsConfirmed = false
         }
 
         // BEYOND-SUBTREE OWNERSHIP RELEASE: rows the root contract owned whose cached row
@@ -474,19 +412,263 @@ object OfflineFolderSyncUtils {
         // describes where they live.
         val beyondSubtreeConfirmed = releaseOwnershipBeyondSubtree(context, userDrive, folder.id)
 
-        // A refused deletion keeps the root row: the next unmark pass retries it, and the
-        // protected files stay covered meanwhile.
-        if (allDeletionsConfirmed && beyondSubtreeConfirmed) FileController.getRealmInstance(userDrive).use { realm ->
-            realm.executeTransaction { mutableRealm ->
-                mutableRealm.where(OfflineFolderRoot::class.java)
-                    .equalTo(OfflineFolderRoot::uid.name, rootUid)
-                    .findAll()
-                    .deleteAllFromRealm()
+        // FINAL ATOMIC CLOSER: the root-row deletion shares ONE authority hold with a fresh
+        // re-run of the release sweep, so the coordinated marking transactions of a walk
+        // (which join this same authority and re-check the registry inside their own
+        // transaction) can neither resurrect claimed work between the sweep and the
+        // deletion (they would see the registry row still present) nor after it (they see
+        // it gone and skip). Byte-less claimed rows — the marking race's residue, pending
+        // work that never published — are cleared here (nothing to delete, no digest
+        // needed); rows that still hold bytes keep their claim and force a retriable
+        // unmark, so a destructive decision is never made inside this bounded hold without
+        // fresh digest evidence.
+        val closerConfirmed = withContext(Dispatchers.IO) {
+            val job = currentCoroutineContext()[Job]
+            OfflineCommitAuthority.withCommitAuthority {
+                var rowsWithBytesRemain = false
+                val claimedIds = FileController.getRealmInstance(userDrive).use { realm ->
+                    realm.where(File::class.java)
+                        .equalTo(File::offlineOwnedByRoot.name, true)
+                        .equalTo(File::driveId.name, userDrive.driveId)
+                        .findAll()
+                        .map { it.id }
+                }
+                for (fileId in claimedIds) {
+                    if (job?.isActive == false) return@withCommitAuthority false // incomplete closer: retriable
+                    FileController.getRealmInstance(userDrive).use { realm ->
+                        val file = FileController.getFileProxyById(fileId, customRealm = realm)
+                            ?: return@use // the row is gone: nothing left to release
+                        if (file.isFolder()) return@use // walkSubtree never claims folders
+                        if (isCoveredByRoot(file, realm, userDrive, excludedRootFolderId = folder.id)) {
+                            return@use // another live owner keeps the claim until its own withdrawal
+                        }
+                        if (file.isDirectlyPinned) {
+                            realm.executeTransaction { mutableRealm ->
+                                FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.offlineOwnedByRoot = false
+                            }
+                            return@use
+                        }
+                        val recordedPath = file.offlinePublishedPath
+                        val offlineFile: JavaFile? = if (recordedPath.isNullOrBlank()) {
+                            file.getOfflineFile(context, userDrive.userId)
+                        } else {
+                            JavaFile(recordedPath)
+                        }
+                        if (offlineFile?.exists() == true) {
+                            // Bytes still stand: never a destructive decision without the
+                            // full evidence pass — keep the claim and retry on the next
+                            // unmark pass.
+                            rowsWithBytesRemain = true
+                            return@use
+                        }
+                        realm.executeTransaction { mutableRealm ->
+                            FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
+                                proxy.isMarkedAsOffline = false
+                                proxy.isOffline = false
+                                if (!proxy.isDirectlyPinned) proxy.isDirectlyPinned = false
+                                proxy.offlineOwnedByRoot = false
+                                proxy.offlineBasisModifiedAt = 0L
+                                proxy.offlineBasisSize = null
+                                proxy.offlineContentDigest = null
+                                proxy.serverContentHash = null
+                            }
+                        }
+                    }
+                }
+                if (rowsWithBytesRemain) return@withCommitAuthority false
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    realm.executeTransaction { mutableRealm ->
+                        mutableRealm.where(OfflineFolderRoot::class.java)
+                            .equalTo(OfflineFolderRoot::uid.name, rootUid)
+                            .findAll()
+                            .deleteAllFromRealm()
+                    }
+                }
+                true
             }
         }
-        // A refused beyond-subtree deletion is reported to the caller too (FHNW-caf1 intake
-        // WIP observation): the unmark is only complete when EVERY release confirmed.
-        return allDeletionsConfirmed && beyondSubtreeConfirmed
+
+        // A refused deletion (or an incomplete closer) keeps the root row: the next unmark
+        // pass retries it, and the protected files stay covered meanwhile. The unmark is
+        // only complete when EVERY release confirmed.
+        return allDeletionsConfirmed && beyondSubtreeConfirmed && closerConfirmed
+    }
+
+    /**
+     * Pre-hold withdrawal evidence for one copy: the stat values and the digest verdict a
+     * destructive decision would rest on, computed OUTSIDE the commit authority (a
+     * whole-file digest never runs inside a hold). The hold re-stats before acting: an
+     * unchanged stat keeps the evidence authoritative (every coordinated writer is excluded
+     * for the whole hold); a changed stat means a non-participating writer touched the
+     * bytes — the evidence is stale and the copy is PRESERVED, never deleted on stale
+     * evidence.
+     */
+    private data class WithdrawalEvidence(
+        val offlineFile: JavaFile?,
+        val localExists: Boolean,
+        val length: Long?,
+        val modifiedSec: Long?,
+        val preservesBytes: Boolean,
+    )
+
+    private fun readWithdrawalEvidence(
+        context: Context,
+        file: File,
+        userDrive: UserDrive,
+        atRecordedPath: Boolean,
+    ): WithdrawalEvidence {
+        val recordedPath = file.offlinePublishedPath
+        val offlineFile: JavaFile? = when {
+            atRecordedPath && !recordedPath.isNullOrBlank() -> JavaFile(recordedPath)
+            else -> file.getOfflineFile(context, userDrive.userId)
+        }
+        val localExists = offlineFile?.exists() == true
+        if (!localExists || offlineFile == null) {
+            return WithdrawalEvidence(offlineFile, localExists = false, length = null, modifiedSec = null, preservesBytes = false)
+        }
+        val length = offlineFile.length()
+        val modifiedSec = offlineFile.lastModified().div(1_000L)
+        val basis = if (file.offlineBasisModifiedAt > 0L) PublicationBasis(
+            modifiedAt = file.offlineBasisModifiedAt,
+            size = file.offlineBasisSize,
+            digest = file.offlineContentDigest,
+            serverHash = file.serverContentHash,
+        ) else null
+        val localState = classifyLocalCopy(
+            basis = basis,
+            localExists = true,
+            localSize = length,
+            localModifiedSec = modifiedSec,
+        )
+        // A same-size/same-mtime edit still diverges from the accepted digest: verify the
+        // accepted identity before any destructive step. An unreadable digest (null) or a
+        // digest-less basis is preservation, not authority.
+        val digestVerifies = basis?.digest != null && computeDigest(offlineFile) == basis.digest
+        val preservesBytes = localState == LocalCopyState.LOCALLY_EDITED ||
+            localState == LocalCopyState.UNKNOWN ||
+            !digestVerifies
+        return WithdrawalEvidence(offlineFile, localExists = true, length = length, modifiedSec = modifiedSec, preservesBytes = preservesBytes)
+    }
+
+    /**
+     * ONE copy's coordinated withdrawal: classification evidence is read OUTSIDE the
+     * authority ([readWithdrawalEvidence]), then the hold re-reads the row fresh, re-checks
+     * every keep-copy contract, re-stats the evidence, and performs the checked deletion
+     * and the state clear. Returns TRUE only for a REFUSAL (a deletion the filesystem
+     * refused — the claim stays and the caller reports a retriable unmark); skips,
+     * preserved releases and confirmed deletions return false.
+     *
+     * @param otherRootSubtreeIds the in-subtree loop's pre-computed other-roots snapshot
+     *   (overlapping-roots check); null selects the sweep's live registry check against
+     *   [excludedRootFolderId] instead
+     * @param excludedRootFolderId the root whose own coverage must not keep the claim (the
+     *   sweep runs while its root row is still registered); null for the in-subtree loop
+     * @param atRecordedPath look the bytes up at their RECORDED publication path first (a
+     *   moved-out row's derived path no longer describes where they live)
+     */
+    private suspend fun withdrawSingleCopyInHold(
+        context: Context,
+        userDrive: UserDrive,
+        fileId: Int,
+        otherRootSubtreeIds: Set<Int>?,
+        excludedRootFolderId: Int?,
+        atRecordedPath: Boolean,
+    ): Boolean {
+        // Evidence pass OUTSIDE the hold.
+        val evidence = FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.getFileProxyById(fileId, customRealm = realm)?.let { row ->
+                if (row.isFolder()) null else readWithdrawalEvidence(context, row, userDrive, atRecordedPath)
+            }
+        } ?: return false // vanished row or folder: nothing to release
+
+        return withContext(Dispatchers.IO) {
+            OfflineCommitAuthority.withCommitAuthority {
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    val file = FileController.getFileProxyById(fileId, customRealm = realm)
+                        ?: return@withCommitAuthority false // the row is gone: nothing left to release
+                    if (file.isFolder()) return@withCommitAuthority false // walkSubtree never claims folders
+                    val coveredByOtherRoot = when {
+                        otherRootSubtreeIds != null -> fileId in otherRootSubtreeIds
+                        excludedRootFolderId != null -> isCoveredByRoot(file, realm, userDrive, excludedRootFolderId)
+                        else -> false
+                    }
+                    if (file.isDirectlyPinned || coveredByOtherRoot) {
+                        if (excludedRootFolderId != null && file.isDirectlyPinned && !coveredByOtherRoot) {
+                            // Explicit direct retention keeps its own contract (bytes, pin
+                            // and offline state untouched): only the root's claim is
+                            // released (the sweep's contract).
+                            realm.executeTransaction { mutableRealm ->
+                                FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.offlineOwnedByRoot = false
+                            }
+                        }
+                        return@withCommitAuthority false
+                    }
+
+                    // The evidence re-stat: an unchanged stat keeps the pre-hold evidence
+                    // authoritative (every coordinated writer is excluded for the whole
+                    // hold); a changed stat means a non-participating writer touched the
+                    // bytes — PRESERVED, never deleted on stale evidence.
+                    val statUnchanged = evidence.offlineFile != null && evidence.offlineFile.exists() &&
+                        evidence.offlineFile.length() == evidence.length &&
+                        evidence.offlineFile.lastModified().div(1_000L) == evidence.modifiedSec
+                    val preservesBytes = when {
+                        evidence.localExists -> !statUnchanged || evidence.preservesBytes
+                        // Bytes appeared under the coordination (an external writer): unproven — preserved.
+                        else -> evidence.offlineFile?.exists() == true
+                    }
+                    if (preservesBytes) {
+                        if (evidence.localExists && statUnchanged) {
+                            SentryLog.w(TAG, "Unmark keeps edited/unknown/unverifiable bytes for file ${file.id}")
+                        } else {
+                            SentryLog.w(TAG, "Unmark evidence went stale under the coordination for file ${file.id}; bytes preserved")
+                        }
+                        realm.executeTransaction { mutableRealm ->
+                            FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
+                                proxy.isMarkedAsOffline = false
+                                proxy.isOffline = false
+                                proxy.offlineOwnedByRoot = false
+                                proxy.offlineBasisModifiedAt = 0L
+                                proxy.offlineBasisSize = null
+                                proxy.offlineContentDigest = null
+                                proxy.serverContentHash = null
+                            }
+                        }
+                        return@withCommitAuthority false
+                    }
+
+                    // Checked deletion: clear the offline state only once the bytes are
+                    // really gone. The pin writer is excluded for the whole hold (it joins
+                    // this authority), so the pre-hold pin reads above are final; the
+                    // in-transaction flag re-check below stays as defense-in-depth only.
+                    val copyGone = if (evidence.localExists && evidence.offlineFile != null) {
+                        evidence.offlineFile.delete()
+                    } else {
+                        true
+                    }
+                    if (!copyGone) {
+                        SentryLog.w(TAG, "Offline copy deletion refused, keeping pin for file ${file.id}")
+                        return@withCommitAuthority true
+                    }
+                    if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
+                    realm.executeTransaction { mutableRealm ->
+                        FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
+                            proxy.isMarkedAsOffline = false
+                            proxy.isOffline = false
+                            // R4 defense-in-depth: the pin writer is excluded for the whole
+                            // hold, so a pin cannot land here — the flag re-read only guards
+                            // against a mutation that bypassed the coordination.
+                            if (!proxy.isDirectlyPinned) proxy.isDirectlyPinned = false
+                            proxy.offlineOwnedByRoot = false
+                            proxy.offlineBasisModifiedAt = 0L
+                            proxy.offlineBasisSize = null
+                            proxy.offlineContentDigest = null
+                            proxy.serverContentHash = null
+                        }
+                    }
+                    false
+                }
+            }
+        }
     }
 
     /**
@@ -524,108 +706,20 @@ object OfflineFolderSyncUtils {
         var allConfirmed = true
         claimedIds.forEach { fileId ->
             currentCoroutineContext().ensureActive()
-            val confirmed = withPublicationLock {
-                FileController.getRealmInstance(userDrive).use { realm ->
-                    val file = FileController.getFileProxyById(fileId, customRealm = realm)
-                        ?: return@use true // the row is gone: nothing left to release
-                    if (file.isFolder()) return@use true // walkSubtree never claims folders
-                    if (isCoveredByRoot(file, realm, userDrive, excludedRootFolderId = withdrawnRootFolderId)) {
-                        return@use true // another live owner keeps the claim until its own withdrawal
-                    }
-                    if (file.isDirectlyPinned) {
-                        // Explicit direct retention keeps its own contract (bytes, pin and
-                        // offline state untouched): only the root's claim is released.
-                        realm.executeTransaction { mutableRealm ->
-                            FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.offlineOwnedByRoot = false
-                        }
-                        return@use true
-                    }
-
-                    // Full release decision — the same classification, digest verification,
-                    // checked deletion and state clear as the in-subtree withdrawal, but the
-                    // bytes are looked up at their RECORDED publication path first.
-                    val recordedPath = file.offlinePublishedPath
-                    val offlineFile: JavaFile? = if (recordedPath.isNullOrBlank()) {
-                        file.getOfflineFile(context, userDrive.userId)
-                    } else {
-                        JavaFile(recordedPath)
-                    }
-                    val localExists = offlineFile?.exists() == true
-
-                    // Classify against the accepted basis BEFORE any destructive step: changed
-                    // and unknown bytes belong to the user — release the claim, keep the bytes.
-                    if (localExists) {
-                        val basis = if (file.offlineBasisModifiedAt > 0L) PublicationBasis(
-                            modifiedAt = file.offlineBasisModifiedAt,
-                            size = file.offlineBasisSize,
-                            digest = file.offlineContentDigest,
-                            serverHash = file.serverContentHash,
-                        ) else null
-                        val localState = classifyLocalCopy(
-                            basis = basis,
-                            localExists = localExists,
-                            localSize = offlineFile?.takeIf { localExists }?.length(),
-                            localModifiedSec = offlineFile?.takeIf { localExists }?.lastModified()?.div(1_000L),
-                        )
-                        val digestVerifies = basis?.digest != null && offlineFile != null &&
-                            withContext(Dispatchers.IO) { computeDigest(offlineFile) } == basis.digest
-                        val preservesBytes = localState == LocalCopyState.LOCALLY_EDITED ||
-                            localState == LocalCopyState.UNKNOWN ||
-                            !digestVerifies
-                        if (preservesBytes) {
-                            SentryLog.w(TAG, "Beyond-subtree unmark keeps edited/unknown/unverifiable bytes for file ${file.id}")
-                            realm.executeTransaction { mutableRealm ->
-                                FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
-                                    proxy.isMarkedAsOffline = false
-                                    proxy.isOffline = false
-                                    proxy.offlineOwnedByRoot = false
-                                    proxy.offlineBasisModifiedAt = 0L
-                                    proxy.offlineBasisSize = null
-                                    proxy.offlineContentDigest = null
-                                    proxy.serverContentHash = null
-                                }
-                            }
-                            return@use true
-                        }
-                    }
-
-                    // Checked deletion: clear the offline state only once the bytes are really gone.
-                    // R4, same as the in-subtree withdrawal: the pin flag is re-read at the
-                    // last point before the destructive step.
-                    val pinnedSinceRead = FileController.getFileProxyById(fileId, customRealm = realm)
-                        ?.isDirectlyPinned ?: return@use true
-                    if (pinnedSinceRead) {
-                        realm.executeTransaction { mutableRealm ->
-                            FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.offlineOwnedByRoot = false
-                        }
-                        return@use true
-                    }
-                    val copyGone = if (localExists && offlineFile != null) {
-                        withContext(Dispatchers.IO) { offlineFile.delete() }
-                    } else {
-                        true
-                    }
-                    if (!copyGone) {
-                        SentryLog.w(TAG, "Beyond-subtree offline copy deletion refused, keeping the claim for file ${file.id}")
-                        return@use false // the claim stays: the next unmark pass retries it
-                    }
-                    if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
-                    realm.executeTransaction { mutableRealm ->
-                        FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
-                            proxy.isMarkedAsOffline = false
-                            proxy.isOffline = false
-                            if (!proxy.isDirectlyPinned) proxy.isDirectlyPinned = false
-                            proxy.offlineOwnedByRoot = false
-                            proxy.offlineBasisModifiedAt = 0L
-                            proxy.offlineBasisSize = null
-                            proxy.offlineContentDigest = null
-                            proxy.serverContentHash = null
-                        }
-                    }
-                    true
-                }
-            }
-            if (!confirmed) allConfirmed = false
+            // Each claimed row runs the SAME coordinated withdrawal as the in-subtree loop,
+            // with the sweep's own contracts: the bytes are looked up at their RECORDED
+            // publication path first, another live root's coverage keeps the claim, and a
+            // direct pin loses only the root's claim ([withdrawSingleCopyInHold]'s
+            // excluded-root mode). A refusal keeps the claim for the next unmark pass.
+            val refusal = withdrawSingleCopyInHold(
+                context = context,
+                userDrive = userDrive,
+                fileId = fileId,
+                otherRootSubtreeIds = null,
+                excludedRootFolderId = withdrawnRootFolderId,
+                atRecordedPath = true,
+            )
+            if (refusal) allConfirmed = false
         }
         return allConfirmed
     }
@@ -657,61 +751,11 @@ object OfflineFolderSyncUtils {
     }
 
     /**
-     * Maintenance-side ownership release (FHNW-caf1 R2) — run ONLY after a COMPLETE root
-     * walk: [listedFileIds] are excluded because the walk PROVED them remotely present
-     * inside this root, whatever the cached parent chain looks like (a chain gap must never
-     * read as a move-out). Every row still carrying the recorded claim that no live root
-     * covers anymore ([isCoveredByRoot] against the other roots; direct pins are excluded —
-     * their own contract keeps its suppression until the pin ends, and the next pass after
-     * an unpin discharges them) is released under the publication critical section with the
-     * remote-delete release's exact postcondition: bytes PRESERVED (the remote-move
-     * contract is distinct from explicit unmark's clean-copy removal), every offline field
-     * cleared including the transient pending marker.
-     */
-    private suspend fun releaseOwnershipBeyondCoverage(
-        userDrive: UserDrive,
-        excludedRootFolderId: Int,
-        listedFileIds: Set<Int>,
-    ) {
-        val claimedIds = FileController.getRealmInstance(userDrive).use { realm ->
-            realm.where(File::class.java)
-                .equalTo(File::offlineOwnedByRoot.name, true)
-                .equalTo(File::driveId.name, userDrive.driveId)
-                .notEqualTo(File::isDirectlyPinned.name, true)
-                .findAll()
-                .map { it.id }
-                .toSet()
-        } - listedFileIds
-        claimedIds.forEach { fileId ->
-            currentCoroutineContext().ensureActive()
-            withPublicationLock {
-                FileController.getRealmInstance(userDrive).use { realm ->
-                    val file = FileController.getFileProxyById(fileId, customRealm = realm) ?: return@use
-                    if (file.isFolder()) return@use // walkSubtree never claims folders
-                    if (isCoveredByRoot(file, realm, userDrive, excludedRootFolderId)) return@use // another live owner keeps it
-                    // The remote-delete release's postcondition, plus the pending marker:
-                    // bytes preserved, every offline field cleared.
-                    realm.executeTransaction { mutableRealm ->
-                        FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
-                            proxy.isMarkedAsOffline = false
-                            proxy.isOffline = false
-                            proxy.offlineOwnedByRoot = false
-                            proxy.offlineBasisModifiedAt = 0L
-                            proxy.offlineBasisSize = null
-                            proxy.offlineContentDigest = null
-                            proxy.serverContentHash = null
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /**
      * Maintenance pass over every root of the current user's drives: re-walks each root,
-     * refreshes changed files and — only after a COMPLETE walk — releases coverage of
-     * remotely deleted files without deleting bytes. Hooked into the existing offline sync
-     * cadence.
+     * refreshes changed files and — only when EVERY registered root's walk COMPLETED and the
+     * registry is unchanged since the pass started — releases coverage of remotely deleted
+     * files without deleting bytes, in ONE coordinated pass-wide discharge. Hooked into the
+     * existing offline sync cadence.
      */
     suspend fun syncOfflineFolderRoots(context: Context) {
         DriveInfosController.getDrives(AccountUtils.currentUserId).forEach { drive ->
@@ -720,13 +764,23 @@ object OfflineFolderSyncUtils {
             val roots = FileController.getRealmInstance(userDrive).use { realm ->
                 realm.where(OfflineFolderRoot::class.java).findAll().map { realm.copyFromRealm(it, 0) }
             }
+            if (roots.isEmpty()) return@forEach
+
+            // Walk EVERY root first. Each walk records the ids it PROVED remotely present;
+            // an incomplete walk proves nothing and disables the whole pass's release phase
+            // (completing root A proves nothing about root B — a discharge judged from one
+            // root's completion could clear another root's live ownership).
+            var allWalksComplete = true
+            val completedWalks = mutableListOf<Triple<OfflineFolderRoot, Set<Int>, Set<Int>>>()
             roots.forEach root@{ root ->
                 currentCoroutineContext().ensureActive()
                 val previousSubtree = collectSubtreeIdsFromCache(userDrive, root.folderId)
                 val rootFolder = FileController.getRealmInstance(userDrive).use { realm ->
                     FileController.getFileProxyById(root.folderId, customRealm = realm)?.let { realm.copyFromRealm(it, 0) }
-                } ?: return@root
-
+                } ?: run {
+                    allWalksComplete = false // the root's folder row is gone: its walk is missing
+                    return@root
+                }
                 val listedFileIds = mutableSetOf<Int>()
                 val outcome = walkSubtree(
                     context = context,
@@ -734,31 +788,68 @@ object OfflineFolderSyncUtils {
                     rootFolderFile = rootFolder,
                     onFileVisited = listedFileIds::add,
                 )
-                if (outcome == WalkOutcome.INCOMPLETE) return@root // incomplete traversal proves nothing
+                if (outcome == WalkOutcome.INCOMPLETE) {
+                    allWalksComplete = false // incomplete traversal proves nothing
+                    return@root
+                }
+                completedWalks.add(Triple(root, previousSubtree, listedFileIds.toSet()))
 
-                // Remotely deleted within a complete walk: release coverage, keep the bytes.
-                // Coverage is the persistent copy state (isOffline + recorded basis), never the
-                // transient pending-download marker; directly pinned copies stay with their own
-                // contract (retained until withdrawn) and are not released here. Files marked
-                // pending but never yet published are released too: their download intent died
-                // with the remote file, and no stale queued worker may keep trying bodies for
-                // them. An INCOMPLETE traversal never reaches this code.
-                val remoteDeletedIds = (FileController.getRealmInstance(userDrive).use { realm ->
-                    realm.where(File::class.java)
-                        .beginGroup()
-                        .equalTo(File::isOffline.name, true)
-                        .or()
-                        .equalTo(File::isMarkedAsOffline.name, true)
-                        .endGroup()
-                        .findAll()
-                        .filter { !it.isFolder() && !it.isDirectlyPinned }
-                        .map { it.id }
-                        .toSet()
-                } intersect previousSubtree) - listedFileIds
-                remoteDeletedIds.forEach { fileId ->
-                    // The coverage release is an intent withdrawal: it participates in the
-                    // publication critical section like every other covered withdrawal.
-                    withPublicationLock {
+                listedFileIds.forEach { fileId ->
+                    currentCoroutineContext().ensureActive()
+                    refreshOfflineFile(context, userDrive, fileId)
+                }
+            }
+            if (!allWalksComplete || completedWalks.isEmpty()) return@forEach
+
+            // PASS-WIDE COORDINATED DISCHARGE (RESUME-b528-2212 item 2): one authority hold,
+            // gated on (a) every registered root's walk having COMPLETED this pass and (b)
+            // the registry re-read in the hold still matching the pass-start snapshot — a
+            // root registered mid-pass has no walk yet (a missing walk disables the
+            // discharge), and a root withdrawn mid-pass released its own rows through the
+            // unmark path. The evidence is the UNION of the completed walks' listed ids —
+            // remote presence inside a root — never the cached chain: a chain gap must never
+            // read as a move-out, and a row under any registered root with a complete walk
+            // is listed by that walk regardless of its cached links.
+            val job = currentCoroutineContext()[Job]
+            withContext(Dispatchers.IO) {
+                OfflineCommitAuthority.withCommitAuthority {
+                    val registryNow = FileController.getRealmInstance(userDrive).use { realm ->
+                        realm.where(OfflineFolderRoot::class.java)
+                            .equalTo(OfflineFolderRoot::driveId.name, userDrive.driveId)
+                            .findAll()
+                            .map { it.folderId }
+                            .toSet()
+                    }
+                    if (registryNow != roots.map { it.folderId }.toSet()) {
+                        SentryLog.i(TAG, "Offline root registry changed during the maintenance pass; releases skipped")
+                        return@withCommitAuthority
+                    }
+                    val listedUnion = completedWalks.flatMapTo(mutableSetOf<Int>()) { it.third }
+
+                    // 1. Remote-delete release: rows whose cached chain placed them inside a
+                    //    root's subtree at pass start, that still carry offline intent, and
+                    //    that NO completed walk lists anymore — remotely absent from every
+                    //    root. Directly pinned rows keep their own contract. Bytes PRESERVED
+                    //    (the remote-move contract), every offline field cleared including
+                    //    the transient pending marker; the release is an intent withdrawal
+                    //    under the same coordination as every other one.
+                    val intentRowIds = FileController.getRealmInstance(userDrive).use { realm ->
+                        realm.where(File::class.java)
+                            .beginGroup()
+                            .equalTo(File::isOffline.name, true)
+                            .or()
+                            .equalTo(File::isMarkedAsOffline.name, true)
+                            .endGroup()
+                            .findAll()
+                            .filter { !it.isFolder() && !it.isDirectlyPinned }
+                            .map { it.id }
+                            .toSet()
+                    }
+                    val remoteDeletedIds = completedWalks.flatMapTo(mutableSetOf<Int>()) { (_, previousSubtree, _) ->
+                        previousSubtree intersect intentRowIds
+                    } - listedUnion
+                    for (fileId in remoteDeletedIds) {
+                        if (job?.isActive == false) return@withCommitAuthority
                         FileController.getRealmInstance(userDrive).use { realm ->
                             realm.executeTransaction { mutableRealm ->
                                 FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
@@ -773,23 +864,39 @@ object OfflineFolderSyncUtils {
                             }
                         }
                     }
-                }
 
-                // BEYOND-COVERAGE OWNERSHIP RELEASE (FHNW-caf1 R2): a cached tree update can
-                // move an owned row out of every root between passes — the COMPLETE walk
-                // above proved the row absent from THIS root's remote subtree (an incomplete
-                // walk proves nothing and released nothing), and the rows the walk DID list
-                // are excluded: they are remotely present inside a root and keep their
-                // contract regardless of cache chain gaps. Releasing the recorded claim here
-                // (bytes PRESERVED — the remote-move contract, distinct from explicit
-                // unmark's clean-copy removal) keeps a moved-out owned row from freezing
-                // forever: no walk lists it, no release found it, every baseline guard
-                // skipped it.
-                releaseOwnershipBeyondCoverage(userDrive, excludedRootFolderId = root.folderId, listedFileIds = listedFileIds)
-
-                listedFileIds.forEach { fileId ->
-                    currentCoroutineContext().ensureActive()
-                    refreshOfflineFile(context, userDrive, fileId)
+                    // 2. Beyond-coverage ownership discharge: every row still carrying the
+                    //    recorded claim that NO completed walk lists — no live root proves
+                    //    it anymore — is released the same way (bytes PRESERVED, state
+                    //    cleared). Directly pinned rows keep their own contract (the pin
+                    //    suppresses the claim; the next pass after an unpin discharges
+                    //    them); the pin state is re-read in the hold, fresh.
+                    val claimedIds = FileController.getRealmInstance(userDrive).use { realm ->
+                        realm.where(File::class.java)
+                            .equalTo(File::offlineOwnedByRoot.name, true)
+                            .equalTo(File::driveId.name, userDrive.driveId)
+                            .findAll()
+                            .map { it.id }
+                            .toSet()
+                    } - listedUnion
+                    for (fileId in claimedIds) {
+                        if (job?.isActive == false) return@withCommitAuthority
+                        FileController.getRealmInstance(userDrive).use { realm ->
+                            val file = FileController.getFileProxyById(fileId, customRealm = realm) ?: return@use
+                            if (file.isFolder() || file.isDirectlyPinned) return@use
+                            realm.executeTransaction { mutableRealm ->
+                                FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
+                                    proxy.isMarkedAsOffline = false
+                                    proxy.isOffline = false
+                                    proxy.offlineOwnedByRoot = false
+                                    proxy.offlineBasisModifiedAt = 0L
+                                    proxy.offlineBasisSize = null
+                                    proxy.offlineContentDigest = null
+                                    proxy.serverContentHash = null
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -826,6 +933,7 @@ object OfflineFolderSyncUtils {
         onFolderWithMarkedFiles: ((Int) -> Unit)? = null,
     ): WalkOutcome {
         val okHttpClient = AccountUtils.getHttpClient(userDrive.userId, null)
+        val rootUid = OfflineFolderRoot.buildUid(rootFolderFile.id, userDrive.driveId, userDrive.userId)
         val queue = ArrayDeque<Pair<Int, File?>>()
         queue.add(rootFolderFile.id to rootFolderFile)
         val visitedFolders = mutableSetOf<Int>()
@@ -856,27 +964,40 @@ object OfflineFolderSyncUtils {
                         isFirstPage = isFirstPage,
                         isCompleteFolder = false,
                     )
-                    realm.executeTransaction { mutableRealm ->
-                        page.forEach { child ->
-                            val proxy = mutableRealm.where(File::class.java)
-                                .equalTo(File::uid.name, child.uid)
-                                .findFirst() ?: return@forEach
-                            if (proxy.isTrashed() || proxy.isFolder()) return@forEach
-                            if (!proxy.isMarkedAsOffline && !proxy.isOffline && !proxy.isDirectlyPinned) {
-                                proxy.isMarkedAsOffline = true
-                                folderHasMarkedFiles = true
+                    // The marking/acquisition transaction is a coordinated writer: it joins
+                    // the commit authority AND re-checks the registry INSIDE its own
+                    // transaction — a root withdrawn mid-walk (an unmark's coordinated
+                    // deletion serialized against this hold) marks and claims nothing, so a
+                    // dying root can never resurrect offline work or ownership claims.
+                    OfflineCommitAuthority.withCommitAuthority {
+                        realm.executeTransaction { mutableRealm ->
+                            if (mutableRealm.where(OfflineFolderRoot::class.java)
+                                    .equalTo(OfflineFolderRoot::uid.name, rootUid)
+                                    .count() == 0L
+                            ) {
+                                return@executeTransaction // the root was withdrawn mid-walk
                             }
-                            // ROOT OWNERSHIP is recorded for EVERY visited copy of the root's
-                            // subtree — not only brand-new pending work: an already-offline or
-                            // directly-pinned copy the root adopts keeps its own contract, but
-                            // the root contract also owns its maintenance, and a later cached
-                            // move-out must not strip that protection with both coverage walks
-                            // dead (isRootOwnedCopy). The direct pin suppresses the recorded
-                            // claim while it stands (baseline semantics preserved), and the
-                            // unmark's beyond-subtree sweep releases it when the last owner
-                            // withdraws.
-                            proxy.offlineOwnedByRoot = true
-                            onFileVisited?.invoke(proxy.id)
+                            page.forEach { child ->
+                                val proxy = mutableRealm.where(File::class.java)
+                                    .equalTo(File::uid.name, child.uid)
+                                    .findFirst() ?: return@forEach
+                                if (proxy.isTrashed() || proxy.isFolder()) return@forEach
+                                if (!proxy.isMarkedAsOffline && !proxy.isOffline && !proxy.isDirectlyPinned) {
+                                    proxy.isMarkedAsOffline = true
+                                    folderHasMarkedFiles = true
+                                }
+                                // ROOT OWNERSHIP is recorded for EVERY visited copy of the root's
+                                // subtree — not only brand-new pending work: an already-offline or
+                                // directly-pinned copy the root adopts keeps its own contract, but
+                                // the root contract also owns its maintenance, and a later cached
+                                // move-out must not strip that protection with both coverage walks
+                                // dead (isRootOwnedCopy). The direct pin suppresses the recorded
+                                // claim while it stands (baseline semantics preserved), and the
+                                // unmark's beyond-subtree sweep releases it when the last owner
+                                // withdraws.
+                                proxy.offlineOwnedByRoot = true
+                                onFileVisited?.invoke(proxy.id)
+                            }
                         }
                     }
                 }
@@ -1044,18 +1165,29 @@ object OfflineFolderSyncUtils {
      * already equal), false when the adoption DECLINED (row vanished or offline intent
      * withdrawn) — the caller must report that accurately, never as a publication.
      *
-     * The final live-intent re-read, the local timestamp adoption and the basis record run
-     * INSIDE the publication critical section: the timestamp can no longer be mutated
-     * before a decline that the coordination could have caught (a covered withdrawal
-     * cannot complete between the in-lock intent read and the record). The digest
-     * verification of the local bytes stays before the section — it is content evidence,
-     * not intent evidence.
+     * The local byte evidence (stat + digest) is computed OUTSIDE the commit authority — a
+     * whole-file digest never runs inside a hold. The final live-intent re-read, the stat
+     * confirmation, the local timestamp adoption and the basis record run INSIDE the hold:
+     * the timestamp can no longer be mutated before a decline that the coordination could
+     * have caught (a covered withdrawal — or any coordinated writer — cannot commit between
+     * the in-hold intent read and the record).
      */
     private suspend fun updatePublicationBasis(userDrive: UserDrive, fileId: Int, remoteFile: File, offlineFile: JavaFile?): Boolean = withContext(Dispatchers.IO) {
-        withPublicationLock { updatePublicationBasisLocked(userDrive, fileId, remoteFile, offlineFile) }
+        val verifiedBytes = offlineFile?.takeIf { it.exists() }?.let { copy ->
+            VerifiedLocalCopy(length = copy.length(), modifiedSec = copy.lastModified().div(1_000L), digest = computeDigest(copy))
+        }
+        OfflineCommitAuthority.withCommitAuthority {
+            updatePublicationBasisLocked(userDrive, fileId, remoteFile, offlineFile, verifiedBytes)
+        }
     }
 
-    private fun updatePublicationBasisLocked(userDrive: UserDrive, fileId: Int, remoteFile: File, offlineFile: JavaFile?): Boolean {
+    private fun updatePublicationBasisLocked(
+        userDrive: UserDrive,
+        fileId: Int,
+        remoteFile: File,
+        offlineFile: JavaFile?,
+        verifiedBytes: VerifiedLocalCopy?,
+    ): Boolean {
         FileController.getRealmInstance(userDrive).use { realm ->
             val proxy = FileController.getFileProxyById(fileId, customRealm = realm) ?: return false
             if (!hasLiveOfflineIntent(proxy, realm, userDrive)) {
@@ -1097,10 +1229,20 @@ object OfflineFolderSyncUtils {
             }
 
             if (offlineFile?.exists() == true) {
-                val basisDigest = proxy.offlineContentDigest
-                if (basisDigest != null) {
-                    val localDigest = computeDigest(offlineFile)
-                    if (localDigest == null || localDigest != basisDigest) {
+                // The byte evidence was computed OUTSIDE the hold; the hold re-stats. An
+                // unchanged stat keeps it authoritative (every coordinated writer is
+                // excluded); a changed or missing stat means stale evidence — the preserved
+                // bytes keep their recorded basis (an adoption skip, not a withdrawal).
+                val statCurrent = verifiedBytes != null &&
+                    verifiedBytes.length == offlineFile.length() &&
+                    verifiedBytes.modifiedSec == offlineFile.lastModified().div(1_000L)
+                if (!statCurrent) {
+                    SentryLog.w(TAG, "Local bytes changed under the coordination for file $fileId; metadata-only adoption skipped")
+                    return true // preserved bytes are consistent with THEIR basis; not a withdrawal
+                }
+                if (proxy.offlineContentDigest != null) {
+                    val evidenceDigest = verifiedBytes?.digest
+                    if (evidenceDigest == null || evidenceDigest != proxy.offlineContentDigest) {
                         SentryLog.w(TAG, "Local bytes diverge from the accepted digest for file $fileId; metadata-only adoption skipped")
                         return true // preserved bytes are consistent with THEIR basis; not a withdrawal
                     }
@@ -1213,14 +1355,24 @@ object OfflineFolderSyncUtils {
 
             currentCoroutineContext().ensureActive()
 
+            // CONTENT EVIDENCE PREVIEW — computed OUTSIDE the hold: a whole-file digest never
+            // runs inside the commit authority (a hold must stay local-IO sized, and UI-thread
+            // writers wait on it). The hold re-stats the copy below and keeps this digest as
+            // evidence only when the stat is unchanged.
+            val previewExists = offlineFile.exists()
+            val previewLength = if (previewExists) offlineFile.length() else null
+            val previewModifiedSec = if (previewExists) offlineFile.lastModified().div(1_000L) else null
+            val previewDigest = if (previewExists) computeDigest(offlineFile) else null
+
             // PUBLICATION CRITICAL SECTION: from the FINAL live-intent and content reads
-            // through the rename and the basis record, coordinated under [publicationLock]
-            // with every intent-withdrawal mutation — an unmark can no longer complete
-            // between the final checks and the bytes' replacement (it suspends on the same
-            // lock; the defined orders are "withdrawn first -> nothing published" or
-            // "published first -> the unmark removes it afterwards"). The network transfer
-            // stayed OUTSIDE; the section is local-IO sized. ALL DECISIVE EVIDENCE is (re-)
-            // read INSIDE the coordination: the pre-lock row/digest reads above are only a
+            // through the rename and the basis record, coordinated under the commit authority
+            // with EVERY predicate mutation — the covered withdrawals AND the previously
+            // non-participating tree/pin/intent writers (a cached tree move can no longer
+            // commit between the in-hold checks and the rename; it either commits before the
+            // hold — the fresh reads decline before the effect — or after the record, where
+            // it observes the completed publication). The network transfer and the digests
+            // stayed OUTSIDE; the hold is local-IO sized. ALL DECISIVE EVIDENCE is (re-)
+            // read INSIDE the coordination: the pre-hold row/digest reads above are only a
             // preview — an edit or withdrawal landing before the section is judged from
             // fresh evidence here, never from stale content.
             val publicationOutcome = withPublicationLock {
@@ -1259,10 +1411,19 @@ object OfflineFolderSyncUtils {
                     return@withPublicationLock StagedPublication.INTENT_WITHDRAWN
                 }
 
-                // Content evidence under the coordination: an edit that landed after the
-                // preview digest read is seen HERE — stale evidence never authorizes the
-                // rename over it.
-                val existingDigest = if (offlineFile.exists()) computeDigest(offlineFile) else null
+                // Content evidence under the coordination: the whole-file digest was computed
+                // OUTSIDE the hold (the preview above); the hold re-stats the copy and keeps
+                // the preview digest only when the stat is unchanged. Every coordinated
+                // writer is excluded for the whole hold, so an app-side byte change between
+                // the preview and here is impossible by construction; a stat change means the
+                // evidence is stale (an external, non-participating writer) and the copy is
+                // treated as unproven — PRESERVED, never replaced on stale evidence.
+                val currentExists = offlineFile.exists()
+                val currentLength = if (currentExists) offlineFile.length() else null
+                val currentModifiedSec = if (currentExists) offlineFile.lastModified().div(1_000L) else null
+                val digestEvidenceCurrent = currentExists && previewExists &&
+                    currentLength == previewLength && currentModifiedSec == previewModifiedSec
+                val existingDigest = if (digestEvidenceCurrent) previewDigest else null
                 val basis = PublicationBasis(
                     modifiedAt = authoritativeRow.offlineBasisModifiedAt,
                     size = authoritativeRow.offlineBasisSize,
@@ -1271,9 +1432,9 @@ object OfflineFolderSyncUtils {
                 )
                 when (decidePublication(
                     basis = basis,
-                    localExists = offlineFile.exists(),
-                    localSize = offlineFile.takeIf { it.exists() }?.length(),
-                    localModifiedSec = offlineFile.takeIf { it.exists() }?.lastModified()?.div(1_000L),
+                    localExists = currentExists,
+                    localSize = currentLength,
+                    localModifiedSec = currentModifiedSec,
                     existingDigest = existingDigest,
                     downloadDigest = digest,
                 )) {
@@ -1284,9 +1445,16 @@ object OfflineFolderSyncUtils {
                     PublicationDecision.ADOPT_METADATA_ONLY -> {
                         // Body identical to the preserved publication: metadata-only
                         // adoption on the verified clean copy (timestamp and basis move
-                        // together; the bytes are never touched). A declined adoption is a
-                        // withdrawn intent: report it accurately.
-                        val adopted = updatePublicationBasisLocked(userDrive, file.id, file, offlineFile)
+                        // together; the bytes are never touched). The preview byte evidence
+                        // is current (an ADOPT decision requires it); pass it so the record
+                        // re-stats instead of re-digesting inside the hold. A declined
+                        // adoption is a withdrawn intent: report it accurately.
+                        val verified = VerifiedLocalCopy(
+                            length = currentLength ?: return@withPublicationLock StagedPublication.PRESERVED_EXISTING,
+                            modifiedSec = currentModifiedSec ?: return@withPublicationLock StagedPublication.PRESERVED_EXISTING,
+                            digest = previewDigest,
+                        )
+                        val adopted = updatePublicationBasisLocked(userDrive, file.id, file, offlineFile, verified)
                         return@withPublicationLock if (adopted) {
                             StagedPublication.ADOPTED_METADATA_ONLY
                         } else {
@@ -1402,6 +1570,13 @@ object OfflineFolderSyncUtils {
         }
     }
 
+    /**
+     * Digest evidence for a publication computed OUTSIDE the commit authority (the
+     * cache-move seam digests its staged bytes before the hold that publishes them).
+     * Package-facing accessor for the private [computeDigest].
+     */
+    internal fun computeDigestForEvidence(file: JavaFile): String? = computeDigest(file)
+
     private fun computeDigest(file: JavaFile): String? = runCatching {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
@@ -1444,59 +1619,79 @@ object OfflineFolderSyncUtils {
         offlineFile: JavaFile,
         acceptedServerHash: String?,
     ): PublicationOutcome = withContext(Dispatchers.IO) {
-        // The FINAL content evidence (the digest being recorded), the live-intent
-        // validation and the basis record ALL run INSIDE the publication critical section:
-        // evidence read before acquiring the lock would be stale by the time it is
-        // recorded.
-        withPublicationLock {
-            val digest = computeDigest(offlineFile)
-            if (digest == null) {
-                SentryLog.w(TAG, "Accepted offline bytes could not be digested for file ${remoteFile.id}; basis not recorded")
-                return@withPublicationLock PublicationOutcome.NOT_RECORDED
+        // The FINAL content evidence (the digest being recorded) is computed OUTSIDE the
+        // commit authority — a whole-file digest never runs inside a hold. The stat
+        // re-verification, the live-intent validation and the basis record ALL run INSIDE
+        // the hold: evidence whose stat changed under the coordination is stale (a
+        // non-participating writer) and records nothing; every coordinated writer is
+        // excluded for the whole hold.
+        val acceptedLength = offlineFile.length()
+        val acceptedDigest = computeDigest(offlineFile)
+        OfflineCommitAuthority.withCommitAuthority {
+            recordAcceptedPublicationInHold(userDrive, remoteFile, offlineFile, acceptedServerHash, acceptedDigest, acceptedLength)
+        }
+    }
+
+    /**
+     * The accepted-publication record INSIDE an already-held commit authority (the
+     * cache-move publication seam publishes and records in one hold; the digest evidence
+     * [acceptedDigest]/[acceptedLength] was computed outside — for a staged publication the
+     * evidence describes the staged bytes, which the rename makes identical). Non-suspending
+     * by contract; MUST be called under [OfflineCommitAuthority.withCommitAuthority].
+     */
+    internal fun recordAcceptedPublicationInHold(
+        userDrive: UserDrive,
+        remoteFile: File,
+        offlineFile: JavaFile,
+        acceptedServerHash: String?,
+        acceptedDigest: String?,
+        acceptedLength: Long,
+    ): PublicationOutcome {
+        if (acceptedDigest == null || offlineFile.length() != acceptedLength) {
+            SentryLog.w(TAG, "Accepted offline bytes could not be digested (or changed under the coordination) for file ${remoteFile.id}; basis not recorded")
+            return PublicationOutcome.NOT_RECORDED
+        }
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val proxy = FileController.getFileProxyById(remoteFile.id, customRealm = realm)
+                ?: return PublicationOutcome.INTENT_WITHDRAWN
+            if (!hasLiveOfflineIntent(proxy, realm, userDrive)) {
+                SentryLog.w(TAG, "Offline intent withdrawn during download for file ${remoteFile.id}; publication skipped")
+                return PublicationOutcome.INTENT_WITHDRAWN
             }
-            FileController.getRealmInstance(userDrive).use { realm ->
-                val proxy = FileController.getFileProxyById(remoteFile.id, customRealm = realm)
-                    ?: return@withPublicationLock PublicationOutcome.INTENT_WITHDRAWN
-                if (!hasLiveOfflineIntent(proxy, realm, userDrive)) {
-                    SentryLog.w(TAG, "Offline intent withdrawn during download for file ${remoteFile.id}; publication skipped")
-                    return@withPublicationLock PublicationOutcome.INTENT_WITHDRAWN
-                }
-                var recorded = false
-                realm.executeTransaction { mutableRealm ->
-                    FileController.getFileProxyById(remoteFile.id, customRealm = mutableRealm)?.let { row ->
-                        // Defense-in-depth inside the transaction (the lock excludes every
-                        // covered withdrawal for this whole section).
-                        if (!hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
-                            SentryLog.w(TAG, "Offline intent withdrawn before the accepted basis record for file ${remoteFile.id}; nothing recorded")
-                            return@executeTransaction
-                        }
-                        // The same final-publication-window defense as the staged record: a
-                        // non-participating refresh can move the row out before THIS record —
-                        // the root contract's reach has then ended, and no accepted
-                        // publication may record a basis or offline status for a moved-out
-                        // owned copy. The claim stands for the unmark's beyond-subtree sweep.
-                        if (row.offlineOwnedByRoot && !row.isDirectlyPinned && !isRootCoveredCopy(row, mutableRealm, userDrive)) {
-                            SentryLog.w(TAG, "Root ownership stale at the accepted basis record for file ${remoteFile.id}; nothing recorded")
-                            return@executeTransaction
-                        }
-                        row.lastModifiedAt = remoteFile.lastModifiedAt
-                        row.size = remoteFile.size
-                        // Only an identity established for THIS accepted body is recorded; a
-                        // hash-less capture clears the record (unknown identity).
-                        row.serverContentHash = acceptedServerHash
-                        row.offlineBasisModifiedAt = remoteFile.lastModifiedAt
-                        row.offlineBasisSize = remoteFile.size
-                        row.offlineContentDigest = digest
-                        row.offlinePublishedPath = offlineFile.path
-                        // A publication under live root coverage records the root contract as
-                        // the owner (see the staged record above).
-                        if (isRootCoveredCopy(row, mutableRealm, userDrive)) row.offlineOwnedByRoot = true
-                        row.isOffline = true
-                        recorded = true
+            var recorded = false
+            realm.executeTransaction { mutableRealm ->
+                FileController.getFileProxyById(remoteFile.id, customRealm = mutableRealm)?.let { row ->
+                    // Defense-in-depth inside the transaction (the hold excludes every
+                    // coordinated writer for this whole section).
+                    if (!hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
+                        SentryLog.w(TAG, "Offline intent withdrawn before the accepted basis record for file ${remoteFile.id}; nothing recorded")
+                        return@executeTransaction
                     }
+                    // The same final-publication-window defense as the staged record: the
+                    // root contract's reach has ended for a moved-out owned copy, and no
+                    // accepted publication may record a basis or offline status for one.
+                    // The claim stands for the unmark's beyond-subtree sweep.
+                    if (row.offlineOwnedByRoot && !row.isDirectlyPinned && !isRootCoveredCopy(row, mutableRealm, userDrive)) {
+                        SentryLog.w(TAG, "Root ownership stale at the accepted basis record for file ${remoteFile.id}; nothing recorded")
+                        return@executeTransaction
+                    }
+                    row.lastModifiedAt = remoteFile.lastModifiedAt
+                    row.size = remoteFile.size
+                    // Only an identity established for THIS accepted body is recorded; a
+                    // hash-less capture clears the record (unknown identity).
+                    row.serverContentHash = acceptedServerHash
+                    row.offlineBasisModifiedAt = remoteFile.lastModifiedAt
+                    row.offlineBasisSize = remoteFile.size
+                    row.offlineContentDigest = acceptedDigest
+                    row.offlinePublishedPath = offlineFile.path
+                    // A publication under live root coverage records the root contract as
+                    // the owner (see the staged record above).
+                    if (isRootCoveredCopy(row, mutableRealm, userDrive)) row.offlineOwnedByRoot = true
+                    row.isOffline = true
+                    recorded = true
                 }
-                if (recorded) PublicationOutcome.PUBLISHED else PublicationOutcome.INTENT_WITHDRAWN
             }
+            return if (recorded) PublicationOutcome.PUBLISHED else PublicationOutcome.INTENT_WITHDRAWN
         }
     }
 
