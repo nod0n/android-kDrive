@@ -487,6 +487,24 @@ object FileController {
         }
     }
 
+    /**
+     * Coordinated INSERT of a VALIDATED remote row that is missing from the cache — the
+     * missing-root recovery lever (FHNW-1189 A3, corrected by RESUME-962c item 2):
+     * [updateExistingFile] refreshes an EXISTING row only (its write runs inside
+     * `getFileById(...)?.let`), so an ABSENT row would make a recovery a silent no-op that
+     * still reports success. This is the insert side: it joins the commit authority like
+     * every row-creation writer and stores the remote representation as-is — there is no
+     * local row whose offline/pin fields could be preserved, and the registry's intent is
+     * untouched (the registration stands, the next pass walks the recovered row).
+     */
+    fun upsertMissingRemoteFile(newFile: File, realm: Realm) {
+        OfflineCommitAuthority.withCommitAuthority {
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.insertOrUpdate(newFile)
+            }
+        }
+    }
+
     private fun insertOrUpdateFile(
         realm: Realm,
         newFile: File,

@@ -261,11 +261,13 @@ class DownloadOfflineFileManager(
     ): CacheMoveOutcome = withContext(Dispatchers.IO) {
         if (file.isObsoleteOrNotIntact(cacheFile)) return@withContext CacheMoveOutcome.NOT_INTACT
 
-        // The mutation generation is captured BEFORE the staging copy: any participating
-        // mutation that commits while the copy runs (a competing publication completing, an
-        // unmark, a tree move) advances it, and the hold below refuses on the change — the
-        // pre-effect refusal covers the WHOLE copy span, not just the in-hold window.
-        val generationAtStart = OfflineCommitAuthority.withCommitAuthority {
+        // The mutation generation is captured BEFORE the staging copy, under an OBSERVATION
+        // acquisition (an evidence capture never advances the generation — RESUME-962c item
+        // 1): any participating mutation that commits while the copy runs (a competing
+        // publication completing, an unmark, a tree move) advances it, and the hold below
+        // refuses on the change — the pre-effect refusal covers the WHOLE copy span, not
+        // just the in-hold window.
+        val generationAtStart = OfflineCommitAuthority.withCommitAuthorityForEvidence {
             OfflineCommitAuthority.currentGenerationUnderAuthority()
         }
 
@@ -289,6 +291,17 @@ class DownloadOfflineFileManager(
             // bytes — the rename makes them identical to the published ones).
             val stagedLength = staging.length()
             val stagedDigest = OfflineFolderSyncUtils.computeDigestForEvidence(staging)
+
+            // DESTINATION CONTENT EVIDENCE (RESUME-962c item 4), also computed OUTSIDE the
+            // hold: when the destination is occupied, the in-hold classification below must
+            // prove its BYTES — not just their stat — match the row's accepted publication
+            // before rename(2) may replace them. A pre-existing same-stat in-place edit
+            // (original length and mtime) is invisible to every stat comparison.
+            val destinationDigest = if (offlineFile.exists()) {
+                OfflineFolderSyncUtils.computeDigestForEvidence(offlineFile)
+            } else {
+                null
+            }
 
             val published = OfflineCommitAuthority.withCommitAuthority {
                 // EVIDENCE CERTIFICATION (generation) FIRST: a participating mutation
@@ -326,15 +339,22 @@ class DownloadOfflineFileManager(
                     // DESTINATION AUTHORITY: rename(2) replaces silently, so the
                     // destination is judged before the effect. An occupied destination is
                     // refused UNLESS it is provably THIS row's own intact accepted
-                    // publication (the recorded path plus a matching basis stat) — the
-                    // baseline refresh of the row's own copy; an edited, unknown, stray or
-                    // competing publication's bytes are NEVER replaced (both sides
-                    // preserved; no move-then-delete repair).
+                    // publication: the recorded path, a matching basis stat, AND a content
+                    // proof — the destination's digest (computed outside the hold) must
+                    // equal the row's recorded offlineContentDigest (RESUME-962c item 4).
+                    // Stat equality alone cannot distinguish the accepted copy from a
+                    // pre-existing same-stat in-place edit, and a missing digest (row or
+                    // destination) cannot prove replaceable bytes either: every such case
+                    // is conservatively refused — an edited, unknown, stray or competing
+                    // publication's bytes are NEVER replaced (both sides preserved; no
+                    // move-then-delete repair).
                     if (offlineFile.exists()) {
                         val basisIntact = row.offlineBasisModifiedAt > 0L &&
                             row.offlinePublishedPath == offlineFile.path &&
                             offlineFile.lastModified().div(1_000L) == row.offlineBasisModifiedAt &&
-                            (row.offlineBasisSize == null || offlineFile.length() == row.offlineBasisSize)
+                            (row.offlineBasisSize == null || offlineFile.length() == row.offlineBasisSize) &&
+                            row.offlineContentDigest != null &&
+                            destinationDigest == row.offlineContentDigest
                         if (!basisIntact) {
                             SentryLog.w(TAG, "The cache move's destination holds bytes this row does not own for ${file.id}; both sides preserved")
                             return@withCommitAuthority null

@@ -122,8 +122,17 @@ object OfflineFolderSyncUtils {
      */
     internal fun certifiedFreshRealm(userDrive: UserDrive?): Realm {
         val realm = FileController.getRealmInstance(userDrive)
-        check(!realm.isInTransaction) { "a certified-fresh read cannot start inside a transaction" }
-        realm.refresh()
+        try {
+            check(!realm.isInTransaction) { "a certified-fresh read cannot start inside a transaction" }
+            realm.refresh()
+        } catch (t: Throwable) {
+            // The caller's .use was never entered (this reference was not handed over), so
+            // the failed acquisition closes its own instance (RESUME-962c item 3): the
+            // failure evidence (the thrown check/refresh error) is preserved for the caller,
+            // which treats it as a refusal/preserve.
+            runCatching { realm.close() }
+            throw t
+        }
         return realm
     }
 
@@ -622,8 +631,10 @@ object OfflineFolderSyncUtils {
     ): Boolean {
         var attempt = 0
         while (true) {
-            // Snapshot hold: the row fields, the byte stat and the generation, together.
-            val snapshot = OfflineCommitAuthority.withCommitAuthority {
+            // Snapshot hold (OBSERVATION — an evidence capture never advances the
+            // generation, RESUME-962c item 1): the row fields, the byte stat and the
+            // generation, together.
+            val snapshot = OfflineCommitAuthority.withCommitAuthorityForEvidence {
                 certifiedFreshRealm(userDrive).use { realm ->
                     FileController.getFileProxyById(fileId, customRealm = realm)?.let { row ->
                         if (row.isFolder()) null
@@ -833,7 +844,15 @@ object OfflineFolderSyncUtils {
             val roots = certifiedFreshRealm(userDrive).use { realm ->
                 realm.where(OfflineFolderRoot::class.java).findAll().map { realm.copyFromRealm(it, 0) }
             }
-            if (roots.isEmpty()) return@forEach
+            // RESUME-962c item 2b: NO early return for an empty registry. A drive whose
+            // last root was withdrawn (the missing-root resolution's definitive answer,
+            // completed unmarks' residues) still owns CLAIMED rows, and the pass's union
+            // discharge below is the machinery that releases them (bytes preserved). With
+            // zero roots the discharge is vacuously all-complete and the empty registry
+            // matches its pass-start snapshot, so the orphaned claims converge on the
+            // SUBSEQUENT pass instead of being immortal (the sole-root definitive-gone
+            // schedule's promised "later pass" release is THIS path).
+
 
             // PASS-START CLAIMED SNAPSHOT (FHNW-1189 A6): the rows carrying the recorded
             // claim when the pass started. The beyond-coverage discharge releases only rows
@@ -850,17 +869,17 @@ object OfflineFolderSyncUtils {
                     .toSet()
             }
 
-            // Walk EVERY root first. Each walk records the ids it PROVED remotely present;
-            // an incomplete walk proves nothing. A root whose CACHED folder row is missing
-            // gets an AUTHORITATIVE remote resolution instead of a walk (FHNW-1189 A3): a
-            // missing cache row is NOT evidence of a remote deletion, so the registration
-            // survives unless the remote answer is definitive. Every root WITHOUT a
-            // complete walk this pass (failed listing, unresolved missing row) lands in
-            // [unprovenRootFolderIds]: its remote status proves nothing, and its possible
-            // ownership keeps rows alive in every release phase (b528 discipline — one
-            // root's completion never judges another root's rows).
+            // Walk EVERY registered root first. Each walk records the ids it PROVED remotely
+            // present; an incomplete walk proves nothing. A root whose CACHED folder row is
+            // missing gets an AUTHORITATIVE remote resolution instead of a walk (FHNW-1189
+            // A3): a missing cache row is NOT evidence of a remote deletion, so the
+            // registration survives unless the remote answer is definitive. Every root
+            // WITHOUT a complete walk this pass (failed listing, unresolved missing row)
+            // withholds the whole release hold below (RESUME-962c item 5 / FHNW-962c P2-5):
+            // its remote status is unproven, and a row omitted from a completed root's
+            // listing may have MOVED into it — negative cached ancestry is not negative
+            // coverage, so no claim or intent is released on partial-pass evidence.
             var allWalksComplete = true
-            val unprovenRootFolderIds = mutableSetOf<Int>()
             val completedWalks = mutableListOf<Triple<OfflineFolderRoot, Set<Int>, Set<Int>>>()
             roots.forEach root@{ root ->
                 currentCoroutineContext().ensureActive()
@@ -870,10 +889,9 @@ object OfflineFolderSyncUtils {
                 } ?: run {
                     when (resolveMissingRootFolder(userDrive, root)) {
                         MissingRootResolution.RECOVERED -> Unit // the row is back: the next pass walks it
-                        MissingRootResolution.DEFINITIVELY_GONE -> Unit // the registration was withdrawn; bytes preserved
+                        MissingRootResolution.DEFINITIVELY_GONE -> Unit // the registration was withdrawn; its claims ride the SUBSEQUENT pass's discharge (bytes preserved)
                         MissingRootResolution.UNRESOLVED -> Unit // inconclusive answer: the registration stands, retry next pass
                     }
-                    unprovenRootFolderIds.add(root.folderId)
                     allWalksComplete = false // no walk evidence exists for this root
                     return@root
                 }
@@ -886,7 +904,6 @@ object OfflineFolderSyncUtils {
                 )
                 if (outcome == WalkOutcome.INCOMPLETE) {
                     allWalksComplete = false // incomplete traversal proves nothing
-                    unprovenRootFolderIds.add(root.folderId)
                     return@root
                 }
                 completedWalks.add(Triple(root, previousSubtree, listedFileIds.toSet()))
@@ -898,16 +915,25 @@ object OfflineFolderSyncUtils {
             }
 
             // PASS-WIDE COORDINATED RELEASE (RESUME-b528-2212 item 2, extended by
-            // FHNW-1189 A3/A6/A7): one authority hold, gated on the registry re-read still
-            // matching the pass-start snapshot (a root registered or withdrawn mid-pass
-            // invalidates the snapshot). TWO phases with DIFFERENT evidence scopes:
-            //  1. Remote-delete release — per COMPLETED root: rows in that root's previous
-            //     cached subtree, still carrying intent, that no completed walk lists. A
-            //     row still covered by an UNPROVEN root keeps its intent (that root's
-            //     remote status proves nothing). Runs even while some root is unresolved —
-            //     a missing cache row must not freeze unrelated complete roots forever.
-            //  2. Beyond-coverage discharge — ONLY when every registered root's walk
-            //     COMPLETED: rows claimed at PASS START that no completed walk lists.
+            // FHNW-1189 A3/A6/A7, RESTRUCTURED by RESUME-962c item 5 / FHNW-962c P2-5):
+            // one authority hold, gated on the registry re-read still matching the pass-start
+            // snapshot (a root registered or withdrawn mid-pass invalidates the snapshot) AND
+            // on EVERY registered root's walk having completed this pass. The former
+            // per-completed-root partial-pass release is GONE — FHNW-962c P2-5 proved its
+            // schedule: X sat in A's cached previousSubtree, moved to B remotely during the
+            // pass, B's walk was incomplete, and X's cached chain still reached A — so the
+            // unproven-root keep-check (a cached-chain walk) could not see B and released
+            // X's claim and intent although an unproven root may own it. Negative cached
+            // ancestry is not negative coverage. With the all-complete gate, a row omitted
+            // from every completed listing is remotely absent from every PROVEN root, and a
+            // row that moved into an unproven root's subtree is re-listed there (kept) or
+            // the whole release defers to the next pass. TWO phases with DIFFERENT target
+            // sets, the SAME evidence bar:
+            //  1. Remote-delete release — rows in a completed root's previous cached
+            //     subtree, still carrying intent, that no completed walk lists.
+            //  2. Beyond-coverage discharge — rows claimed at PASS START that no completed
+            //     walk lists (also the empty-registry pass's orphaned-claim convergence,
+            //     RESUME-962c item 2b).
             val job = currentCoroutineContext()[Job]
             withContext(Dispatchers.IO) {
                 OfflineCommitAuthority.withCommitAuthority {
@@ -920,6 +946,10 @@ object OfflineFolderSyncUtils {
                     }
                     if (registryNow != roots.map { it.folderId }.toSet()) {
                         SentryLog.i(TAG, "Offline root registry changed during the maintenance pass; releases skipped")
+                        return@withCommitAuthority
+                    }
+                    if (!allWalksComplete) {
+                        SentryLog.i(TAG, "An offline root's walk is incomplete; the release pass defers — no claim or intent is judged on partial-pass evidence")
                         return@withCommitAuthority
                     }
                     val listedUnion = completedWalks.flatMapTo(mutableSetOf<Int>()) { it.third }
@@ -956,11 +986,6 @@ object OfflineFolderSyncUtils {
                                     if (job?.isActive == false) return@executeTransaction
                                     val proxy = FileController.getFileProxyById(fileId, customRealm = mutableRealm)
                                         ?: continue
-                                    // A row still covered by a root WITHOUT a complete walk
-                                    // this pass keeps its intent: that root's remote status
-                                    // is unproven, and completing another root proved
-                                    // nothing about it.
-                                    if (isCoveredByAnyRootOf(proxy, mutableRealm, userDrive, unprovenRootFolderIds)) continue
                                     clearClaimedRowFields(mutableRealm, fileId)
                                 }
                             }
@@ -969,13 +994,12 @@ object OfflineFolderSyncUtils {
 
                     // 2. Beyond-coverage ownership discharge: rows claimed at PASS START
                     //    that NO completed walk lists — no live root proves them anymore —
-                    //    released the same way (bytes PRESERVED, state cleared). Only on
-                    //    ALL-COMPLETE walks (a failed or unresolved root withholds the
-                    //    globally-scoped phase, which could otherwise mis-judge its rows).
+                    //    released the same way (bytes PRESERVED, state cleared). The
+                    //    all-complete gate above covers this phase too (with zero registered
+                    //    roots it is the orphaned-claim convergence of RESUME-962c item 2b).
                     //    Directly pinned rows keep their own contract (the pin suppresses
                     //    the claim; the next pass after an unpin discharges them); the pin
                     //    state is re-read fresh inside the transaction.
-                    if (!allWalksComplete) return@withCommitAuthority
                     val claimedNow = certifiedFreshRealm(userDrive).use { realm ->
                         realm.where(File::class.java)
                             .equalTo(File::offlineOwnedByRoot.name, true)
@@ -1014,8 +1038,12 @@ object OfflineFolderSyncUtils {
      *    the next pass walks the root again;
      *  - a trashed folder or the API's object_not_found -> definitive: the registration
      *    is withdrawn (a coordinated registry deletion; bytes are NEVER deleted here —
-     *    the existing release scope policy disposes of the claims with bytes preserved on
-     *    the next pass);
+     *    the claims release through the maintenance discharge on the SUBSEQUENT pass,
+     *    which no longer exits at an empty registry (RESUME-962c item 2b). The release
+     *    deliberately does NOT run inside this resolution: remaining roots' walk status
+     *    is unproven at this point, and a claim whose cached chain reaches the ended
+     *    root may have moved into an unproven one (the P2-5 discipline applies to this
+     *    contract end too);
      *  - anything else (network, permission, another code) -> unresolved: the
      *    registration and the row stand and the next pass retries.
      */
@@ -1027,8 +1055,13 @@ object OfflineFolderSyncUtils {
         val remoteFolder = details.data
         return when {
             details.isSuccess() && remoteFolder != null && !remoteFolder.isTrashed() -> {
+                // RESUME-962c item 2: the cached row is ABSENT here — the very premise of
+                // this branch — so the refresh-only [FileController.updateExistingFile] was
+                // a silent no-op that still reported recovery. The coordinated INSERT
+                // lever actually creates the row (the remote details carry the folder's
+                // identity; the registry's intent stands untouched).
                 certifiedFreshRealm(userDrive).use { realm ->
-                    FileController.updateExistingFile(newFile = remoteFolder, realm = realm)
+                    FileController.upsertMissingRemoteFile(newFile = remoteFolder, realm = realm)
                 }
                 SentryLog.i(TAG, "Offline root ${root.uid}: the cached folder row was recovered from the remote details")
                 MissingRootResolution.RECOVERED
@@ -1372,7 +1405,7 @@ object OfflineFolderSyncUtils {
         // snapshot and the acquisition: the evidence is uncertified and the adoption is
         // SKIPPED (the preserved bytes stay consistent with THEIR basis) — never recorded
         // from stale evidence.
-        val (byteStat, snapshotGeneration) = OfflineCommitAuthority.withCommitAuthority {
+        val (byteStat, snapshotGeneration) = OfflineCommitAuthority.withCommitAuthorityForEvidence {
             offlineFile?.takeIf { it.exists() }?.let { copy ->
                 copy.length() to copy.lastModified().div(1_000L)
             } to OfflineCommitAuthority.currentGenerationUnderAuthority()
@@ -1399,7 +1432,10 @@ object OfflineFolderSyncUtils {
         offlineFile: JavaFile?,
         verifiedBytes: VerifiedLocalCopy?,
     ): Boolean {
-        FileController.getRealmInstance(userDrive).use { realm ->
+        // CERTIFIED decision read (RESUME-962c item 3): this read authorizes the timestamp
+        // adoption EFFECT below — a retained stale view here would setLastModified and write
+        // basis fields for an intent that was already withdrawn.
+        certifiedFreshRealm(userDrive).use { realm ->
             val proxy = FileController.getFileProxyById(fileId, customRealm = realm) ?: return false
             if (!hasLiveOfflineIntent(proxy, realm, userDrive)) {
                 SentryLog.w(TAG, "Offline intent withdrawn before metadata adoption for file $fileId; adoption skipped")
@@ -1577,7 +1613,10 @@ object OfflineFolderSyncUtils {
             // evidence never authorizes destruction).
             var attempt = 0
             while (true) {
-                val (preview, snapshotGeneration) = OfflineCommitAuthority.withCommitAuthority {
+                // OBSERVATION acquisition (RESUME-962c item 1): the evidence capture never
+                // advances the generation — only a real mutation between the capture and
+                // the publication hold can.
+                val (preview, snapshotGeneration) = OfflineCommitAuthority.withCommitAuthorityForEvidence {
                     val previewExists = offlineFile.exists()
                     Triple(
                         previewExists,
@@ -1868,7 +1907,7 @@ object OfflineFolderSyncUtils {
         // publication's basis classifies the bytes. The residual external SAME-STAT edit
         // class (same length, same second-rounded mtime, spanning the unbounded lock wait)
         // is disclosed in [OfflineCommitAuthority]'s contract.
-        val (acceptedStat, snapshotGeneration) = OfflineCommitAuthority.withCommitAuthority {
+        val (acceptedStat, snapshotGeneration) = OfflineCommitAuthority.withCommitAuthorityForEvidence {
             (offlineFile.length() to offlineFile.lastModified().div(1_000L)) to
                 OfflineCommitAuthority.currentGenerationUnderAuthority()
         }
@@ -1904,7 +1943,9 @@ object OfflineFolderSyncUtils {
             SentryLog.w(TAG, "Accepted offline bytes could not be digested (or changed under the coordination) for file ${remoteFile.id}; basis not recorded")
             return PublicationOutcome.NOT_RECORDED
         }
-        FileController.getRealmInstance(userDrive).use { realm ->
+        // CERTIFIED decision read (RESUME-962c item 3): this is the record's pre-effect
+        // authority read — a retained stale view must not let a withdrawn intent record.
+        certifiedFreshRealm(userDrive).use { realm ->
             val proxy = FileController.getFileProxyById(remoteFile.id, customRealm = realm)
                 ?: return PublicationOutcome.INTENT_WITHDRAWN
             if (!hasLiveOfflineIntent(proxy, realm, userDrive)) {
