@@ -36,6 +36,7 @@ import io.mockk.spyk
 import io.mockk.unmockkAll
 import io.realm.Realm
 import io.realm.RealmConfiguration
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
@@ -53,9 +54,10 @@ import org.junit.jupiter.api.TestInstance
 import java.io.ByteArrayInputStream
 import java.util.Date
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import android.database.Cursor
 
@@ -96,7 +98,16 @@ class PhotoTrashConsentQueueTest {
     private val mediaTrashed = AtomicBoolean(false)
     private val remoteTrashed = AtomicBoolean(true)
     private val remoteHash = AtomicReference(pairingHash)
-    private val remoteQueryPauseMillis = AtomicLong(0L)
+
+    /**
+     * Mid-IO interleaving is established with an EXPLICIT capture/release latch at the
+     * production remote-details seam — never with Thread.sleep: a blocking sleep in the
+     * runBlocking event loop never yields to a child that inherited that loop, so the
+     * identity flip could run entirely before the poll even started.
+     */
+    private var parkAtRemoteQuery = false
+    private lateinit var remoteQueryCapture: CountDownLatch
+    private lateinit var remoteQueryRelease: CountDownLatch
 
     /** How many times the poll actually REACHED the gated remote-details boundary. */
     private val remoteQueryEntered = AtomicInteger(0)
@@ -124,7 +135,9 @@ class PhotoTrashConsentQueueTest {
         mediaTrashed.set(false)
         remoteTrashed.set(true)
         remoteHash.set(pairingHash)
-        remoteQueryPauseMillis.set(0L)
+        parkAtRemoteQuery = false
+        remoteQueryCapture = CountDownLatch(1)
+        remoteQueryRelease = CountDownLatch(1)
         remoteQueryEntered.set(0)
 
         val mockResolver = mockk<android.content.ContentResolver>()
@@ -159,12 +172,13 @@ class PhotoTrashConsentQueueTest {
     }
 
     /** A live account flip DURING the poll's remote IO must end the drain (softcheck #3):
-     *  tests park here, flip the identity, then release. */
+     *  the parked poll first PROVES it reached the seam, then the identity flips, then the
+     *  poll is released. A latch timeout fails OPEN so a broken park cannot wedge the suite. */
     private fun remoteQueryGate() {
         remoteQueryEntered.incrementAndGet()
-        val pauseMillis = remoteQueryPauseMillis.get()
-        if (pauseMillis > 0L) {
-            Thread.sleep(pauseMillis)
+        if (parkAtRemoteQuery) {
+            remoteQueryCapture.countDown()
+            remoteQueryRelease.await(15, TimeUnit.SECONDS)
         }
     }
 
@@ -218,6 +232,8 @@ class PhotoTrashConsentQueueTest {
         remoteFileId = remoteFileId,
         pendingSince = stamp,
         pairedAt = pairedAt,
+        activationEpoch = 0L,
+        bindingGeneration = 0L,
     )
 
     @Test
@@ -330,13 +346,19 @@ class PhotoTrashConsentQueueTest {
     @DisplayName("an account switched DURING the poll's remote IO ends the drain without launching")
     fun accountSwitchMidPollEndsTheDrain() {
         seedArmedRow(uriA, remoteFileIdA, stampA)
-        remoteQueryPauseMillis.set(300L)
 
         val surfaced = runBlocking {
-            val poll = async { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
-            // The account is switched WHILE the poll sits in its remote-details IO.
-            Thread.sleep(100)
+            parkAtRemoteQuery = true
+            // An explicit IO dispatcher: a child inheriting the runBlocking event loop
+            // could not even start while the parent blocked, and the flip must land
+            // strictly INSIDE the poll's remote IO.
+            val poll = async(Dispatchers.IO) { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
+            assertTrue(
+                remoteQueryCapture.await(15, TimeUnit.SECONDS),
+                "the poll must reach the remote-details seam before the identity flip",
+            )
             every { AccountUtils.currentUserId } returns userId + 1
+            remoteQueryRelease.countDown()
             poll.await()
         }
 

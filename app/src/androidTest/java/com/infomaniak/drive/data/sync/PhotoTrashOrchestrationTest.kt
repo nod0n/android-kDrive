@@ -36,6 +36,7 @@ import io.mockk.spyk
 import io.mockk.unmockkAll
 import io.realm.Realm
 import io.realm.RealmConfiguration
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
@@ -53,6 +54,8 @@ import org.junit.jupiter.api.TestInstance
 import java.io.ByteArrayInputStream
 import java.util.Date
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -107,8 +110,18 @@ class PhotoTrashOrchestrationTest {
     /** The live opt-in value the mocked settings serve (flippable mid-pass). */
     private val syncSettingsEnabled = AtomicBoolean(true)
 
-    /** > 0: the remote-details query parks this long, so tests can flip state mid-IO. */
-    private val remoteQueryPauseMillis = AtomicLong(0L)
+    /** The live activation epoch the mocked settings serve (bumped to simulate an activation). */
+    private val settingsActivationEpoch = AtomicLong(0L)
+
+    /**
+     * Mid-IO interleaving is established with EXPLICIT capture/release latches at the
+     * production remote-details seam — never with Thread.sleep: a blocking sleep in the
+     * runBlocking event loop never yields to a child that inherited that loop, so the
+     * mutation could run entirely before the pass even started.
+     */
+    private var parkAtRemoteQuery = false
+    private lateinit var remoteQueryCapture: CountDownLatch
+    private lateinit var remoteQueryRelease: CountDownLatch
 
     /** How many times the pass actually REACHED the gated remote-details boundary. */
     private val remoteQueryEntered = AtomicInteger(0)
@@ -139,7 +152,10 @@ class PhotoTrashOrchestrationTest {
         remoteHash.set(pairingHash)
         deleteRequests.set(0)
         syncSettingsEnabled.set(true)
-        remoteQueryPauseMillis.set(0L)
+        settingsActivationEpoch.set(0L)
+        parkAtRemoteQuery = false
+        remoteQueryCapture = CountDownLatch(1)
+        remoteQueryRelease = CountDownLatch(1)
         remoteQueryEntered.set(0)
 
         val mockResolver = mockk<android.content.ContentResolver>()
@@ -158,6 +174,7 @@ class PhotoTrashOrchestrationTest {
                 userId = userId,
                 driveId = driveId,
                 photoTrashSyncEnabled = syncSettingsEnabled.get(),
+                photoTrashActivationEpoch = settingsActivationEpoch.get(),
             )
         }
         every { ApiRepository.deleteFile(any()) } answers {
@@ -179,16 +196,37 @@ class PhotoTrashOrchestrationTest {
     }
 
     /**
-     * The remote-query gate: a live opt-in/scope flip DURING a pass's network IO must be
-     * caught by the FINAL pre-delete recheck (softcheck #3). Tests park here, flip the
-     * gate, then release.
+     * The remote-query gate at the REAL production IO boundary. When a test arms
+     * [parkAtRemoteQuery], the parked pass first PROVES it reached the seam (its row list
+     * and pairing-time observation were captured BEFORE this point — the mutation may only
+     * begin after the capture latch fires) and then stays suspended until the test
+     * releases it. A latch timeout fails OPEN so a broken park can never wedge the suite.
      */
     private fun remoteQueryGate() {
         remoteQueryEntered.incrementAndGet()
-        val pauseMillis = remoteQueryPauseMillis.get()
-        if (pauseMillis > 0L) {
-            Thread.sleep(pauseMillis)
+        if (parkAtRemoteQuery) {
+            remoteQueryCapture.countDown()
+            remoteQueryRelease.await(15, TimeUnit.SECONDS)
         }
+    }
+
+    /**
+     * Drives the REAL pass on an IO dispatcher (async WITHOUT a dispatcher inherits this
+     * runBlocking event loop — the parent's blocking sleep would never let it start, so
+     * the "interleaving" could happen entirely before the pass began). The test blocks
+     * until the pass has REACHED the production remote-details seam, performs the mutation
+     * against the LIVE stores, releases the suspended pass, and returns its result.
+     */
+    private fun runPassWithMidIoMutation(mutation: () -> Unit): Int = runBlocking {
+        parkAtRemoteQuery = true
+        val pass = async(Dispatchers.IO) { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+        assertTrue(
+            remoteQueryCapture.await(15, TimeUnit.SECONDS),
+            "the pass must reach the remote-details seam (old row captured) before the mutation",
+        )
+        mutation()
+        remoteQueryRelease.countDown()
+        pass.await()
     }
 
     private fun mediaCursor(trashed: Boolean, rowPresent: Boolean = true): Cursor = mockk(relaxed = true) {
@@ -380,7 +418,7 @@ class PhotoTrashOrchestrationTest {
             }
         }
         mediaRowPresent.set(false)
-        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        PhotoTrashController.captureActivationBaselines(mockContext, 0L, config)
         assertNull(row().baselineTrashed, "an unavailable reactivation observation resets the baseline to pending")
         assertEquals(PhotoPairing.State.ACTIVE.name, row().state, "no state promotion happens without a real observation")
     }
@@ -390,16 +428,11 @@ class PhotoTrashOrchestrationTest {
     fun optionDisabledMidPassStopsBeforeTheDestructiveCall() {
         seedPairing()
         mediaTrashed.set(true)
-        remoteQueryPauseMillis.set(300L)
 
-        val propagated = runBlocking {
-            val pass = async {
-                PhotoTrashController.runLocalReconciliation(mockContext, config)
-            }
-            // The option is switched off WHILE the pass sits in its remote-details IO.
-            Thread.sleep(100)
+        val propagated = runPassWithMidIoMutation {
+            // The option is switched off WHILE the pass is suspended in its remote-details
+            // IO (proven reached).
             syncSettingsEnabled.set(false)
-            pass.await()
         }
 
         assertEquals(0, propagated, "the unauthorized pass propagated nothing")
@@ -419,7 +452,7 @@ class PhotoTrashOrchestrationTest {
         // The item is trashed while the option is still off; the user then enables the
         // option: the activation capture re-baselines EVERY row off the REAL MediaStore.
         mediaTrashed.set(true)
-        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        PhotoTrashController.captureActivationBaselines(mockContext, 0L, config)
         val activated = row()
         assertEquals(true, activated.baselineTrashed, "the activation baseline is the real opt-in state")
         assertEquals(PhotoPairing.State.INCONCLUSIVE.name, activated.state, "a pre-activation trash is visibly inconclusive")
@@ -437,7 +470,7 @@ class PhotoTrashOrchestrationTest {
         seedPairing(baselineTrashed = false, lastObservedTrashed = false)
 
         // Activation re-baseline observes the item NOT trashed: no state change.
-        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        PhotoTrashController.captureActivationBaselines(mockContext, 0L, config)
         assertEquals(PhotoPairing.State.ACTIVE.name, row().state)
         assertEquals(false, row().baselineTrashed)
 
@@ -457,7 +490,7 @@ class PhotoTrashOrchestrationTest {
         val pending = seedPairing(baselineTrashed = null)
         mediaTrashed.set(true)
 
-        val baseline = PhotoTrashController.captureActivationBaseline(mockContext, pending, config)
+        val baseline = PhotoTrashController.captureActivationBaseline(mockContext, pending, 0L, config)
 
         assertTrue(baseline)
         val captured = row()
@@ -504,13 +537,11 @@ class PhotoTrashOrchestrationTest {
     fun staleObservationCannotTrashAReplacementPairing() {
         seedPairing()
         mediaTrashed.set(true)
-        remoteQueryPauseMillis.set(300L)
 
-        val propagated = runBlocking {
-            val pass = async { PhotoTrashController.runLocalReconciliation(mockContext, config) }
-            // While the pass sits in its remote IO, the user re-uploads the SAME uri: a NEW
-            // binding — new remote file, new pairing moment, new content binding.
-            Thread.sleep(100)
+        val propagated = runPassWithMidIoMutation {
+            // While the pass is suspended in its remote IO (its OLD row already captured),
+            // the user re-uploads the SAME uri: a NEW binding — new remote file, new
+            // pairing moment, new content binding.
             PhotoTrashController.recordPairing(
                 context = mockContext,
                 uploadFile = uploadFile(),
@@ -521,7 +552,6 @@ class PhotoTrashOrchestrationTest {
             // The stale pass's boundary re-read still verifies its OWN recorded digest
             // (contentA): the witness must catch the replacement, not the digest.
             resolverContent.set(contentA)
-            pass.await()
         }
 
         assertTrue(remoteQueryEntered.get() >= 1, "the pass reached the gated mid-IO boundary")
@@ -538,16 +568,14 @@ class PhotoTrashOrchestrationTest {
     fun offOnActivationBetweenObservationAndEffectIsNeverBypassed() {
         seedPairing(baselineTrashed = false, lastObservedTrashed = false)
         mediaTrashed.set(true)
-        remoteQueryPauseMillis.set(300L)
 
-        val propagated = runBlocking {
-            val pass = async { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+        val propagated = runPassWithMidIoMutation {
             // The user turns the option OFF->ON mid-pass: the activation capture re-baselines
-            // EVERY row off the real MediaStore — the trashed item becomes a visible
-            // INCONCLUSIVE. The in-flight pass holds the PRE-toggle detached copy.
-            Thread.sleep(100)
-            PhotoTrashController.captureActivationBaselines(mockContext, config)
-            pass.await()
+            // EVERY row off the real MediaStore under a NEW epoch (every captured value can
+            // come back identical — the epoch is what invalidates the in-flight pass, which
+            // holds the PRE-toggle detached copy).
+            settingsActivationEpoch.incrementAndGet()
+            PhotoTrashController.captureActivationBaselines(mockContext, settingsActivationEpoch.get(), config)
         }
 
         assertTrue(remoteQueryEntered.get() >= 1, "the pass reached the gated mid-IO boundary")
@@ -555,6 +583,7 @@ class PhotoTrashOrchestrationTest {
         assertEquals(0L, deleteRequests.get(), "the destructive API was never called by the stale pass")
         val activated = row()
         assertEquals(true, activated.baselineTrashed, "the activation re-baseline stands")
+        assertEquals(1L, activated.activationEpoch, "the activation re-stamped the generation")
         assertEquals(PhotoPairing.State.INCONCLUSIVE.name, activated.state, "the activation's fresh-start protection is NOT bypassed")
         assertEquals(0L, activated.lastLocalTrashReconciledAt, "the stale pass left no reconciled marker")
     }
@@ -570,13 +599,10 @@ class PhotoTrashOrchestrationTest {
         }
         mediaTrashed.set(false)
         remoteTrashed.set(false) // the stale pass will observe a restored remote
-        remoteQueryPauseMillis.set(300L)
 
-        runBlocking {
-            val pass = async { PhotoTrashController.runLocalReconciliation(mockContext, config) }
-            Thread.sleep(100)
+        runPassWithMidIoMutation {
             // The binding is replaced AND freshly armed (a new remote trash the old pass
-            // knows nothing about) while the pass sits in its remote IO.
+            // knows nothing about) while the pass is suspended in its remote IO.
             PhotoTrashController.recordPairing(
                 context = mockContext,
                 uploadFile = uploadFile(),
@@ -589,7 +615,6 @@ class PhotoTrashOrchestrationTest {
                     mutableRealm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, pairingUri).findFirst()?.remoteTrashPendingSince = 9_000L
                 }
             }
-            pass.await()
         }
 
         assertTrue(remoteQueryEntered.get() >= 1, "the pass reached the gated mid-IO boundary")
@@ -616,7 +641,7 @@ class PhotoTrashOrchestrationTest {
         // The row becomes VISIBLE, content unchanged: the late capture fills the baseline,
         // and the pass propagates on the content binding alone — no false metadata conflict.
         mediaRowPresent.set(true)
-        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        PhotoTrashController.captureActivationBaselines(mockContext, 0L, config)
         assertEquals(false, row().baselineTrashed, "the late capture fills the pending baseline")
         mediaTrashed.set(true)
         assertEquals(1, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }, "the unchanged visible row propagates")
@@ -638,7 +663,7 @@ class PhotoTrashOrchestrationTest {
             customRealmConfig = config,
         )
         mediaRowPresent.set(true) // visible again, still serving B
-        PhotoTrashController.captureActivationBaselines(mockContext, config)
+        PhotoTrashController.captureActivationBaselines(mockContext, 0L, config)
         assertEquals(false, realm().use { realm ->
             realm.where(PhotoPairing::class.java).equalTo(PhotoPairing::uri.name, replacedUri).findFirst()!!.baselineTrashed
         }, "the visible row's baseline filled")
