@@ -409,11 +409,17 @@ class FileInfoActionsView @JvmOverloads constructor(
         if (cacheFile.exists() && path.isNotEmpty() && !isObsoleteOrNotIntact(cacheFile)) {
             getOfflineFile(context)?.let { offlineFile ->
                 Utils.moveCacheFileToOffline(file = this, cacheFile, offlineFile)
-                CoroutineScope(Dispatchers.IO).launch { FileController.updateOfflineStatus(id, isOffline = true) }
+                CoroutineScope(Dispatchers.IO).launch {
+                    FileController.updateOfflineStatus(id, isOffline = true)
+                    FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
+                }
                 isOffline = true
                 onItemClickListener.onCacheAddedToOffline()
             }
         } else {
+            CoroutineScope(Dispatchers.IO).launch {
+                FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
+            }
             Utils.downloadAsOfflineFile(context, file = this)
             if (isMarkedAsOffline) mainViewModel.updateOfflineFile.value = id
         }

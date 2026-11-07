@@ -271,6 +271,22 @@ object FileController {
         }
         customRealm?.let(block) ?: getRealmInstance().use(block)
     }
+
+    /**
+     * Records INDEPENDENT pin intent (the user pinned this file itself, as opposed to a copy
+     * covered by an offline folder root): set by the direct-pin actions, cleared by the direct
+     * unpin. Root walks never write it.
+     */
+    fun setDirectlyPinned(customRealm: Realm? = null, fileId: Int, isDirectlyPinned: Boolean) {
+        val block: (Realm) -> Unit? = { realm ->
+            realm.executeTransaction {
+                realm.where(File::class.java)
+                    .equalTo(File::id.name, fileId)
+                    .findFirst()?.isDirectlyPinned = isDirectlyPinned
+            }
+        }
+        customRealm?.let(block) ?: getRealmInstance().use(block)
+    }
     //endregion
 
     fun removeFile(
@@ -997,10 +1013,12 @@ object FileController {
         offlineBasisModifiedAt = oldFile.offlineBasisModifiedAt
         offlineBasisSize = oldFile.offlineBasisSize
         offlineContentDigest = oldFile.offlineContentDigest
-        // Server content hash is server-side identity: a response that carries it always wins
-        // (identity refresh); listings and plain details carry no hash, so absence keeps the
-        // preserved value instead of erasing the recorded publication basis.
-        if (serverContentHash == null) serverContentHash = oldFile.serverContentHash
+        // serverContentHash is the identity OF THE ACCEPTED BYTES (the publication basis), not
+        // the current remote metadata: it must survive every listing/details refresh unchanged
+        // and advance only through the verified publication paths (the download seam, a
+        // hash-verified metadata adoption, or a staged replacement). Otherwise a refreshed
+        // remote hash could make stale local bytes look current.
+        serverContentHash = oldFile.serverContentHash
         responseAt = oldFile.responseAt
         if (path.isEmpty() && oldFile.path.isNotEmpty()) path = oldFile.path
         if (oldFile.revisedAt > revisedAt) revisedAt = oldFile.revisedAt

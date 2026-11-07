@@ -127,16 +127,20 @@ object OfflineFolderSyncUtils {
 
     //endregion
 
+    /**
+     * True when this copy's lifecycle is owned by an offline folder root: the persistent
+     * coverage marker is the accepted-basis record. The baseline offline sync must not apply
+     * its delete/upload/download effects to such copies first — the root maintenance pass
+     * handles remote deletions (keeping bytes), refreshes changes through the staged path and
+     * preserves local edits.
+     */
+    fun isRootCoveredCopy(file: File): Boolean = file.offlineBasisModifiedAt > 0L
+
     enum class WalkOutcome { COMPLETE, INCOMPLETE }
 
     /** Marks a folder (and its whole subtree) as persistently available offline. */
     suspend fun markFolderOffline(context: Context, folder: File, userDrive: UserDrive): Boolean {
         val root = OfflineFolderRoot(folderId = folder.id, driveId = userDrive.driveId, userId = userDrive.userId).apply { initUid() }
-        // Pre-existing persistent copies (direct pins) are recorded as direct pins so a later
-        // unmark of this root never deletes their bytes.
-        val preExistingPinnedIds = FileController.getRealmInstance(userDrive).use { realm ->
-            realm.where(File::class.java).equalTo(File::isOffline.name, true).findAll().map { it.id }.toSet()
-        }
         FileController.getRealmInstance(userDrive).use { realm ->
             realm.executeTransaction { mutableRealm -> mutableRealm.insertOrUpdate(root) }
         }
@@ -146,8 +150,6 @@ object OfflineFolderSyncUtils {
             context = context,
             userDrive = userDrive,
             rootFolderFile = folder,
-            initialMark = true,
-            preExistingPinnedIds = preExistingPinnedIds,
             onFolderWithMarkedFiles = foldersWithMarkedFiles::add,
         )
         if (outcome == WalkOutcome.INCOMPLETE) {
@@ -165,7 +167,10 @@ object OfflineFolderSyncUtils {
     /**
      * Removes a root and stops maintaining its subtree. Copies are deleted only through the
      * checked path; files directly pinned or covered by another root keep their copies and
-     * marks. Returns true when no copy had to be kept against a refused deletion.
+     * marks; copies classified as locally edited or unknown against the accepted basis are
+     * PRESERVED (their bytes are the user's, never deleted by an unmark). On a REFUSED
+     * deletion the root row is kept so the next pass retries; the return value reports that
+     * retriable state.
      */
     suspend fun unmarkFolderOffline(context: Context, folder: File, userDrive: UserDrive): Boolean {
         val rootUid = OfflineFolderRoot.buildUid(folder.id, userDrive.driveId, userDrive.userId)
@@ -186,9 +191,63 @@ object OfflineFolderSyncUtils {
                 val keepCopy = file.isFolder() || file.isDirectlyPinned || file.id in otherRootSubtreeIds
                 if (keepCopy) return@use false
 
-                // Checked deletion: clear the offline state only once the bytes are really gone.
                 val offlineFile = file.getOfflineFile(context, userDrive.userId)
-                val copyGone = if (offlineFile?.exists() == true) {
+                val localExists = offlineFile?.exists() == true
+
+                // Classify against the accepted basis BEFORE any destructive step: changed and
+                // unknown bytes belong to the user — release coverage, keep the bytes.
+                val basis = if (file.offlineBasisModifiedAt > 0L) PublicationBasis(
+                    modifiedAt = file.offlineBasisModifiedAt,
+                    size = file.offlineBasisSize,
+                    digest = file.offlineContentDigest,
+                    serverHash = file.serverContentHash,
+                ) else null
+                val localState = classifyLocalCopy(
+                    basis = basis,
+                    localExists = localExists,
+                    localSize = offlineFile?.takeIf { localExists }?.length(),
+                    localModifiedSec = offlineFile?.takeIf { localExists }?.lastModified()?.div(1_000L),
+                )
+                if (localState == LocalCopyState.LOCALLY_EDITED || localState == LocalCopyState.UNKNOWN) {
+                    if (localExists) {
+                        SentryLog.w(TAG, "Unmark keeps locally edited/unknown bytes for file ${file.id}")
+                        realm.executeTransaction { mutableRealm ->
+                            FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
+                                proxy.isMarkedAsOffline = false
+                                proxy.isOffline = false
+                                proxy.offlineBasisModifiedAt = 0L
+                                proxy.offlineBasisSize = null
+                                proxy.offlineContentDigest = null
+                                proxy.serverContentHash = null
+                            }
+                        }
+                        return@use false
+                    }
+                }
+
+                // A same-size/same-mtime edit still diverges from the accepted digest: verify
+                // the accepted identity before the destructive step (unpin is rare; the hash
+                // cost is fine). A mismatch is preservation, not authority to delete.
+                if (localExists && basis?.digest != null) {
+                    val localDigest = withContext(Dispatchers.IO) { computeDigest(offlineFile) }
+                    if (localDigest != null && localDigest != basis.digest) {
+                        SentryLog.w(TAG, "Unmark keeps bytes diverging from the accepted digest for file ${file.id}")
+                        realm.executeTransaction { mutableRealm ->
+                            FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
+                                proxy.isMarkedAsOffline = false
+                                proxy.isOffline = false
+                                proxy.offlineBasisModifiedAt = 0L
+                                proxy.offlineBasisSize = null
+                                proxy.offlineContentDigest = null
+                                proxy.serverContentHash = null
+                            }
+                        }
+                        return@use false
+                    }
+                }
+
+                // Checked deletion: clear the offline state only once the bytes are really gone.
+                val copyGone = if (localExists) {
                     withContext(Dispatchers.IO) { offlineFile.delete() }
                 } else {
                     true
@@ -214,7 +273,9 @@ object OfflineFolderSyncUtils {
             if (keptAgainstRefusal) allDeletionsConfirmed = false
         }
 
-        FileController.getRealmInstance(userDrive).use { realm ->
+        // A refused deletion keeps the root row: the next unmark pass retries it, and the
+        // protected files stay covered meanwhile.
+        if (allDeletionsConfirmed) FileController.getRealmInstance(userDrive).use { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(OfflineFolderRoot::class.java)
                     .equalTo(OfflineFolderRoot::uid.name, rootUid)
@@ -250,8 +311,6 @@ object OfflineFolderSyncUtils {
                     context = context,
                     userDrive = userDrive,
                     rootFolderFile = rootFolder,
-                    initialMark = false,
-                    preExistingPinnedIds = null,
                     onFileVisited = listedFileIds::add,
                 )
                 if (outcome == WalkOutcome.INCOMPLETE) return@root // incomplete traversal proves nothing
@@ -300,15 +359,16 @@ object OfflineFolderSyncUtils {
      * publication basis is recorded from ACCEPTED bytes by the download seam
      * ([recordAcceptedPublication]), never from a listing or an enqueued download. Files that
      * already keep an offline copy ([File.isOffline]) are not re-marked: their bytes are
-     * preserved and maintained by the existing offline cadence. Every visited non-folder file
-     * is reported through [onFileVisited] (coverage bookkeeping includes pre-existing pins).
+     * preserved and maintained by the existing offline cadence. The walk NEVER touches
+     * [File.isDirectlyPinned]: that flag records independent user pin intent (direct-pin UI,
+     * migration), not root coverage — otherwise marking an overlapping root would turn every
+     * existing root copy into a permanent pin. Every visited non-folder file is reported
+     * through [onFileVisited] (coverage bookkeeping includes pre-existing pins).
      */
     private suspend fun walkSubtree(
         context: Context,
         userDrive: UserDrive,
         rootFolderFile: File,
-        initialMark: Boolean,
-        preExistingPinnedIds: Set<Int>?,
         onFileVisited: ((Int) -> Unit)? = null,
         onFolderWithMarkedFiles: ((Int) -> Unit)? = null,
     ): WalkOutcome {
@@ -349,9 +409,6 @@ object OfflineFolderSyncUtils {
                                 .equalTo(File::uid.name, child.uid)
                                 .findFirst() ?: return@forEach
                             if (proxy.isTrashed() || proxy.isFolder()) return@forEach
-                            if (initialMark && proxy.id in preExistingPinnedIds.orEmpty()) {
-                                proxy.isDirectlyPinned = true
-                            }
                             if (!proxy.isMarkedAsOffline && !proxy.isOffline) {
                                 proxy.isMarkedAsOffline = true
                                 folderHasMarkedFiles = true
@@ -423,7 +480,7 @@ object OfflineFolderSyncUtils {
         when (decideFromListing(basis, localState)) {
             ListingDecision.SKIP_LOCAL_EDIT -> return
             ListingDecision.DOWNLOAD -> {
-                stagedRedownload(context, userDrive, snapshot)
+                stagedRedownload(context, userDrive, snapshot, assumedLocalState = localState)
                 return
             }
             ListingDecision.VERIFY_DETAILS -> Unit
@@ -442,19 +499,32 @@ object OfflineFolderSyncUtils {
             serverHash = remoteFile.serverContentHash,
         )
         when (decideFromDetails(detailsMeta, basis)) {
-            DetailsDecision.METADATA_ONLY -> updatePublicationBasis(userDrive, fileId, remoteFile)
-            DetailsDecision.REDOWNLOAD -> stagedRedownload(context, userDrive, remoteFile)
+            DetailsDecision.METADATA_ONLY -> updatePublicationBasis(userDrive, fileId, remoteFile, offlineFile)
+            DetailsDecision.REDOWNLOAD -> stagedRedownload(context, userDrive, remoteFile, assumedLocalState = LocalCopyState.INTACT)
         }
     }
 
-    /** Metadata-only change: adopt new remote metadata while keeping the verified bytes. */
-    private fun updatePublicationBasis(userDrive: UserDrive, fileId: Int, remoteFile: File) {
+    /**
+     * Metadata-only change: adopt new remote metadata while keeping the verified bytes. The
+     * local file timestamp follows the adopted metadata FIRST — if it cannot be updated the
+     * adoption is skipped, so the preserved basis always describes the actual local bytes
+     * (a hash-identical timestamp change must never make a clean copy classify as edited).
+     */
+    private suspend fun updatePublicationBasis(userDrive: UserDrive, fileId: Int, remoteFile: File, offlineFile: JavaFile?) = withContext(Dispatchers.IO) {
+        if (offlineFile?.exists() == true) {
+            if (!offlineFile.setLastModified(remoteFile.getLastModifiedInMilliSecond())) {
+                SentryLog.w(TAG, "Local timestamp refused for file $fileId; metadata-only adoption skipped")
+                return@withContext
+            }
+        }
         FileController.getRealmInstance(userDrive).use { realm ->
             realm.executeTransaction { mutableRealm ->
                 FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
                     proxy.lastModifiedAt = remoteFile.lastModifiedAt
                     proxy.size = remoteFile.size
-                    proxy.serverContentHash = remoteFile.serverContentHash
+                    // The accepted identity advances ONLY here, on a hash-verified adoption,
+                    // and is never erased by a hash-less response.
+                    remoteFile.serverContentHash?.let { proxy.serverContentHash = it }
                     proxy.offlineBasisModifiedAt = remoteFile.lastModifiedAt
                     proxy.offlineBasisSize = remoteFile.size
                 }
@@ -468,37 +538,91 @@ object OfflineFolderSyncUtils {
      * content-identical: the basis is updated without replacing the bytes. The previous copy
      * and all preserved state survive failure, refusal and cancellation.
      */
-    private suspend fun stagedRedownload(context: Context, userDrive: UserDrive, file: File): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * Downloads the current remote body to a staging file and PUBLISHES it with one atomic
+     * rename over the previous copy (this storage's rename(2) replaces atomically: a crash or
+     * a failed rename always leaves either the old or the new complete file — the previous
+     * bytes are never deleted separately). Guards immediately before the destructive step, all
+     * on IO: cancellation, a local edit that appeared during the transfer (re-classified
+     * against the same preserved basis), an existing copy whose bytes no longer match the
+     * accepted digest (a same-size/time edit), and a vanished row. Every refusal preserves
+     * the previous bytes and state. The response is closed on every return path.
+     */
+    private suspend fun stagedRedownload(
+        context: Context,
+        userDrive: UserDrive,
+        file: File,
+        assumedLocalState: LocalCopyState,
+    ): Boolean = withContext(Dispatchers.IO) {
         val okHttpClient = AccountUtils.getHttpClient(userDrive.userId, null)
-        val response = DownloadOfflineFileManager.downloadFileResponseAsync(ApiRoutes.downloadFile(file), okHttpClient)
-        if (!response.isSuccessful) return@withContext false
-
         val offlineFile = file.getOfflineFile(context, userDrive.userId) ?: return@withContext false
         val parentDir = offlineFile.parentFile ?: return@withContext false
+        if (!parentDir.exists()) parentDir.mkdirs() // newly discovered nested files
+        if (!parentDir.isDirectory) return@withContext false
         val staging = JavaFile.createTempFile("offline_staging_", null, parentDir)
+
         try {
-            val saved = DownloadOfflineFileManager.saveRemoteData(TAG, response, staging)
+            val response = DownloadOfflineFileManager.downloadFileResponseAsync(ApiRoutes.downloadFile(file), okHttpClient)
+            val saved = response.use { resp ->
+                if (!resp.isSuccessful) return@withContext false
+                DownloadOfflineFileManager.saveRemoteData(TAG, resp, staging)
+            }
             if (!saved) return@withContext false
             // Exact-byte guard against the server's own length when available
             if (file.size != null && staging.length() != file.size) return@withContext false
             val digest = computeDigest(staging) ?: return@withContext false
 
-            val preservedDigest = FileController.getRealmInstance(userDrive).use { realm ->
-                FileController.getFileProxyById(file.id, customRealm = realm)?.offlineContentDigest
+            val currentRow = FileController.getRealmInstance(userDrive).use { realm ->
+                FileController.getFileProxyById(file.id, customRealm = realm)?.let { realm.copyFromRealm(it, 0) }
+            } ?: run {
+                SentryLog.w(TAG, "Row vanished during staged download for file ${file.id}; replacement aborted")
+                return@withContext false
             }
+            val preservedDigest = currentRow.offlineContentDigest
+
             if (preservedDigest != null && preservedDigest == digest) {
-                // Body identical to the preserved publication: metadata-only adoption.
-                updatePublicationBasis(userDrive, file.id, file)
+                // Body identical to the preserved publication: metadata-only adoption. The
+                // local timestamp must follow the adopted metadata, or a clean copy would
+                // classify as locally edited on the next pass; on failure the basis stays
+                // consistent with the untouched bytes (a harmless metadata re-check loop).
+                if (!offlineFile.setLastModified(file.getLastModifiedInMilliSecond())) return@withContext false
+                updatePublicationBasis(userDrive, file.id, file, offlineFile)
                 return@withContext true
             }
 
-            // Only now, with verified new bytes in hand, is the old copy touched — and even
-            // then a refused delete preserves it and aborts the replacement.
-            if (offlineFile.exists() && !offlineFile.delete()) {
-                SentryLog.w(TAG, "Previous offline copy deletion refused for file ${file.id}; replacement aborted")
+            // ---- Guards immediately before the destructive publication (all preserve) ----
+            currentCoroutineContext().ensureActive()
+            val reClassified = classifyLocalCopy(
+                basis = PublicationBasis(
+                    modifiedAt = currentRow.offlineBasisModifiedAt,
+                    size = currentRow.offlineBasisSize,
+                    digest = preservedDigest,
+                    serverHash = currentRow.serverContentHash,
+                ),
+                localExists = offlineFile.exists(),
+                localSize = offlineFile.takeIf { it.exists() }?.length(),
+                localModifiedSec = offlineFile.takeIf { it.exists() }?.lastModified()?.div(1_000L),
+            )
+            if (reClassified == LocalCopyState.LOCALLY_EDITED || reClassified == LocalCopyState.UNKNOWN) {
+                SentryLog.w(TAG, "Local copy changed during staged download for file ${file.id}; replacement aborted")
                 return@withContext false
             }
-            if (!staging.renameTo(offlineFile)) return@withContext false
+            if (offlineFile.exists() && preservedDigest != null) {
+                val existingDigest = computeDigest(offlineFile)
+                if (existingDigest != null && existingDigest != preservedDigest) {
+                    // Existing bytes diverged from the accepted publication (equal size/mtime
+                    // edit): unknown identity is preservation, never authority to overwrite.
+                    SentryLog.w(TAG, "Existing copy digest diverged from the accepted basis for file ${file.id}; replacement aborted")
+                    return@withContext false
+                }
+            }
+
+            // One atomic publication step: rename(2) over the existing file. Failure keeps
+            // the old bytes (staging is removed in finally).
+            if (!staging.renameTo(offlineFile)) {
+                SentryLog.w(TAG, "Atomic replace refused for file ${file.id}; previous copy preserved")
+                return@withContext false
+            }
             offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
 
             FileController.getRealmInstance(userDrive).use { realm ->
@@ -543,7 +667,12 @@ object OfflineFolderSyncUtils {
      * failure records nothing: an unrecorded basis classifies the copy as UNKNOWN, which
      * maintenance leaves untouched.
      */
-    suspend fun recordAcceptedPublication(userDrive: UserDrive, remoteFile: File, offlineFile: JavaFile) = withContext(Dispatchers.IO) {
+    suspend fun recordAcceptedPublication(
+        userDrive: UserDrive,
+        remoteFile: File,
+        offlineFile: JavaFile,
+        acceptedServerHash: String?,
+    ) = withContext(Dispatchers.IO) {
         val digest = computeDigest(offlineFile)
         if (digest == null) {
             SentryLog.w(TAG, "Accepted offline bytes could not be digested for file ${remoteFile.id}; basis not recorded")
@@ -554,7 +683,10 @@ object OfflineFolderSyncUtils {
                 FileController.getFileProxyById(remoteFile.id, customRealm = mutableRealm)?.let { proxy ->
                     proxy.lastModifiedAt = remoteFile.lastModifiedAt
                     proxy.size = remoteFile.size
-                    proxy.serverContentHash = remoteFile.serverContentHash
+                    // Only the identity of the accepted body is recorded here — captured from
+                    // the raw with=hash response that drove this transfer, never from a later
+                    // listing/details refresh.
+                    proxy.serverContentHash = acceptedServerHash
                     proxy.offlineBasisModifiedAt = remoteFile.lastModifiedAt
                     proxy.offlineBasisSize = remoteFile.size
                     proxy.offlineContentDigest = digest

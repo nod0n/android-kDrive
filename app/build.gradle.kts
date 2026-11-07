@@ -254,6 +254,8 @@ dependencies {
     testImplementation(libs.coroutines.test)
     testImplementation(libs.androidx.arch.core.testing)
     testImplementation(core.mockk.android)
+    androidTestImplementation(core.mockk.android)
+    androidTestImplementation(libs.coroutines.test)
     androidTestImplementation(libs.androidx.ui.automator)
 
     androidTestImplementation(libs.androidx.espresso.contrib) {

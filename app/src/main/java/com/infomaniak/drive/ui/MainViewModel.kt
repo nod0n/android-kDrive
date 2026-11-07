@@ -565,6 +565,7 @@ class MainViewModel(
         // We need to call this method outside the UI thread
         viewModelScope.launch(Dispatchers.IO) {
             FileController.updateOfflineStatus(file.id, isOffline = false)
+            FileController.setDirectlyPinned(fileId = file.id, isDirectlyPinned = false) // direct pin intent withdrawn
         }
         deleteFile(file, offlineFile, cacheFile, userDrive, onFileRemovedFromOffline)
     }

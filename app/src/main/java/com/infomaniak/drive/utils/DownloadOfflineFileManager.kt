@@ -71,6 +71,13 @@ class DownloadOfflineFileManager(
     private var currentFile: File? = null
     private var filesDownloaded = 0
 
+    /**
+     * The with=hash identity captured from the RAW details response, before the row refresh
+     * (whose preservation rules keep the previously accepted identity). This is the identity
+     * of the body the transfer is about to fetch, and only the publication seam may record it.
+     */
+    private var acceptedServerHash: String? = null
+
     private var lastUpdateProgressMillis = System.currentTimeMillis()
 
     suspend fun execute(
@@ -95,7 +102,18 @@ class DownloadOfflineFileManager(
             // and for some reason, the worker is cancelled after a long time, the worker is restarted
             filesDownloaded += 1
             lastDownloadedFile = offlineFile
-            OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile)
+            OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
+            return ListenableWorker.Result.success()
+        }
+
+        if (offlineFile.exists() && OfflineFolderSyncUtils.isRootCoveredCopy(file)) {
+            // Root coverage owns this copy's lifecycle: a stale queued download (initial bulk
+            // work, retry, or a download enqueued before an unmark) must never reach the
+            // delete-then-transfer below — a locally edited or unknown copy would be lost.
+            // The root maintenance pass refreshes it through the staged path instead.
+            filesDownloaded += 1
+            lastDownloadedFile = offlineFile
+            OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
             return ListenableWorker.Result.success()
         }
 
@@ -118,6 +136,10 @@ class DownloadOfflineFileManager(
     }
 
     fun cleanLastDownloadedFile() {
+        val file = currentFile
+        // A root-covered copy is never cleaned up here: its lifecycle belongs to the root
+        // contract, which releases coverage without deleting bytes.
+        if (file != null && OfflineFolderSyncUtils.isRootCoveredCopy(file)) return
         lastDownloadedFile?.let {
             if (it.exists() && currentFile?.isIntactFile(it) == false) it.delete()
         }
@@ -144,12 +166,15 @@ class DownloadOfflineFileManager(
         userDrive: UserDrive = UserDrive(),
     ): File {
         // with=hash is requested on the details call that drives the download, so the
-        // publication seam can record the server content identity at no extra request.
+        // publication seam can record the server content identity at no extra request. The
+        // hash is captured from the RAW response: the row refresh below preserves the
+        // previously accepted identity by design.
         val fileDetails = Dispatchers.IO {
             ApiRepository.getFileDetailsWithHash(File(id = fileId, driveId = userDrive.driveId))
         }
         val remoteFile = fileDetails.data
         val file = if (fileDetails.isSuccess() && remoteFile != null) {
+            acceptedServerHash = remoteFile.serverContentHash
             FileController.getRealmInstance(userDrive).use { realm ->
                 FileController.updateExistingFile(newFile = remoteFile, realm = realm)
             }
@@ -223,7 +248,7 @@ class DownloadOfflineFileManager(
     private suspend fun notifyCompleted(file: File, offlineFile: java.io.File, context: Context) {
         FileController.updateOfflineStatus(file.id, true)
         offlineFile.setLastModified(file.getLastModifiedInMilliSecond())
-        OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile)
+        OfflineFolderSyncUtils.recordAcceptedPublication(userDrive, file, offlineFile, acceptedServerHash)
         if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
         fileDownloaded(context, file.id)
     }
