@@ -82,69 +82,38 @@ import java.util.concurrent.atomic.AtomicInteger
  * hoisted and released in finally BEFORE the bounded cancel+join, and the last assertions run
  * after the released loads have actually finished.
  *
- * Evidence level: JVM orchestration guarantees only. The earlier 240 s device timeout of this
- * class is NOT explained by these cases — its cause stays open until a completed device run
- * records one, and a passing device run alone would not close the completion-proof gaps the
- * join discipline above closes. ActivityResult/lifecycle wiring is out of scope here.
+ * Evidence level: JVM orchestration guarantees only. The class has never yet completed a
+ * case on device: the 9118 (240 s), 8ad8 (90 s) and 6f85 (90 s) runs all timed out in setUp,
+ * and DEVICE-6f85-RESULT-2045 localized the hang to the collection-returning getGalleryDrive
+ * stub recording with the MockK core-collection recursion captured — the corrected harness
+ * (that stub removed; the tested flows never reach it) is COMPILED, NOT EXECUTED until a
+ * device run records one. ActivityResult/lifecycle wiring is out of scope here.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GalleryViewModelTest {
 
     /**
-     * Bounded phase diagnostics (GALLERY-DIAGNOSTIC-2000-RESULT): the 2d4d device run of this
-     * class timed out with ONLY the class header — no case result was ever recorded and no
-     * Java stack could be collected — so the last emitted marker must localize the hang
-     * (setUp phase, MockK registration, ViewModel construction, test entry/exit). These
-     * markers carry no account, token or photo payloads.
+     * Bounded phase diagnostics: setUp/tearDown and test ENTER/EXIT marks via println +
+     * Log.i, so a device hang is localized by the last emitted mark without any payload.
+     * These markers carry no account, token or photo payloads.
      *
-     * Device-8ad8 localization: the last recorded marker is "setUp AccountUtils mocked"; the
-     * intervening block is [FileController] mocking, so the markers below split every
-     * operation in it, and a bounded watchdog dumps the process's thread stacks once at 45 s
-     * (debuggerd -j was root-denied on device — this in-process dump is the only stack
-     * evidence available; frames only, no payloads). The dump fires at most once and the
-     * runner's own bound still terminates the class.
+     * Device evidence (DEVICE-6f85-RESULT-2045): the 9118/8ad8/6f85 runs all timed out in
+     * setUp. The 6f85 run localized the hang to the `every { FileController.getGalleryDrive() }
+     * returns arrayListOf()` stub recording and captured the mechanism: MockK's Android advice
+     * machinery recursed (AndroidMockKDispatcher.getOrigin -> ArrayList.add -> ArraysKt.zip ->
+     * Advice.isOverridden) — a child-mock instrumentation of the FINAL core collection return
+     * whose own comparison path then dispatches back through the instrumented collection.
+     * The correction removes that stub (the tested flows never reach getGalleryDrive) and the
+     * now-understood diagnostic noise; the class has never yet completed a case on device, so
+     * the phase marks stay.
      */
     @RegisterExtension
     @JvmField
     val phaseLogger: PhaseLogger = PhaseLogger()
 
-    @Volatile
-    private var setupWatchdog: Thread? = null
-
     private fun mark(message: String) {
         println("GalleryVMTest: $message")
         Log.i("GalleryVMTest", "GalleryVMTest: $message")
-    }
-
-    /** One bounded stack dump if the guarded setup block never finishes (frames only). */
-    private fun armSetupWatchdog(owner: Thread) {
-        setupWatchdog = Thread {
-            try {
-                Thread.sleep(45_000)
-            } catch (_: InterruptedException) {
-                return@Thread
-            }
-            // Owner-first, one bounded frame per log line: a single large Log string can be
-            // truncated by Android's log buffer and lose the owner stack, and the map's
-            // iteration order is arbitrary — the setup thread must always be the first and
-            // most complete trace.
-            val traces = Thread.getAllStackTraces()
-            mark("SETUP WATCHDOG — setup did not finish in 45s; threads=${traces.size}; owner=${owner.name}")
-            val ordered = listOf(owner) + traces.keys.filter { it !== owner }
-            for (thread in ordered) {
-                val frames = traces[thread] ?: emptyArray()
-                mark("WATCHDOG [${thread.name}] state=${thread.state} frames=${frames.size}")
-                frames.take(30).forEachIndexed { index, frame -> mark("WATCHDOG #$index ${thread.name}: $frame") }
-            }
-        }.apply {
-            isDaemon = true
-            start()
-        }
-    }
-
-    private fun disarmSetupWatchdog() {
-        setupWatchdog?.interrupt()
-        setupWatchdog = null
     }
 
     class PhaseLogger : BeforeTestExecutionCallback, TestWatcher {
@@ -172,31 +141,26 @@ class GalleryViewModelTest {
     fun setUp() {
         mark("setUp begin")
         MockKAnnotations.init(this)
-        mark("setUp MockKAnnotations done")
         Dispatchers.setMain(testMainDispatcher)
         ArchTaskExecutor.getInstance().setDelegate(synchronousTaskExecutor)
-        mark("setUp dispatchers done")
 
         mockkObject(AccountUtils)
         every { AccountUtils.currentUserId } returns USER_ID
         every { AccountUtils.currentDriveId } returns DRIVE_ID
-        mark("setUp AccountUtils mocked")
 
-        // device-8ad8: the run died between "AccountUtils mocked" and "FileController
-        // mocked" — split every operation in this block and guard it with the one-shot
-        // stack-dump watchdog so the next run names the exact blocking frame.
-        armSetupWatchdog(Thread.currentThread())
-        mark("setUp FileController mockkObject begin")
         mockkObject(FileController)
-        mark("setUp FileController object mocked")
-        every { FileController.getGalleryDrive() } returns arrayListOf()
-        mark("setUp FileController getGalleryDrive stubbed")
+        // DEVICE-6f85 EVIDENCE: recording `every { FileController.getGalleryDrive() } returns
+        // arrayListOf()` hung the class on device — MockK's advice machinery recursed through
+        // AndroidMockKDispatcher.getOrigin -> ArrayList.add -> ArraysKt.zip -> Advice.isOverridden
+        // (a child-mock instrumentation of the FINAL core collection return) while comparing
+        // methods across threads. The tested flows NEVER reach this method: ignoreCloud=false
+        // with SUCCESS responses never falls back to buildRealmLoad — so the stub is simply not
+        // registered, and the unstubbed fall-through is never exercised. A future cloud-failure
+        // case must bring the Offline suite's synthetic-realm setup instead of this stub. The
+        // Unit-returning stubs below stay: no concrete collection return is recorded, which the
+        // Consent/Upload device runs show to be safe on object mocks.
         every { FileController.storeGalleryDrive(any(), any()) } returns Unit
-        mark("setUp FileController storeGalleryDrive stubbed")
         every { FileController.removeOrphanFiles() } returns Unit
-        mark("setUp FileController removeOrphanFiles stubbed")
-        disarmSetupWatchdog()
-        mark("setUp FileController mocked")
 
         mockkObject(ApiRepository)
         mark("setUp done")
@@ -204,7 +168,6 @@ class GalleryViewModelTest {
 
     @AfterEach
     fun tearDown() {
-        disarmSetupWatchdog()
         mark("tearDown begin")
         unmockkAll()
         ArchTaskExecutor.getInstance().setDelegate(null)
