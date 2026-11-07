@@ -82,11 +82,24 @@ class OfflineFolderMaintenanceOrchestrationTest {
     )
 
     private val bodyV1 = "fixture-body-v1".toByteArray()
-    private val bodyV2 = "fixture-body-v2-with-different-length".toByteArray()
+    // Same length as bodyV1 ON PURPOSE: a changed-hash-under-unchanged-metadata remote still
+    // reports the UNCHANGED size — a different-length body would contradict the details the
+    // same fixture serves, and production's exact-byte guard correctly refuses it (runtime
+    // evidence: the 2d4d run left the old bytes because the staged transfer failed the guard).
+    private val bodyV2 = "fixture-body-v2".toByteArray()
     private val editedBody = "fixture-EDITED!".toByteArray() // same length as bodyV1: a same-stat edit
 
     private val detailsRequests = AtomicLong(0)
     private val bodyRequests = AtomicLong(0)
+
+    /**
+     * The body transport runs the covered-root unmark BEFORE delivering the bytes, only when
+     * the case arms it. The unmark stays inside the ONE counting transport stub — an
+     * override stub would silently stop counting at the real boundary (runtime evidence:
+     * the 2d4d withdrawal case replaced the stub and lost the body count).
+     */
+    @Volatile
+    private var deliverBodyAfterUnmark = false
 
     @BeforeAll
     fun initRealm() {
@@ -98,6 +111,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         MockKAnnotations.init(this)
         detailsRequests.set(0)
         bodyRequests.set(0)
+        deliverBodyAfterUnmark = false
         runCatching { Realm.deleteRealm(FileController.getRealmConfiguration(userDrive)) }
         runCatching { offlineRoot.deleteRecursively() }
 
@@ -107,8 +121,12 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // The body transport is injected; staging, digest, atomic rename and the basis seam
         // below it stay REAL. saveRemoteData is deliberately NOT mocked.
         mockkObject(DownloadOfflineFileManager.Companion)
-        coEvery { DownloadOfflineFileManager.downloadFileResponseAsync(any(), any(), any()) } answers {
+        coEvery { DownloadOfflineFileManager.downloadFileResponseAsync(any(), any(), any()) } coAnswers {
             bodyRequests.incrementAndGet()
+            if (deliverBodyAfterUnmark) {
+                val unmarked = OfflineFolderSyncUtils.unmarkFolderOffline(context, folderRow(800_401), userDrive)
+                check(unmarked) { "fixture unmark must confirm" }
+            }
             fakeBodyResponse(lastAnswerBody.get())
         }
     }
@@ -157,6 +175,11 @@ class OfflineFolderMaintenanceOrchestrationTest {
                     name = "fixture-orch.bin"
                     path = "Private/fixture-orch.bin"
                     lastModifiedAt = modifiedAtSec
+                    // A real server-listing row always carries the file size: without it the
+                    // recorded basis size is null and every later intact copy classifies as
+                    // locally edited (runtime evidence: the 2d4d deleted-copy pass 2 made no
+                    // details request at all for exactly this reason).
+                    size = bodyBytes.size.toLong()
                     isOffline = true
                     isFromUploads = false
                     offlineBasisModifiedAt = modifiedAtSec
@@ -216,6 +239,17 @@ class OfflineFolderMaintenanceOrchestrationTest {
             }
         }
     }
+
+    /** Bounded row-state evidence for assertion messages: no content bytes, no account data. */
+    private fun offlineRowDiagnostics(): String = runCatching {
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()
+                ?: return@use "absent"
+            "isOffline=${row.isOffline}, marked=${row.isMarkedAsOffline}, basisM=${row.offlineBasisModifiedAt}, " +
+                "basisSize=${row.offlineBasisSize}, digestNull=${row.offlineContentDigest == null}, " +
+                "hash=${row.serverContentHash}, publishedPathNull=${row.offlinePublishedPath == null}"
+        }
+    }.getOrDefault("row read failed")
 
     private fun getOfflineFixtureFile(): JavaFile {
         // DETACH inside the use: a managed row is invalid the moment the realm closes, and
@@ -311,7 +345,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     @Test
-    @DisplayName("a deleted local copy with an unchanged remote is restored with exactly one body")
+    @DisplayName("a deleted local copy is restored with one body; the unknown identity is then adopted with one digest-checked body")
     fun deletedCopyIsRestoredWithExactlyOneBody() {
         seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_000L, hash = "hash-1")
         val offlineFile = getOfflineFixtureFile()
@@ -320,16 +354,33 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // The user (or storage cleanup) removes the local bytes; the row keeps its basis.
         check(offlineFile.delete()) { "fixture setup: the copy must be removable" }
 
-        // Pass 1: MISSING -> one staged body republishes the copy.
+        // Pass 1: MISSING -> the body is fetched WITHOUT a details request (the DOWNLOAD
+        // policy: no response establishes this body's hash identity, so the publication
+        // records an unknown identity by clearing the previous one).
         stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
         refresh()
+        assertEquals(0L, detailsRequests.get(), "the missing-copy restore costs no details request (the DOWNLOAD policy)")
         assertEquals(1L, bodyRequests.get(), "a missing copy costs exactly one body")
         assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(bodyV1), "the copy is restored")
 
-        // Pass 2: intact again -> details only, no repeated body.
+        // Pass 2: intact again, but the basis carries NO server identity (it was cleared by
+        // the restore): the details cannot prove equality, so ONE conservative digest-checked
+        // body adopts the identity — the identical body is adopted metadata-only, never a
+        // byte replacement.
         refresh()
-        assertEquals(2L, detailsRequests.get())
-        assertEquals(1L, bodyRequests.get(), "no repeated body for the restored copy")
+        assertEquals(1L, detailsRequests.get(), "the intact pass consults details")
+        assertEquals(2L, bodyRequests.get(), "the unknown identity costs exactly one digest-checked adoption body")
+        assertTrue(offlineFile.readBytes().contentEquals(bodyV1), "the adoption never replaced the bytes")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertEquals("hash-1", row.serverContentHash, "the identity was re-recorded by the adoption")
+        }
+
+        // Pass 3: identity recorded -> stable. Details only, no repeated body: the forbidden
+        // repeated-unchanged-body behavior would show up exactly here.
+        refresh()
+        assertEquals(2L, detailsRequests.get(), "the steady state still consults details")
+        assertEquals(2L, bodyRequests.get(), "a recorded identity is never re-downloaded")
         assertTrue(offlineFile.readBytes().contentEquals(bodyV1))
     }
 
@@ -481,7 +532,16 @@ class OfflineFolderMaintenanceOrchestrationTest {
         )
         val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
 
-        assertTrue(result.toString().contains("Success"), "the initial covered download succeeds")
+        // Bounded failure evidence (DEVICE-2d4d-TRIAGE-1958): the production outcome enums
+        // and guards log their decisive branch to Sentry only — an assertion failure here
+        // carries the observable outcome, request counts, offline-dir listing and row state
+        // so the next run pins the failing branch without any production logging change.
+        assertTrue(
+            result.toString().contains("Success"),
+            "the initial covered download succeeds (result=$result, bodyRequests=${bodyRequests.get()}, " +
+                "detailsRequests=${detailsRequests.get()}, offlineDir=${offlineFile.parentFile?.list()?.sorted()}, " +
+                "row=${offlineRowDiagnostics()})",
+        )
         assertEquals(1L, bodyRequests.get(), "exactly one body was fetched")
         assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(bodyV1), "the bytes were published")
         assertEquals(
@@ -507,12 +567,9 @@ class OfflineFolderMaintenanceOrchestrationTest {
 
         stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
         // The user unmarks the root WHILE the transfer is in flight: the body is delivered
-        // only after the unmark completed.
-        coEvery { DownloadOfflineFileManager.downloadFileResponseAsync(any(), any(), any()) } coAnswers {
-            val unmarked = OfflineFolderSyncUtils.unmarkFolderOffline(context, folderRow(800_401), userDrive)
-            check(unmarked) { "fixture unmark must confirm" }
-            fakeBodyResponse(lastAnswerBody.get())
-        }
+        // only after the unmark completed. The unmark runs inside the ONE counting transport
+        // stub (armed below) — an override stub would stop counting at the real boundary.
+        deliverBodyAfterUnmark = true
         val manager = DownloadOfflineFileManager(
             userDrive = userDrive,
             filesCount = 1,
@@ -521,7 +578,13 @@ class OfflineFolderMaintenanceOrchestrationTest {
         )
         val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
 
-        assertTrue(result.toString().contains("Success"), "withdrawn work completes silently (no retry loop)")
+        // Bounded failure evidence, as in the covered-initial case above.
+        assertTrue(
+            result.toString().contains("Success"),
+            "withdrawn work completes silently (no retry loop) (result=$result, bodyRequests=${bodyRequests.get()}, " +
+                "detailsRequests=${detailsRequests.get()}, offlineDir=${offlineFile.parentFile?.list()?.sorted()}, " +
+                "row=${offlineRowDiagnostics()})",
+        )
         assertTrue(!offlineFile.exists(), "the final path was never written: the owned staging was discarded instead")
         assertEquals(1L, bodyRequests.get(), "the transfer fetched a body into staging")
         FileController.getRealmInstance(userDrive).use { realm ->

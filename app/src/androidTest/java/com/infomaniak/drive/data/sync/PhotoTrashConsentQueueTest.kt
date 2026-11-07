@@ -113,14 +113,10 @@ class PhotoTrashConsentQueueTest {
     /** How many times the poll actually REACHED the gated remote-details boundary. */
     private val remoteQueryEntered = AtomicInteger(0)
 
-    private val fixtureName = "photoTrashConsentQueue-${UUID.randomUUID()}"
-    private val config = RealmConfiguration.Builder()
-        .schemaVersion(UploadMigration.DB_VERSION)
-        .modules(RealmModules.SyncFilesModule())
-        .name(fixtureName)
-        .directory(context.cacheDir)
-        .build()
-
+    // A FRESH fixture realm per case (runtime evidence: a shared per-class file turned one
+    // leaked open instance into duplicate-primary-key failures for every later case, because
+    // setUp's delete could not remove a file an open instance still held).
+    private lateinit var config: RealmConfiguration
     private lateinit var mockContext: android.content.Context
 
     @BeforeAll
@@ -131,7 +127,12 @@ class PhotoTrashConsentQueueTest {
     @BeforeEach
     fun setUp() {
         MockKAnnotations.init(this)
-        runCatching { Realm.deleteRealm(config) }
+        config = RealmConfiguration.Builder()
+            .schemaVersion(UploadMigration.DB_VERSION)
+            .modules(RealmModules.SyncFilesModule())
+            .name("photoTrashConsentQueue-${UUID.randomUUID()}")
+            .directory(context.cacheDir)
+            .build()
         resolverContent.set(contentA)
         mediaTrashed.set(false)
         remoteTrashed.set(true)
@@ -431,9 +432,10 @@ class PhotoTrashConsentQueueTest {
         // unsettled and pre-bumps the generation BEFORE its transaction, which then BLOCKS
         // on the write lock this thread holds — so the writer is in flight (bumped,
         // uncommitted) before the poll starts, the schedule the mid-drain regression could
-        // not see.
-        val holder = realm()
-        holder.beginTransaction()
+        // not see. The holder instance is CLOSED here (use): a shared thread-local cached
+        // instance left open pinned the pre-commit snapshot, so the replacement was
+        // inspected through a stale read (runtime evidence: remoteTrashPendingSince was
+        // 1000 after the writer had committed 0).
         val writerFailure = AtomicReference<Throwable?>(null)
         val writer = Thread {
             try {
@@ -457,32 +459,40 @@ class PhotoTrashConsentQueueTest {
                 writerFailure.set(throwable)
             }
         }
-        try {
-            writer.start()
-            // Deterministic condition poll (no interleaving by timing): the writer's
-            // pre-commit bump is the condition; only its visibility is awaited.
-            val deadline = System.currentTimeMillis() + 15_000
-            while (PhotoTrashController.bindingGeneration(uriA) == generationBefore && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10)
-            }
-            assertTrue(
-                PhotoTrashController.bindingGeneration(uriA) > generationBefore,
-                "the in-flight writer pre-bumped the generation before its commit",
-            )
+        realm().use { holder ->
+            holder.beginTransaction()
+            try {
+                writer.start()
+                // Deterministic condition poll (no interleaving by timing): the writer's
+                // pre-commit bump is the condition; only its visibility is awaited.
+                val deadline = System.currentTimeMillis() + 15_000
+                while (PhotoTrashController.bindingGeneration(uriA) == generationBefore && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(10)
+                }
+                assertTrue(
+                    PhotoTrashController.bindingGeneration(uriA) > generationBefore,
+                    "the in-flight writer pre-bumped the generation before its commit",
+                )
 
-            // The poll runs on a worker thread (this thread holds the fixture write lock):
-            val surfaced = runBlocking {
-                val poll = async(Dispatchers.IO) { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
-                poll.await()
+                // The poll runs on a worker thread (this thread holds the fixture write lock):
+                val surfaced = runBlocking {
+                    val poll = async(Dispatchers.IO) { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
+                    poll.await()
+                }
+                assertNull(surfaced, "a drain that starts while a binding write is in flight surfaces nothing")
+            } finally {
+                // Releases the write lock; the replacement commits. A commit refusal must not
+                // skip the close: runCatching, and the exception propagates after the close.
+                runCatching { if (holder.isInTransaction) holder.commitTransaction() }
+                    .onFailure { throw it }
             }
-            assertNull(surfaced, "a drain that starts while a binding write is in flight surfaces nothing")
-        } finally {
-            holder.commitTransaction() // releases the write lock; the replacement commits
         }
         writer.join(15_000)
         assertFalse(writer.isAlive, "the replacement writer finished")
         assertNull(writerFailure.get(), "the replacement committed cleanly: ${writerFailure.get()}")
         assertTrue(PhotoTrashController.bindingGeneration(uriA) > generationBefore, "the replacement advanced the generation")
+        // The holder instance is closed above: this read opens a FRESH instance with the
+        // committed state, never the pinned pre-commit snapshot.
         val replaced = row(uriA)
         assertEquals(0L, replaced.remoteTrashPendingSince, "the replacement starts unarmed; no old request leaked through")
     }
@@ -674,6 +684,15 @@ class PhotoTrashConsentQueueTest {
     @AfterEach
     fun tearDown() {
         unmockkAll()
+        // Leak report, not a silent swallow: an open instance makes deleteRealm throw, which
+        // is exactly the stale-fixture corruption the per-case configs above exist to expose.
+        if (this::config.isInitialized) {
+            try {
+                Realm.deleteRealm(config)
+            } catch (leak: Throwable) {
+                throw IllegalStateException("fixture realm leaked (an instance was still open): ${config.realmFileName}", leak)
+            }
+        }
     }
 
     @AfterAll

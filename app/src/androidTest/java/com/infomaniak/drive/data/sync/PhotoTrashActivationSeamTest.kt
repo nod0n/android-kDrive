@@ -23,7 +23,7 @@ import com.infomaniak.drive.data.models.UploadFile
 import com.infomaniak.drive.ui.PhotoTrashConsentUiQueue
 import com.infomaniak.drive.utils.RealmModules
 import io.mockk.every
-import io.mockk.spyk
+import io.mockk.mockkObject
 import io.mockk.unmockkAll
 import io.realm.Realm
 import io.realm.RealmConfiguration
@@ -44,24 +44,28 @@ import java.util.concurrent.atomic.AtomicReference
 
 /**
  * THE REAL SETTINGS SEAM under the unsettled-writes protocol and the launch section
- * (RESUME-9118-1853): the writer schedules the JVM helper tests cannot distinguish — a REAL
- * [UploadFile.setAppSyncSettings] parked INSIDE its open transaction (begun, uncommitted)
- * and AFTER its commit but before its publish/settle — plus a failure injected AFTER the
- * transaction began (real rollback, settled authority, certified-read rebuild), the REAL
- * [UploadFile.getAppSyncSettings] publishing only certified reads under the pre-commit
- * poisoning schedule, and both launch/write orders through the production seam against the
+ * (RESUME-9118-1853, DEVICE-2d4d-TRIAGE-1958): a REAL [UploadFile.setAppSyncSettings] on a
+ * REAL fixture realm, held at its PRODUCTION protocol points — parked right after its
+ * unsettled begin mark inside the open transaction (before the mutation), and parked after
+ * its commit but before its publish/settle — plus a publication failure injected AT the
+ * production publish seam after a real commit (the abandoned-write rule covers a post-commit
+ * publication failure exactly like a rollback: neither may be trusted without a certified
+ * read), the REAL [UploadFile.getAppSyncSettings] publishing only certified reads while a
+ * write is unsettled, and both launch/write orders through the production seam against the
  * Main launch section.
  *
- * Harness discipline (device-evidenced fixes):
- *  - every Realm is opened, used AND closed on the thread that touches it (thread
- *    confinement): each writer thread creates its own spied instance from its own
- *    per-case fixture config and closes it in a finally;
- *  - the park inside the transaction is NONRECURSIVE: the stub performs the transaction
- *    itself (begin -> the production lambda -> park -> commit) instead of re-entering
- *    [Realm.executeTransaction];
- *  - the injected failure happens AFTER the production lambda's begin and mutation, inside
- *    a real transaction frame that is cancelled exactly like Realm cancels a failing
- *    lambda — so the seam settles an ABANDONED write, which is the schedule that matters;
+ * HARNESS DISCIPLINE (device-evidenced fixes):
+ *  - NO Realm spy: every device case that drove the real seam through a MockK spy of
+ *    [Realm] died with ArrayIndexOutOfBoundsException(length=2, index=2) inside the real
+ *    write, and the spy's shallow field-copy leaks the native instance (all five teardowns
+ *    reported an open realm). The 2d4d run is the recorded evidence. Real realms only, and
+ *    interleavings are established by parking at the PRODUCTION protocol seams
+ *    ([PhotoTrashController.beginActivationWrite] via callOriginal — the real mark lands
+ *    inside the real transaction — and [PhotoTrashController.noteActivationWritten]).
+ *  - every Realm is opened, used AND closed on the thread that touches it; the writer
+ *    closes its own instance even on failure, and a close failure is attached as a
+ *    SUPPRESSED exception to the primary failure — cleanup never hides it;
+ *  - the full writer exception STACK is preserved and surfaced (not just its toString);
  *  - each case gets its OWN fixture realm (no shared accumulating state, no JUnit-order
  *    dependence), cleanup DELETES each fixture and REPORTS a leak (an open instance makes
  *    deleteRealm throw) instead of swallowing it;
@@ -70,9 +74,12 @@ import java.util.concurrent.atomic.AtomicReference
  * SCOPE HONESTY: the launch sections here are helper-driven (the controller's
  * tryBeginLaunchSection/capture/gate plus the REAL settings seam) — they do NOT exercise
  * MainActivity's ActivityResult/lifecycle wiring or any system dialog; that wiring remains a
- * declared device case. Fully disposable and account-free: random fixture files in the
- * instrumentation target's cacheDir, synthetic rows only — NO owner data, NO account, NO
- * network.
+ * declared device case. The in-transaction ROLLBACK injection (a failure after the mutation
+ * inside the open transaction) needs intercepting Realm's own transaction frame, which the
+ * device evidence forbids; it stays covered by the JVM suite, and this suite proves the
+ * post-commit publication-failure variant of the same abandoned-write rule. Fully disposable
+ * and account-free: random fixture files in the instrumentation target's cacheDir, synthetic
+ * rows only — NO owner data, NO account, NO network.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class PhotoTrashActivationSeamTest {
@@ -147,14 +154,14 @@ class PhotoTrashActivationSeamTest {
      * BLOCKED INSIDE [PhotoTrashController.beginActivationWrite] — its thread is WAITING and
      * the blocked frame is on its stack — so the launch section (the monitor it waits on) is
      * what prevents progress, not scheduler timing. A later bounded absence window is then
-     * meaningful; without this evidence a non-started writer would pass it too.
+     * meaningful; without this evidence a non-started writer would pass it too. No MockK
+     * interception is active on this path: the frame is the REAL production method (method
+     * names may carry a variant-transform suffix, $app on the JVM run — match the base name).
      */
     private fun awaitWriterContendingAtBegin(writer: Thread) {
         assertTrue(
             awaitTrue {
                 writer.state == Thread.State.WAITING &&
-                    // Method names may carry a variant-transform suffix ($app on the JVM
-                    // run): match the base name.
                     writer.stackTrace.any { it.methodName.startsWith("beginActivationWrite") }
             },
             "the real writer is verifiably blocked inside beginActivationWrite (positive guard-contention evidence)",
@@ -172,85 +179,90 @@ class PhotoTrashActivationSeamTest {
     }
 
     /**
+     * Full exception evidence for an assertion message: type, message and STACK — never only
+     * the toString, which hid the ArrayIndexOutOfBoundsException's origin in the 2d4d run.
+     */
+    private fun failureText(failure: AtomicReference<Throwable?>): String =
+        failure.get()?.let { throwable -> "${throwable::class.java.name}: ${throwable.message}\n${throwable.stackTraceToString()}" }
+            ?: "null"
+
+    /**
      * Runs ONE real [UploadFile.setAppSyncSettings] on its OWN writer thread against ITS OWN
-     * spied fixture realm (opened, used AND closed on that thread — Realm instances are
-     * thread-confined). The [stub] installs the park; any failure surfaces through
-     * [failure]; [onDone] runs after the seam returned (or threw).
+     * REAL fixture realm (no spy; opened, used AND closed on that thread — Realm instances
+     * are thread-confined). Any failure surfaces through [failure] WITH its stack; a close
+     * failure is suppressed onto the primary instead of hiding it. [onDone] runs after the
+     * seam returned (or threw).
      */
     private fun writerThread(
         settings: SyncSettings,
         config: RealmConfiguration,
         failure: AtomicReference<Throwable?>,
-        stub: (Realm) -> Unit = {},
         onDone: (() -> Unit)? = null,
     ): Thread = Thread {
-        var realm: Realm? = null
+        val realm = Realm.getInstance(config)
         try {
-            realm = spyk(Realm.getInstance(config))
-            stub(realm)
             UploadFile.setAppSyncSettings(settings, realm)
-        } catch (throwable: Throwable) {
-            failure.set(throwable)
+        } catch (primary: Throwable) {
+            failure.set(primary)
         } finally {
-            runCatching { realm?.close() }
+            try {
+                realm.close()
+            } catch (closeFailure: Throwable) {
+                (failure.get() ?: IllegalStateException("the writer failed while closing its realm").also { failure.set(it) })
+                    .addSuppressed(closeFailure)
+            }
             onDone?.invoke()
         }
     }
 
     /**
-     * NONRECURSIVE park INSIDE the open transaction: the stub performs the transaction
-     * itself (begin -> the production lambda -> park -> commit) instead of re-entering
-     * [Realm.executeTransaction] (which would hit the same stub). A failure after the park
-     * cancels the open transaction, mirroring Realm's rollback semantics.
+     * Park INSIDE the open transaction, immediately AFTER the production begin mark
+     * ([PhotoTrashController.beginActivationWrite] is called by the seam inside the
+     * transaction, before its mutation): callOriginal keeps the REAL mark (the unsettled
+     * counter and the revision bump), then the writer holds — the transaction is begun and
+     * uncommitted, the mark unsettled, nothing mutated yet. A stub left installed after its
+     * park's release latch opened passes later writers through harmlessly (reach is a no-op
+     * countDown; hold returns immediately), so a second phase needs no unstubbing.
      */
-    private fun parkInsideTransaction(park: Park): (Realm) -> Unit = { spied ->
-        every { spied.executeTransaction(any()) } answers {
-            val original = firstArg<Realm.Transaction>()
-            spied.beginTransaction()
-            try {
-                original.execute(spied)
-                park.reach()
-                park.hold()
-                spied.commitTransaction()
-            } catch (throwable: Throwable) {
-                runCatching { if (spied.isInTransaction) spied.cancelTransaction() }
-                throw throwable
-            }
+    private fun parkAtActivationBegin(park: Park) {
+        mockkObject(PhotoTrashController)
+        every { PhotoTrashController.beginActivationWrite() } answers {
+            val revision = callOriginal()
+            park.reach()
+            park.hold()
+            revision
         }
     }
 
-    /** Park AFTER the commit but before the seam's publish/settle (the real call, then hold). */
-    private fun parkAfterCommit(park: Park): (Realm) -> Unit = { spied ->
-        every { spied.executeTransaction(any()) } answers {
-            callOriginal()
+    /** Park AFTER the commit but before the seam's publish/settle (the real publish runs after the hold). */
+    private fun parkAtPublication(park: Park) {
+        mockkObject(PhotoTrashController)
+        every {
+            PhotoTrashController.noteActivationWritten(any(), any(), any(), any())
+        } answers {
             park.reach()
             park.hold()
+            callOriginal()
         }
     }
 
     /**
-     * Failure injected AFTER the production lambda's begin and mutation, inside a REAL
-     * transaction frame (begin -> lambda -> throw, then cancel): the seam's finally settles
-     * an ABANDONED write — not a failure that preceded the begin, which would prove nothing.
+     * Failure injected AT the production publish seam, after the transaction committed for
+     * real: the seam's finally settles the ABANDONED write. This is the post-commit
+     * publication-failure variant of the abandoned-write rule (RESUME-9118-1853 D) — the
+     * in-transaction rollback variant stays JVM-covered (see the class kDoc).
      */
-    private fun failAfterBeginAndMutation(): (Realm) -> Unit = { spied ->
-        every { spied.executeTransaction(any()) } answers {
-            val original = firstArg<Realm.Transaction>()
-            spied.beginTransaction()
-            try {
-                original.execute(spied)
-                throw IllegalStateException("injected transaction failure after begin and mutation")
-            } catch (throwable: Throwable) {
-                runCatching { if (spied.isInTransaction) spied.cancelTransaction() }
-                throw throwable
-            }
-        }
+    private fun failAtPublication() {
+        mockkObject(PhotoTrashController)
+        every {
+            PhotoTrashController.noteActivationWritten(any(), any(), any(), any())
+        } throws IllegalStateException("injected publication failure after the real commit")
     }
 
     private fun joinedWithoutFailure(thread: Thread, failure: AtomicReference<Throwable?>) {
         thread.join(15_000)
         assertFalse(thread.isAlive, "the writer thread finished")
-        assertNull(failure.get(), "the real write ran cleanly: ${failure.get()}")
+        assertNull(failure.get(), "the real write ran cleanly: ${failureText(failure)}")
     }
 
     private fun committedRow(config: RealmConfiguration, userId: Int): SyncSettings =
@@ -267,19 +279,20 @@ class PhotoTrashActivationSeamTest {
         val warmed = PhotoTrashController.currentActivationSnapshot
         assertNotNull(warmed)
 
-        // PHASE 1: parked INSIDE the open transaction (begun, uncommitted).
+        // PHASE 1: parked INSIDE the open transaction, after the real unsettled begin mark
+        // (before the mutation).
         val opened1 = CountDownLatch(1)
         val release1 = CountDownLatch(1)
         val failure1 = AtomicReference<Throwable?>(null)
+        parkAtActivationBegin(Park(opened1, release1))
         val writer1 = writerThread(
             SyncSettings(userId = 981, driveId = 771, photoTrashSyncEnabled = false),
             config,
             failure1,
-            parkInsideTransaction(Park(opened1, release1)),
         )
         try {
             writer1.start()
-            assertTrue(opened1.await(15, TimeUnit.SECONDS), "the writer reached its transaction body")
+            assertTrue(opened1.await(15, TimeUnit.SECONDS), "the writer reached its production begin mark inside the open transaction")
             assertEquals(1, PhotoTrashController.activationWritesUnsettled(), "the real seam marked the write unsettled inside its transaction")
             assertEquals(warmed, PhotoTrashController.currentActivationSnapshot, "nothing publishes while a write is unsettled")
         } finally {
@@ -289,16 +302,17 @@ class PhotoTrashActivationSeamTest {
         assertEquals(0, PhotoTrashController.activationWritesUnsettled(), "the publish settles the write")
         assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn, "the committed disable is published by the real seam")
 
-        // PHASE 2: parked AFTER the commit, before the seam's publish/settle — the
-        // commit-before-publish interval at the real seam.
+        // PHASE 2: parked AFTER the real commit, before the seam's publish/settle — the
+        // commit-before-publish interval at the real seam (the phase-1 begin stub passes
+        // this writer through: its release latch is already open).
         val committed2 = CountDownLatch(1)
         val release2 = CountDownLatch(1)
         val failure2 = AtomicReference<Throwable?>(null)
+        parkAtPublication(Park(committed2, release2))
         val writer2 = writerThread(
             SyncSettings(userId = 981, driveId = 771, photoTrashSyncEnabled = true),
             config,
             failure2,
-            parkAfterCommit(Park(committed2, release2)),
         )
         try {
             writer2.start()
@@ -315,45 +329,45 @@ class PhotoTrashActivationSeamTest {
     }
 
     @Test
-    @DisplayName("a failed real write rolls back, settles and resumes certified reads without another write")
-    fun aFailedRealWriteSettlesWithoutStrandingTheAuthority() {
+    @DisplayName("a real write whose publication fails after the commit settles without stranding the authority")
+    fun aFailedPublicationSettlesWithoutStrandingTheAuthority() {
         val config = freshConfig()
         seedSettings(config, userId = 982, driveId = 772, enabled = true)
         UploadFile.getAppSyncSettings(config) // warm/publish the enabled state through the real getter
         val warmed = PhotoTrashController.currentActivationSnapshot
         assertNotNull(warmed)
 
+        failAtPublication()
         val failure = AtomicReference<Throwable?>(null)
         val writer = writerThread(
             SyncSettings(userId = 982, driveId = 772, photoTrashSyncEnabled = false),
             config,
             failure,
-            failAfterBeginAndMutation(),
         )
         writer.start()
         writer.join(15_000)
         assertFalse(writer.isAlive, "the failed writer finished")
-        assertTrue(failure.get() is IllegalStateException, "the injected failure surfaced through the real seam: ${failure.get()}")
+        assertTrue(failure.get() is IllegalStateException, "the injected publication failure surfaced through the real seam: ${failureText(failure)}")
         assertEquals(0, PhotoTrashController.activationWritesUnsettled(), "the abandoned write settled in its finally: nothing stranded")
 
-        // REAL rollback: the transaction was cancelled — the committed row is unchanged,
-        // and the abandoned write published nothing.
-        assertTrue(committedRow(config, userId = 982).photoTrashSyncEnabled, "the failed transaction was cancelled")
-        assertEquals(warmed, PhotoTrashController.currentActivationSnapshot, "an abandoned write publishes nothing")
+        // POST-COMMIT failure (unlike a rollback): the disable COMMITTED, but the mirror was
+        // never republished. The begin's revision bump leads the unpublished mirror.
+        assertFalse(committedRow(config, userId = 982).photoTrashSyncEnabled, "the disable committed before the publication failed")
+        assertEquals(warmed, PhotoTrashController.currentActivationSnapshot, "a failed publication republishes nothing")
 
-        // THE AUTHORITY IS INCOHERENT (the counter leads the mirror): the launch gate
+        // THE AUTHORITY IS INCOHERENT (the revisions lead the mirror): the launch gate
         // refuses it. A rollback and a post-commit publication failure are indistinguishable
         // without a rebuild, and neither may be trusted.
         val witness = PhotoTrashController.captureLaunchWitness("content://fixture/seam-failure")
-        assertFalse(witness.activationSettled, "the counter leading the mirror is an incoherent capture")
+        assertFalse(witness.activationSettled, "the revisions leading the mirror is an incoherent capture")
         assertTrue(witness.activationSnapshot?.optIn == true, "the mirror content is unchanged; settledness is what failed")
 
-        // Certified reads resume WITHOUT another write: the real getter republishes the
-        // committed (still-enabled) state at the current counter, and coherence returns.
+        // Certified reads rebuild WITHOUT another write: the real getter republishes the
+        // committed (disabled) state at the current revisions, and coherence returns.
         val read = UploadFile.getAppSyncSettings(config)
         assertNotNull(read)
-        assertTrue(read!!.photoTrashSyncEnabled)
-        assertEquals(true, PhotoTrashController.currentActivationSnapshot?.optIn)
+        assertFalse(read!!.photoTrashSyncEnabled)
+        assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn)
         assertTrue(
             PhotoTrashController.captureLaunchWitness("content://fixture/seam-failure").activationSettled,
             "a certified read rebuilt the authority",
@@ -361,7 +375,7 @@ class PhotoTrashActivationSeamTest {
     }
 
     @Test
-    @DisplayName("the real settings getter publishes only certified reads (pre-commit poisoning schedule)")
+    @DisplayName("the real settings getter publishes only certified reads while a write is unsettled")
     fun theRealSettingsGetterPublishesOnlyCertifiedReads() {
         val config = freshConfig()
         seedSettings(config, userId = 983, driveId = 773, enabled = true)
@@ -373,19 +387,19 @@ class PhotoTrashActivationSeamTest {
         val opened = CountDownLatch(1)
         val release = CountDownLatch(1)
         val failure = AtomicReference<Throwable?>(null)
+        parkAtActivationBegin(Park(opened, release))
         val writer = writerThread(
             SyncSettings(userId = 983, driveId = 773, photoTrashSyncEnabled = false),
             config,
             failure,
-            parkInsideTransaction(Park(opened, release)),
         )
         try {
             writer.start()
-            assertTrue(opened.await(15, TimeUnit.SECONDS), "the writer reached its transaction body")
+            assertTrue(opened.await(15, TimeUnit.SECONDS), "the writer reached its production begin mark inside the open transaction")
 
-            // THE POISONING SCHEDULE at the real seam: the reader reads the PRE-commit (still
-            // enabled) row while the writer is unsettled — it must return that row (the
-            // caller's decision evidence) and publish NOTHING at the writer's revision.
+            // THE SCHEDULE at the real seam: the reader reads the PRE-commit (still enabled)
+            // row while the writer is unsettled — it must return that row (the caller's
+            // decision evidence) and publish NOTHING at the writer's revision.
             val read = UploadFile.getAppSyncSettings(config)
             assertNotNull(read)
             assertTrue(read!!.photoTrashSyncEnabled, "the pre-commit row is what the caller sees")
@@ -431,10 +445,10 @@ class PhotoTrashActivationSeamTest {
             assertTrue(PhotoTrashConsentUiQueue.launchAllowedNow(request, 984, witness, lifecycleStarted = true))
 
             // A REAL settings write arriving now blocks INSIDE its open transaction, at its
-            // begin (beginActivationWrite waits for the section): no mutation, no publish.
-            // The contention is proven POSITIVELY first (the writer verifiably sits inside
-            // beginActivationWrite), so the bounded absence below measures the guard, not a
-            // non-started thread.
+            // begin (beginActivationWrite waits on the launch section's monitor): no
+            // mutation, no publish. NO MockK interception is active here — the writer blocks
+            // in the REAL monitor wait, and the contention evidence below inspects the real
+            // frame; the bounded absence then measures the guard, not a non-started thread.
             val w = writerThread(
                 SyncSettings(userId = 984, driveId = 774, photoTrashSyncEnabled = false),
                 config,
@@ -446,7 +460,7 @@ class PhotoTrashActivationSeamTest {
             awaitWriterContendingAtBegin(w)
             assertFalse(writerDone.await(500, TimeUnit.MILLISECONDS), "no real write may begin while a launch section is active")
             assertEquals(0, PhotoTrashController.activationWritesUnsettled(), "the section's witness stays valid: nothing began")
-            assertTrue(committedRow(config, userId = 984).photoTrashSyncEnabled, "the parked write has not mutated the row")
+            assertTrue(committedRow(config, userId = 984).photoTrashSyncEnabled, "the held write has not mutated the row")
 
             // LAUNCH WINS: the section ends after the launch completed; the writer then
             // begins, commits and publishes its disable — observing a request already issued.
@@ -466,7 +480,7 @@ class PhotoTrashActivationSeamTest {
                 "the NEXT gate evaluation reads the disabled state",
             )
         } finally {
-            // Never leak the section or a parked writer into other cases, whatever failed.
+            // Never leak the section or a held writer into other cases, whatever failed.
             PhotoTrashController.endLaunchSection()
             writer?.join(15_000)
         }
@@ -492,19 +506,20 @@ class PhotoTrashActivationSeamTest {
             bindingGeneration = PhotoTrashController.bindingGeneration(uri),
         )
 
-        // A REAL writer parks inside its open transaction, having begun (unsettled) a disable.
+        // A REAL writer parks inside its open transaction, having begun (unsettled) a
+        // disable: the real mark landed inside the real transaction, before the mutation.
         val opened = CountDownLatch(1)
         val release = CountDownLatch(1)
         val failure = AtomicReference<Throwable?>(null)
+        parkAtActivationBegin(Park(opened, release))
         val writer = writerThread(
             SyncSettings(userId = 985, driveId = 775, photoTrashSyncEnabled = false),
             config,
             failure,
-            parkInsideTransaction(Park(opened, release)),
         )
         try {
             writer.start()
-            assertTrue(opened.await(15, TimeUnit.SECONDS), "the writer reached its transaction body")
+            assertTrue(opened.await(15, TimeUnit.SECONDS), "the writer reached its production begin mark inside the open transaction")
 
             // WRITE WINS: the section begins after the write did; its witness reads the
             // unsettled begin and the gate refuses — the launch never pairs the pre-write

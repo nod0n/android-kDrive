@@ -84,7 +84,16 @@ class UploadTaskDigestCaptureTest {
     private val contentA = "fixture-upload-content-A".toByteArray()
     private val chunkedContent = ByteArray(5 * 1024 * 1024 + 1_024) { index -> (index % 251).toByte() }
 
-    private val transferredBodies = CopyOnWriteArrayList<ByteArray>()
+    private val transferredBodies = CopyOnWriteArrayList<TransferredBody>()
+
+    /**
+     * One captured transfer: the chunk identity the request URL itself declared (null for a
+     * whole-file request) and the exact bytes the transfer read from the local source. The
+     * chunk number is parsed from the production chunk URL's chunk_number/chunk_size query
+     * parameters — arrival order is NOT byte-position order (the chunk launches are
+     * parallel), so every later comparison is keyed by the declared index.
+     */
+    private class TransferredBody(val chunkNumber: Long?, val chunkSize: Long?, val bytes: ByteArray)
     private val recordedDigest = AtomicReference<String?>(null)
     private val recordedRemoteFile = AtomicReference<File?>(null)
 
@@ -136,12 +145,19 @@ class UploadTaskDigestCaptureTest {
     }
 
     /** Fakes the transfer: consumes the request body (which reads the upload's digesting
-     *  stream, exactly as a server would) and answers with a canned success body. */
+     *  stream, exactly as a server would), records the request's own chunk identity and
+     *  answers with a canned success body. */
     private fun fakeTransferInterceptor(responseJson: String): Interceptor = Interceptor { chain ->
         val request = chain.request()
         val buffer = okio.Buffer()
         request.body?.writeTo(buffer)
-        transferredBodies.add(buffer.readByteArray())
+        transferredBodies.add(
+            TransferredBody(
+                chunkNumber = request.url.queryParameter("chunk_number")?.toLongOrNull(),
+                chunkSize = request.url.queryParameter("chunk_size")?.toLongOrNull(),
+                bytes = buffer.readByteArray(),
+            ),
+        )
         Response.Builder()
             .request(request)
             .protocol(Protocol.HTTP_1_1)
@@ -189,7 +205,7 @@ class UploadTaskDigestCaptureTest {
         assertTrue(runUpload(uploadFile(fileSize = contentA.size.toLong())))
 
         assertEquals(1, transferredBodies.size, "exactly one request carried the body")
-        assertEquals(contentA.toList(), transferredBodies.single().toList(), "the transfer read the local source bytes")
+        assertTrue(transferredBodies.single().bytes.contentEquals(contentA), "the transfer read the local source bytes")
         val digest = recordedDigest.get()
         assertNotNull(digest, "the transfer-bound digest reached recordPairing")
         assertEquals(sha256Hex(contentA), digest, "the digest is of the bytes the upload read, not a later sample")
@@ -214,6 +230,7 @@ class UploadTaskDigestCaptureTest {
     @DisplayName("a fresh chunked upload passes NO stream digest; the finish-session file is passed through")
     fun freshChunkedUploadPassesNoStreamDigest() {
         resolverContent.set(chunkedContent)
+        val chunkConfig = FileChunkSizeManager().computeChunkConfig(fileSize = chunkedContent.size.toLong())
         coEvery { ApiRepository.startUploadSession(any(), any(), any()) } answers {
             ApiResponse(
                 result = ApiResponseStatus.SUCCESS,
@@ -243,8 +260,13 @@ class UploadTaskDigestCaptureTest {
 
         assertTrue(runUpload(uploadFile))
 
-        assertTrue(transferredBodies.size >= 2, "the chunks were transferred")
-        assertEquals(chunkedContent.toList(), transferredBodies.concatenated().toList(), "every chunk came from the local source")
+        assertEquals(chunkConfig.totalChunks, transferredBodies.size, "exactly one transfer per chunk: no missing, duplicate or extra body request")
+        assertEveryTransferredChunkMatchesItsSourceSlice(
+            totalChunks = chunkConfig.totalChunks,
+            fileChunkSize = chunkConfig.fileChunkSize,
+            fileSize = chunkedContent.size.toLong(),
+            source = chunkedContent,
+        )
         assertNull(recordedDigest.get(), "parallel per-chunk streams compose to no whole-body digest: null, never a sample")
         assertEquals(createdRemoteId, recordedRemoteFile.get()?.id, "the finish-session response's file is the pairing identity")
     }
@@ -285,8 +307,19 @@ class UploadTaskDigestCaptureTest {
 
         assertTrue(runUpload(uploadFile))
 
-        // Chunk 1 was already valid and is NOT re-read; only the remaining chunk(s) transferred.
-        assertTrue(transferredBodies.isNotEmpty())
+        // Chunk 1 was already valid and is NOT re-read; exactly the remaining chunk(s)
+        // transferred, each from its own byte position.
+        assertEquals(
+            (2L..chunkConfig.totalChunks).toList(),
+            transferredBodies.mapNotNull { it.chunkNumber }.sorted(),
+            "exactly the not-yet-valid chunks transferred; the valid chunk 1 was never re-read",
+        )
+        assertEveryTransferredChunkMatchesItsSourceSlice(
+            totalChunks = chunkConfig.totalChunks,
+            fileChunkSize = chunkConfig.fileChunkSize,
+            fileSize = chunkedContent.size.toLong(),
+            source = chunkedContent,
+        )
         assertNull(recordedDigest.get(), "a resumed run never re-reads a previous run's chunks: no whole-body digest exists")
         assertEquals(createdRemoteId, recordedRemoteFile.get()?.id)
     }
@@ -308,8 +341,50 @@ class UploadTaskDigestCaptureTest {
         unmockkAll()
     }
 
-    private fun List<ByteArray>.concatenated(): ByteArray =
-        flatMap { it.toList() }.toByteArray()
+    /**
+     * Bounded per-chunk verification (DEVICE-2d4d-TRIAGE-1958): each transferred body is
+     * checked against the source slice its declared chunk_number maps to, by LENGTH and
+     * SHA-256 — never by embedding multi-MB byte lists in a failure message (that exact
+     * formatting OOM'd the 2d4d device runner mid-class and hid the real mismatch). The
+     * checks keep the old comparison's powers: a chunk read from the wrong offset, with the
+     * wrong length, with different bytes, or a chunk whose URL carried no chunk identity,
+     * all fail with a SHORT diagnostic naming the chunk index.
+     */
+    private fun assertEveryTransferredChunkMatchesItsSourceSlice(
+        totalChunks: Int,
+        fileChunkSize: Long,
+        fileSize: Long,
+        source: ByteArray,
+    ) {
+        val failures = buildList {
+            for (body in transferredBodies) {
+                val index = body.chunkNumber
+                if (index == null) {
+                    add("a transfer carried no chunk identity: ${body.bytes.size} bytes")
+                    continue
+                }
+                if (index < 1 || index > totalChunks) {
+                    add("chunk $index outside 1..$totalChunks (${body.bytes.size} bytes)")
+                    continue
+                }
+                val offset = (index - 1) * fileChunkSize
+                val expectedLength = minOf(fileChunkSize, fileSize - offset).toInt()
+                if (body.bytes.size != expectedLength) {
+                    add("chunk $index: ${body.bytes.size} bytes transferred, expected $expectedLength")
+                    continue
+                }
+                val expectedHash = sha256Hex(source.copyOfRange(offset.toInt(), offset.toInt() + expectedLength))
+                val actualHash = sha256Hex(body.bytes)
+                if (actualHash != expectedHash) {
+                    add("chunk $index: sha256 $actualHash, expected $expectedHash ($expectedLength bytes at offset $offset)")
+                }
+            }
+        }
+        assertTrue(
+            failures.isEmpty(),
+            "every transferred chunk matches the source slice its chunk_number maps to: ${failures.joinToString("; ")}",
+        )
+    }
 
     private fun sha256Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }

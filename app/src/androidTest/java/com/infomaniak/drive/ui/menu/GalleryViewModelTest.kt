@@ -17,6 +17,7 @@
  */
 package com.infomaniak.drive.ui.menu
 
+import android.util.Log
 import androidx.arch.core.executor.ArchTaskExecutor
 import androidx.arch.core.executor.TaskExecutor
 import androidx.lifecycle.viewModelScope
@@ -49,6 +50,10 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.extension.BeforeTestExecutionCallback
+import org.junit.jupiter.api.extension.ExtensionContext
+import org.junit.jupiter.api.extension.RegisterExtension
+import org.junit.jupiter.api.extension.TestWatcher
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -85,6 +90,29 @@ import java.util.concurrent.atomic.AtomicInteger
 @OptIn(ExperimentalCoroutinesApi::class)
 class GalleryViewModelTest {
 
+    /**
+     * Bounded phase diagnostics (GALLERY-DIAGNOSTIC-2000-RESULT): the 2d4d device run of this
+     * class timed out with ONLY the class header — no case result was ever recorded and no
+     * Java stack could be collected — so the last emitted marker must localize the hang
+     * (setUp phase, MockK registration, ViewModel construction, test entry/exit). These
+     * markers carry no account, token or photo payloads.
+     */
+    @RegisterExtension
+    @JvmField
+    val phaseLogger: PhaseLogger = PhaseLogger()
+
+    class PhaseLogger : BeforeTestExecutionCallback, TestWatcher {
+        private fun mark(message: String, displayName: String) {
+            val line = "GalleryVMTest: $message $displayName"
+            println(line)
+            Log.i("GalleryVMTest", line)
+        }
+
+        override fun beforeTestExecution(context: ExtensionContext) = mark("ENTER", context.displayName)
+        override fun testSuccessful(context: ExtensionContext) = mark("EXIT-OK", context.displayName)
+        override fun testFailed(context: ExtensionContext, cause: Throwable?) = mark("EXIT-FAIL", context.displayName)
+    }
+
     private val testMainDispatcher = StandardTestDispatcher()
 
     /** Synchronous executor: LiveData delivery on the calling thread (plain JVM has no main looper). */
@@ -96,27 +124,35 @@ class GalleryViewModelTest {
 
     @BeforeEach
     fun setUp() {
+        println("GalleryVMTest: setUp begin"); Log.i("GalleryVMTest", "GalleryVMTest: setUp begin")
         MockKAnnotations.init(this)
+        println("GalleryVMTest: setUp MockKAnnotations done"); Log.i("GalleryVMTest", "GalleryVMTest: setUp MockKAnnotations done")
         Dispatchers.setMain(testMainDispatcher)
         ArchTaskExecutor.getInstance().setDelegate(synchronousTaskExecutor)
+        println("GalleryVMTest: setUp dispatchers done"); Log.i("GalleryVMTest", "GalleryVMTest: setUp dispatchers done")
 
         mockkObject(AccountUtils)
         every { AccountUtils.currentUserId } returns USER_ID
         every { AccountUtils.currentDriveId } returns DRIVE_ID
+        println("GalleryVMTest: setUp AccountUtils mocked"); Log.i("GalleryVMTest", "GalleryVMTest: setUp AccountUtils mocked")
 
         mockkObject(FileController)
         every { FileController.getGalleryDrive() } returns arrayListOf()
         every { FileController.storeGalleryDrive(any(), any()) } returns Unit
         every { FileController.removeOrphanFiles() } returns Unit
+        println("GalleryVMTest: setUp FileController mocked"); Log.i("GalleryVMTest", "GalleryVMTest: setUp FileController mocked")
 
         mockkObject(ApiRepository)
+        println("GalleryVMTest: setUp done"); Log.i("GalleryVMTest", "GalleryVMTest: setUp done")
     }
 
     @AfterEach
     fun tearDown() {
+        println("GalleryVMTest: tearDown begin"); Log.i("GalleryVMTest", "GalleryVMTest: tearDown begin")
         unmockkAll()
         ArchTaskExecutor.getInstance().setDelegate(null)
         Dispatchers.resetMain()
+        println("GalleryVMTest: tearDown done"); Log.i("GalleryVMTest", "GalleryVMTest: tearDown done")
     }
 
     /**
