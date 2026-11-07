@@ -209,6 +209,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         return ApiResponse(
             result = ApiResponseStatus.SUCCESS,
             data = File(id = responseFileId, driveId = userDrive.driveId).apply {
+                initUid() // the real deserializer derives the primary key; a raw fixture must too
                 this.name = name
                 this.path = path
                 lastModifiedAt = modifiedAtSec
@@ -1805,7 +1806,11 @@ class OfflineFolderMaintenanceOrchestrationTest {
         val probeSawFreeAuthority = java.util.concurrent.atomic.AtomicBoolean(true)
         val writerAtEntry = java.util.concurrent.CountDownLatch(1)
         val writerCommitted = java.util.concurrent.CountDownLatch(1)
+        var writerError: Throwable? = null
+        var writerRef: Thread? = null
         var gateReached = false
+        var writerQueuedWhileHoldActive = false
+        var pinLandedInsideHold = false
         OfflineFolderSyncUtils.preRenameGate = {
             gateReached = true
             // Positive held-evidence: ANOTHER thread cannot take the authority while the
@@ -1816,22 +1821,58 @@ class OfflineFolderMaintenanceOrchestrationTest {
             check(!probe.isAlive) { "the authority probe thread must finish (bounded)" }
             check(!probeSawFreeAuthority.get()) { "the authority must be HELD while the publication is in its window" }
             // The REAL coordinated writer, from its real entry point: it signals arrival,
-            // then blocks on the commit authority until the publication releases.
-            Thread {
-                writerAtEntry.countDown()
-                FileController.setDirectlyPinned(fileId = fileId, isDirectlyPinned = true)
-                writerCommitted.countDown()
-            }.start()
+            // then calls the real setter — and the gate WAITS (bounded) until the writer is
+            // provably QUEUED at the real authority acquisition while the hold is active
+            // (FHNW-1189 E1: the entry latch alone cannot show the writer reached the
+            // acquisition — it may be descheduled before it — and a different thread's
+            // probe shows only that A lock is held, not that THIS writer contended).
+            writerRef = Thread {
+                try {
+                    writerAtEntry.countDown()
+                    FileController.setDirectlyPinned(fileId = fileId, isDirectlyPinned = true)
+                    writerCommitted.countDown()
+                } catch (t: Throwable) {
+                    writerError = t
+                    writerCommitted.countDown()
+                }
+            }.also { it.start() }
+            val queuedDeadline = System.currentTimeMillis() + 10_000
+            while (!OfflineCommitAuthority.hasQueuedWriter() && System.currentTimeMillis() < queuedDeadline) {
+                Thread.sleep(10)
+            }
+            check(OfflineCommitAuthority.hasQueuedWriter()) {
+                "the real pin writer must QUEUE at the authority while the publication hold is active"
+            }
+            writerQueuedWhileHoldActive = true
+            // The forbidden interleaving cannot complete: while the writer waits at the
+            // acquisition, its pin is NOT in the row.
+            OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
+                val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+                check(!row.isDirectlyPinned) { "the queued pin writer must not commit inside the publication's hold" }
+                pinLandedInsideHold = row.isDirectlyPinned
+            }
         }
         try {
             refresh()
         } finally {
             OfflineFolderSyncUtils.preRenameGate = null
+            // Unconditional join AFTER the hold released (never inside it): the writer's
+            // completion is awaited with a bound, its failure is rethrown, the thread never
+            // leaks.
+            writerRef?.let { writer ->
+                check(writerAtEntry.await(10, java.util.concurrent.TimeUnit.SECONDS)) { "the writer reached its real entry point" }
+                check(writerCommitted.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                    "the coordinated writer completed only after the publication released the authority"
+                }
+                writer.join(10_000)
+                check(!writer.isAlive) { "the pin writer thread must terminate (bounded)" }
+            }
+            writerError?.let { throw it }
         }
 
         assertTrue(gateReached, "the pre-rename point was actually reached (the gate is not a silent no-op)")
-        assertTrue(writerAtEntry.await(10, java.util.concurrent.TimeUnit.SECONDS), "the writer reached its real entry point while the hold was active")
-        assertTrue(writerCommitted.await(10, java.util.concurrent.TimeUnit.SECONDS), "the coordinated writer completed only after the publication released the authority")
+        assertTrue(writerQueuedWhileHoldActive, "the real writer PROVABLY contended at the authority acquisition while the hold was active")
+        assertFalse(pinLandedInsideHold, "the pin never landed inside the publication window")
         val offlineFile = getOfflineFixtureFile()
         assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(bodyV2), "the publication's bytes stand at the final path")
         FileController.getRealmInstance(userDrive).use { realm ->
@@ -2081,6 +2122,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 result = ApiResponseStatus.SUCCESS,
                 data = listOf(
                     File(id = fileId, driveId = userDrive.driveId).apply {
+                        initUid() // listing rows carry their primary key in production
                         name = "fixture-orch.bin"
                         path = "Private/fixture-orch.bin"
                         type = "file"
@@ -2135,6 +2177,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 result = ApiResponseStatus.SUCCESS,
                 data = listOf(
                     File(id = fileId, driveId = userDrive.driveId).apply {
+                        initUid() // listing rows carry their primary key in production
                         name = "fixture-orch.bin"
                         path = "Private/fixture-orch.bin"
                         type = "file"
@@ -2182,6 +2225,615 @@ class OfflineFolderMaintenanceOrchestrationTest {
         }
         assertTrue(offlineFile.exists() && offlineFile.readBytes().contentEquals(editedBodyOtherLength), "the EDITED bytes were preserved (never deleted by the release)")
         assertEquals(1_700_050_000L, offlineFile.lastModified().div(1000L), "the edit's mtime is untouched")
+    }
+
+    @Test
+    @DisplayName("a real unmark completing during the cache copy declines BEFORE the rename: cache and destination preserved")
+    fun realWithdrawalDuringTheCacheCopyDeclinesBeforeTheRenameAndPreservesBoth() {
+        // FHNW-1189 A2 schedule 1: the staging copy runs OUTSIDE the authority; a REAL
+        // unmark (coordinated writer) completes in exactly that span and clears EVERY
+        // intent signal — a row that only checked stale-ownership would read "not stale"
+        // (owned=false) and rename, discovering the withdrawal only at the record
+        // (the forbidden move-then-delete repair). The pre-effect gate must refuse BEFORE
+        // the rename: the destination is never created, the cache bytes stay.
+        seedCoveredPendingRow()
+        val cacheFile = File(id = fileId, driveId = userDrive.driveId).getCacheFile(context, userDrive)
+        cacheFile.parentFile?.mkdirs()
+        cacheFile.writeBytes(bodyV1)
+        check(cacheFile.setLastModified(1_700_000_000L * 1000)) { "the cache bytes must be intact against the served metadata" }
+        lastAnswerBody.set(bodyV1) // must never be fetched
+        stubDetails(
+            hash = "hash-1",
+            modifiedAtSec = 1_700_000_000L,
+            size = bodyV1.size.toLong(),
+            parentId = coveredFolderId, // the row stays covered until the unmark clears it
+        )
+        every { AccountUtils.currentUserId } returns userDrive.userId
+        every { AccountUtils.currentDriveId } returns userDrive.driveId
+
+        DownloadOfflineFileManager.preCacheMovePublicationGate = {
+            // The REAL withdrawal, at its real entry point, completing while the staging
+            // copy has already run and the hold has not started (the gate runs OUTSIDE the
+            // authority, so a bounded blocking wait is safe here).
+            val unmarked = runBlocking {
+                OfflineFolderSyncUtils.unmarkFolderOffline(context, folderRow(coveredFolderId), userDrive)
+            }
+            check(unmarked) { "fixture unmark must confirm" }
+        }
+        val worker = TestListenableWorkerBuilder<BulkDownloadWorker>(context)
+            .setInputData(
+                workDataOf(
+                    BulkDownloadWorker.FOLDER_ID to coveredFolderId,
+                    BaseDownloadWorker.USER_ID to userDrive.userId,
+                    BaseDownloadWorker.DRIVE_ID to userDrive.driveId,
+                ),
+            )
+            .build()
+        try {
+            val workResult = runBlocking { worker.doWork() }
+
+            assertTrue(workResult.toString().contains("Success"), "the declined cache-move completes silently (result=$workResult, row=${offlineRowDiagnostics()})")
+            assertEquals(0L, bodyRequests.get(), "nothing was transferred")
+            assertTrue(cacheFile.exists() && cacheFile.readBytes().contentEquals(bodyV1), "the cache bytes were PRESERVED")
+            val destination = getOfflineFixtureFile()
+            assertFalse(destination.exists(), "the rename never happened: the destination was never created")
+            assertTrue(
+                destination.parentFile?.list().orEmpty().none { it.startsWith("offline_staging_") },
+                "no staging leftover at the destination directory",
+            )
+            FileController.getRealmInstance(userDrive).use { realm ->
+                val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+                assertFalse(row.isOffline, "the withdrawn offline status was not resurrected")
+                assertFalse(row.isMarkedAsOffline, "the unmark cleared the pending marker")
+                assertFalse(row.offlineOwnedByRoot, "the unmark cleared the recorded claim")
+                assertEquals(0L, row.offlineBasisModifiedAt, "no basis was published")
+                assertNull(row.offlineContentDigest, "no digest was recorded")
+                assertNull(row.offlinePublishedPath, "no published path was recorded")
+                assertEquals(0L, realm.where(OfflineFolderRoot::class.java).count(), "the real unmark completed")
+            }
+        } finally {
+            DownloadOfflineFileManager.preCacheMovePublicationGate = null
+        }
+    }
+
+    @Test
+    @DisplayName("an occupied destination whose bytes the row does not own is never replaced by the cache move")
+    fun occupiedEditedDestinationIsNeverReplacedByTheCacheMove() {
+        // FHNW-1189 A2 gap 2: rename(2) replaces silently — bytes that arrived at the
+        // destination during the staging copy (here: an edited/unknown occupant) must be
+        // judged BEFORE the effect; the refusal preserves BOTH sides.
+        seedCoveredPendingRow()
+        val cacheFile = File(id = fileId, driveId = userDrive.driveId).getCacheFile(context, userDrive)
+        cacheFile.parentFile?.mkdirs()
+        cacheFile.writeBytes(bodyV1)
+        check(cacheFile.setLastModified(1_700_000_000L * 1000)) { "the cache bytes must be intact against the served metadata" }
+        lastAnswerBody.set(bodyV1) // must never be fetched
+        stubDetails(
+            hash = "hash-1",
+            modifiedAtSec = 1_700_000_000L,
+            size = bodyV1.size.toLong(),
+            parentId = coveredFolderId,
+        )
+        every { AccountUtils.currentUserId } returns userDrive.userId
+        every { AccountUtils.currentDriveId } returns userDrive.driveId
+
+        DownloadOfflineFileManager.preCacheMovePublicationGate = {
+            // The occupant arrives during the copy (the row is still pending: no basis,
+            // no recorded path — the bytes can never be this row's accepted publication).
+            val destination = getOfflineFixtureFile()
+            destination.parentFile?.mkdirs()
+            destination.writeBytes(editedBodyOtherLength)
+            check(destination.setLastModified(1_700_050_000L * 1000)) { "the occupant carries its own mtime" }
+        }
+        val worker = TestListenableWorkerBuilder<BulkDownloadWorker>(context)
+            .setInputData(
+                workDataOf(
+                    BulkDownloadWorker.FOLDER_ID to coveredFolderId,
+                    BaseDownloadWorker.USER_ID to userDrive.userId,
+                    BaseDownloadWorker.DRIVE_ID to userDrive.driveId,
+                ),
+            )
+            .build()
+        try {
+            val workResult = runBlocking { worker.doWork() }
+
+            assertTrue(workResult.toString().contains("Success"), "the refused cache-move completes silently (result=$workResult, row=${offlineRowDiagnostics()})")
+            assertEquals(0L, bodyRequests.get(), "nothing was transferred")
+            assertTrue(cacheFile.exists() && cacheFile.readBytes().contentEquals(bodyV1), "the cache bytes were PRESERVED")
+            val destination = getOfflineFixtureFile()
+            assertTrue(destination.exists() && destination.readBytes().contentEquals(editedBodyOtherLength), "the occupant's bytes were NOT replaced")
+            FileController.getRealmInstance(userDrive).use { realm ->
+                val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+                assertFalse(row.isOffline, "no offline status was published over the occupant")
+                assertTrue(row.isMarkedAsOffline, "the row's own pending intent stands (only the publication was refused)")
+                assertEquals(0L, row.offlineBasisModifiedAt, "no basis was recorded")
+                assertNull(row.offlineContentDigest, "no digest was recorded")
+                assertNull(row.offlinePublishedPath, "no path was recorded over the occupant")
+            }
+            assertTrue(
+                destination.parentFile?.list().orEmpty().none { it.startsWith("offline_staging_") },
+                "no staging leftover at the destination directory",
+            )
+        } finally {
+            DownloadOfflineFileManager.preCacheMovePublicationGate = null
+        }
+    }
+
+    @Test
+    @DisplayName("a real publication completing during the cache copy is never downgraded by the stale cache bytes")
+    fun aPublicationDuringTheCacheCopyIsNeverReplacedByTheStaleCacheBytes() {
+        // FHNW-1189 A2 schedule 2: a competing publication completes between the
+        // generation capture and the hold (the whole copy span). The hold's generation
+        // certification refuses BEFORE the rename: the recorded publication's bytes and
+        // basis stand, the cache body never replaces them, and no stale digest is stamped
+        // as the accepted publication.
+        seedCoveredPendingRow()
+        val cacheFile = File(id = fileId, driveId = userDrive.driveId).getCacheFile(context, userDrive)
+        cacheFile.parentFile?.mkdirs()
+        cacheFile.writeBytes(bodyV1)
+        check(cacheFile.setLastModified(1_700_000_000L * 1000)) { "the cache bytes must be intact against the served metadata" }
+        lastAnswerBody.set(bodyV1) // must never be fetched
+        stubDetails(
+            hash = "hash-1",
+            modifiedAtSec = 1_700_000_000L,
+            size = bodyV1.size.toLong(),
+            parentId = coveredFolderId,
+        )
+        every { AccountUtils.currentUserId } returns userDrive.userId
+        every { AccountUtils.currentDriveId } returns userDrive.driveId
+
+        DownloadOfflineFileManager.preCacheMovePublicationGate = {
+            // A REAL coordinated publication lands at the destination mid-copy, through
+            // the real record seam (bytes + basis + identity).
+            val destination = getOfflineFixtureFile()
+            destination.parentFile?.mkdirs()
+            destination.writeBytes(editedBodyOtherLength)
+            check(destination.setLastModified(1_700_000_000L * 1000)) { "the published bytes carry the basis mtime" }
+            val published = runBlocking {
+                OfflineFolderSyncUtils.recordAcceptedPublication(
+                    userDrive,
+                    FileController.getRealmInstance(userDrive).use { realm ->
+                        realm.copyFromRealm(realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!, 0)
+                    },
+                    destination,
+                    acceptedServerHash = "hash-live",
+                )
+            }
+            check(published == OfflineFolderSyncUtils.PublicationOutcome.PUBLISHED) { "fixture: the competing publication must record (got $published)" }
+        }
+        val worker = TestListenableWorkerBuilder<BulkDownloadWorker>(context)
+            .setInputData(
+                workDataOf(
+                    BulkDownloadWorker.FOLDER_ID to coveredFolderId,
+                    BaseDownloadWorker.USER_ID to userDrive.userId,
+                    BaseDownloadWorker.DRIVE_ID to userDrive.driveId,
+                ),
+            )
+            .build()
+        try {
+            val workResult = runBlocking { worker.doWork() }
+
+            assertTrue(workResult.toString().contains("Success"), "the refused cache-move completes silently (result=$workResult, row=${offlineRowDiagnostics()})")
+            assertEquals(0L, bodyRequests.get(), "nothing was transferred")
+            assertTrue(cacheFile.exists() && cacheFile.readBytes().contentEquals(bodyV1), "the cache bytes were PRESERVED")
+            val destination = getOfflineFixtureFile()
+            assertTrue(destination.exists() && destination.readBytes().contentEquals(editedBodyOtherLength), "the competing publication's bytes stand")
+            FileController.getRealmInstance(userDrive).use { realm ->
+                val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+                assertTrue(row.isOffline, "the competing publication's offline status stands")
+                assertEquals("hash-live", row.serverContentHash, "the recorded identity was not downgraded")
+                assertEquals(sha256Hex(editedBodyOtherLength), row.offlineContentDigest, "the recorded digest still describes the published bytes — never the stale cache body")
+            }
+        } finally {
+            DownloadOfflineFileManager.preCacheMovePublicationGate = null
+        }
+    }
+
+    @Test
+    @DisplayName("a retained reader's thread still sees a pre-acquisition commit under the certified fresh read")
+    fun retainedReaderSeesAPreAcquisitionCommitUnderTheCertifiedFreshRead() {
+        // FHNW-1189 B: per-call .use is good discipline but not PROOF — when a legitimate
+        // second reference stays open on the reading thread, the Realm cache returns that
+        // retained instance with its OLDER MVCC view. With REAL realms and a REAL
+        // coordinated writer (no native spy, no naked row patch): the stale view is
+        // observed without certification, the certified fresh read observes the
+        // pre-acquisition commit, and the production record seam declines on it
+        // (writer-wins, before any effect).
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_100L, hash = "hash-v1")
+        val offlineFile = getOfflineFixtureFile()
+        val retained = java.util.concurrent.atomic.AtomicReference<Realm>()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            // 1. The retained reader: an instance pinned to the CURRENT view, left open.
+            executor.submit {
+                val realm = FileController.getRealmInstance(userDrive)
+                realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()
+                retained.set(realm)
+            }.get(10, java.util.concurrent.TimeUnit.SECONDS)
+
+            // 2. The REAL coordinated writer commits on another thread: the offline intent
+            // is withdrawn through the production entry the file list uses.
+            FileController.updateIsOfflineForFiles(listOf(fileId), userDrive = userDrive, isOffline = false)
+
+            executor.submit {
+                val realm = retained.get()!!
+                // The uncertified read of the retained view: deterministically stale on a
+                // non-Looper thread (the view never advances by itself).
+                val staleRow = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+                check(staleRow.isOffline) { "fixture premise: the retained view predates the writer's commit" }
+                // The CERTIFIED read under the authority: the pre-acquisition commit is
+                // observed BEFORE any effect could run.
+                OfflineCommitAuthority.withCommitAuthority {
+                    OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { fresh ->
+                        check(!fresh.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!.isOffline) {
+                            "the certified read must observe the pre-acquisition withdrawal"
+                        }
+                    }
+                }
+                // The production schedule: the record seam inside the hold declines on the
+                // pre-acquisition withdrawal (writer-wins, no filesystem effect).
+                val outcome = OfflineCommitAuthority.withCommitAuthority {
+                    OfflineFolderSyncUtils.recordAcceptedPublicationInHold(
+                        userDrive,
+                        File(id = fileId, driveId = userDrive.driveId),
+                        offlineFile,
+                        acceptedServerHash = null,
+                        acceptedDigest = sha256Hex(bodyV1),
+                        acceptedLength = offlineFile.length(),
+                    )
+                }
+                check(outcome == OfflineFolderSyncUtils.PublicationOutcome.INTENT_WITHDRAWN) {
+                    "the publication must decline on the pre-acquisition withdrawal (got $outcome)"
+                }
+            }.get(15, java.util.concurrent.TimeUnit.SECONDS)
+        } finally {
+            runCatching { executor.submit { retained.get()?.close() }.get(5, java.util.concurrent.TimeUnit.SECONDS) }
+            executor.shutdownNow()
+        }
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertFalse(row.isOffline, "the withdrawal stands")
+            assertTrue(offlineFile.exists(), "the declined publication recorded nothing and destroyed nothing")
+            assertEquals(sha256Hex(bodyV1), row.offlineContentDigest, "the basis evidence stands for the preserved bytes")
+        }
+    }
+
+    @Test
+    @DisplayName("a coordinated pin writer queues at the WITHDRAWAL's hold: the withdrawal completes, the pin lands after")
+    fun coordinatedPinWriterIsExcludedFromTheWithdrawalHold() {
+        // FHNW-1189 E1, pin-versus-withdrawal: the real setDirectlyPinned is launched
+        // inside a withdrawal's per-file hold and PROVABLY queues at the real authority
+        // acquisition (hasQueuedWriter) — it cannot resurrect intent inside the hold; the
+        // withdrawal completes, and the pin commits afterwards, observing the completed
+        // operation.
+        seedCoveredPendingRow()
+        val writerAtEntry = java.util.concurrent.CountDownLatch(1)
+        val writerCommitted = java.util.concurrent.CountDownLatch(1)
+        var writerError: Throwable? = null
+        var writerRef: Thread? = null
+        var writerQueuedWhileHoldActive = false
+        OfflineFolderSyncUtils.preWithdrawalDecisionGate = {
+            writerRef = Thread {
+                try {
+                    writerAtEntry.countDown()
+                    FileController.setDirectlyPinned(fileId = fileId, isDirectlyPinned = true)
+                    writerCommitted.countDown()
+                } catch (t: Throwable) {
+                    writerError = t
+                    writerCommitted.countDown()
+                }
+            }.also { it.start() }
+            val queuedDeadline = System.currentTimeMillis() + 10_000
+            while (!OfflineCommitAuthority.hasQueuedWriter() && System.currentTimeMillis() < queuedDeadline) {
+                Thread.sleep(10)
+            }
+            check(OfflineCommitAuthority.hasQueuedWriter()) {
+                "the real pin writer must QUEUE at the authority while the withdrawal hold is active"
+            }
+            writerQueuedWhileHoldActive = true
+            // The forbidden interleaving cannot complete: the pin is not in the row while
+            // the withdrawal decides.
+            OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
+                check(!realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!.isDirectlyPinned) {
+                    "the queued pin writer must not commit inside the withdrawal's hold"
+                }
+            }
+        }
+        var unmarkConfirmed = false
+        try {
+            unmarkConfirmed = runBlocking {
+                OfflineFolderSyncUtils.unmarkFolderOffline(context, folderRow(coveredFolderId), userDrive)
+            }
+        } finally {
+            OfflineFolderSyncUtils.preWithdrawalDecisionGate = null
+            // Unconditional join AFTER the hold released (never inside it).
+            writerRef?.let { writer ->
+                check(writerAtEntry.await(10, java.util.concurrent.TimeUnit.SECONDS)) { "the writer reached its real entry point" }
+                check(writerCommitted.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                    "the coordinated writer completed only after the withdrawal released the authority"
+                }
+                writer.join(10_000)
+                check(!writer.isAlive) { "the pin writer thread must terminate (bounded)" }
+            }
+            writerError?.let { throw it }
+        }
+
+        assertTrue(unmarkConfirmed, "the unmark completed")
+        assertTrue(writerQueuedWhileHoldActive, "the real writer PROVABLY contended at the authority acquisition while the hold was active")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(row.isDirectlyPinned, "the pin commit landed AFTER the withdrawal (both effects present, defined order)")
+            assertFalse(row.isOffline, "the withdrawal cleared the offline state before the pin landed")
+            assertFalse(row.isMarkedAsOffline, "the withdrawal cleared the pending marker")
+            assertFalse(row.offlineOwnedByRoot, "the withdrawal released the recorded claim")
+        }
+        assertEquals(0L, FileController.getRealmInstance(userDrive).use { realm ->
+            realm.where(OfflineFolderRoot::class.java).count()
+        }, "the confirmed unmark released the root")
+    }
+
+    @Test
+    @DisplayName("a missing root folder row recovered from the authoritative remote answer; the registry and the other root's release discipline stand")
+    fun missingRootFolderRowIsRecoveredFromTheAuthoritativeRemoteAnswer() {
+        // FHNW-1189 A3, cache loss: the root's cached folder row is GONE (never evidence
+        // of a remote deletion) while its registry row stands. The authoritative details
+        // answer recovers the cached row; the registration is NOT withdrawn, and the
+        // unproven root withholds the globally-scoped discharge while the completed
+        // root's per-root evidence still applies.
+        seedCoveredPendingRow()
+        val rootBFolder = 800_402
+        seedRootRegistry(rootBFolder) // registry row WITHOUT a cached folder row (cache loss)
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+
+        mockkObject(DriveInfosController)
+        every { DriveInfosController.getDrives(any(), any(), any(), any()) } answers {
+            arrayListOf(Drive(objectId = "fixture-drive").apply { id = userDrive.driveId })
+        }
+        coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
+            CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = emptyList<File>(), cursor = null, hasMore = false)
+        }
+        // The authoritative remote answer for the missing folder: LIVE (recovered).
+        every { ApiRepository.getFileDetails(any(), any()) } answers {
+            ApiResponse(
+                result = ApiResponseStatus.SUCCESS,
+                data = File(id = rootBFolder, driveId = userDrive.driveId).apply {
+                    initUid()
+                    name = "fixture-root-b"
+                    path = "Private/fixture-root-b"
+                    type = "dir"
+                },
+            )
+        }
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+
+        val recoveredRow = FileController.getRealmInstance(userDrive).use { realm ->
+            realm.where(File::class.java).equalTo(File::id.name, rootBFolder).findFirst()
+        }
+        assertNotNull(recoveredRow, "the cached root folder row was RECOVERED from the remote details")
+        assertNotNull(
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(OfflineFolderRoot::class.java).equalTo(OfflineFolderRoot::folderId.name, rootBFolder).findFirst()
+            },
+            "the registration was NOT withdrawn on a missing cache row",
+        )
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertFalse(row.offlineOwnedByRoot, "the completed root's per-root remote-delete release applied (its walk listed nothing)")
+            assertFalse(row.isOffline, "the released row's intent stands cleared")
+            assertFalse(row.isMarkedAsOffline, "the released row's marker stands cleared")
+        }
+        assertEquals(0L, bodyRequests.get(), "a release preserves: nothing was re-downloaded")
+    }
+
+    @Test
+    @DisplayName("an inconclusive missing-root answer keeps the registration and does not freeze the completed root's release")
+    fun inconclusiveMissingRootDoesNotFreezeTheCompletedRootsRemoteDeleteRelease() {
+        // FHNW-1189 A3, transient failure: the authoritative answer is inconclusive
+        // (network). The registration stands, the row is not recovered, the unproven
+        // root's possible rows keep their claims (the globally-scoped discharge stays
+        // off) — and the COMPLETED root's per-root remote-delete release still runs (a
+        // missing cache row must not freeze unrelated complete roots forever).
+        seedCoveredPendingRow()
+        val rootBFolder = 800_402
+        seedRootRegistry(rootBFolder)
+        // A row that might belong to root B (its cached subtree is gone): claimed+pending.
+        val maybeOwnedListId = 800_701
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.createObject(File::class.java, "${maybeOwnedListId}_${userDrive.driveId}").apply {
+                    id = maybeOwnedListId
+                    driveId = userDrive.driveId
+                    name = "fixture-maybe-owned.bin"
+                    path = "Private/fixture-root-b/fixture-maybe-owned.bin"
+                    type = "file"
+                    parentId = rootBFolder
+                    isMarkedAsOffline = true
+                    offlineOwnedByRoot = true
+                    isFromUploads = false
+                }
+            }
+        }
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+
+        mockkObject(DriveInfosController)
+        every { DriveInfosController.getDrives(any(), any(), any(), any()) } answers {
+            arrayListOf(Drive(objectId = "fixture-drive").apply { id = userDrive.driveId })
+        }
+        coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
+            CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = emptyList<File>(), cursor = null, hasMore = false)
+        }
+        every { ApiRepository.getFileDetails(any(), any()) } answers {
+            ApiResponse(
+                result = ApiResponseStatus.ERROR,
+                data = null,
+                error = com.infomaniak.core.network.models.ApiError(exception = com.infomaniak.core.network.models.exceptions.NetworkException()),
+            )
+        }
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+
+        assertNotNull(
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(OfflineFolderRoot::class.java).equalTo(OfflineFolderRoot::folderId.name, rootBFolder).findFirst()
+            },
+            "an inconclusive answer never withdraws the registration",
+        )
+        assertNull(
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(File::class.java).equalTo(File::id.name, rootBFolder).findFirst()
+            },
+            "an inconclusive answer never fabricates the cached row",
+        )
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val maybeOwned = realm.where(File::class.java).equalTo(File::id.name, maybeOwnedListId).findFirst()!!
+            assertTrue(maybeOwned.offlineOwnedByRoot, "the unproven root's possible row keeps its claim (no b528 global sweep)")
+            assertTrue(maybeOwned.isMarkedAsOffline, "the unproven root's possible row keeps its intent")
+            val released = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertFalse(released.offlineOwnedByRoot, "the COMPLETED root's per-root remote-delete release still ran (no freeze)")
+            assertFalse(released.isOffline, "the completed root's release cleared the intent")
+        }
+    }
+
+    @Test
+    @DisplayName("a definitive remote answer (object_not_found) withdraws the missing root's registration with bytes preserved")
+    fun definitiveRemoteAnswerWithdrawsTheMissingRootRegistrationWithBytesPreserved() {
+        // FHNW-1189 A3, definitive deletion: the authoritative answer is the API's
+        // object_not_found — the ONE non-trash signal that may withdraw the registration.
+        // The withdrawal deletes ONLY the registry row: the claims release through the
+        // existing scope policy on a later pass, and the BYTES ARE PRESERVED.
+        seedCoveredPendingRow()
+        val rootBFolder = 800_402
+        seedRootRegistry(rootBFolder)
+        // A claimed row with REAL bytes under the definitively-gone root.
+        val ownedId = 800_702
+        val ownedBytes = bodyV1
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.createObject(File::class.java, "${ownedId}_${userDrive.driveId}").apply {
+                    id = ownedId
+                    driveId = userDrive.driveId
+                    name = "fixture-owned.bin"
+                    path = "Private/fixture-root-b/fixture-owned.bin"
+                    type = "file"
+                    parentId = rootBFolder
+                    isOffline = true
+                    offlineOwnedByRoot = true
+                    offlineBasisModifiedAt = 1_700_000_000L
+                    offlineBasisSize = ownedBytes.size.toLong()
+                    offlineContentDigest = sha256Hex(ownedBytes)
+                    isFromUploads = false
+                }
+            }
+        }
+        val ownedFile = JavaFile(
+            File.getOfflineFolder(context),
+            "${userDrive.userId}/${userDrive.driveId}/Private/fixture-root-b/fixture-owned.bin",
+        )
+        ownedFile.parentFile?.mkdirs()
+        ownedFile.writeBytes(ownedBytes)
+        check(ownedFile.setLastModified(1_700_000_000L * 1000)) { "the owned bytes carry the basis mtime" }
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+
+        mockkObject(DriveInfosController)
+        every { DriveInfosController.getDrives(any(), any(), any(), any()) } answers {
+            arrayListOf(Drive(objectId = "fixture-drive").apply { id = userDrive.driveId })
+        }
+        coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
+            CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = emptyList<File>(), cursor = null, hasMore = false)
+        }
+        every { ApiRepository.getFileDetails(any(), any()) } answers {
+            ApiResponse(
+                result = ApiResponseStatus.ERROR,
+                data = null,
+                error = com.infomaniak.core.network.models.ApiError(code = "object_not_found"),
+            )
+        }
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+
+        assertNull(
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(OfflineFolderRoot::class.java).equalTo(OfflineFolderRoot::folderId.name, rootBFolder).findFirst()
+            },
+            "the definitive answer withdrew the registration",
+        )
+        assertNotNull(
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.where(OfflineFolderRoot::class.java).equalTo(OfflineFolderRoot::folderId.name, coveredFolderId).findFirst()
+            },
+            "the other root's registration stands",
+        )
+        assertTrue(ownedFile.exists() && ownedFile.readBytes().contentEquals(ownedBytes), "the BYTES ARE PRESERVED (the registration withdrawal never deletes)")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val owned = realm.where(File::class.java).equalTo(File::id.name, ownedId).findFirst()!!
+            assertTrue(owned.offlineOwnedByRoot, "the claim releases through the existing scope policy on a later pass (conservative this pass)")
+            assertTrue(owned.isOffline, "the claimed row's state stands untouched this pass")
+        }
+    }
+
+    @Test
+    @DisplayName("a same-id re-registration mid-pass does not discharge the attached claims (A6 lifetime churn)")
+    fun sameIdReregistrationMidPassDoesNotDischargeTheAttachedClaims() {
+        // FHNW-1189 A6: the root is unmarked and re-marked (same folder id) mid-pass; the
+        // old walk attaches to the new registration and the pass-end set equals the
+        // snapshot. The discharge releases only rows claimed AT PASS START — a claim the
+        // attached walk created mid-pass is judged by the pass that walks it, never
+        // discharged from the old walk's union evidence (churn, not byte loss, and now
+        // bounded).
+        seedCoveredPendingRow()
+        val midPassClaimId = 800_703
+        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
+
+        mockkObject(DriveInfosController)
+        every { DriveInfosController.getDrives(any(), any(), any(), any()) } answers {
+            arrayListOf(Drive(objectId = "fixture-drive").apply { id = userDrive.driveId })
+        }
+        var injected = false
+        coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
+            if (!injected) {
+                injected = true
+                // The REAL coordinated remove+re-register of the SAME uid, plus the
+                // attached walk's marking transaction shape claiming a NEW row (the
+                // in-transaction registry re-check passes for the new registration).
+                OfflineCommitAuthority.withCommitAuthority {
+                    FileController.getRealmInstance(userDrive).use { realm ->
+                        realm.executeTransaction { mutableRealm ->
+                            mutableRealm.where(OfflineFolderRoot::class.java)
+                                .equalTo(OfflineFolderRoot::folderId.name, coveredFolderId)
+                                .findAll().deleteAllFromRealm()
+                            mutableRealm.createObject(
+                                OfflineFolderRoot::class.java,
+                                OfflineFolderRoot.buildUid(coveredFolderId, userDrive.driveId, userDrive.userId),
+                            ).apply {
+                                folderId = coveredFolderId
+                                driveId = userDrive.driveId
+                                userId = userDrive.userId
+                            }
+                            mutableRealm.createObject(File::class.java, "${midPassClaimId}_${userDrive.driveId}").apply {
+                                id = midPassClaimId
+                                this.driveId = userDrive.driveId
+                                name = "fixture-attached.bin"
+                                path = "Private/fixture-orch-folder/fixture-attached.bin"
+                                type = "file"
+                                parentId = coveredFolderId
+                                isMarkedAsOffline = true
+                                offlineOwnedByRoot = true // the attached walk's claim, created MID-PASS
+                                isFromUploads = false
+                            }
+                        }
+                    }
+                }
+            }
+            CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = emptyList<File>(), cursor = null, hasMore = false)
+        }
+        runBlocking { OfflineFolderSyncUtils.syncOfflineFolderRoots(context) }
+
+        assertEquals(1L, FileController.getRealmInstance(userDrive).use { realm ->
+            realm.where(OfflineFolderRoot::class.java).count()
+        }, "the same-id re-registration really happened")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val attached = realm.where(File::class.java).equalTo(File::id.name, midPassClaimId).findFirst()!!
+            assertTrue(attached.offlineOwnedByRoot, "the attached walk's mid-pass claim was NOT discharged from the old walk's evidence")
+            assertTrue(attached.isMarkedAsOffline, "the attached claim's pending marker stands for the pass that walks it")
+        }
     }
 
     private fun folderRow(folderId: Int): File = FileController.getRealmInstance(userDrive).use { realm ->
