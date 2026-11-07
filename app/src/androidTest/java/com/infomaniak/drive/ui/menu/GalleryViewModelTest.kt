@@ -19,6 +19,7 @@ package com.infomaniak.drive.ui.menu
 
 import androidx.arch.core.executor.ArchTaskExecutor
 import androidx.arch.core.executor.TaskExecutor
+import androidx.lifecycle.viewModelScope
 import com.infomaniak.core.network.models.ApiResponseStatus
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.CursorApiResponse
@@ -32,21 +33,43 @@ import io.mockk.unmockkAll
 import io.mockk.verify
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.job
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Orchestration tests for the gallery filter: delayed and reordered responses through the real
  * GalleryViewModel flow, asserting that a superseded request can produce NO side effect
  * (cursor, shared cache, orphan cleanup, UI event) and that filtered queries never write the
  * shared all-media cache.
+ *
+ * Deterministic discipline (SOFTCHECK-1924): every wait is a bounded, ASSERTED latch or
+ * completion-poll — a timeout fails the case, it is never ignored, and a harness-side latch
+ * timeout is RECORDED and asserted not to have fired (it must never manufacture an ordering).
+ * An old request's arrival at the network seam is proven by an ENTRY latch asserted BEFORE the
+ * supersession. A drop branch's execution is proven at a production boundary the branch itself
+ * must cross (test 3: the scope check's account read, held and released by the test), never by
+ * a timer and never by the absence of an assertion failure. Superseded-by-cancellation cases
+ * (1, 2) claim only what the guards make true — the released response cannot apply, by
+ * cancellation or by the scope check; they do not claim the scope-mismatch branch. Finally,
+ * every case releases its parked responses and CANCELS AND JOINS the ViewModel's load
+ * coroutines (bounded) BEFORE tearDown unmocks and restores production implementations — no
+ * late coroutine runs into unmocked code, and no IO thread outlives a failed case.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GalleryViewModelTest {
@@ -85,6 +108,23 @@ class GalleryViewModelTest {
         Dispatchers.resetMain()
     }
 
+    /**
+     * Cancels and joins (bounded) every load coroutine the case left in the ViewModel's
+     * scope, BEFORE [tearDown] unmocks: no late apply/drop can run against restored
+     * production implementations. Runs from each case's finally, after its parked latches
+     * were released.
+     */
+    private fun cancelAndJoinLoads(vm: GalleryViewModel) {
+        val scopeJob = vm.viewModelScope.coroutineContext.job
+        val children = scopeJob.children.toList()
+        children.forEach { it.cancel() }
+        runBlocking {
+            withTimeout(5_000) {
+                children.forEach { it.join() }
+            }
+        }
+    }
+
     private fun apiPage(files: List<File>, cursor: String?, hasMore: Boolean) = CursorApiResponse(
         result = ApiResponseStatus.SUCCESS,
         data = ArrayList(files),
@@ -97,6 +137,12 @@ class GalleryViewModelTest {
         this.extensionType = extensionType
     }
 
+    /**
+     * Bounded completion-poll for an IO-thread coroutine's observable outcome (the ViewModel
+     * runs its loads on real Dispatchers.IO threads — there is no schedulable seam to latch
+     * every internal hop). Every call site ASSERTS the result: a timeout is a failure, never
+     * an ignored false.
+     */
     private fun awaitTrue(timeoutMs: Long = 5_000L, condition: () -> Boolean): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
@@ -110,87 +156,147 @@ class GalleryViewModelTest {
     @DisplayName("a superseded all-media response produces no side effect after a filter switch")
     fun supersededAllMediaResponseProducesNoSideEffectAfterFilterSwitch() {
         val vm = GalleryViewModel()
+        val oldRequestEntered = CountDownLatch(1)
         val blockedResponse = CountDownLatch(1)
-        val stalePage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE), file(2, ExtensionTypes.VIDEO)), cursor = "stale-cursor", hasMore = false)
+        val answerTimedOut = AtomicBoolean(false)
+        val stalePage = apiPage(
+            files = listOf(file(1, ExtensionTypes.IMAGE), file(2, ExtensionTypes.VIDEO)),
+            cursor = "stale-cursor",
+            hasMore = false,
+        )
 
         every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } answers {
-            blockedResponse.await()
+            oldRequestEntered.countDown()
+            // A timed-out hold would manufacture the intended ordering: record it, and the
+            // case asserts below that it never happened.
+            if (!blockedResponse.await(5, TimeUnit.SECONDS)) answerTimedOut.set(true)
             stalePage
         }
 
-        vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
+        try {
+            vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
+            assertTrue(oldRequestEntered.await(5, TimeUnit.SECONDS), "the old request reached the network seam")
 
-        // Switch the filter while the first response is still in flight
-        vm.setMediaFilter(GalleryMediaFilter.VIDEOS)
-        val freshPage = apiPage(files = listOf(file(3, ExtensionTypes.VIDEO), file(4, ExtensionTypes.IMAGE)), cursor = "fresh-cursor", hasMore = true)
-        every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } returns freshPage
-        vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
+            // Switch the filter while the first response is still parked in the seam: the
+            // superseding load cancels the parked job (it can apply only via the guards).
+            vm.setMediaFilter(GalleryMediaFilter.VIDEOS)
+            val freshPage = apiPage(
+                files = listOf(file(3, ExtensionTypes.VIDEO), file(4, ExtensionTypes.IMAGE)),
+                cursor = "fresh-cursor",
+                hasMore = true,
+            )
+            every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } returns freshPage
+            vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
 
-        awaitTrue { vm.galleryApiResult.value?.generation == 3 }
+            assertTrue(awaitTrue { vm.galleryApiResult.value?.generation == 3 }, "the fresh request applied (generation 3)")
+            assertTrue(awaitTrue { vm.currentCursor == "fresh-cursor" }, "the fresh cursor is the live one")
 
-        // Release the stale response: it must be dropped without touching anything
-        blockedResponse.countDown()
-        awaitTrue { vm.currentCursor == "fresh-cursor" }
+            // Release the parked stale response. The superseded coroutine resumes into a
+            // CANCELLED job (or, at most, into a failing scope check): by either guard it
+            // cannot apply — this case claims exactly that, not the scope-mismatch branch.
+            blockedResponse.countDown()
+            assertTrue(awaitTrue(2_000) { vm.galleryApiResult.value?.generation == 3 && vm.currentCursor == "fresh-cursor" }, "the world is quiescent after the release")
 
-        verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) } // VIDEOS never writes; stale ALL was dropped
-        verify(exactly = 0) { FileController.removeOrphanFiles() }
-        assert(vm.currentCursor == "fresh-cursor")
-        assert(vm.galleryApiResult.value?.files?.all { it.matchesMediaFilter(GalleryMediaFilter.VIDEOS) } == true)
+            assertFalse(answerTimedOut.get(), "the harness released the parked response only via timeout: the ordering claims above are void")
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) } // VIDEOS never writes; stale ALL was dropped
+            verify(exactly = 0) { FileController.removeOrphanFiles() }
+            assertEquals("fresh-cursor", vm.currentCursor)
+            assertTrue(
+                vm.galleryApiResult.value?.files?.all { it.matchesMediaFilter(GalleryMediaFilter.VIDEOS) } == true,
+                "the presented files match the switched filter",
+            )
+        } finally {
+            blockedResponse.countDown()
+            cancelAndJoinLoads(vm)
+        }
     }
 
     @Test
     @DisplayName("a reordered response of an older request is dropped within the same filter")
     fun reorderedResponseOfAnOlderRequestIsDroppedWithinTheSameFilter() {
         val vm = GalleryViewModel()
-        val blockedResponse = CountDownLatch(1)
+        val oldRequestEntered = CountDownLatch(1)
+        val blockedOld = CountDownLatch(1)
+        val answerTimedOut = AtomicBoolean(false)
         val olderPage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE)), cursor = "older-cursor", hasMore = false)
-        var callCount = 0
+        val callCount = AtomicInteger(0)
 
         every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } answers {
-            if (callCount++ == 0) {
-                blockedResponse.await()
+            if (callCount.incrementAndGet() == 1) {
+                oldRequestEntered.countDown()
+                if (!blockedOld.await(5, TimeUnit.SECONDS)) answerTimedOut.set(true)
                 olderPage
             } else {
                 apiPage(files = listOf(file(2, ExtensionTypes.IMAGE)), cursor = "newer-cursor", hasMore = false)
             }
         }
 
-        vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
-        vm.loadLastGallery(DRIVE_ID, ignoreCloud = false) // supersedes the first request
+        try {
+            vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
+            assertTrue(oldRequestEntered.await(5, TimeUnit.SECONDS), "the older request reached the seam before supersession")
+            vm.loadLastGallery(DRIVE_ID, ignoreCloud = false) // supersedes (cancels) the first request
 
-        awaitTrue { vm.galleryApiResult.value?.generation == 2 }
-        blockedResponse.countDown()
-        awaitTrue { vm.currentCursor == "newer-cursor" }
+            assertTrue(awaitTrue { vm.galleryApiResult.value?.generation == 2 }, "the newer request applied (generation 2)")
 
-        assert(vm.currentCursor == "newer-cursor")
-        assert(vm.galleryApiResult.value?.files?.singleOrNull()?.id == 2)
-        verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 1 && it.first().id == 2 }, isFirstPage = true) }
+            // Release the parked older response: a reordered response of a cancelled,
+            // superseded request cannot apply (the guards above).
+            blockedOld.countDown()
+            assertTrue(awaitTrue(2_000) { vm.galleryApiResult.value?.generation == 2 && vm.currentCursor == "newer-cursor" }, "the world is quiescent after the release")
+
+            assertFalse(answerTimedOut.get(), "the harness released the parked response only via timeout: the ordering claims above are void")
+            assertEquals("newer-cursor", vm.currentCursor)
+            assertEquals(2, vm.galleryApiResult.value?.files?.singleOrNull()?.id)
+            verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 1 && it.first().id == 2 }, isFirstPage = true) }
+        } finally {
+            blockedOld.countDown()
+            cancelAndJoinLoads(vm)
+        }
     }
 
     @Test
     @DisplayName("a response of a changed account scope is dropped before any side effect")
     fun responseOfAChangedAccountScopeIsDroppedBeforeAnySideEffect() {
         val vm = GalleryViewModel()
+        val oldRequestEntered = CountDownLatch(1)
         val blockedResponse = CountDownLatch(1)
+        val answerTimedOut = AtomicBoolean(false)
         val staleUserPage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE)), cursor = "other-user", hasMore = false)
 
         every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } answers {
-            blockedResponse.await()
+            oldRequestEntered.countDown()
+            if (!blockedResponse.await(5, TimeUnit.SECONDS)) answerTimedOut.set(true)
             staleUserPage
         }
 
-        vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
+        try {
+            vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
+            assertTrue(oldRequestEntered.await(5, TimeUnit.SECONDS), "the old request reached the seam before the account switch")
 
-        // Account switches while the response is in flight
-        every { AccountUtils.currentUserId } returns USER_ID + 1
-        blockedResponse.countDown()
+            // Account switches while the response is in flight. The post-switch account stub
+            // is a HANDSHAKE, not a timer: the drop branch's scope check must READ the
+            // account here; the test observes the read, then lets the branch decide. The
+            // decision value is fixed (USER_ID + 1 -> mismatch), so the zero-effect asserts
+            // below cannot race a side effect that the branch can never produce.
+            val branchReachedScopeCheck = CountDownLatch(1)
+            val branchMayDecide = CountDownLatch(1)
+            every { AccountUtils.currentUserId } answers {
+                branchReachedScopeCheck.countDown()
+                if (!branchMayDecide.await(5, TimeUnit.SECONDS)) answerTimedOut.set(true)
+                USER_ID + 1
+            }
+            blockedResponse.countDown()
+            assertTrue(branchReachedScopeCheck.await(5, TimeUnit.SECONDS), "the stale branch reached the production scope check (the drop ran)")
+            branchMayDecide.countDown()
 
-        awaitTrue { blockedResponse.count == 0L }
-        Thread.sleep(200) // let the in-flight load finish and (not) apply
-
-        assert(vm.galleryApiResult.value == null)
-        assert(vm.currentCursor == null)
-        verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) }
+            assertFalse(answerTimedOut.get(), "the harness released a handshake only via timeout: the ordering claims above are void")
+            assertTrue(vm.galleryApiResult.value == null, "the stale response was never applied")
+            assertNull(vm.currentCursor, "the stale cursor was never taken")
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) }
+            verify(exactly = 0) { FileController.removeOrphanFiles() }
+        } finally {
+            blockedResponse.countDown()
+            cancelAndJoinLoads(vm)
+        }
     }
 
     @Test
@@ -201,17 +307,25 @@ class GalleryViewModelTest {
 
         // Server ignored types[]: response mixes images and videos
         every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } returns
-            apiPage(files = listOf(file(1, ExtensionTypes.IMAGE), file(2, ExtensionTypes.VIDEO)), cursor = "c1", hasMore = true)
+            apiPage(
+                files = listOf(file(1, ExtensionTypes.IMAGE), file(2, ExtensionTypes.VIDEO)),
+                cursor = "c1",
+                hasMore = true,
+            )
 
-        vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
+        try {
+            vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
 
-        awaitTrue { vm.galleryApiResult.value != null }
+            assertTrue(awaitTrue { vm.galleryApiResult.value != null }, "the filtered load applied")
 
-        val page = vm.galleryApiResult.value!!
-        assert(page.files.map { it.id } == listOf(2)) // only videos survive the local match
-        assert(page.isComplete == false)
-        verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) }
-        verify(exactly = 0) { FileController.removeOrphanFiles() }
+            val page = vm.galleryApiResult.value!!
+            assertEquals(listOf(2), page.files.map { it.id }, "only videos survive the local match")
+            assertEquals(false, page.isComplete)
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) }
+            verify(exactly = 0) { FileController.removeOrphanFiles() }
+        } finally {
+            cancelAndJoinLoads(vm)
+        }
     }
 
     @Test
@@ -219,15 +333,23 @@ class GalleryViewModelTest {
     fun allMediaFirstPageReplacesTheSharedCacheAndCleansOrphans() {
         val vm = GalleryViewModel()
         every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } returns
-            apiPage(files = listOf(file(1, ExtensionTypes.IMAGE), file(2, ExtensionTypes.VIDEO)), cursor = null, hasMore = false)
+            apiPage(
+                files = listOf(file(1, ExtensionTypes.IMAGE), file(2, ExtensionTypes.VIDEO)),
+                cursor = null,
+                hasMore = false,
+            )
 
-        vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
+        try {
+            vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
 
-        awaitTrue { vm.galleryApiResult.value != null }
+            assertTrue(awaitTrue { vm.galleryApiResult.value != null }, "the load applied")
 
-        verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 2 }, isFirstPage = true) }
-        verify(exactly = 1) { FileController.removeOrphanFiles() }
-        assert(vm.galleryApiResult.value?.isComplete == true)
+            verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 2 }, isFirstPage = true) }
+            verify(exactly = 1) { FileController.removeOrphanFiles() }
+            assertEquals(true, vm.galleryApiResult.value?.isComplete)
+        } finally {
+            cancelAndJoinLoads(vm)
+        }
     }
 
     private object ExtensionTypes {

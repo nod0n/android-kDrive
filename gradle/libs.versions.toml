@@ -20,6 +20,7 @@ androidxArchCoreTesting = "2.2.0"
 pahoMqttAndroid = "4.4.1"
 realmAndroidAdapters = "v4.0.0"
 realmGradlePlugin = "11.0.1-agp9-infomaniak"
+rxjava2 = "2.2.21"
 touchImageView = "3.7.1"
 uiAndroid = "1.10.0"
 uiAutomator = "2.3.0"
@@ -51,6 +52,7 @@ androidx-arch-core-testing = { module = "androidx.arch.core:core-testing", versi
 paho-mqtt-android = { module = "com.github.hannesa2:paho.mqtt.android", version.ref = "pahoMqttAndroid" }
 realm-android-adapters = { module = "com.github.realm:realm-android-adapters", version.ref = "realmAndroidAdapters" }
 realm-gradle-plugin = { module = "io.realm:realm-gradle-plugin", version.ref = "realmGradlePlugin" }
+rxjava2 = { module = "io.reactivex.rxjava2:rxjava", version.ref = "rxjava2" }
 touch-image-view = { module = "com.github.MikeOrtiz:TouchImageView", version.ref = "touchImageView" }
 
 # Unit tests

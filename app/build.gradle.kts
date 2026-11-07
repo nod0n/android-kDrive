@@ -255,6 +255,12 @@ dependencies {
     testImplementation(libs.androidx.arch.core.testing)
     testImplementation(core.mockk.android)
     androidTestImplementation(core.mockk.android)
+    // Test-only runtime dependency, for MockK's reflective method scan only: every
+    // RealmObject inherits BaseRealm.asFlowable() whose signature references the OPTIONAL
+    // io.reactivex.rxjava2 types Realm was compiled with; instrumentation-time proxy
+    // creation loads them (device evidence: DEVICE-FUNCTIONAL-TRIAGE-1903). No production
+    // and no test code uses RxJava.
+    androidTestImplementation(libs.rxjava2)
     androidTestImplementation(libs.coroutines.test)
     androidTestImplementation(libs.androidx.ui.automator)
 

@@ -415,6 +415,16 @@ class PhotoTrashConsentUiQueueTest {
         }
     }
 
+    /** Bounded condition wait whose result the CALLER asserts; observes a thread's verifiable position. */
+    private fun awaitTrue(timeoutMs: Long = 5_000L, condition: () -> Boolean): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (condition()) return true
+            Thread.sleep(10)
+        }
+        return condition()
+    }
+
     @Test
     fun `a launch section excludes a writer's begin until it ends`() {
         val base = revisionBase()
@@ -433,16 +443,29 @@ class PhotoTrashConsentUiQueueTest {
             assertTrue(gate(req))
 
             // A writer arriving NOW cannot begin: it waits at its begin point under the
-            // section's monitor. A violation counts the latch EARLY (detected immediately);
-            // observing the correct absence costs the bounded window.
+            // section's monitor. POSITIVE contention evidence first (the writer verifiably
+            // sits inside beginActivationWrite), so the bounded absence below measures the
+            // guard rather than a possibly non-started thread (SOFTCHECK-1924 #4).
             val writerBegan = CountDownLatch(1)
-            writer = Thread {
+            val w = Thread {
                 PhotoTrashController.beginActivationWrite()
                 writerBegan.countDown()
                 settleNow.await(15, TimeUnit.SECONDS)
                 PhotoTrashController.endActivationWrite()
             }
-            writer.start()
+            writer = w
+            w.start()
+            assertTrue(
+                awaitTrue {
+                    w.state == Thread.State.WAITING &&
+                        // The JVM variant transform renames methods with an $app suffix
+                        // (seen in the diagnostic run r33b): match the base name.
+                        w.stackTrace.any { it.methodName.startsWith("beginActivationWrite") }
+                },
+                "the writer is verifiably blocked inside beginActivationWrite (positive guard-contention evidence); " +
+                    "final state=${w.state} alive=${w.isAlive} began=${writerBegan.count} " +
+                    "stack=${w.stackTrace.take(8).joinToString(" | ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }}",
+            )
             assertFalse(writerBegan.await(500, TimeUnit.MILLISECONDS), "no writer may begin while a launch section is active")
             assertEquals(0, PhotoTrashController.activationWritesUnsettled(), "the witness stays valid: nothing began mid-section")
 

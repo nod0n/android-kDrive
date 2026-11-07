@@ -124,8 +124,8 @@ class OfflineFolderMaintenanceOrchestrationTest {
         .body(bytes.toResponseBody("application/octet-stream".toMediaType()))
         .build()
 
-    private fun detailsResponse(hash: String?, modifiedAtSec: Long, size: Long?): ApiResponse<File> {
-        detailsRequests.incrementAndGet()
+    /** The details payload the stub serves (counting happens at INVOCATION, in stubDetails). */
+    private fun detailsPayload(hash: String?, modifiedAtSec: Long, size: Long?): ApiResponse<File> {
         return ApiResponse(
             result = ApiResponseStatus.SUCCESS,
             data = File(id = fileId, driveId = userDrive.driveId).apply {
@@ -139,7 +139,12 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     private fun stubDetails(hash: String?, modifiedAtSec: Long, size: Long?) {
-        every { ApiRepository.getFileDetailsWithHash(any(), any()) } returns detailsResponse(hash, modifiedAtSec, size)
+        // The counter increments from an ANSWER at actual request time — a `returns` value
+        // is built once at stub SETUP, which counted setups, not network orchestration.
+        every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
+            detailsRequests.incrementAndGet()
+            detailsPayload(hash, modifiedAtSec, size)
+        }
     }
 
     /** Seeds the accepted publication: row basis + real bytes on disk with the basis identity. */
@@ -213,8 +218,11 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     private fun getOfflineFixtureFile(): JavaFile {
+        // DETACH inside the use: a managed row is invalid the moment the realm closes, and
+        // getOfflineFile reads row properties (name/path/id) on the returned file. (Runtime
+        // evidence: all 14 device cases died on "Realm instance already closed" here.)
         val row = FileController.getRealmInstance(userDrive).use { realm ->
-            realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            realm.copyFromRealm(realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!, 0)
         }
         return row.getOfflineFile(context, userDrive.userId)!!
     }
