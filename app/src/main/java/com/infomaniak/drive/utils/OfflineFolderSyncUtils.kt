@@ -755,7 +755,27 @@ object OfflineFolderSyncUtils {
             }
             val metadataUnchanged = proxy.offlineBasisModifiedAt == remoteFile.lastModifiedAt &&
                 (remoteFile.size == null || proxy.offlineBasisSize == null || proxy.offlineBasisSize == remoteFile.size)
-            if (metadataUnchanged) return true // already consistent — a no-op, not a withdrawal
+            if (metadataUnchanged) {
+                // The basis fields are already consistent — a no-op for them, not a
+                // withdrawal. The server IDENTITY may still be missing though: a missing-copy
+                // restore records an unknown identity by design, and the conservative
+                // digest-verified download that follows exists to adopt exactly this hash.
+                // Recording it here (only an established, non-blank hash, only when the row
+                // does not already carry it) is what makes the adoption converge — otherwise
+                // every later pass repeats the same unchanged body download, which the
+                // maintenance policy forbids.
+                val establishedHash = remoteFile.serverContentHash
+                if (!establishedHash.isNullOrBlank() && proxy.serverContentHash != establishedHash) {
+                    realm.executeTransaction { mutableRealm ->
+                        FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { row ->
+                            if (hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
+                                row.serverContentHash = establishedHash
+                            }
+                        }
+                    }
+                }
+                return true // already consistent — a no-op, not a withdrawal
+            }
 
             if (offlineFile?.exists() == true) {
                 val basisDigest = proxy.offlineContentDigest
