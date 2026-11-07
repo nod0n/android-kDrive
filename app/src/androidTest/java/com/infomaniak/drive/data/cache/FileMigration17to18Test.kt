@@ -52,8 +52,10 @@ import java.util.UUID
  *  (B) open the SAME file as a [DynamicRealm] at 17 and shape-correct it to the TRUE v17
  *      schema (remove this branch's four columns and table, add the dev columns, recreate the
  *      dev OfflineRoot table and seed it), every step verified before closing,
- *  (C) reopen at [FileMigration.DB_VERSION] (now 19: the migration runs through 18→19,
- *      whose added provenance column this test does not audit) with the REAL [FileMigration] and the FULL
+ *  (C) reopen at [FileMigration.DB_VERSION] (now 19: the migration runs through 18→19, whose
+ *      added provenance column this fixture therefore also removes in phase B and audits for
+ *      presence and default in phase C — the per-row 18→19 DERIVATION is [FileMigration18to19Test]'s
+ *      audit) with the REAL [FileMigration] and the FULL
  *      production module — exactly what a production upgrade executes — and audit ONLY the
  *      17→18 difference: OfflineRoot rows are TRANSFORMED into OfflineFolderRoot rows (new
  *      three-part uid), the dev table is gone, the undeclared dev File fields are removed
@@ -84,13 +86,16 @@ class FileMigration17to18Test {
         .directory(fixtureDir)
         .build()
 
-    /** This branch's columns that v17 did NOT have. */
+    /** This branch's columns that v17 did NOT have. The list must name EVERY one — leaving
+     *  one out would leave a future column in the old fixture (RESUME-caf1 item 1: exactly
+     *  that happened to offlineOwnedByRoot). */
     private val branchOnlyFileFields = listOf(
         File::isDirectlyPinned.name,
         File::offlineBasisModifiedAt.name,
         File::offlineBasisSize.name,
         File::offlineContentDigest.name,
         File::offlinePublishedPath.name,
+        File::offlineOwnedByRoot.name,
     )
 
     /** The dev columns that v17 HAD and this branch's schema does not declare. */
@@ -213,6 +218,7 @@ class FileMigration17to18Test {
             branchOnlyFileFields.forEach { field ->
                 assertTrue(fileSchema.hasField(field), "the migration adds $field")
             }
+            assertFalse(fileSchema.isNullable(File::offlineOwnedByRoot.name), "the 18→19 step adds the provenance as a required boolean")
 
             val root = realm.where(OfflineFolderRoot::class.java).findFirst()
             check(root != null)
@@ -233,9 +239,14 @@ class FileMigration17to18Test {
             assertEquals("fixture-pinned-17.bin", pinned.name)
             assertEquals(1_700_000_000L, pinned.lastModifiedAt)
             assertTrue(pinned.isOffline)
+            // The 18→19 derivation runs inside this fixture's migration too: the transformed
+            // root (800201) is not an ancestor of either row (both carry the absent-parent 0),
+            // so no root ownership is derived.
+            assertFalse(pinned.offlineOwnedByRoot, "a pin outside the transformed root's subtree derives no root ownership")
 
             val covered = realm.where(File::class.java).equalTo("uid", "900202_721").findFirst()!!
             assertFalse(covered.isDirectlyPinned, "a folder-covered row is not a direct pin")
+            assertFalse(covered.offlineOwnedByRoot, "a row with no offline signal derives no root ownership")
             assertNull(covered.serverContentHash)
             assertEquals(900202, covered.id)
             assertEquals("fixture-covered-17.bin", covered.name)

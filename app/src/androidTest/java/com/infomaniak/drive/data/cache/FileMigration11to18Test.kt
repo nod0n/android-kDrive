@@ -44,10 +44,12 @@ import java.util.UUID
  *  (A) create a disposable TYPED realm at the FULL current module schema STAMPED 11,
  *  (B) open the SAME file as a [DynamicRealm] at 11 and remove ONLY this branch's additions —
  *      the file then holds the TRUE v11 shape, verified by a schema audit before closing,
- *  (C) reopen at [FileMigration.DB_VERSION] (now 19: the migration runs through 18→19,
- *      whose added provenance column this test does not audit) with the REAL [FileMigration] and the FULL
+ *  (C) reopen at [FileMigration.DB_VERSION] (now 19: the migration runs through 18→19, whose
+ *      added provenance column this fixture therefore also removes in phase B and audits for
+ *      presence and default in phase C — the per-row 18→19 DERIVATION is [FileMigration18to19Test]'s
+ *      audit) with the REAL [FileMigration] and the FULL
  *      production module — exactly what a production upgrade executes — and audit ONLY the
- *      11→18 difference: the six columns exist with the right nullability, the registered
+ *      11→18 difference: the seven columns exist with the right nullability, the registered
  *      OfflineFolderRoot table exists empty, the pre-existing pin reads back as a direct pin,
  *      nothing else was invented, every pre-existing field is preserved, and the new nullable
  *      columns are writable.
@@ -103,6 +105,10 @@ class FileMigration11to18Test {
         "currentProgress", "driveColor", "publicShareAuthToken", "publicShareUuid", "result",
     )
 
+    /** EVERY column this branch added on top of v11 — phase B removes exactly these to shape
+     *  the true old schema, phase C audits their presence. Leaving one out would leave a
+     *  future column in the "old" fixture and omit it from the migrated field-set audit
+     *  (RESUME-caf1 item 1: exactly that happened to offlineOwnedByRoot). */
     private val newFileFields = listOf(
         File::isDirectlyPinned.name,
         File::offlineBasisModifiedAt.name,
@@ -110,6 +116,7 @@ class FileMigration11to18Test {
         File::offlineContentDigest.name,
         File::serverContentHash.name,
         File::offlinePublishedPath.name,
+        File::offlineOwnedByRoot.name,
     )
 
     /** A baseline pin: the persistent state in the public baseline is isOffline (not the
@@ -191,6 +198,8 @@ class FileMigration11to18Test {
             assertTrue(fileSchema.hasField(File::offlineContentDigest.name), "the migration adds the basis digest")
             assertTrue(fileSchema.hasField(File::serverContentHash.name), "the migration adds the server hash identity")
             assertTrue(fileSchema.hasField(File::offlinePublishedPath.name), "the migration adds the published path")
+            assertTrue(fileSchema.hasField(File::offlineOwnedByRoot.name), "the migration adds the root-ownership provenance (18→19 runs in this fixture too)")
+            assertFalse(fileSchema.isNullable(File::offlineOwnedByRoot.name), "the provenance is a required boolean")
             assertTrue(fileSchema.isNullable(File::offlineBasisSize.name), "the basis size is nullable")
             assertTrue(fileSchema.isNullable(File::offlineContentDigest.name), "the digest is nullable")
             assertTrue(fileSchema.isNullable(File::serverContentHash.name), "the server hash is nullable")
@@ -221,6 +230,9 @@ class FileMigration11to18Test {
             assertEquals(1_700_000_000L, pinned.lastModifiedAt)
             assertTrue(pinned.isOffline)
             assertFalse(pinned.isMarkedAsOffline)
+            // The 18→19 derivation runs inside this fixture's migration too: no root is
+            // registered, so a never-root baseline pin derives NO root ownership.
+            assertFalse(pinned.offlineOwnedByRoot, "a baseline pin with no registered root derives no root ownership")
 
             val ordinary = realm.where(File::class.java).equalTo("uid", "900102_711").findFirst()!!
             assertFalse(ordinary.isDirectlyPinned, "an unpinned row stays unpinned")
@@ -228,6 +240,7 @@ class FileMigration11to18Test {
             assertEquals("fixture-ordinary.bin", ordinary.name)
             assertEquals(1_700_001_000L, ordinary.lastModifiedAt)
             assertFalse(ordinary.isOffline)
+            assertFalse(ordinary.offlineOwnedByRoot, "a plain row derives no root ownership")
 
             // THE NEW COLUMNS ARE WRITABLE (the publication seam's contract).
             realm.executeTransaction {
