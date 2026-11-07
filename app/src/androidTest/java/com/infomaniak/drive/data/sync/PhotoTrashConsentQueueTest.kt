@@ -450,6 +450,108 @@ class PhotoTrashConsentQueueTest {
         assertTrue(remoteQueryEntered.get() >= 1, "the poll actually reached the remote query boundary")
     }
 
+    @Test
+    @DisplayName("the REAL settings write seam publishes in commit order with the activation epoch")
+    fun realSettingsWriteSeamPublishesInCommitOrder() {
+        // Drives the PRODUCTION UploadFile.setAppSyncSettings against the fixture realm
+        // (never the production one): the snapshot must converge to the LATEST commit at a
+        // strictly growing revision, and the OFF->ON transition must advance the epoch —
+        // the ordering properties the publish protocol exists for.
+        val realmInstance = Realm.getInstance(config)
+        val baseRevision = PhotoTrashController.currentActivationSnapshot?.revision ?: 0L
+        try {
+            UploadFile.setAppSyncSettings(
+                SyncSettings(userId = userId, driveId = driveId, photoTrashSyncEnabled = true),
+                customRealm = realmInstance,
+            )
+            with(PhotoTrashController.currentActivationSnapshot) {
+                assertEquals(true, this?.optIn, "the enable is published")
+                assertEquals(1L, this?.activationEpoch, "the first enable assigns epoch 1")
+                assertEquals(userId, this?.userId, "the authority is scoped to the settings owner")
+                assertTrue(this!!.revision > baseRevision)
+            }
+
+            UploadFile.setAppSyncSettings(
+                SyncSettings(userId = userId, driveId = driveId, photoTrashSyncEnabled = false, photoTrashActivationEpoch = 1L),
+                customRealm = realmInstance,
+            )
+            with(PhotoTrashController.currentActivationSnapshot) {
+                assertEquals(false, this?.optIn, "the disable is published")
+                assertEquals(1L, this?.activationEpoch, "a disable does not advance the epoch")
+                assertTrue(this!!.revision > baseRevision + 0L, "revisions grow across writes")
+            }
+            val disableRevision = PhotoTrashController.currentActivationSnapshot!!.revision
+
+            UploadFile.setAppSyncSettings(
+                SyncSettings(userId = userId, driveId = driveId, photoTrashSyncEnabled = true, photoTrashActivationEpoch = 1L),
+                customRealm = realmInstance,
+            )
+            with(PhotoTrashController.currentActivationSnapshot) {
+                assertEquals(true, this?.optIn, "the re-enable is published")
+                assertEquals(2L, this?.activationEpoch, "the OFF->ON transition advances the epoch")
+                assertTrue(this!!.revision > disableRevision, "a later commit publishes at a higher revision")
+            }
+            assertEquals(
+                2L,
+                realmInstance.where(SyncSettings::class.java)
+                    .equalTo(SyncSettings::userId.name, userId)
+                    .findFirst()!!.photoTrashActivationEpoch,
+                "the live row carries the transitioned epoch",
+            )
+        } finally {
+            realmInstance.close()
+            // The fixture realm rows are deleted with the fixture file in cleanup.
+        }
+    }
+
+    @Test
+    @DisplayName("binding generations advance with real writes and never repeat across a wipe")
+    fun bindingGenerationsAdvanceAndNeverRepeatAcrossAWipe() {
+        val genBefore = PhotoTrashController.bindingGeneration(uriA)
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = UploadFile(
+                uri = uriA,
+                userId = userId,
+                driveId = driveId,
+                fileName = "fixture-queue.jpg",
+                fileSize = contentA.size.toLong(),
+                fileModifiedAt = Date(1_700_000_000_000L),
+            ),
+            remoteFile = File(id = remoteFileIdA, driveId = driveId),
+            uploadedContentDigest = sha256Hex(contentA),
+            customRealmConfig = config,
+        )
+        val genAfterWrite = PhotoTrashController.bindingGeneration(uriA)
+        assertTrue(genAfterWrite > genBefore, "a REAL binding write (pre-commit invalidation) advanced the generation")
+
+        // The wipe (feature off) must invalidate WITHOUT reusing any generation value: a
+        // generation captured before the wipe can never recur after it (no ABA).
+        val genOther = PhotoTrashController.bindingGeneration("content://fixture/never-paired")
+        PhotoTrashController.removeAllPairings(customRealmConfig = config)
+        val genAfterWipe = PhotoTrashController.bindingGeneration(uriA)
+        assertTrue(genAfterWipe != genAfterWrite && genAfterWipe != genBefore, "the wiped world reuses no generation value")
+        assertTrue(genAfterWipe != genOther, "the base invalidation moved every uri, not only the written one")
+
+        PhotoTrashController.recordPairing(
+            context = mockContext,
+            uploadFile = UploadFile(
+                uri = uriA,
+                userId = userId,
+                driveId = driveId,
+                fileName = "fixture-queue.jpg",
+                fileSize = contentA.size.toLong(),
+                fileModifiedAt = Date(1_700_000_000_000L),
+            ),
+            remoteFile = File(id = remoteFileIdA, driveId = driveId),
+            uploadedContentDigest = sha256Hex(contentA),
+            customRealmConfig = config,
+        )
+        val genAfterRewrite = PhotoTrashController.bindingGeneration(uriA)
+        assertTrue(genAfterRewrite > genAfterWipe, "a binding after the wipe advances strictly again")
+        assertTrue(genAfterRewrite != genAfterWrite, "the post-wipe generation is not the pre-wipe value (no ABA)")
+    }
+
     @AfterEach
     fun tearDown() {
         unmockkAll()

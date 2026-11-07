@@ -35,6 +35,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.invoke
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File as JavaFile
 import java.security.MessageDigest
@@ -73,10 +75,42 @@ import java.security.MessageDigest
 object OfflineFolderSyncUtils {
 
     /**
-     * Test seam: invoked at the narrow publication point of [stagedRedownload] — AFTER the
-     * last pre-publication read (the live-row re-read and the existing-file digest), BEFORE
-     * the first mutation — so a regression can withdraw the offline intent exactly inside
-     * the publication window. Production never sets it.
+     * The publication critical section: ONE process-local lock ordering every final
+     * live-intent/current-content validation plus publication against every
+     * intent-withdrawal mutation (explicit unmark, direct unpin, remote-delete release).
+     * Without it, an unmark completing between the last live-intent read and the atomic
+     * rename could still be followed by bytes being re-published at the final path.
+     *
+     * The NETWORK TRANSFER stays outside the critical section — only the narrow
+     * check-to-publish interval (final intent read, timestamp, rename, basis record) and
+     * the equally narrow withdrawal mutations are serialized; the sections are local-IO
+     * sized (metadata, digest, one rename, one Realm transaction). All covered callers
+     * participate: [stagedRedownload], [updatePublicationBasis], [recordAcceptedPublication],
+     * [unmarkFolderOffline] and the remote-delete release of [syncOfflineFolderRoots], plus
+     * the unmark entry points in MainViewModel. A pending-marker clear that keeps
+     * [File.isOffline] (bulk download completion) does NOT withdraw persistent intent and
+     * needs no participation.
+     *
+     * REAL LIMITS (documented, not claimed away): this orders MUTATIONS inside one process
+     * — the filesystem and Realm are NOT one atomic resource, and a crash mid-section can
+     * still leave renamed bytes whose basis write never happened (such bytes classify as
+     * UNKNOWN and are preserved by every later decision) or vice versa. EXTERNAL writers
+     * that do not participate (other processes, adb, unsynchronized code paths that bypass
+     * the covered entry points) are outside any in-process mutex's reach: a non-covered
+     * byte edit between the in-section evidence reads and the rename remains a disclosed
+     * platform-level window, and power loss is outside any app-side lock.
+     */
+    private val publicationLock = Mutex()
+
+    /** Runs [block] inside the publication critical section (see class-level kDoc). */
+    internal suspend fun <T> withPublicationLock(block: suspend () -> T): T = publicationLock.withLock { block() }
+
+    /**
+     * Test seam: invoked at the narrow publication point of [stagedRedownload] — inside the
+     * publication critical section, BEFORE the final live-intent read, so a regression can
+     * withdraw the offline intent (through direct row writes or a concurrent unmark, which
+     * suspends on the same lock) exactly inside the publication window. Production never
+     * sets it.
      */
     @VisibleForTesting
     internal var prePublicationGate: (() -> Unit)? = null
@@ -300,7 +334,12 @@ object OfflineFolderSyncUtils {
         var allDeletionsConfirmed = true
         subtreeIds.forEach { fileId ->
             currentCoroutineContext().ensureActive()
-            val keptAgainstRefusal = FileController.getRealmInstance(userDrive).use { realm ->
+            // The whole per-file withdrawal (classification, digest evidence, checked
+            // deletion, state clear) runs inside the publication critical section: it is
+            // serialized against every publication's final check-to-publish interval, so
+            // neither can interleave into the other's defined order.
+            val keptAgainstRefusal = withPublicationLock {
+                FileController.getRealmInstance(userDrive).use { realm ->
                 val file = FileController.getFileProxyById(fileId, customRealm = realm) ?: return@use false
                 val keepCopy = file.isFolder() || file.isDirectlyPinned || file.id in otherRootSubtreeIds
                 if (keepCopy) return@use false
@@ -372,6 +411,7 @@ object OfflineFolderSyncUtils {
                     }
                 }
                 false
+                }
             }
             if (keptAgainstRefusal) allDeletionsConfirmed = false
         }
@@ -438,15 +478,19 @@ object OfflineFolderSyncUtils {
                         .toSet()
                 } intersect previousSubtree) - listedFileIds
                 remoteDeletedIds.forEach { fileId ->
-                    FileController.getRealmInstance(userDrive).use { realm ->
-                        realm.executeTransaction { mutableRealm ->
-                            FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
-                                proxy.isMarkedAsOffline = false
-                                proxy.isOffline = false
-                                proxy.offlineBasisModifiedAt = 0L
-                                proxy.offlineBasisSize = null
-                                proxy.offlineContentDigest = null
-                                proxy.serverContentHash = null
+                    // The coverage release is an intent withdrawal: it participates in the
+                    // publication critical section like every other covered withdrawal.
+                    withPublicationLock {
+                        FileController.getRealmInstance(userDrive).use { realm ->
+                            realm.executeTransaction { mutableRealm ->
+                                FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { proxy ->
+                                    proxy.isMarkedAsOffline = false
+                                    proxy.isOffline = false
+                                    proxy.offlineBasisModifiedAt = 0L
+                                    proxy.offlineBasisSize = null
+                                    proxy.offlineContentDigest = null
+                                    proxy.serverContentHash = null
+                                }
                             }
                         }
                     }
@@ -686,24 +730,32 @@ object OfflineFolderSyncUtils {
     }
 
     /**
-     * Metadata-only change: adopt new remote metadata while keeping the verified bytes. ALL
-     * guards run before any mutation: live offline intent (an unmark or release during the
-     * details call must not be overridden), an actual metadata difference (an unchanged file
-     * is a no-op, not a per-pass write), and a digest verification of the local copy (a
-     * same-size/same-mtime edit that classified as intact must not be re-stamped as clean).
-     * The local file timestamp follows the adopted metadata FIRST — if it cannot be updated
-     * the adoption is skipped, so the preserved basis always describes the actual local bytes.
+     * Metadata-only change: adopt new remote metadata while keeping the verified bytes.
+     * Returns true when the basis is now consistent with the remote metadata (adopted, or
+     * already equal), false when the adoption DECLINED (row vanished or offline intent
+     * withdrawn) — the caller must report that accurately, never as a publication.
+     *
+     * The final live-intent re-read, the local timestamp adoption and the basis record run
+     * INSIDE the publication critical section: the timestamp can no longer be mutated
+     * before a decline that the coordination could have caught (a covered withdrawal
+     * cannot complete between the in-lock intent read and the record). The digest
+     * verification of the local bytes stays before the section — it is content evidence,
+     * not intent evidence.
      */
-    private suspend fun updatePublicationBasis(userDrive: UserDrive, fileId: Int, remoteFile: File, offlineFile: JavaFile?) = withContext(Dispatchers.IO) {
+    private suspend fun updatePublicationBasis(userDrive: UserDrive, fileId: Int, remoteFile: File, offlineFile: JavaFile?): Boolean = withContext(Dispatchers.IO) {
+        withPublicationLock { updatePublicationBasisLocked(userDrive, fileId, remoteFile, offlineFile) }
+    }
+
+    private fun updatePublicationBasisLocked(userDrive: UserDrive, fileId: Int, remoteFile: File, offlineFile: JavaFile?): Boolean {
         FileController.getRealmInstance(userDrive).use { realm ->
-            val proxy = FileController.getFileProxyById(fileId, customRealm = realm) ?: return@withContext
+            val proxy = FileController.getFileProxyById(fileId, customRealm = realm) ?: return false
             if (!hasLiveOfflineIntent(proxy, realm, userDrive)) {
                 SentryLog.w(TAG, "Offline intent withdrawn before metadata adoption for file $fileId; adoption skipped")
-                return@withContext
+                return false
             }
             val metadataUnchanged = proxy.offlineBasisModifiedAt == remoteFile.lastModifiedAt &&
                 (remoteFile.size == null || proxy.offlineBasisSize == null || proxy.offlineBasisSize == remoteFile.size)
-            if (metadataUnchanged) return@withContext
+            if (metadataUnchanged) return true // already consistent — a no-op, not a withdrawal
 
             if (offlineFile?.exists() == true) {
                 val basisDigest = proxy.offlineContentDigest
@@ -711,18 +763,18 @@ object OfflineFolderSyncUtils {
                     val localDigest = computeDigest(offlineFile)
                     if (localDigest == null || localDigest != basisDigest) {
                         SentryLog.w(TAG, "Local bytes diverge from the accepted digest for file $fileId; metadata-only adoption skipped")
-                        return@withContext
+                        return true // preserved bytes are consistent with THEIR basis; not a withdrawal
                     }
                 }
                 if (!offlineFile.setLastModified(remoteFile.getLastModifiedInMilliSecond())) {
                     SentryLog.w(TAG, "Local timestamp refused for file $fileId; metadata-only adoption skipped")
-                    return@withContext
+                    return true // the preserved basis still describes the actual bytes
                 }
             }
             realm.executeTransaction { mutableRealm ->
                 FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.let { row ->
-                    // Same contract as every publication write: the intent is re-checked
-                    // INSIDE the transaction, not only before the digest/timestamp reads.
+                    // Defense-in-depth inside the transaction (the lock excludes every
+                    // covered withdrawal for this whole section).
                     if (!hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
                         SentryLog.w(TAG, "Offline intent withdrawn before the metadata adoption for file $fileId; nothing recorded")
                         return@executeTransaction
@@ -738,6 +790,7 @@ object OfflineFolderSyncUtils {
                     offlineFile?.let { row.offlinePublishedPath = it.path }
                 }
             }
+            return true
         }
     }
 
@@ -808,102 +861,130 @@ object OfflineFolderSyncUtils {
                 // stale work must not retry-loop, it completes without mutating.
                 return@withContext StagedPublication.INTENT_WITHDRAWN
             }
-            val (currentRow, authorized) = rowRead
+            val (_, authorized) = rowRead
             if (!authorized) {
                 SentryLog.w(TAG, "Offline intent withdrawn during staged download for file ${file.id}; publication skipped")
                 return@withContext StagedPublication.INTENT_WITHDRAWN
             }
 
-            // ---- Guards immediately before any mutation (all preserve) ----
             currentCoroutineContext().ensureActive()
-            val existingDigest = if (offlineFile.exists()) computeDigest(offlineFile) else null
-            val basis = PublicationBasis(
-                modifiedAt = currentRow.offlineBasisModifiedAt,
-                size = currentRow.offlineBasisSize,
-                digest = currentRow.offlineContentDigest,
-                serverHash = currentRow.serverContentHash,
-            )
-            when (decidePublication(
-                basis = basis,
-                localExists = offlineFile.exists(),
-                localSize = offlineFile.takeIf { it.exists() }?.length(),
-                localModifiedSec = offlineFile.takeIf { it.exists() }?.lastModified()?.div(1_000L),
-                existingDigest = existingDigest,
-                downloadDigest = digest,
-            )) {
-                PublicationDecision.PRESERVE_EXISTING -> {
-                    SentryLog.w(TAG, "Existing copy edited, unknown or unverifiable for file ${file.id}; replacement aborted")
-                    return@withContext StagedPublication.PRESERVED_EXISTING
+
+            // PUBLICATION CRITICAL SECTION: from the FINAL live-intent and content reads
+            // through the rename and the basis record, coordinated under [publicationLock]
+            // with every intent-withdrawal mutation — an unmark can no longer complete
+            // between the final checks and the bytes' replacement (it suspends on the same
+            // lock; the defined orders are "withdrawn first -> nothing published" or
+            // "published first -> the unmark removes it afterwards"). The network transfer
+            // stayed OUTSIDE; the section is local-IO sized. ALL DECISIVE EVIDENCE is (re-)
+            // read INSIDE the coordination: the pre-lock row/digest reads above are only a
+            // preview — an edit or withdrawal landing before the section is judged from
+            // fresh evidence here, never from stale content.
+            val publicationOutcome = withPublicationLock {
+                prePublicationGate?.invoke()
+                val inLockRead = FileController.getRealmInstance(userDrive).use { realm ->
+                    FileController.getFileProxyById(file.id, customRealm = realm)
+                        ?.let { realm.copyFromRealm(it, 0) to hasLiveOfflineIntent(it, realm, userDrive) }
+                } ?: run {
+                    SentryLog.w(TAG, "Row vanished at publication for file ${file.id}; staging discarded")
+                    return@withPublicationLock StagedPublication.INTENT_WITHDRAWN
                 }
-                PublicationDecision.ADOPT_METADATA_ONLY -> {
-                    // Body identical to the preserved publication: metadata-only adoption on
-                    // the verified clean copy (timestamp and basis move together in
-                    // [updatePublicationBasis]; the bytes are never touched).
-                    updatePublicationBasis(userDrive, file.id, file, offlineFile)
-                    return@withContext StagedPublication.ADOPTED_METADATA_ONLY
+                val (authoritativeRow, intentStillLiveAtPublication) = inLockRead
+                if (!intentStillLiveAtPublication) {
+                    SentryLog.w(TAG, "Offline intent withdrawn at publication for file ${file.id}; staging discarded")
+                    // Only the OWNED staging artifact is removed (in the finally below); the
+                    // copy already at the offline path is not provably this staging's and is
+                    // never destroyed here.
+                    return@withPublicationLock StagedPublication.INTENT_WITHDRAWN
                 }
-                PublicationDecision.REPLACE_BYTES -> Unit
-            }
 
-            // PUBLICATION POINT: the last pre-publication reads are done (live row, existing
-            // file digest); BEFORE the first mutation the live intent is RE-CHECKED — a
-            // withdrawal during the transfer/digest window must not publish bytes the user
-            // just released (a successful unmark keeps its postcondition).
-            prePublicationGate?.invoke()
-            val intentStillLiveAtPublication = FileController.getRealmInstance(userDrive).use { realm ->
-                FileController.getFileProxyById(file.id, customRealm = realm)
-                    ?.let { hasLiveOfflineIntent(it, realm, userDrive) } == true
-            }
-            if (!intentStillLiveAtPublication) {
-                SentryLog.w(TAG, "Offline intent withdrawn at publication for file ${file.id}; staging discarded")
-                // Only the OWNED staging artifact is removed (in the finally below); the copy
-                // already at the offline path is not provably this staging's and is never
-                // destroyed here.
-                return@withContext StagedPublication.INTENT_WITHDRAWN
-            }
-
-            // The publication timestamp is set on the STAGING file, before the atomic step:
-            // a refusal aborts here, so the previous good bytes are never sacrificed for a
-            // basis that would misdescribe the new ones.
-            if (!staging.setLastModified(file.getLastModifiedInMilliSecond())) {
-                SentryLog.w(TAG, "Staging timestamp refused for file ${file.id}; publication aborted, previous copy preserved")
-                return@withContext StagedPublication.FAILED
-            }
-
-            // One atomic publication step: rename(2) over the existing file (rename keeps the
-            // staging mtime). Failure keeps the old bytes (staging is removed in finally).
-            if (!staging.renameTo(offlineFile)) {
-                SentryLog.w(TAG, "Atomic replace refused for file ${file.id}; previous copy preserved")
-                return@withContext StagedPublication.FAILED
-            }
-
-            FileController.getRealmInstance(userDrive).use { realm ->
-                realm.executeTransaction { mutableRealm ->
-                    FileController.getFileProxyById(file.id, customRealm = mutableRealm)?.let { proxy ->
-                        // The intent is re-checked INSIDE the transaction: a withdrawal that
-                        // landed between the pre-publication check and here records NOTHING
-                        // (no basis, no isOffline) — flag/contract resurrection by a stale
-                        // publication is impossible; the just-published path's bytes are not
-                        // provably this staging's anymore and are left to ownership rules.
-                        if (!hasLiveOfflineIntent(proxy, mutableRealm, userDrive)) {
-                            SentryLog.w(TAG, "Offline intent withdrawn before the basis record for file ${file.id}; nothing recorded")
-                            return@executeTransaction
+                // Content evidence under the coordination: an edit that landed after the
+                // preview digest read is seen HERE — stale evidence never authorizes the
+                // rename over it.
+                val existingDigest = if (offlineFile.exists()) computeDigest(offlineFile) else null
+                val basis = PublicationBasis(
+                    modifiedAt = authoritativeRow.offlineBasisModifiedAt,
+                    size = authoritativeRow.offlineBasisSize,
+                    digest = authoritativeRow.offlineContentDigest,
+                    serverHash = authoritativeRow.serverContentHash,
+                )
+                when (decidePublication(
+                    basis = basis,
+                    localExists = offlineFile.exists(),
+                    localSize = offlineFile.takeIf { it.exists() }?.length(),
+                    localModifiedSec = offlineFile.takeIf { it.exists() }?.lastModified()?.div(1_000L),
+                    existingDigest = existingDigest,
+                    downloadDigest = digest,
+                )) {
+                    PublicationDecision.PRESERVE_EXISTING -> {
+                        SentryLog.w(TAG, "Existing copy edited, unknown or unverifiable for file ${file.id}; replacement aborted")
+                        return@withPublicationLock StagedPublication.PRESERVED_EXISTING
+                    }
+                    PublicationDecision.ADOPT_METADATA_ONLY -> {
+                        // Body identical to the preserved publication: metadata-only
+                        // adoption on the verified clean copy (timestamp and basis move
+                        // together; the bytes are never touched). A declined adoption is a
+                        // withdrawn intent: report it accurately.
+                        val adopted = updatePublicationBasisLocked(userDrive, file.id, file, offlineFile)
+                        return@withPublicationLock if (adopted) {
+                            StagedPublication.ADOPTED_METADATA_ONLY
+                        } else {
+                            StagedPublication.INTENT_WITHDRAWN
                         }
-                        proxy.lastModifiedAt = file.lastModifiedAt
-                        proxy.size = file.size
-                        // Only an identity established for THIS accepted body is recorded;
-                        // an unestablished one clears the record (unknown identity).
-                        proxy.serverContentHash = establishedServerHash
-                        proxy.offlineBasisModifiedAt = file.lastModifiedAt
-                        proxy.offlineBasisSize = file.size
-                        proxy.offlineContentDigest = digest
-                        proxy.offlinePublishedPath = offlineFile.path
-                        proxy.isOffline = true
+                    }
+                    PublicationDecision.REPLACE_BYTES -> Unit
+                }
+
+                // The publication timestamp is set on the STAGING file, before the atomic
+                // step: a refusal aborts here, so the previous good bytes are never
+                // sacrificed for a basis that would misdescribe the new ones.
+                if (!staging.setLastModified(file.getLastModifiedInMilliSecond())) {
+                    SentryLog.w(TAG, "Staging timestamp refused for file ${file.id}; publication aborted, previous copy preserved")
+                    return@withPublicationLock StagedPublication.FAILED
+                }
+
+                // One atomic publication step: rename(2) over the existing file (rename
+                // keeps the staging mtime). Failure keeps the old bytes (staging is removed
+                // in finally).
+                if (!staging.renameTo(offlineFile)) {
+                    SentryLog.w(TAG, "Atomic replace refused for file ${file.id}; previous copy preserved")
+                    return@withPublicationLock StagedPublication.FAILED
+                }
+
+                var recorded = false
+                FileController.getRealmInstance(userDrive).use { realm ->
+                    realm.executeTransaction { mutableRealm ->
+                        FileController.getFileProxyById(file.id, customRealm = mutableRealm)?.let { proxy ->
+                            // Defense-in-depth: the lock already excludes every covered
+                            // withdrawal for this whole section — a decline here would mean
+                            // a mutation that did not participate in the coordination.
+                            if (!hasLiveOfflineIntent(proxy, mutableRealm, userDrive)) {
+                                SentryLog.w(TAG, "Offline intent withdrawn before the basis record for file ${file.id}; nothing recorded")
+                                return@executeTransaction
+                            }
+                            proxy.lastModifiedAt = file.lastModifiedAt
+                            proxy.size = file.size
+                            // Only an identity established for THIS accepted body is recorded;
+                            // an unestablished one clears the record (unknown identity).
+                            proxy.serverContentHash = establishedServerHash
+                            proxy.offlineBasisModifiedAt = file.lastModifiedAt
+                            proxy.offlineBasisSize = file.size
+                            proxy.offlineContentDigest = digest
+                            proxy.offlinePublishedPath = offlineFile.path
+                            proxy.isOffline = true
+                            recorded = true
+                        }
                     }
                 }
+                if (!recorded) {
+                    // The state write declined: the bytes now at the final path are an
+                    // UNACCEPTED copy. Report the withdrawal accurately and never scan an
+                    // unaccepted copy into MediaStore as if it were the owned publication.
+                    return@withPublicationLock StagedPublication.INTENT_WITHDRAWN
+                }
+                if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
+                StagedPublication.PUBLISHED
             }
-            if (file.isMedia()) MediaUtils.scanFile(context, offlineFile)
-            StagedPublication.PUBLISHED
+            return@withContext publicationOutcome
         } finally {
             if (staging.exists()) staging.delete()
         }
@@ -951,40 +1032,47 @@ object OfflineFolderSyncUtils {
         offlineFile: JavaFile,
         acceptedServerHash: String?,
     ): PublicationOutcome = withContext(Dispatchers.IO) {
-        FileController.getRealmInstance(userDrive).use { realm ->
-            val proxy = FileController.getFileProxyById(remoteFile.id, customRealm = realm)
-                ?: return@withContext PublicationOutcome.INTENT_WITHDRAWN
-            if (!hasLiveOfflineIntent(proxy, realm, userDrive)) {
-                SentryLog.w(TAG, "Offline intent withdrawn during download for file ${remoteFile.id}; publication skipped")
-                return@withContext PublicationOutcome.INTENT_WITHDRAWN
-            }
+        // The FINAL content evidence (the digest being recorded), the live-intent
+        // validation and the basis record ALL run INSIDE the publication critical section:
+        // evidence read before acquiring the lock would be stale by the time it is
+        // recorded.
+        withPublicationLock {
             val digest = computeDigest(offlineFile)
             if (digest == null) {
                 SentryLog.w(TAG, "Accepted offline bytes could not be digested for file ${remoteFile.id}; basis not recorded")
-                return@withContext PublicationOutcome.NOT_RECORDED
+                return@withPublicationLock PublicationOutcome.NOT_RECORDED
             }
-            realm.executeTransaction { mutableRealm ->
-                FileController.getFileProxyById(remoteFile.id, customRealm = mutableRealm)?.let { row ->
-                    // The intent is re-checked INSIDE the transaction: the check at the seam
-                    // entry ran BEFORE the digest pass, and the publication contract is that
-                    // a withdrawal landing anywhere in between resurrects nothing.
-                    if (!hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
-                        SentryLog.w(TAG, "Offline intent withdrawn before the accepted basis record for file ${remoteFile.id}; nothing recorded")
-                        return@executeTransaction
-                    }
-                    row.lastModifiedAt = remoteFile.lastModifiedAt
-                    row.size = remoteFile.size
-                    // Only an identity established for THIS accepted body is recorded; a
-                    // hash-less capture clears the record (unknown identity).
-                    row.serverContentHash = acceptedServerHash
-                    row.offlineBasisModifiedAt = remoteFile.lastModifiedAt
-                    row.offlineBasisSize = remoteFile.size
-                    row.offlineContentDigest = digest
-                    row.offlinePublishedPath = offlineFile.path
-                    row.isOffline = true
+            FileController.getRealmInstance(userDrive).use { realm ->
+                val proxy = FileController.getFileProxyById(remoteFile.id, customRealm = realm)
+                    ?: return@withPublicationLock PublicationOutcome.INTENT_WITHDRAWN
+                if (!hasLiveOfflineIntent(proxy, realm, userDrive)) {
+                    SentryLog.w(TAG, "Offline intent withdrawn during download for file ${remoteFile.id}; publication skipped")
+                    return@withPublicationLock PublicationOutcome.INTENT_WITHDRAWN
                 }
+                var recorded = false
+                realm.executeTransaction { mutableRealm ->
+                    FileController.getFileProxyById(remoteFile.id, customRealm = mutableRealm)?.let { row ->
+                        // Defense-in-depth inside the transaction (the lock excludes every
+                        // covered withdrawal for this whole section).
+                        if (!hasLiveOfflineIntent(row, mutableRealm, userDrive)) {
+                            SentryLog.w(TAG, "Offline intent withdrawn before the accepted basis record for file ${remoteFile.id}; nothing recorded")
+                            return@executeTransaction
+                        }
+                        row.lastModifiedAt = remoteFile.lastModifiedAt
+                        row.size = remoteFile.size
+                        // Only an identity established for THIS accepted body is recorded; a
+                        // hash-less capture clears the record (unknown identity).
+                        row.serverContentHash = acceptedServerHash
+                        row.offlineBasisModifiedAt = remoteFile.lastModifiedAt
+                        row.offlineBasisSize = remoteFile.size
+                        row.offlineContentDigest = digest
+                        row.offlinePublishedPath = offlineFile.path
+                        row.isOffline = true
+                        recorded = true
+                    }
+                }
+                if (recorded) PublicationOutcome.PUBLISHED else PublicationOutcome.INTENT_WITHDRAWN
             }
-            PublicationOutcome.PUBLISHED
         }
     }
 

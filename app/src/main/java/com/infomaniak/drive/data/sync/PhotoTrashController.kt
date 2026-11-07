@@ -61,17 +61,22 @@ object PhotoTrashController {
      *
      * Revision protocol (a bare @Volatile Boolean is not one):
      *  - A WRITE seam ([UploadFile.setAppSyncSettings] / [UploadFile.removeAppSyncSettings])
-     *    publishes with a freshly INCREMENTED revision after its commit — a writer is always
-     *    the freshest authority and can never be overwritten by any reader.
-     *  - A reader seam ([UploadFile.getAppSyncSettings]) captures the current revision BEFORE
-     *    it opens the realm and publishes its snapshot with that captured revision: a write
-     *    that lands during the read increments the revision, so the reader's older-revision
-     *    candidate is rejected and a stale observation can never overwrite newer
-     *    authoritative state (the interleaving "reader observes old true, writer commits
-     *    false, reader mirrors old true" is closed).
-     *  - A MISSING row (no settings at all) publishes a FAIL-CLOSED snapshot that overrides
-     *    even a newer stale true — absence is authoritative, it never preserves another
-     *    observation's enabled state. The next write restores the truth.
+     *    assigns its revision INSIDE the write transaction ([assignActivationRevision] —
+     *    commit-ordered) and publishes with it after the commit. Two writers therefore can
+     *    never publish in reverse commit order: a later commit always holds a higher
+     *    revision and a late publish of an earlier commit is rejected. The interval between
+     *    a committed change and its publish is covered too: the counter already leads the
+     *    publish, so a reader whose permit was captured after the commit reads the fresh
+     *    row and outranks the still-pending older publish.
+     *  - A reader seam ([UploadFile.getAppSyncSettings]) captures the current revision
+     *    BEFORE it opens the realm and publishes its snapshot with that permit: a write
+     *    that commits during the read holds a higher (commit-assigned) revision, so the
+     *    reader's older-revision candidate is rejected and a stale observation can never
+     *    overwrite newer authoritative state.
+     *  - Acceptance is a STRICT high-water mark (first observation or strictly newer
+     *    revision) — invalidating snapshots follow the SAME ordering, so a stale
+     *    fail-closed candidate can never rewind the authority and re-authorize an older
+     *    request's epoch.
      *  - Scope: the snapshot carries the user it was observed for; the launch gate compares
      *    it with the current in-memory account.
      */
@@ -85,10 +90,16 @@ object PhotoTrashController {
         get() = activationMirror.get()
 
     /**
+     * Assigns the revision a WRITE will publish under. MUST be called inside the write
+     * transaction (commit-ordered): two writers then publish in commit order regardless of
+     * when their post-commit publishes run.
+     */
+    internal fun assignActivationRevision(): Long = mirrorRevision.incrementAndGet()
+
+    /**
      * Captures the revision a reader's snapshot will be published under. MUST be called
-     * BEFORE the reader opens the realm: a write landing during the read increments the
-     * revision, so the reader's older-revision candidate is then rejected and stale
-     * content can never overwrite the newer authoritative publish.
+     * BEFORE the reader opens the realm: a write committing during the read holds a higher
+     * revision, so the reader's older-revision candidate is then rejected.
      */
     internal fun activationReadPermit(): Long = mirrorRevision.get()
 
@@ -97,42 +108,49 @@ object PhotoTrashController {
         publishActivation(ActivationSnapshot(userId, activationEpoch, optIn, permit))
     }
 
-    /** Publishes a writer's post-commit state at a fresh revision: always wins. */
-    internal fun noteActivationWritten(userId: Int, activationEpoch: Long, optIn: Boolean) {
-        publishActivation(ActivationSnapshot(userId, activationEpoch, optIn, mirrorRevision.incrementAndGet()))
+    /** Publishes a writer's post-commit state under its COMMIT-assigned revision (see class kDoc). */
+    internal fun noteActivationWritten(userId: Int, activationEpoch: Long, optIn: Boolean, revision: Long) {
+        publishActivation(ActivationSnapshot(userId, activationEpoch, optIn, revision))
     }
 
     private fun publishActivation(candidate: ActivationSnapshot) {
         activationMirror.updateAndGet { current ->
-            if (current == null ||
-                candidate.revision > current.revision ||
-                // Fail-closed evidence overrides a stale enabled state regardless of age;
-                // a later authoritative write restores the truth at a fresh revision.
-                (!candidate.optIn && current.optIn)
-            ) candidate else current
+            // STRICT high-water mark — for writes and readers alike, valid or invalidating:
+            // a stale candidate (whatever it asserts) never rewinds the authority.
+            if (current == null || candidate.revision > current.revision) candidate else current
         }
     }
 
     /**
      * Process-local revision of one uri's BINDING. Every binding write ([recordPairing]'s
-     * replacement, [removeAllPairings]'s wipe) bumps it, so the Main-side launch gate can
-     * detect a pairing replacement that landed AFTER the IO validation — without any DB or
-     * network work on Main. A replacement is a NEW binding even when uri, user, file and
-     * metadata are all unchanged; the durable pairedAt identity remains the authoritative
-     * check at validation and result time (this registry covers only the launch window).
-     * Process-local by design: a restored (persisted) request is attributed through the
-     * row-level identity checks, never through this registry.
+     * replacement — bumped BEFORE the transaction, so no Main launch can read the old
+     * identity after the new binding is visible — and [removeAllPairings]'s wipe) advances
+     * it, so the Main-side launch gate can detect a pairing replacement that landed AFTER
+     * the IO validation — without any DB or network work on Main. A replacement is a NEW
+     * binding even when uri, user, file and metadata are all unchanged; the durable
+     * pairedAt identity remains the authoritative check at validation and result time (this
+     * registry covers only the launch window).
+     *
+     * The identity is NON-REUSED: [invalidateAllBindings] bumps a base epoch instead of
+     * resetting counters, so no generation value can recur after a wipe (no ABA) and every
+     * generation ever captured stays distinguishable. Process-local by design: a restored
+     * (persisted) request is attributed through the row-level identity checks, never
+     * through this registry.
      */
     private val bindingGenerations = ConcurrentHashMap<String, Long>()
+    @Volatile
+    private var bindingEpoch = 0L
 
-    fun bindingGeneration(uri: String): Long = bindingGenerations[uri] ?: 0L
+    fun bindingGeneration(uri: String): Long = bindingEpoch + (bindingGenerations[uri] ?: 0L)
 
     private fun noteBindingWritten(uri: String) {
         bindingGenerations.merge(uri, 1L, Long::plus)
     }
 
     private fun invalidateAllBindings() {
-        bindingGenerations.clear()
+        // Base bump only — never clear: every uri's effective generation strictly grows,
+        // so a wiped world cannot reuse an older world's generation value.
+        bindingEpoch++
     }
 
     /** All pairings of the current user, detached. */
@@ -215,12 +233,21 @@ object PhotoTrashController {
         // BEFORE the transaction: the settings seam opens its own instance and must never
         // run inside this write transaction.
         val pairingEpoch = UploadFile.getAppSyncSettings()?.photoTrashActivationEpoch ?: 0L
+        // The launch-window binding invalidation lands BEFORE the transaction: from the
+        // moment the new binding can become authoritative (its commit), no Main-side launch
+        // may still read the previous generation.
+        noteBindingWritten(uploadFile.uri)
         withPairingRealm(customRealmConfig) { realm ->
             realm.executeTransaction { mutableRealm ->
-                mutableRealm.where(PhotoPairing::class.java)
+                val previous = mutableRealm.where(PhotoPairing::class.java)
                     .equalTo(PhotoPairing::uri.name, uploadFile.uri)
                     .findFirst()
-                    ?.deleteFromRealm()
+                // A replacement is a NEW binding with a STRICTLY LATER pairing moment: a
+                // same-millisecond Date() is not a guaranteed unique identity when every
+                // other field is identical, so the moment is forced past the previous
+                // binding's (pairing writes are in-process and serialized per uri).
+                val pairedAtMs = maxOf(System.currentTimeMillis(), (previous?.pairedAt?.time ?: 0L) + 1L)
+                previous?.deleteFromRealm()
                 mutableRealm.createObject(PhotoPairing::class.java, uploadFile.uri)?.apply {
                     userId = uploadFile.userId
                     driveId = uploadFile.driveId
@@ -239,19 +266,16 @@ object PhotoTrashController {
                     remoteContentHash = remoteFile?.serverContentHash
                     baselineTrashed = baseline
                     lastObservedTrashed = baseline ?: false
-                    pairedAt = Date()
+                    pairedAt = Date(pairedAtMs)
                     state = PhotoPairing.State.ACTIVE.name
                 }
             }
         }
-        // The durable binding changed (a replacement is a new binding even when every other
-        // field is unchanged): the launch-window registry learns it for the Main-side gate.
-        noteBindingWritten(uploadFile.uri)
     }
 
     /** Drops pairings and any pending destructive state when the option is turned off. */
-    fun removeAllPairings() {
-        UploadFile.getRealmInstance().use { realm ->
+    fun removeAllPairings(customRealmConfig: RealmConfiguration? = null) {
+        withPairingRealm(customRealmConfig) { realm ->
             realm.executeTransaction { mutableRealm ->
                 mutableRealm.where(PhotoPairing::class.java).findAll().deleteAllFromRealm()
             }

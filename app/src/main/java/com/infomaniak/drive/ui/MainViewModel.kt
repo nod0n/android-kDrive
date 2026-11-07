@@ -71,6 +71,7 @@ import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.FileId
 import com.infomaniak.drive.utils.IOFile
+import com.infomaniak.drive.utils.OfflineFolderSyncUtils
 import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
 import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.SyncOfflineUtils
@@ -536,20 +537,28 @@ class MainViewModel(
     }
 
     fun removeSelectedFilesFromOffline(files: List<File>, onSuccess: (() -> Unit)? = null) = liveData {
-        val filesId = files.map {
+        val filesId = files.map { it.id }
+        val deletions = files.mapNotNull {
             val file: File = it.freeze()
-            if (!file.isFolder()) {
-                val offlineFile = file.getOfflineFile(getApplication())
-                val cacheFile = file.getCacheFile(getApplication())
-                if (file.isOffline && offlineFile != null) {
-                    deleteFile(file, offlineFile, cacheFile)
-                }
+            if (!file.isFolder() && file.isOffline) {
+                Triple(file, file.getOfflineFile(getApplication()), file.getCacheFile(getApplication()))
+            } else {
+                null
             }
-            file.id
         }
 
         viewModelScope.launch(Dispatchers.IO) {
-            FileController.updateIsOfflineForFiles(fileIds = filesId, isOffline = false)
+            // The WHOLE withdrawal — intent mutation AND the actual filesystem deletion —
+            // runs inside the publication critical section and COMPLETES before this job
+            // can be observed as done: no publication's check-to-publish interval can
+            // resurrect offline status, and the function never returns before the bytes
+            // are actually gone.
+            OfflineFolderSyncUtils.withPublicationLock {
+                FileController.updateIsOfflineForFiles(fileIds = filesId, isOffline = false)
+                deletions.forEach { (file, offlineFile, cacheFile) ->
+                    if (offlineFile != null) deleteOfflineArtifacts(file, offlineFile, cacheFile)
+                }
+            }
             onSuccess?.invoke()
             emit(FileResult(isSuccess = true))
         }
@@ -564,29 +573,34 @@ class MainViewModel(
     ) {
         // We need to call this method outside the UI thread
         viewModelScope.launch(Dispatchers.IO) {
-            FileController.updateOfflineStatus(file.id, isOffline = false)
-            FileController.setDirectlyPinned(fileId = file.id, isDirectlyPinned = false) // direct pin intent withdrawn
-            // A surviving pending marker would authorize stale queued work to resurrect the
-            // copy the user just removed.
-            FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false)
+            // The WHOLE withdrawal participates in the publication critical section — the
+            // three signal clears AND the actual byte deletion run inside one section, in
+            // the clear-then-delete order, so a deletion can neither run during a
+            // publication nor before the withdrawal's own intent mutation is committed.
+            OfflineFolderSyncUtils.withPublicationLock {
+                FileController.updateOfflineStatus(file.id, isOffline = false)
+                FileController.setDirectlyPinned(fileId = file.id, isDirectlyPinned = false) // direct pin intent withdrawn
+                // A surviving pending marker would authorize stale queued work to resurrect the
+                // copy the user just removed.
+                FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false)
+                deleteOfflineArtifacts(file, offlineFile, cacheFile, userDrive)
+            }
+            // The callback stays on Main (as the previous dedicated launch delivered it).
+            withContext(Dispatchers.Main) { onFileRemovedFromOffline?.invoke() }
         }
-        deleteFile(file, offlineFile, cacheFile, userDrive, onFileRemovedFromOffline)
     }
 
-    private fun deleteFile(
+    /** The actual filesystem effects of one offline-copy removal (blocking, no callbacks). */
+    private fun deleteOfflineArtifacts(
         file: File,
         offlineFile: IOFile,
         cacheFile: IOFile,
         userDrive: UserDrive = UserDrive(),
-        onFileRemovedFromOffline: (() -> Unit)? = null,
     ) {
-        viewModelScope.launch {
-            if (file.isMedia()) file.deleteInMediaScan(getContext(), userDrive)
-            if (cacheFile.exists()) cacheFile.delete()
-            if (offlineFile.exists()) {
-                offlineFile.delete()
-            }
-            onFileRemovedFromOffline?.invoke()
+        if (file.isMedia()) file.deleteInMediaScan(getContext(), userDrive)
+        if (cacheFile.exists()) cacheFile.delete()
+        if (offlineFile.exists()) {
+            offlineFile.delete()
         }
     }
 

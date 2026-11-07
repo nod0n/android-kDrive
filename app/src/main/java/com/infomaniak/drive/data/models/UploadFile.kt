@@ -436,18 +436,23 @@ open class UploadFile(
         }
 
         fun removeAppSyncSettings() {
+            // The revision is assigned INSIDE the transaction (commit-ordered): a later
+            // commit always publishes at a higher revision, whatever order the post-commit
+            // publishes run in.
+            var writeRevision = 0L
             getRealmInstance().use { realm ->
                 realm.executeTransaction {
+                    writeRevision = PhotoTrashController.assignActivationRevision()
                     it.where(SyncSettings::class.java).findFirst()?.deleteFromRealm()
                 }
             }
             // A write seam: the deletion is authoritative fail-closed evidence (absence of
-            // the opt-in), published at a fresh revision so no stale getter observation can
-            // preserve an older enabled state over it.
+            // the opt-in), published at its commit-assigned revision.
             PhotoTrashController.noteActivationWritten(
                 userId = AccountUtils.currentUserId,
                 activationEpoch = 0L,
                 optIn = false,
+                revision = writeRevision,
             )
         }
 
@@ -458,6 +463,7 @@ open class UploadFile(
             // A stale writer object can therefore never rewind it, and every writer path
             // (settings UI, backup restore, upload-worker refresh) increments coherently.
             var activationEpoch = syncSettings.photoTrashActivationEpoch
+            var writeRevision = 0L
             val block: (Realm) -> Unit = { realm ->
                 realm.executeTransaction { mutableRealm ->
                     val existing = mutableRealm.where(SyncSettings::class.java)
@@ -470,16 +476,21 @@ open class UploadFile(
                         else -> maxOf(existing.photoTrashActivationEpoch, syncSettings.photoTrashActivationEpoch)
                     }
                     syncSettings.photoTrashActivationEpoch = activationEpoch
+                    // Commit-ordered revision: assigned with the write, so writers publish
+                    // in commit order and readers that started after this commit outrank
+                    // the still-pending publish.
+                    writeRevision = PhotoTrashController.assignActivationRevision()
                     mutableRealm.insertOrUpdate(syncSettings)
                 }
             }
             customRealm?.let(block) ?: getRealmInstance().use(block)
             // The single settings write seam refreshes the Main-readable activation
-            // authority at a fresh revision: a writer is always the freshest snapshot.
+            // authority under its commit-assigned revision.
             PhotoTrashController.noteActivationWritten(
                 userId = syncSettings.userId,
                 activationEpoch = activationEpoch,
                 optIn = syncSettings.photoTrashSyncEnabled,
+                revision = writeRevision,
             )
         }
 

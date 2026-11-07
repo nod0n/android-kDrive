@@ -32,6 +32,7 @@ import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkAll
 import io.realm.Realm
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlin.coroutines.cancellation.CancellationException
 import okhttp3.MediaType.Companion.toMediaType
@@ -573,6 +574,120 @@ class OfflineFolderMaintenanceOrchestrationTest {
             assertNull(row.offlineContentDigest, "no digest resurrection at publication")
             assertNull(row.serverContentHash, "no identity resurrection at publication")
         }
+    }
+
+    @Test
+    @DisplayName("an unmark racing the publication window serializes: defined order, no interleaved state")
+    fun unmarkRacingThePublicationWindowSerializesIntoADefinedOrder() {
+        // A root-covered, published, intact copy. The server moved on (new hash, unchanged
+        // metadata): the maintenance chain reaches stagedRedownload and decides
+        // REPLACE_BYTES — it enters the publication critical section.
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_100L, hash = "hash-v1")
+        val folderId = 800_402
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.createObject(File::class.java, "${folderId}_${userDrive.driveId}").apply {
+                    id = folderId
+                    driveId = userDrive.driveId
+                    name = "fixture-orch-folder"
+                    path = "Private/fixture-orch-folder"
+                    type = "dir"
+                }
+                transactionRealm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()?.parentId = folderId
+                transactionRealm.createObject(
+                    OfflineFolderRoot::class.java,
+                    OfflineFolderRoot.buildUid(folderId, userDrive.driveId, userDrive.userId),
+                ).apply {
+                    this.folderId = folderId
+                    driveId = userDrive.driveId
+                    userId = userDrive.userId
+                }
+            }
+        }
+        stubDetails(hash = "hash-v2", modifiedAtSec = 1_700_000_100L, size = bodyV2.size.toLong())
+        lastAnswerBody.set(bodyV2)
+
+        // The gate fires INSIDE the publication critical section (the pass holds the lock):
+        // a concurrent unmark launched HERE can only wait on the same lock — it cannot
+        // interleave between the final intent read, the rename and the basis record. The
+        // defined orders are "withdrawn first -> nothing published" or "published first ->
+        // the unmark removes the published copy afterwards"; either way no mixed state.
+        var publicationWindowReached = false
+        var unmarkJob: kotlinx.coroutines.Job? = null
+        OfflineFolderSyncUtils.prePublicationGate = {
+            publicationWindowReached = true
+            unmarkJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                OfflineFolderSyncUtils.unmarkFolderOffline(
+                    context,
+                    File(id = folderId, driveId = userDrive.driveId),
+                    userDrive,
+                )
+            }
+        }
+        try {
+            refresh()
+        } finally {
+            OfflineFolderSyncUtils.prePublicationGate = null
+        }
+        runBlocking { unmarkJob?.join() }
+
+        assertTrue(publicationWindowReached, "the publication window was actually reached (the gate is not a silent no-op)")
+        assertTrue(bodyRequests.get() == 1L, "exactly one body transfer happened for the publication")
+        // BOTH filesystem bytes AND persisted state, after the serialized unmark: the
+        // published copy was removed by the user's unmark (intact against its own fresh
+        // basis), the intent is gone, and nothing was resurrected or left half-withdrawn.
+        val offlineFile = getOfflineFixtureFile()
+        assertTrue(!offlineFile.exists(), "the unmark deleted the (intact) published copy after the publication completed")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(!row.isOffline, "the unmark cleared the offline flag")
+            assertTrue(!row.isMarkedAsOffline, "the unmark cleared the pending marker")
+            assertTrue(!row.isDirectlyPinned, "the unmark cleared the direct pin")
+            assertEquals(0L, row.offlineBasisModifiedAt, "the unmark cleared the basis")
+            assertNull(row.offlineContentDigest, "the unmark cleared the digest")
+        }
+        val rootLeft = FileController.getRealmInstance(userDrive).use { realm ->
+            realm.where(OfflineFolderRoot::class.java).count()
+        }
+        assertEquals(0L, rootLeft, "the confirmed unmark released the root")
+    }
+
+    @Test
+    @DisplayName("a local edit landing inside the coordinated publication window is re-judged under the lock")
+    fun localEditInsideThePublicationWindowIsRejudgedUnderTheCoordination() {
+        // Published covered copy, intact. The server moved on (new hash, unchanged
+        // metadata): the maintenance chain reaches stagedRedownload and decides
+        // REPLACE_BYTES from its PRE-LOCK preview evidence.
+        seedAcceptedPublication(bodyV1, modifiedAtSec = 1_700_000_100L, hash = "hash-v1")
+        stubDetails(hash = "hash-v2", modifiedAtSec = 1_700_000_100L, size = bodyV2.size.toLong())
+        lastAnswerBody.set(bodyV2)
+
+        // The gate fires INSIDE the publication critical section (before the in-lock
+        // evidence reads): the edit lands there with the intent KEPT — stale pre-lock
+        // evidence must not authorize the rename; the in-lock content revalidation
+        // re-judges the copy as edited and preserves it.
+        var publicationWindowReached = false
+        OfflineFolderSyncUtils.prePublicationGate = {
+            publicationWindowReached = true
+            getOfflineFixtureFile().writeBytes(editedBody)
+        }
+        try {
+            refresh()
+        } finally {
+            OfflineFolderSyncUtils.prePublicationGate = null
+        }
+
+        assertTrue(publicationWindowReached, "the publication window was actually reached (the gate is not a silent no-op)")
+        val offlineFile = getOfflineFixtureFile()
+        assertTrue(offlineFile.readBytes().contentEquals(editedBody), "the in-window edit was never replaced by the staged body")
+        FileController.getRealmInstance(userDrive).use { realm ->
+            val row = realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!
+            assertTrue(row.isOffline, "the intent was never withdrawn")
+            assertEquals(1_700_000_100L, row.offlineBasisModifiedAt, "the accepted basis stands untouched")
+            assertEquals("hash-v1", row.serverContentHash, "no identity re-stamp from the aborted publication")
+            assertEquals(sha256Hex(bodyV1), row.offlineContentDigest, "the recorded digest still describes the preserved basis")
+        }
+        assertTrue(bodyRequests.get() == 1L, "exactly one body transfer happened; nothing re-fetched over the edit")
     }
 
     /** The publication window was actually reached (the gate is not a silent no-op). */

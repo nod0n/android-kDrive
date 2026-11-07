@@ -132,13 +132,25 @@ class PhotoTrashConsentUiQueueTest {
         assertTrue(PhotoTrashConsentUiQueue.launchAllowedNow(req, currentUserId = 951, activationSnapshot = snapshot(), bindingGenerationCurrent = 7L, lifecycleStarted = true))
     }
 
+    /**
+     * The activation authority and its revision counter are process-wide singletons, and
+     * earlier tests publish explicit revisions. Advancing the counter here guarantees a
+     * base STRICTLY above everything any earlier test used, so each test's sequence is
+     * deterministic whatever ran before (the counter is monotonic; anything below it loses).
+     */
+    private fun revisionBase(): Long {
+        repeat(20) { PhotoTrashController.assignActivationRevision() }
+        return PhotoTrashController.activationReadPermit()
+    }
+
     @Test
     fun `a stale reader snapshot cannot overwrite a newer authoritative write`() {
-        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = false)
+        val base = revisionBase()
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = false, revision = base + 2L)
 
-        // A reader that captured its revision BEFORE that write and observed the old
-        // enabled state publishes after it: the newer write must survive.
-        PhotoTrashController.noteActivationObserved(permit = 0L, userId = 951, activationEpoch = 0L, optIn = true)
+        // A reader that captured its permit BEFORE that write and observed the old enabled
+        // state publishes after it: the newer write must survive.
+        PhotoTrashController.noteActivationObserved(permit = base + 1L, userId = 951, activationEpoch = 0L, optIn = true)
 
         val authority = PhotoTrashController.currentActivationSnapshot
         assertEquals(false, authority?.optIn, "a getter snapshot is never an authority over a newer write")
@@ -146,33 +158,87 @@ class PhotoTrashConsentUiQueueTest {
     }
 
     @Test
-    fun `a missing-row observation fails closed over a stale enabled state`() {
-        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true)
+    fun `a late publish of an earlier commit loses to a later commit's publish`() {
+        val base = revisionBase()
+        // Writer B (the LATER commit, disabled) publishes first; writer A (the EARLIER
+        // commit, enabled) is paused and publishes afterwards. Revisions are assigned at
+        // COMMIT time, so A's late publish must lose: Main must never see a state older
+        // than the latest commit.
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = false, revision = base + 6L)
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true, revision = base + 5L)
 
-        // The settings row is GONE (logout, restore wipe): a reader observing absence must
-        // invalidate the enabled state, not preserve it, whatever its revision was.
-        PhotoTrashController.noteActivationObserved(permit = 0L, userId = 951, activationEpoch = 0L, optIn = false)
-
-        assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn, "missing data fails closed; it never preserves another observation's true")
+        val authority = PhotoTrashController.currentActivationSnapshot
+        assertEquals(false, authority?.optIn, "the later commit's publish stays authoritative")
+        assertEquals(base + 6L, authority?.revision, "the stored revision never rewinds to an earlier commit")
     }
 
     @Test
-    fun `a write landing during a read outranks the read and the read publishes under its permit`() {
-        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true)
+    fun `a stale invalidating candidate never rewinds the authority`() {
+        val base = revisionBase()
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true, revision = base + 2L)
+
+        // The exact rewind sequence: a stale fail-closed observation, then an older
+        // enabled state — both must lose against the monotonic high-water mark, else the
+        // stale true/epoch1 pair could re-authorize an older request.
+        PhotoTrashController.noteActivationObserved(permit = base + 1L, userId = 951, activationEpoch = 0L, optIn = false)
+        with(PhotoTrashController.currentActivationSnapshot) {
+            assertEquals(true, this?.optIn)
+            assertEquals(base + 2L, this?.revision)
+        }
+        PhotoTrashController.noteActivationObserved(permit = base + 1L, userId = 951, activationEpoch = 1L, optIn = true)
+        with(PhotoTrashController.currentActivationSnapshot) {
+            assertEquals(base + 2L, this?.revision)
+            assertEquals(2L, this?.activationEpoch)
+        }
+    }
+
+    @Test
+    fun `absence published by the write seam at its commit revision is authoritative fail-closed`() {
+        val base = revisionBase()
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = true, revision = base + 6L)
+
+        // The settings row is GONE (logout, restore wipe): the DELETION is a write seam —
+        // its commit-assigned revision outranks the enabled state. Absence never preserves
+        // another observation's true, and it is itself revision-ordered (a stale absence
+        // observation loses — see the rewind test above).
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 0L, optIn = false, revision = base + 7L)
+
+        with(PhotoTrashController.currentActivationSnapshot) {
+            assertEquals(false, this?.optIn)
+            assertEquals(base + 7L, this?.revision)
+        }
+    }
+
+    @Test
+    fun `a reader starting after a write's commit outranks the still-pending publish`() {
+        val base = revisionBase()
+        // A legitimately published (earlier-commit) enabled state, and the counter advanced
+        // past it (two later commits nobody mirrored) so the disable below commits strictly
+        // after it.
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 1L, optIn = true, revision = base + 1L)
+        repeat(2) { PhotoTrashController.assignActivationRevision() }
+
+        // The disable commits (revision assigned INSIDE its transaction) but has not
+        // published yet; a reader capturing its permit NOW holds the committed write's
+        // revision — the committed-to-publish visibility gap cannot keep showing the
+        // pre-commit enabled state.
+        val writerRevision = PhotoTrashController.assignActivationRevision()
         val permit = PhotoTrashController.activationReadPermit()
+        assertTrue(permit >= writerRevision, "the revision counter leads the publish")
 
-        // The write lands while the reader sits in its DB read; the reader then publishes
-        // its older observation under the pre-read permit: rejected.
-        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 2L, optIn = false)
-        PhotoTrashController.noteActivationObserved(permit = permit, userId = 951, activationEpoch = 1L, optIn = true)
+        // The reader reads the COMMITTED (disabled) row and publishes it first:
+        PhotoTrashController.noteActivationObserved(permit = permit, userId = 951, activationEpoch = 0L, optIn = false)
+        with(PhotoTrashController.currentActivationSnapshot) {
+            assertEquals(false, this?.optIn, "the post-commit observation outranks the pending pre-commit publish")
+            assertEquals(writerRevision, this?.revision)
+        }
 
-        val authority = PhotoTrashController.currentActivationSnapshot
-        assertEquals(false, authority?.optIn, "the mid-read write stays authoritative")
-        assertEquals(2L, authority?.activationEpoch)
-
-        // With NO write landing during the read, the reader publishes normally.
-        val freshPermit = PhotoTrashController.activationReadPermit()
-        PhotoTrashController.noteActivationObserved(permit = freshPermit, userId = 951, activationEpoch = 2L, optIn = false)
-        assertEquals(false, PhotoTrashController.currentActivationSnapshot?.optIn)
+        // The writer's own pending publish lands (equal revision, same committed content:
+        // first publisher wins, content identical).
+        PhotoTrashController.noteActivationWritten(userId = 951, activationEpoch = 0L, optIn = false, revision = writerRevision)
+        with(PhotoTrashController.currentActivationSnapshot) {
+            assertEquals(false, this?.optIn)
+            assertEquals(writerRevision, this?.revision)
+        }
     }
 }
