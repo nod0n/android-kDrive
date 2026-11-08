@@ -937,10 +937,14 @@ object PhotoTrashController {
                             // would never surface). Skip exactly this row — it stays armed
                             // (durable, retried first on the next drain) — and let a later
                             // eligible row surface. Opt-in/account/unsettled-authority
-                            // changes above remain global stops; this is the only per-row
-                            // continuation, and the armed-rows loop visits each row once
-                            // (bounded). The launch gate keeps its own epoch comparison as
-                            // the backstop for the residual poll-to-launch window.
+                            // changes above remain global stops. The per-row continuations
+                            // in this loop are THIS epoch-mismatch skip (added by the
+                            // stale-generation repair) and the PRE-EXISTING transient-
+                            // unreachable continue at :899 ("an unreachable remote is a
+                            // TRANSIENT condition", :893-897); there is no third. The
+                            // armed-rows loop visits each row once (bounded). The launch
+                            // gate keeps its own epoch comparison as the backstop for the
+                            // residual poll-to-launch window.
                             if (liveSettings.photoTrashActivationEpoch != pairing.activationEpoch) continue
                             // THE BINDING WITNESS: the generation is captured FIRST, then
                             // the registry is re-verified — a write bumping between the

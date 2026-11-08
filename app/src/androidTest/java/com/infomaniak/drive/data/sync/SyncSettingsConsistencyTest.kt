@@ -73,7 +73,16 @@ class SyncSettingsConsistencyTest {
     private val driveId = 761
     private val syncFolder = 555
 
-    private lateinit var config: RealmConfiguration
+    // THIS case's owned fixture configuration. Nullable, not lateinit: PER_CLASS keeps one
+    // instance across cases, so a lateinit field would silently retain the PREVIOUS case's
+    // config when a later setUp fails at the builder (and be unassigned on the first). setUp
+    // clears it before the only throwing setup op and publishes once built; teardown consumes
+    // only what it owns. Test bodies read it through the loud `config` accessor below.
+    private var ownedConfig: RealmConfiguration? = null
+
+    private val config: RealmConfiguration
+        get() = ownedConfig
+            ?: error("no owned fixture config (setUp not run, failed before publication, or already consumed)")
 
     @BeforeAll
     fun initRealm() {
@@ -82,7 +91,12 @@ class SyncSettingsConsistencyTest {
 
     @BeforeEach
     fun setUp() {
-        config = RealmConfiguration.Builder()
+        // Ownership is cleared BEFORE the only throwing setup op (the builder): if it
+        // throws, this case owns NOTHING — teardown consumes null, and a PREVIOUS case's
+        // retained config (PER_CLASS keeps this instance) or its failed-cleanup evidence
+        // is never re-deleted or erased by a later setup failure.
+        ownedConfig = null
+        ownedConfig = RealmConfiguration.Builder()
             .schemaVersion(UploadMigration.DB_VERSION)
             .modules(RealmModules.SyncFilesModule())
             .name("syncSettingsConsistency-${UUID.randomUUID()}")
@@ -93,7 +107,12 @@ class SyncSettingsConsistencyTest {
     @AfterEach
     fun tearDown() {
         unmockkAll()
-        // Leak report, not a silent swallow: deleteRealm throws while an instance is open.
+        // Consume only THIS case's owned config: a setUp that failed before publication
+        // (or an already-consumed config) leaves nothing to delete, so a failed deletion's
+        // evidence is never retried or erased. The leak report stays loud, not swallowed:
+        // deleteRealm throws while an instance is open.
+        val config = ownedConfig ?: return
+        ownedConfig = null
         try {
             Realm.deleteRealm(config)
         } catch (leak: Throwable) {
@@ -398,7 +417,10 @@ class SyncSettingsConsistencyTest {
         assertEquals(
             3L,
             pairing("content://fixture/consistency-deletion")!!.activationEpoch,
-            "pairing and settings share one generation: the launch gate's epoch comparison can pass for fresh requests",
+            "in THIS exercised schedule the pairing and the saved settings share one generation " +
+                "(a single deletion between capture and save); arbitrary intervening settings writers " +
+                "— the two-concurrent-UI schedule, review B.4, OPEN pending orchestrator disposition — " +
+                "remain outside this guarantee",
         )
     }
 
@@ -460,7 +482,9 @@ class SyncSettingsConsistencyTest {
         assertEquals(
             1L,
             pairing("content://fixture/consistency-reaffirm")!!.activationEpoch,
-            "the captured pairing and the persisted settings share the CURRENT generation",
+            "under THIS exercised schedule the captured pairing and the persisted settings share " +
+                "the CURRENT generation; the two-concurrent-UI schedule (review B.4, OPEN pending " +
+                "orchestrator disposition) is an open baseline residual, not covered here",
         )
     }
 }
