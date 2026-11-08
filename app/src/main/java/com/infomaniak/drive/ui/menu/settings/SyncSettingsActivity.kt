@@ -486,15 +486,25 @@ class SyncSettingsActivity : BaseActivity() {
                         // flag is on, so none can race this capture into propagating against
                         // a stale pairing-time baseline (an item trashed while the option was
                         // off becomes a visible INCONCLUSIVE at activation, never a new
-                        // post-activation transition). The capture stamps every row with the
-                        // NEXT activation epoch (read fresh here; the settings write seam
-                        // stamps the same next value into the persisted settings, since the
-                        // live row has not changed in between) — so an OFF->ON cycle
-                        // invalidates every in-flight observation even when it ends at
-                        // identical Boolean values. Off the UI thread.
+                        // post-activation transition). The epoch is DERIVED FROM THE LIVE ROW
+                        // through the SAME derivation the settings write seam applies
+                        // ([UploadFile.nextActivationEpoch]) — never from this stale UI
+                        // snapshot — so the capture's stamps and the persisted settings land
+                        // in one generation whatever the live row did between the snapshot
+                        // and this save: a live disabled/absent row is an activation
+                        // (increment), a live ALREADY-ENABLED row is a re-affirmation that
+                        // re-baselines every pairing under the CURRENT generation (the seam
+                        // keeps that value; incrementing here would strand the pairings an
+                        // epoch ahead of the settings). The derived value rides on the saved
+                        // object so the seam lands on it even if the row is deleted before
+                        // the write (the capture/save deletion seam). Off the UI thread.
                         if (oldSyncSettings?.photoTrashSyncEnabled != true && syncSettings.photoTrashSyncEnabled) {
-                            val activationEpoch =
-                                (UploadFile.getAppSyncSettings()?.photoTrashActivationEpoch ?: 0L) + 1L
+                            val activationEpoch = UploadFile.nextActivationEpoch(
+                                UploadFile.getAppSyncSettings(),
+                                inputEpoch = 0L,
+                                inputEnabled = true,
+                            )
+                            syncSettings.photoTrashActivationEpoch = activationEpoch
                             PhotoTrashController.captureActivationBaselines(applicationContext, activationEpoch)
                         }
                         SentryLog.i(TAG, "start update appSettings")

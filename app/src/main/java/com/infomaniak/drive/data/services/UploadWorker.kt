@@ -573,11 +573,17 @@ class UploadWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 SentryLog.i(TAG, "localMediaFound> $fileName saved in realm")
             }
 
-            UploadFile.setAppSyncSettings(
+            // Per-media scan bookkeeping: advance ONLY the scan watermark of the EXISTING
+            // live settings row for this scan's scope. The detached scan copy (read once
+            // before the cursor loop) is never written back — a full write here would
+            // resurrect deleted settings, re-enable the photo-trash option from the stale
+            // snapshot, and overwrite a concurrent settings edit.
+            UploadFile.advanceSyncLastSync(
+                userId = syncSettings.userId,
+                driveId = syncSettings.driveId,
+                syncFolder = syncSettings.syncFolder,
+                scannedLastSync = fileModifiedAt,
                 customRealm = realm,
-                syncSettings = syncSettings.apply {
-                    if (fileModifiedAt > lastSync) lastSync = fileModifiedAt
-                },
             )
         } else {
             SentryLog.w(TAG, "localMediaFound> Cannot upload $fileName, size=$fileSize")

@@ -468,12 +468,32 @@ open class UploadFile(
             }
         }
 
+        /**
+         * THE activation-epoch derivation, shared by the settings write seam and the
+         * settings UI's pre-save activation capture so both land in the SAME generation
+         * from ANY live-row state (the live row, never a detached snapshot, is the
+         * authority):
+         *  - no live row: an enabled input is a FIRST activation (generation 1) unless
+         *    the input itself carries a higher derived activation intent — the capture/save
+         *    deletion seam, where the capture already stamped the pairings before the row
+         *    vanished (a disabled input never fabricates a generation);
+         *  - live disabled, input enabled: THE activation increment (the only bump);
+         *  - otherwise (a live enabled row, or any disabling write): the live generation
+         *    stands; a higher input intent is preserved, never rewound.
+         */
+        fun nextActivationEpoch(live: SyncSettings?, inputEpoch: Long, inputEnabled: Boolean): Long = when {
+            live == null -> maxOf(inputEpoch, if (inputEnabled) 1L else 0L)
+            !live.photoTrashSyncEnabled && inputEnabled -> live.photoTrashActivationEpoch + 1L
+            else -> maxOf(live.photoTrashActivationEpoch, inputEpoch)
+        }
+
         fun setAppSyncSettings(syncSettings: SyncSettings, customRealm: Realm? = null) {
-            // The activation epoch is a per-user MONOTONIC generation owned by THIS seam:
-            // every not-enabled -> enabled transition increments it (the live row, not a
-            // detached snapshot, is the authority), any other write keeps the live value.
-            // A stale writer object can therefore never rewind it, and every writer path
-            // (settings UI, backup restore, upload-worker refresh) increments coherently.
+            // The activation epoch is a per-user MONOTONIC generation owned by THIS seam,
+            // derived from the LIVE row through [nextActivationEpoch] (the same derivation
+            // the settings UI's activation capture applies): every not-enabled -> enabled
+            // transition increments it, any other write keeps the live value, and a
+            // detached writer object can never rewind it nor fabricate a fresh generation
+            // over one the capture already stamped.
             var activationEpoch = syncSettings.photoTrashActivationEpoch
             var writeRevision = 0L
             var began = false
@@ -483,12 +503,11 @@ open class UploadFile(
                         val existing = mutableRealm.where(SyncSettings::class.java)
                             .equalTo(SyncSettings::userId.name, syncSettings.userId)
                             .findFirst()
-                        activationEpoch = when {
-                            existing == null -> if (syncSettings.photoTrashSyncEnabled) 1L else 0L
-                            !existing.photoTrashSyncEnabled && syncSettings.photoTrashSyncEnabled ->
-                                existing.photoTrashActivationEpoch + 1L
-                            else -> maxOf(existing.photoTrashActivationEpoch, syncSettings.photoTrashActivationEpoch)
-                        }
+                        activationEpoch = nextActivationEpoch(
+                            existing,
+                            syncSettings.photoTrashActivationEpoch,
+                            syncSettings.photoTrashSyncEnabled,
+                        )
                         syncSettings.photoTrashActivationEpoch = activationEpoch
                         // Commit-ordered revision, marked UNSETTLED before any mutation (see
                         // removeAppSyncSettings).
@@ -511,6 +530,40 @@ open class UploadFile(
                 // Settles the write whatever happened (see removeAppSyncSettings).
                 if (began) PhotoTrashController.endActivationWrite()
             }
+        }
+
+        /**
+         * Per-media scan bookkeeping (the upload worker's found-media loop): advances ONLY
+         * the scan watermark ([SyncSettings.lastSync]) of the EXISTING live settings row
+         * for the scanned configuration, monotonically. The scan's detached settings copy
+         * is deliberately NOT written back — a full write here would (a) resurrect
+         * settings that a concurrent [disableAutoSync][com.infomaniak.drive.utils.SyncUtils
+         * .disableAutoSync] deleted, fabricating a fresh activation generation that every
+         * surviving pairing then mismatches (the confirmed consent-queue starvation root),
+         * (b) re-enable the photo-trash option from the scan's stale snapshot, and (c)
+         * overwrite a concurrent settings edit. A row that is absent, or whose identity no
+         * longer matches the scan's scope (a replacement account/drive/folder
+         * configuration), is left untouched: the watermark belongs to the configuration
+         * the scan actually ran for. Publishes nothing to the activation mirror: no
+         * mirror-covered field (opt-in, epoch) changes.
+         */
+        fun advanceSyncLastSync(
+            userId: Int,
+            driveId: Int,
+            syncFolder: Int,
+            scannedLastSync: Date,
+            customRealm: Realm? = null,
+        ) {
+            val block: (Realm) -> Unit = { realm ->
+                realm.executeTransaction { mutableRealm ->
+                    val live = mutableRealm.where(SyncSettings::class.java)
+                        .equalTo(SyncSettings::userId.name, userId)
+                        .findFirst() ?: return@executeTransaction
+                    if (live.driveId != driveId || live.syncFolder != syncFolder) return@executeTransaction
+                    if (scannedLastSync.after(live.lastSync)) live.lastSync = scannedLastSync
+                }
+            }
+            customRealm?.let(block) ?: getRealmInstance().use(block)
         }
 
         fun getAppSyncSettings(customRealmConfig: RealmConfiguration? = null): SyncSettings? {

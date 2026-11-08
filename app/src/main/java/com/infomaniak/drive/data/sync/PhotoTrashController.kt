@@ -923,11 +923,25 @@ object PhotoTrashController {
                             // have changed DURING it. The request is handed out only when
                             // the gate still holds now; otherwise the drain ends with
                             // nothing surfaced and the row's state untouched.
-                            if (!UploadFile.getAppSyncSettings()?.photoTrashSyncEnabled.orFalse() ||
+                            val liveSettings = UploadFile.getAppSyncSettings()
+                            if (liveSettings == null || !liveSettings.photoTrashSyncEnabled ||
                                 pairing.userId != AccountUtils.currentUserId
                             ) {
                                 return@withContext null
                             }
+                            // A stale-GENERATION row cannot be surfaced by this drain: its
+                            // activation epoch no longer matches the persisted settings, so
+                            // the Main launch gate would refuse it — and because the poll is
+                            // oldest-first, one such row would otherwise end every drain
+                            // here and starve the whole queue (rows whose epochs DO match
+                            // would never surface). Skip exactly this row — it stays armed
+                            // (durable, retried first on the next drain) — and let a later
+                            // eligible row surface. Opt-in/account/unsettled-authority
+                            // changes above remain global stops; this is the only per-row
+                            // continuation, and the armed-rows loop visits each row once
+                            // (bounded). The launch gate keeps its own epoch comparison as
+                            // the backstop for the residual poll-to-launch window.
+                            if (liveSettings.photoTrashActivationEpoch != pairing.activationEpoch) continue
                             // THE BINDING WITNESS: the generation is captured FIRST, then
                             // the registry is re-verified — a write bumping between the
                             // earlier stamp comparison and the generation read would

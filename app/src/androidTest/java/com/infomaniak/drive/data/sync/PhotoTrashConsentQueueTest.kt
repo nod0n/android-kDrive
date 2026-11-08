@@ -345,6 +345,41 @@ class PhotoTrashConsentQueueTest {
     }
 
     @Test
+    @DisplayName("a stale-generation armed row is skipped in its drain and a later eligible row surfaces")
+    fun aStaleGenerationRowIsSkippedAndALaterEligibleRowSurfaces() {
+        seedArmedRow(uriA, remoteFileIdA, stampA)
+        seedArmedRow(uriB, remoteFileIdB, stampB)
+        // Row A is armed under a PREVIOUS activation generation (2) while the persisted
+        // settings moved to generation 1 (the confirmed post-revival schedule): the launch
+        // gate would refuse A on the epoch comparison. Row B carries the CURRENT generation.
+        val staleGeneration = 2L
+        val currentGeneration = 1L
+        every { UploadFile.getAppSyncSettings() } returns SyncSettings(
+            userId = userId,
+            driveId = driveId,
+            photoTrashSyncEnabled = true,
+            photoTrashActivationEpoch = currentGeneration,
+        )
+        realm().use { realm ->
+            realm.executeTransaction { mutableRealm ->
+                mutableRealm.where(PhotoPairing::class.java)
+                    .equalTo(PhotoPairing::uri.name, uriA).findFirst()?.activationEpoch = staleGeneration
+                mutableRealm.where(PhotoPairing::class.java)
+                    .equalTo(PhotoPairing::uri.name, uriB).findFirst()?.activationEpoch = currentGeneration
+            }
+        }
+
+        val surfaced = runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }
+            ?: throw AssertionError("an eligible later row is not starved by the stale-generation row ahead of it")
+        assertEquals(uriB, surfaced.uri, "the eligible CURRENT-generation row surfaces")
+        assertEquals(currentGeneration, surfaced.activationEpoch, "the surfaced request carries the live generation")
+        // The skipped row stays armed and untouched: it is retried first on the next drain.
+        assertEquals(stampA, row(uriA).remoteTrashPendingSince, "the stale-generation row remains armed")
+        assertEquals(PhotoPairing.State.ACTIVE.name, row(uriA).state, "no state was written by the skip")
+        assertEquals(staleGeneration, row(uriA).activationEpoch, "the skip never re-stamps the stale row")
+    }
+
+    @Test
     @DisplayName("an account switched DURING the poll's remote IO ends the drain without launching")
     fun accountSwitchMidPollEndsTheDrain() {
         seedArmedRow(uriA, remoteFileIdA, stampA)
