@@ -82,6 +82,15 @@ class DownloadOfflineFileManager(
     private var lastUpdateProgressMillis = System.currentTimeMillis()
 
     /**
+     * The file ids whose cache-move chain ended in a REFUSED publication (the destination
+     * holds bytes the row does not own, or the in-lock record declined): nothing was
+     * published and the row's queued intent stands, so the bulk finish must not clear
+     * those rows' pending markers (the marker is the only record that the work is still
+     * owed). Every completed transfer keeps the existing baseline behavior.
+     */
+    val refusedPublicationFileIds: MutableSet<Int> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /**
      * The row's validation-gate state: live offline intent and the root contract's claim at
      * one read. The claim is [OfflineFolderSyncUtils.isRootOwnedCopy] — live subtree coverage
      * OR recorded root ownership ([File.offlineOwnedByRoot]) surviving a cached tree update
@@ -387,6 +396,7 @@ class DownloadOfflineFileManager(
                             destinationDigest == row.offlineContentDigest
                         if (!basisIntact) {
                             SentryLog.w(TAG, "The cache move's destination holds bytes this row does not own for ${file.id}; both sides preserved")
+                            refusedPublicationFileIds.add(file.id)
                             return@withCommitAuthority null
                         }
                     }
@@ -441,6 +451,7 @@ class DownloadOfflineFileManager(
                 // refused publication's bytes at the offline path are unwanted and
                 // unrecorded; the CACHE bytes are PRESERVED (a claimed refusal never
                 // destroys them).
+                refusedPublicationFileIds.add(file.id)
                 finishCompleted(file, offlineFile, context, published)
             }
             return@withContext CacheMoveOutcome.OWNERSHIP_STALE

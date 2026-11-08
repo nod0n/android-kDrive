@@ -410,12 +410,19 @@ object OfflineFolderSyncUtils {
     suspend fun unmarkFolderOffline(context: Context, folder: File, userDrive: UserDrive): Boolean {
         val rootUid = OfflineFolderRoot.buildUid(folder.id, userDrive.driveId, userDrive.userId)
         val subtreeIds = collectSubtreeIdsFromCache(userDrive, folder.id)
-        val otherRootSubtreeIds = certifiedFreshRealm(userDrive).use { realm ->
+        // The subtree collection opens its own certified-fresh realm (a refresh) on this
+        // thread: running it inside the iteration of the registry's LIVE results invalidates
+        // the iterator (ConcurrentModificationException). Snapshot the primitive root ids
+        // first; the set-union semantics are unchanged.
+        val otherRootFolderIds = certifiedFreshRealm(userDrive).use { realm ->
             realm.where(OfflineFolderRoot::class.java)
                 .notEqualTo(OfflineFolderRoot::uid.name, rootUid)
                 .findAll()
-                .flatMap { root -> collectSubtreeIdsFromCache(userDrive, root.folderId) }
+                .map { it.folderId }
                 .toSet()
+        }
+        val otherRootSubtreeIds = otherRootFolderIds.flatMapTo(mutableSetOf()) {
+            collectSubtreeIdsFromCache(userDrive, it)
         }
 
         var allDeletionsConfirmed = true

@@ -65,7 +65,15 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
     override suspend fun downloadAction(): Result = downloadFiles()
 
     override fun onFinish() {
-        FileController.markFilesAsOffline(filesId = files.map { it.id }, isMarkedAsOffline = false)
+        // The pending marker is the queued intent: a file whose publication was REFUSED
+        // (destination not owned by the row, or the record declined) published nothing and
+        // keeps its marker — the bulk finish clears it only for files whose chain did not
+        // refuse (FHNW-1189 A2 gap 2: the refusal preserved both byte sides and the row's
+        // own pending intent).
+        FileController.markFilesAsOffline(
+            filesId = files.filter { it.id !in downloadOfflineFileManager.refusedPublicationFileIds }.map { it.id },
+            isMarkedAsOffline = false,
+        )
         clearLastDownloadedFile()
         notifyDownloadFinished()
         notificationManagerCompat.cancel(BULK_DOWNLOAD_ID)
