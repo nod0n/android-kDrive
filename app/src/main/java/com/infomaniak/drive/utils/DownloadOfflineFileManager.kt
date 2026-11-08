@@ -83,12 +83,15 @@ class DownloadOfflineFileManager(
 
     /**
      * The file ids whose cache-move chain ended in a REFUSED publication (the destination
-     * holds bytes the row does not own, or the in-lock record declined): nothing was
-     * published and the row's queued intent stands, so the bulk finish must not clear
-     * those rows' pending markers (the marker is the only record that the work is still
-     * owed). Every completed transfer keeps the existing baseline behavior.
+     * holds bytes the row does not own, or the publication was refused/declined after an
+     * intact evidence chain): nothing was published and the row's queued intent stands, so
+     * the bulk finish must not clear those rows' pending markers (the marker is the only
+     * record that the work is still owed). Every completed transfer keeps the existing
+     * baseline behavior. Read-only view: only the chain itself records outcomes.
      */
-    val refusedPublicationFileIds: MutableSet<Int> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    private val refusedPublicationIds: MutableSet<Int> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    val refusedPublicationFileIds: Set<Int> get() = refusedPublicationIds
 
     /**
      * The row's validation-gate state: live offline intent and the root contract's claim at
@@ -164,6 +167,14 @@ class DownloadOfflineFileManager(
             // R1 (FHNW-caf1): the authority was declined inside the move seam itself — the
             // cache bytes are preserved where they are, nothing was published.
             CacheMoveOutcome.OWNERSHIP_STALE -> return ListenableWorker.Result.success()
+            // A refusal where the row's queued intent still stands: record it centrally so
+            // the bulk finish keeps the pending marker (nothing was published; the work is
+            // still owed). Withdrawn intents are NOT recorded here — the marker clear must
+            // never resurrect withdrawn work.
+            CacheMoveOutcome.PUBLICATION_REFUSED -> {
+                refusedPublicationIds.add(file.id)
+                return ListenableWorker.Result.success()
+            }
             CacheMoveOutcome.NOT_INTACT -> Unit // continue below
         }
 
@@ -289,8 +300,15 @@ class DownloadOfflineFileManager(
 
     /** Outcome of the cache-move entry (R1, FHNW-caf1): the publication is the seam's
      *  atomic rename INSIDE the commit authority's hold; every refusal preserves the cache
-     *  bytes where they are. */
-    private enum class CacheMoveOutcome { MOVED, NOT_INTACT, OWNERSHIP_STALE }
+     *  bytes where they are. PUBLICATION_REFUSED marks a decline where the row's own
+     *  queued intent STILL STANDS (the destination was not the row's, or the publication
+     *  was refused/declined after an intact evidence chain) — nothing was published and
+     *  the work is still owed, so the bulk finish must not clear the pending marker.
+     *  OWNERSHIP_STALE marks a decline where the intent itself is gone or moot (a
+     *  withdrawn intent, a vanished row, a stale root contract, a competing mutation that
+     *  owns the row now): skipping the marker clear there must never resurrect
+     *  withdrawn work. */
+    private enum class CacheMoveOutcome { MOVED, NOT_INTACT, PUBLICATION_REFUSED, OWNERSHIP_STALE }
 
     private suspend fun moveCacheFileIfIntact(
         context: Context,
@@ -342,6 +360,10 @@ class DownloadOfflineFileManager(
                 null
             }
 
+            // Set by the in-hold refusals where the row's queued intent still stands (the
+            // destination was not the row's, or the publication was refused after an intact
+            // evidence chain): the central PUBLICATION_REFUSED decision below.
+            var publicationRefused = false
             val published = OfflineCommitAuthority.withCommitAuthority {
                 // EVIDENCE CERTIFICATION (generation) FIRST: a participating mutation
                 // committed while the staging copy ran (FHNW-1189 A2 schedule 2: a
@@ -396,7 +418,7 @@ class DownloadOfflineFileManager(
                             destinationDigest == row.offlineContentDigest
                         if (!basisIntact) {
                             SentryLog.w(TAG, "The cache move's destination holds bytes this row does not own for ${file.id}; both sides preserved")
-                            refusedPublicationFileIds.add(file.id)
+                            publicationRefused = true
                             return@withCommitAuthority null
                         }
                     }
@@ -406,6 +428,7 @@ class DownloadOfflineFileManager(
                     // condition is checked BEFORE the first effect, never discovered after.
                     if (stagedDigest == null || !staging.exists() || staging.length() != stagedLength) {
                         SentryLog.w(TAG, "The staged cache copy's evidence is unusable for ${file.id}; cache bytes preserved, nothing published")
+                        publicationRefused = true
                         return@withCommitAuthority null
                     }
 
@@ -415,11 +438,13 @@ class DownloadOfflineFileManager(
                     // (frozen as locally edited forever).
                     if (!staging.setLastModified(file.getLastModifiedInMilliSecond())) {
                         SentryLog.w(TAG, "Staging timestamp refused for ${file.id}; cache bytes preserved, nothing published")
+                        publicationRefused = true
                         return@withCommitAuthority null
                     }
 
                     if (!staging.renameTo(offlineFile)) {
                         SentryLog.w(TAG, "Cache-move publication refused for ${file.id}; cache bytes preserved")
+                        publicationRefused = true
                         return@withCommitAuthority null
                     }
                     // The moved bytes come from the cache, not from this transfer: their
@@ -451,10 +476,18 @@ class DownloadOfflineFileManager(
                 // refused publication's bytes at the offline path are unwanted and
                 // unrecorded; the CACHE bytes are PRESERVED (a claimed refusal never
                 // destroys them).
-                refusedPublicationFileIds.add(file.id)
                 finishCompleted(file, offlineFile, context, published)
             }
-            return@withContext CacheMoveOutcome.OWNERSHIP_STALE
+            // The central outcome decision: a refusal where the row's queued intent still
+            // stands (destination not the row's, evidence/timestamp/rename refused, record
+            // declined) preserves the pending marker at the bulk finish; every other
+            // decline (withdrawn intent, vanished row, stale ownership, a competing
+            // mutation) leaves the marker clear to the finish as before.
+            return@withContext if (publicationRefused || published != null) {
+                CacheMoveOutcome.PUBLICATION_REFUSED
+            } else {
+                CacheMoveOutcome.OWNERSHIP_STALE
+            }
         } finally {
             if (staging.exists()) staging.delete()
         }
@@ -661,7 +694,7 @@ class DownloadOfflineFileManager(
     }
 
     private fun fileDownloaded(context: Context, fileId: Int) {
-        FileController.markFileAsOffline(fileId = fileId, isMarkedAsOffline = false)
+        FileController.markFileAsOffline(fileId = fileId, isMarkedAsOffline = false, userDrive = userDrive)
         lastUpdateProgressMillis = System.currentTimeMillis()
         filesDownloaded += 1
 

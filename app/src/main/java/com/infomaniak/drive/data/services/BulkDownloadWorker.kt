@@ -34,7 +34,10 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
 
     private val folderId: Int by lazy { inputData.getInt(FOLDER_ID, 0) }
     private val files: List<File> by lazy {
-        FileController.getFolderOfflineFilesId(folderId = folderId, sortType = UiSettings(context).sortType)
+        // The pending-file query and the finish marker clear are drive-scoped: the former
+        // default-realm reads resolved the ACCOUNT defaults instead of this worker's
+        // explicit userDrive.
+        FileController.getFolderOfflineFilesId(folderId = folderId, sortType = UiSettings(context).sortType, userDrive = userDrive)
             .map { FileController.getFileByUidOrId(it, userDrive)!! }
     }
 
@@ -73,6 +76,7 @@ class BulkDownloadWorker(context: Context, workerParams: WorkerParameters) : Bas
         FileController.markFilesAsOffline(
             filesId = files.filter { it.id !in downloadOfflineFileManager.refusedPublicationFileIds }.map { it.id },
             isMarkedAsOffline = false,
+            userDrive = userDrive,
         )
         clearLastDownloadedFile()
         notifyDownloadFinished()

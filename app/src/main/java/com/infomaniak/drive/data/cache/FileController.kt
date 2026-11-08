@@ -241,8 +241,8 @@ object FileController {
         }
     }
 
-    fun getFolderOfflineFilesId(folderId: Int, sortType: SortType): List<Int> {
-        return getRealmInstance().use { realm ->
+    fun getFolderOfflineFilesId(folderId: Int, sortType: SortType, userDrive: UserDrive? = null): List<Int> {
+        return getRealmInstance(userDrive).use { realm ->
             val realmFiles = realm.where(File::class.java)
                 .equalTo(File::parentId.name, folderId)
                 .equalTo(File::isMarkedAsOffline.name, true)
@@ -260,7 +260,12 @@ object FileController {
             }
     }
 
-    fun markFilesAsOffline(customRealm: Realm? = null, filesId: List<Int>, isMarkedAsOffline: Boolean) {
+    fun markFilesAsOffline(
+        customRealm: Realm? = null,
+        filesId: List<Int>,
+        isMarkedAsOffline: Boolean,
+        userDrive: UserDrive? = null,
+    ) {
         val block: (Realm) -> Unit? = { realm ->
             // Coordinated writer (pending-marker intent): joins the commit authority so the
             // write cannot commit inside a publication/withdrawal hold.
@@ -271,10 +276,10 @@ object FileController {
             }
         }
 
-        customRealm?.let(block) ?: getRealmInstance().use(block)
+        customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
-    fun markFileAsOffline(customRealm: Realm? = null, fileId: Int, isMarkedAsOffline: Boolean) {
+    fun markFileAsOffline(customRealm: Realm? = null, fileId: Int, isMarkedAsOffline: Boolean, userDrive: UserDrive? = null) {
         val block: (Realm) -> Unit? = { realm ->
             OfflineCommitAuthority.withCommitAuthority {
                 realm.executeTransaction {
@@ -282,7 +287,7 @@ object FileController {
                 }
             }
         }
-        customRealm?.let(block) ?: getRealmInstance().use(block)
+        customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
     /**
@@ -382,7 +387,13 @@ object FileController {
                 Unit
             }
         }
-        customRealm?.let(block) ?: getRealmInstance().use(block)
+        // The initial row lookup MUST happen in the requested drive's realm: the former
+        // no-argument getRealmInstance() resolved the ACCOUNT defaults, so an explicit
+        // userDrive was silently ignored (a caller's drive had no bearing on the query —
+        // device-5ea2 failure 5: the fixture row was never seen by removeFile at all).
+        // UserDrive() defaults keep the account behavior for callers without an explicit
+        // drive; customRealm semantics unchanged.
+        customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
     fun renameFile(file: File, newName: String, realm: Realm? = null): ApiResponse<CancellableAction> {
