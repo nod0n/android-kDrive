@@ -88,6 +88,10 @@ class OfflineFolderMaintenanceOrchestrationTest {
 
     private val context = ApplicationProvider.getApplicationContext<android.content.Context>()
     private val userDrive = UserDrive(userId = 951, driveId = 751)
+    // The fixture marker: the ONLY drive name this class may write into the shared
+    // DriveInfos realm, part of the exact identity that collision detection and cleanup
+    // match on (see seedFixtureDriveInRealDrivesRealm's contract).
+    private val fixtureDriveMarker = "fixture-orchestration-drive-${userDrive.userId}-${userDrive.driveId}"
     private val fileId = 900_401
     private val coveredFolderId = 800_401
     private val offlineRoot = JavaFile(
@@ -391,32 +395,80 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     /**
-     * Seeds the fixture drive into the REAL DriveInfos realm so the maintenance walk's
-     * [DriveInfosController.getDrives] (and startSyncOffline's drive iteration) runs
-     * UNMOCKED. Device-f094, sixth Offline case: RECORDING the former ArrayList-returning
-     * getDrives stub made MockK-Android instrument java.util.ArrayList, and the advice's
-     * own origin resolution (refEquals -> zip -> ArrayList.add) then recursed to
-     * StackOverflow — the same mechanism as the Gallery finding fbc284a39 fixed by stub
-     * removal. Idempotent: the previous fixture row is replaced. The real query filters
-     * userId + sharedWithMe=false, so any real account drives on the device are excluded
-     * and the walk sees exactly this drive.
+     * Seeds the fixture drive into the REAL shared DriveInfos realm so the maintenance
+     * walk's [DriveInfosController.getDrives] (and startSyncOffline's drive iteration)
+     * runs UNMOCKED — any collection-returning stub wedges MockK-Android advice
+     * recording (the device-f094 sixth-case StackOverflow; the 6f85 Gallery precedent).
+     *
+     * FIXTURE OWNERSHIP CONTRACT for the shared database:
+     *  - IDENTITY: a row is TEST-OWNED iff pk "${driveId}_${userId}" AND marker name
+     *    [fixtureDriveMarker] AND id/userId equal to [userDrive] — i.e. exactly what
+     *    this class inserts. A leftover of an earlier test or crashed run matches.
+     *  - ABSENCE BEFORE MUTATION: any OTHER drive for this synthetic userId (a real
+     *    account's row included) is a COLLISION: the seed FAILS WITHOUT CHANGING ANY
+     *    STATE, so foreign data is never walked and never deleted.
+     *  - SCOPED REPLACE: only the exact test-owned identity is deleted — a delete is
+     *    never scoped by the read query's fields alone.
+     *  - CLEANUP: [cleanupFixtureDriveInRealDrivesRealm] runs in @AfterEach on success
+     *    AND assertion failure. If a crash prevents teardown, the leftover row is
+     *    recognized by THIS seed on the next run (exact identity) and replaced; foreign
+     *    rows never match and are left alone.
      */
     private fun seedFixtureDriveInRealDrivesRealm() {
         DriveInfosController.getRealmInstance().use { realm ->
+            // Absence BEFORE mutation: count the userId cohort that is NOT the exact
+            // fixture identity. No write has happened yet — a collision refuses cleanly.
+            val foreign = realm.where(Drive::class.java)
+                .equalTo(Drive::userId.name, userDrive.userId)
+                .findAll()
+                .count { it.objectId != fixtureDriveObjectId() || it.name != fixtureDriveMarker }
+            check(foreign == 0) {
+                "DriveInfos realm holds $foreign non-fixture drive(s) for synthetic userId " +
+                    "${userDrive.userId} — refusing to seed; NO state was changed"
+            }
             realm.executeTransaction { transactionRealm ->
                 transactionRealm.where(Drive::class.java)
+                    .equalTo(Drive::objectId.name, fixtureDriveObjectId())
+                    .equalTo(Drive::name.name, fixtureDriveMarker)
                     .equalTo(Drive::id.name, userDrive.driveId)
+                    .equalTo(Drive::userId.name, userDrive.userId)
                     .findAll()
                     .deleteAllFromRealm()
-                transactionRealm.copyToRealm(
-                    Drive(objectId = "${userDrive.driveId}_${userDrive.userId}").apply {
-                        id = userDrive.driveId
-                        userId = userDrive.userId
-                        name = "fixture-drive"
-                        sharedWithMe = false
-                    },
-                )
+                transactionRealm.copyToRealm(fixtureDrive())
             }
+        }
+    }
+
+    private fun fixtureDriveObjectId() = "${userDrive.driveId}_${userDrive.userId}"
+
+    private fun fixtureDrive() = Drive(objectId = fixtureDriveObjectId()).apply {
+        id = userDrive.driveId
+        userId = userDrive.userId
+        name = fixtureDriveMarker
+        sharedWithMe = false
+    }
+
+    /**
+     * Removes ONLY the exact test-owned fixture identity (pk + marker + id/userId all
+     * matching); a foreign row can never match. Called from @AfterEach on success and
+     * assertion failure. A cleanup failure is EVIDENCE (printed, never silent): the row
+     * remains and the next run's seed recognizes it by the exact identity.
+     */
+    private fun cleanupFixtureDriveInRealDrivesRealm() {
+        runCatching {
+            DriveInfosController.getRealmInstance().use { realm ->
+                realm.executeTransaction { transactionRealm ->
+                    transactionRealm.where(Drive::class.java)
+                        .equalTo(Drive::objectId.name, fixtureDriveObjectId())
+                        .equalTo(Drive::name.name, fixtureDriveMarker)
+                        .equalTo(Drive::id.name, userDrive.driveId)
+                        .equalTo(Drive::userId.name, userDrive.userId)
+                        .findAll()
+                        .deleteAllFromRealm()
+                }
+            }
+        }.onFailure { failure ->
+            println("OfflineOrchestration fixture-drive cleanup failed: $failure")
         }
     }
 
@@ -1207,12 +1259,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
             }
         }
 
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: ANY
-        // collection-returning stub on an ArrayList-typed method wedges MockK-Android
-        // advice recording (fbc284a39's Gallery finding; proven again by the f094
-        // sixth-case StackOverflow). The real query (userId + sharedWithMe=false)
-        // isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         every { ApiRepository.getFilesLastActivities(any(), any()) } answers {
             activityRequests.incrementAndGet()
@@ -1940,13 +1987,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
             }
         }
 
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: ANY
-        // collection-returning stub on an ArrayList-typed method wedges MockK-Android
-        // advice recording, whether the list is built as a `returns` value or INSIDE an
-        // answer at invocation time (fbc284a39's Gallery finding; proven again by the
-        // f094 sixth-case StackOverflow). The real query (userId + sharedWithMe=false)
-        // isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         // PHASE 1 — INCOMPLETE walk: the remote listing FAILS; absence is proven by nothing.
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
@@ -2015,13 +2056,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         val offlineFile = getOfflineFixtureFile()
         check(!offlineFile.exists()) { "fixture precondition: pending work has no bytes yet" }
 
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         // Root A (the primary covered folder) completes EMPTY; root B's listing FAILS.
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
@@ -2073,13 +2108,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         }
         val midPassRegisteredFolder = 800_404
 
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         var injected = false
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
@@ -2138,13 +2167,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
             check(!row.isMarkedAsOffline && !row.offlineOwnedByRoot) { "fixture precondition: unmarked, unclaimed" }
         }
 
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         var withdrawn = false
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
@@ -2647,13 +2670,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         seedRootRegistry(rootBFolder) // registry row WITHOUT a cached folder row (cache loss)
         stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
 
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         val walkedFolderIds = java.util.Collections.synchronizedList(mutableListOf<Int>())
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
@@ -2742,13 +2759,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
             path = "Private/fixture-root-b-renamed"
             type = "dir"
         }
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         val walkedFolderIds = java.util.Collections.synchronizedList(mutableListOf<Int>())
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
@@ -2861,13 +2872,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
             size = bodyV1.size.toLong()
         }
         lastAnswerBody.set(bodyV1)
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         val walkCalls = java.util.concurrent.atomic.AtomicInteger()
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
@@ -3102,13 +3107,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         }
         val remarkPhase = java.util.concurrent.atomic.AtomicBoolean(false)
         val remarkListingReached = java.util.concurrent.atomic.AtomicBoolean(false)
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
             if (remarkPhase.get()) {
@@ -3220,13 +3219,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         offlineFile.writeBytes(bodyV1 + 0x00)
 
         lastAnswerBody.set(bodyV2)
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         stubDetails(hash = "hash-2", modifiedAtSec = 1_700_000_100L, size = bodyV2.size.toLong())
 
@@ -3401,13 +3394,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         }
         stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
 
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
             CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = emptyList<File>(), cursor = null, hasMore = false)
@@ -3524,13 +3511,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         check(ownedFile.setLastModified(1_700_000_000L * 1000)) { "the owned bytes carry the basis mtime" }
         stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong())
 
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
             CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = emptyList<File>(), cursor = null, hasMore = false)
@@ -3607,13 +3588,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
             size = bodyV1.size.toLong()
         }
         lastAnswerBody.set(bodyV1)
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
             CursorApiResponse(result = ApiResponseStatus.SUCCESS, data = arrayListOf(remoteRow), cursor = null, hasMore = false)
@@ -3679,13 +3654,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         }
         lastAnswerBody.set(bodyV1)
         var bWalkSucceeds = false
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
         coEvery { ApiRepository.getFolderFiles(any(), any(), any(), any(), any()) } answers {
             when (thirdArg<Int>()) {
@@ -3788,13 +3757,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 error = com.infomaniak.core.network.models.ApiError(code = "object_not_found"),
             )
         }
-        // The walk's getDrives runs UNMOCKED against the real DriveInfos realm: recording
-        // an ArrayList-returning stub wedges MockK-Android advice recording (the f094
-        // sixth-case StackOverflow — ArrayList got instrumented during the stub recording
-        // and the advice's own refEquals -> zip -> ArrayList.add origin resolution
-        // recursed; the same mechanism as the Gallery finding fbc284a39 fixed by removal).
-        // The real query (userId + sharedWithMe=false) isolates the seeded fixture drive.
-        seedFixtureDriveInRealDrivesRealm()
+        seedFixtureDriveInRealDrivesRealm() // real shared realm, test-owned identity only — contract on the helper
         every { AccountUtils.currentUserId } returns userDrive.userId
 
         // PASS 1: the definitive answer withdraws the ONLY registration; the claims stand
@@ -3973,6 +3936,9 @@ class OfflineFolderMaintenanceOrchestrationTest {
     @AfterEach
     fun tearDown() {
         unmockkAll()
+        // Remove this class's fixture row from the shared DriveInfos realm on success
+        // AND assertion failure (exact test-owned identity only — see the helper's contract).
+        cleanupFixtureDriveInRealDrivesRealm()
     }
 
     @AfterAll
