@@ -49,7 +49,9 @@ import java.util.UUID
  * write of a WHOLE detached settings copy resurrected deleted settings, re-enabled the
  * option from a stale snapshot and fabricated a fresh activation generation that
  * permanently blocked every prior-generation pairing; the settings UI's activation capture
- * derived its epoch from the stale UI snapshot instead of the live row.
+ * read the live row's epoch and unconditionally added one — even over an ALREADY-ENABLED
+ * row (stranding the pairings it stamped one epoch ahead of the persisted settings) and
+ * from 0 when the row was absent — diverging from the write seam's own derivation.
  *
  * These cases exercise the REAL production seams — [UploadFile.advanceSyncLastSync] (the
  * scan-bookkeeping seam that replaced the worker's full detached write),
@@ -221,7 +223,7 @@ class SyncSettingsConsistencyTest {
     }
 
     @Test
-    @DisplayName("an obsolete scan scope never advances a replacement configuration's watermark; same scope advances monotonically past a concurrent edit")
+    @DisplayName("an obsolete scope — wholly, each half alone, or another user's selection — never advances a replacement configuration's watermark; same scope advances monotonically past a concurrent edit")
     fun scanWatermarkIsScopedAndMonotonic() {
         // The live row was EDITED while the scan held an older copy: new drive/folder, the
         // option re-affirmed, a new epoch, a watermark of its own, other settings flipped.
@@ -240,15 +242,19 @@ class SyncSettingsConsistencyTest {
             ),
         )
 
-        // The obsolete scan's scope (pre-edit drive/folder): must not move the replacement
-        // configuration's watermark — media found under the old scope was never scanned for
-        // the new configuration, and advancing the watermark would hide uploads from it.
+        // The replacement watermark is 9_000 and every rejected candidate below is 12_000 —
+        // GREATER than the live watermark — so each rejection is provable only by the guard
+        // half it exercises: monotonicity alone would have accepted 12_000.
+        //
+        // The fully obsolete scan scope (pre-edit drive AND folder): media found under it
+        // was never scanned for the replacement configuration, and advancing the watermark
+        // would hide uploads from that configuration.
         withFixtureRealm { fixtureRealm ->
             UploadFile.advanceSyncLastSync(
                 userId = userId,
                 driveId = driveId,
                 syncFolder = syncFolder,
-                scannedLastSync = Date(5_000L),
+                scannedLastSync = Date(12_000L),
                 customRealm = fixtureRealm,
             )
         }
@@ -262,6 +268,47 @@ class SyncSettingsConsistencyTest {
                 live.syncVideo && live.deleteAfterSync && live.onlyWifiSyncMedia && live.syncImmediately,
                 "the concurrent settings edit survived the scan write",
             )
+        }
+
+        // Wrong DRIVE only (the live row's folder matches): a guard that checked the folder
+        // half alone would accept this candidate — exactly the hole this probe closes.
+        withFixtureRealm { fixtureRealm ->
+            UploadFile.advanceSyncLastSync(
+                userId = userId,
+                driveId = driveId,
+                syncFolder = syncFolder + 1,
+                scannedLastSync = Date(12_000L),
+                customRealm = fixtureRealm,
+            )
+        }
+        assertEquals(9_000L, liveSettings()!!.lastSync.time, "a wrong-drive scan scope never advances the watermark even with the folder matching")
+
+        // Wrong FOLDER only (the live row's drive matches): the mirror-image hole.
+        withFixtureRealm { fixtureRealm ->
+            UploadFile.advanceSyncLastSync(
+                userId = userId,
+                driveId = driveId + 1,
+                syncFolder = syncFolder,
+                scannedLastSync = Date(12_000L),
+                customRealm = fixtureRealm,
+            )
+        }
+        assertEquals(9_000L, liveSettings()!!.lastSync.time, "a wrong-folder scan scope never advances the watermark even with the drive matching")
+
+        // Wrong USER: the seam selects the settings row by its owner; another user's scan
+        // selection must neither advance this row nor fabricate one of its own.
+        withFixtureRealm { fixtureRealm ->
+            UploadFile.advanceSyncLastSync(
+                userId = userId + 1,
+                driveId = driveId + 1,
+                syncFolder = syncFolder + 1,
+                scannedLastSync = Date(12_000L),
+                customRealm = fixtureRealm,
+            )
+        }
+        assertEquals(9_000L, liveSettings()!!.lastSync.time, "another user's selection never advances this row's watermark")
+        withFixtureRealm { fixtureRealm ->
+            assertEquals(1L, fixtureRealm.where(SyncSettings::class.java).count(), "no row was fabricated for the other user either")
         }
 
         // Same scope: the bookkeeping advances ONLY the watermark, past the concurrent edit.
@@ -356,7 +403,7 @@ class SyncSettingsConsistencyTest {
     }
 
     @Test
-    @DisplayName("a stale-UI save over an already-enabled live row re-baselines the CURRENT generation; a pre-save request's epoch stays invalid")
+    @DisplayName("a stale-UI save over an already-enabled live row re-baselines the CURRENT generation; the captured pairing and the persisted settings agree")
     fun staleUiSaveOverALiveEnabledRowRebaselinesTheCurrentGeneration() {
         // The live row was re-enabled OUTSIDE this UI's snapshot (the fabricated-revival
         // shape): enabled at generation 1, while the pairing still carries generation 2.
@@ -398,9 +445,11 @@ class SyncSettingsConsistencyTest {
             pairing("content://fixture/consistency-reaffirm")!!.activationEpoch,
             "the re-affirmation re-baselines the pairing under the CURRENT generation",
         )
-        // A request issued BEFORE the save carries the pairing's pre-save generation.
-        val staleRequestEpoch = 2L
-
+        // A request issued BEFORE the save would carry the pairing's pre-save generation
+        // (2) and mismatch the persisted settings (1); the Main launch gate's epoch
+        // comparison refuses it, and that gate's own behavior is covered by the JVM
+        // PhotoTrashConsentUiQueueTest witness cases. This fixture verifies only the
+        // generation coherence that refusal relies on — nothing here executes the gate.
         withFixtureRealm { fixtureRealm ->
             UploadFile.setAppSyncSettings(savedObject, fixtureRealm)
         }
@@ -408,10 +457,10 @@ class SyncSettingsConsistencyTest {
         val finalSettings = liveSettings()!!
         assertEquals(1L, finalSettings.photoTrashActivationEpoch, "the save keeps the live generation (no fabricated bump)")
         assertTrue(finalSettings.photoTrashSyncEnabled)
-        assertEquals(1L, pairing("content://fixture/consistency-reaffirm")!!.activationEpoch)
-        assertTrue(
-            staleRequestEpoch != finalSettings.photoTrashActivationEpoch,
-            "the pre-save request's generation no longer matches the persisted settings: the launch gate refuses it",
+        assertEquals(
+            1L,
+            pairing("content://fixture/consistency-reaffirm")!!.activationEpoch,
+            "the captured pairing and the persisted settings share the CURRENT generation",
         )
     }
 }
