@@ -89,9 +89,12 @@ class OfflineFolderMaintenanceOrchestrationTest {
     private val context = ApplicationProvider.getApplicationContext<android.content.Context>()
     private val userDrive = UserDrive(userId = 951, driveId = 751)
     // The fixture marker: the ONLY drive name this class may write into the shared
-    // DriveInfos realm, part of the exact identity that collision detection and cleanup
-    // match on (see seedFixtureDriveInRealDrivesRealm's contract).
-    private val fixtureDriveMarker = "fixture-orchestration-drive-${userDrive.userId}-${userDrive.driveId}"
+    // DriveInfos realm, run-unique so cleanup can distinguish this run's row, and part
+    // of the exact identity its collision check and cleanup match on.
+    private val fixtureDriveRunMarker = "fixture-orchestration-drive-${userDrive.userId}-${userDrive.driveId}-" +
+        java.util.UUID.randomUUID().toString().substring(0, 8)
+    /** Whether THIS instance has committed a fixture insertion (cleanup's only gate). */
+    private var fixtureDriveOwned = false
     private val fileId = 900_401
     private val coveredFolderId = 800_401
     private val offlineRoot = JavaFile(
@@ -395,47 +398,40 @@ class OfflineFolderMaintenanceOrchestrationTest {
     }
 
     /**
-     * Seeds the fixture drive into the REAL shared DriveInfos realm so the maintenance
-     * walk's [DriveInfosController.getDrives] (and startSyncOffline's drive iteration)
-     * runs UNMOCKED — any collection-returning stub wedges MockK-Android advice
-     * recording (the device-f094 sixth-case StackOverflow; the 6f85 Gallery precedent).
+     * Seeds this run's fixture drive into the REAL shared DriveInfos realm so the walk's
+     * [DriveInfosController.getDrives] (and startSyncOffline's drive iteration) runs
+     * unmocked — this avoids the observed ArrayList-returning stub interception
+     * (device-f094; the 6f85 Gallery precedent; phase inferred, not marker-proven).
      *
-     * FIXTURE OWNERSHIP CONTRACT for the shared database:
-     *  - IDENTITY: a row is TEST-OWNED iff pk "${driveId}_${userId}" AND marker name
-     *    [fixtureDriveMarker] AND id/userId equal to [userDrive] — i.e. exactly what
-     *    this class inserts. A leftover of an earlier test or crashed run matches.
-     *  - ABSENCE BEFORE MUTATION: any OTHER drive for this synthetic userId (a real
-     *    account's row included) is a COLLISION: the seed FAILS WITHOUT CHANGING ANY
-     *    STATE, so foreign data is never walked and never deleted.
-     *  - SCOPED REPLACE: only the exact test-owned identity is deleted — a delete is
-     *    never scoped by the read query's fields alone.
-     *  - CLEANUP: [cleanupFixtureDriveInRealDrivesRealm] runs in @AfterEach on success
-     *    AND assertion failure. If a crash prevents teardown, the leftover row is
-     *    recognized by THIS seed on the next run (exact identity) and replaced; foreign
-     *    rows never match and are left alone.
+     * CONTRACT: check + insert in ONE write transaction — ANY pre-existing drive for the
+     * synthetic userId OR with the fixture pk is a COLLISION (including a crash-skipped
+     * leftover of an earlier run) and the seed refuses with NO mutation; it NEVER deletes
+     * or adopts pre-existing rows. Ownership is recorded only after the insert commits;
+     * cleanup (gated on it) deletes ONLY this run's exact row (pk + run-unique marker +
+     * id/userId). If a crash skips teardown, the next run REFUSES; recovery is an
+     * explicit orchestrator-owned delete of exactly (objectId=751_951, userId=951,
+     * name=this run's marker) after provenance/backup checks.
      */
     private fun seedFixtureDriveInRealDrivesRealm() {
         DriveInfosController.getRealmInstance().use { realm ->
-            // Absence BEFORE mutation: count the userId cohort that is NOT the exact
-            // fixture identity. No write has happened yet — a collision refuses cleanly.
-            val foreign = realm.where(Drive::class.java)
-                .equalTo(Drive::userId.name, userDrive.userId)
-                .findAll()
-                .count { it.objectId != fixtureDriveObjectId() || it.name != fixtureDriveMarker }
-            check(foreign == 0) {
-                "DriveInfos realm holds $foreign non-fixture drive(s) for synthetic userId " +
-                    "${userDrive.userId} — refusing to seed; NO state was changed"
-            }
+            // The reads see the write transaction's own fresh snapshot, so the refusal
+            // is atomic with the insertion (a collision throws -> Realm rolls back).
             realm.executeTransaction { transactionRealm ->
-                transactionRealm.where(Drive::class.java)
-                    .equalTo(Drive::objectId.name, fixtureDriveObjectId())
-                    .equalTo(Drive::name.name, fixtureDriveMarker)
-                    .equalTo(Drive::id.name, userDrive.driveId)
+                val cohortCount = transactionRealm.where(Drive::class.java)
                     .equalTo(Drive::userId.name, userDrive.userId)
-                    .findAll()
-                    .deleteAllFromRealm()
+                    .count()
+                val pkCount = transactionRealm.where(Drive::class.java)
+                    .equalTo(Drive::objectId.name, fixtureDriveObjectId())
+                    .count()
+                check(cohortCount == 0L && pkCount == 0L) {
+                    "DriveInfos collision: $cohortCount drive(s) for synthetic userId " +
+                        "${userDrive.userId}, $pkCount row(s) with fixture pk " +
+                        "${fixtureDriveObjectId()} — refusing to seed; NO state was changed " +
+                        "(a crash-leftover requires explicit orchestrator recovery)"
+                }
                 transactionRealm.copyToRealm(fixtureDrive())
             }
+            fixtureDriveOwned = true // only a COMMITTED insertion is owned
         }
     }
 
@@ -444,32 +440,29 @@ class OfflineFolderMaintenanceOrchestrationTest {
     private fun fixtureDrive() = Drive(objectId = fixtureDriveObjectId()).apply {
         id = userDrive.driveId
         userId = userDrive.userId
-        name = fixtureDriveMarker
+        name = fixtureDriveRunMarker
         sharedWithMe = false
     }
 
     /**
-     * Removes ONLY the exact test-owned fixture identity (pk + marker + id/userId all
-     * matching); a foreign row can never match. Called from @AfterEach on success and
-     * assertion failure. A cleanup failure is EVIDENCE (printed, never silent): the row
-     * remains and the next run's seed recognizes it by the exact identity.
+     * Removes only THIS run's exact committed row (pk + run-unique marker + id/userId);
+     * a no-op unless this instance committed an insertion. Failures propagate to JUnit
+     * (never silent); ownership resets only after the deletion commits.
      */
     private fun cleanupFixtureDriveInRealDrivesRealm() {
-        runCatching {
-            DriveInfosController.getRealmInstance().use { realm ->
-                realm.executeTransaction { transactionRealm ->
-                    transactionRealm.where(Drive::class.java)
-                        .equalTo(Drive::objectId.name, fixtureDriveObjectId())
-                        .equalTo(Drive::name.name, fixtureDriveMarker)
-                        .equalTo(Drive::id.name, userDrive.driveId)
-                        .equalTo(Drive::userId.name, userDrive.userId)
-                        .findAll()
-                        .deleteAllFromRealm()
-                }
+        if (!fixtureDriveOwned) return
+        DriveInfosController.getRealmInstance().use { realm ->
+            realm.executeTransaction { transactionRealm ->
+                transactionRealm.where(Drive::class.java)
+                    .equalTo(Drive::objectId.name, fixtureDriveObjectId())
+                    .equalTo(Drive::name.name, fixtureDriveRunMarker)
+                    .equalTo(Drive::id.name, userDrive.driveId)
+                    .equalTo(Drive::userId.name, userDrive.userId)
+                    .findAll()
+                    .deleteAllFromRealm()
             }
-        }.onFailure { failure ->
-            println("OfflineOrchestration fixture-drive cleanup failed: $failure")
         }
+        fixtureDriveOwned = false
     }
 
     /** Bounded row-state evidence for assertion messages: no content bytes, no account data. */
@@ -3935,10 +3928,12 @@ class OfflineFolderMaintenanceOrchestrationTest {
 
     @AfterEach
     fun tearDown() {
-        unmockkAll()
-        // Remove this class's fixture row from the shared DriveInfos realm on success
-        // AND assertion failure (exact test-owned identity only — see the helper's contract).
-        cleanupFixtureDriveInRealDrivesRealm()
+        try {
+            unmockkAll()
+        } finally {
+            // Runs even if unmockkAll fails; failures propagate to JUnit (never green).
+            cleanupFixtureDriveInRealDrivesRealm()
+        }
     }
 
     @AfterAll
