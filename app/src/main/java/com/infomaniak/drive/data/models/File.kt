@@ -324,9 +324,19 @@ open class File(
         return IOFile(folder, id.toString())
     }
 
-    fun deleteCaches(context: Context) {
-        if (isOffline) getOfflineFile(context)?.apply { if (exists()) delete() }
-        else getCacheFile(context).apply { if (exists()) delete() }
+    /**
+     * Deletes this row's stored bytes. Drive identity MUST flow into both paths:
+     * [getOfflineFile] derives the drive from the row but takes the USER from its
+     * argument (former default: the account), and [getCacheFile] takes the whole
+     * [UserDrive] (former default: the account) — without the explicit identity, a row
+     * deleted in a requested drive's realm had its bytes resolved against the device
+     * account (FileController.removeFile / deleteFileAndChildrenRec with an explicit
+     * userDrive). The [UserDrive]() default keeps the account behavior for callers
+     * without an explicit drive, byte-identical to the former signature.
+     */
+    fun deleteCaches(context: Context, userDrive: UserDrive = UserDrive()) {
+        if (isOffline) getOfflineFile(context, userDrive.userId)?.apply { if (exists()) delete() }
+        else getCacheFile(context, userDrive).apply { if (exists()) delete() }
     }
 
     private fun getPublicShareCache(context: Context): IOFile {

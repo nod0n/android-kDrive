@@ -363,7 +363,11 @@ object FileController {
                             if (freshRow != null) {
                                 val rootPreserved = OfflineFolderSyncUtils.isRootOwnedCopy(freshRow, realm, userDrive)
                                 if (!rootPreserved && !keepFileCaches.contains(fileId)) {
-                                    freshRow.deleteCaches(Realm.getApplicationContext()!!)
+                                    // The bytes follow the REQUESTED drive's identity, not the
+                                    // account defaults (device-5ea2 failure 5's realm routing,
+                                    // byte half): deleteCaches(context) alone resolved the
+                                    // offline user / cache drive from the account.
+                                    freshRow.deleteCaches(Realm.getApplicationContext()!!, userDrive)
                                 }
                                 if (!rootPreserved && !keepFiles.contains(fileId) && freshRow.isValid) {
                                     realm.executeTransaction { freshRow.deleteFromRealm() }
@@ -371,7 +375,8 @@ object FileController {
                             }
                         }
                     } else {
-                        if (!keepFileCaches.contains(fileId)) file.deleteCaches(Realm.getApplicationContext()!!)
+                        // Same byte-half of the realm routing: the bytes follow userDrive.
+                        if (!keepFileCaches.contains(fileId)) file.deleteCaches(Realm.getApplicationContext()!!, userDrive)
                         // Coordinated writer (row deletion — parent chains and coverage walks
                         // read these links): joins the commit authority.
                         if (!keepFiles.contains(fileId)) OfflineCommitAuthority.withCommitAuthority {
@@ -424,7 +429,9 @@ object FileController {
         val children = getFileByUidOrId(file.id, userDrive)?.children ?: emptyList()
 
         filesToDelete.addAll(children)
-        file.deleteCaches(context)
+        // The row operations here are drive-scoped; the byte deletion must be too (null
+        // keeps the account-default byte path, the former behavior for no-drive callers).
+        file.deleteCaches(context, userDrive ?: UserDrive())
         updateFile(file.id, realm, userDrive) { localFile -> localFile.deleteFromRealm() }
 
         deleteFileAndChildrenRec(filesToDelete, realm, userDrive, context)
