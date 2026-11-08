@@ -164,10 +164,23 @@ class OfflineFolderMaintenanceOrchestrationTest {
         bodyParkReached = java.util.concurrent.CountDownLatch(1)
         runCatching { Realm.deleteRealm(FileController.getRealmConfiguration(userDrive)) }
         runCatching { offlineRoot.deleteRecursively() }
+        // Per-case CACHE isolation (device-5ea2 failure 4): the offline root above does not
+        // cover the app-cache side, and several cases intentionally PRESERVE cache bytes at
+        // the fixture file id — a leftover intact cache made the covered initial download
+        // succeed through the cache-move with zero body fetches. Delete exactly THIS
+        // class's synthetic drive cache namespace (the same synthetic ids as offlineRoot;
+        // never a real account's cache tree).
+        runCatching { java.io.File(context.cacheDir, "cloud_storage/${userDrive.userId}/${userDrive.driveId}").deleteRecursively() }
 
         mockkObject(ApiRepository)
         mockkObject(AccountUtils)
         coEvery { AccountUtils.getHttpClient(any(), any(), any(), any()) } returns OkHttpClient()
+        // ACCOUNT-SEAM BOUNDARY (device-5ea2 failures 3/5): every default-realm resolution
+        // (UserDrive() -> AccountUtils.currentUserId/currentDriveId) must land in THIS
+        // fixture's realm, never in the device's real account realm. Deliberately varied
+        // cases stub their own seam explicitly.
+        every { AccountUtils.currentUserId } returns userDrive.userId
+        every { AccountUtils.currentDriveId } returns userDrive.driveId
         // The body transport is injected; staging, digest, atomic rename and the basis seam
         // below it stay REAL. saveRemoteData is deliberately NOT mocked.
         mockkObject(DownloadOfflineFileManager.Companion)
@@ -2595,12 +2608,8 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // withdrawal completes, and the pin commits afterwards, observing the completed
         // operation.
         seedCoveredPendingRow()
-        // The REAL setDirectlyPinned resolves its realm through the account seam
-        // (getRealmInstance() -> UserDrive() -> AccountUtils.currentUserId/currentDriveId):
-        // without these stubs the pin writer commits into the device's real account realm,
-        // not this fixture's kDrive-951-751.realm (device-5ea2 failure 3).
-        every { AccountUtils.currentUserId } returns userDrive.userId
-        every { AccountUtils.currentDriveId } returns userDrive.driveId
+        // (The account seam is bound to this fixture at the setUp boundary, so the REAL
+        // setDirectlyPinned below resolves THIS fixture's realm, not the device account's.)
         val writerAtEntry = java.util.concurrent.CountDownLatch(1)
         val writerCommitted = java.util.concurrent.CountDownLatch(1)
         var writerError: Throwable? = null
