@@ -1262,7 +1262,11 @@ class OfflineFolderMaintenanceOrchestrationTest {
             )
         }
         // The root cadence riding the same entry is out of scope here: its per-file refresh
-        // is covered by the other cases in this class.
+        // is covered by the other cases in this class. The object MUST be mocked before the
+        // coEvery records on it — otherwise the recording block executes the real suspend
+        // function with a matcher as its argument and the leftover any<Context>() matcher
+        // collides with the first intercepted AccountUtils call (device-5ea2 failure 9).
+        mockkObject(OfflineFolderSyncUtils)
         coEvery { OfflineFolderSyncUtils.syncOfflineFolderRoots(any()) } returns Unit
         every { AccountUtils.currentUserId } returns userDrive.userId
         every { AccountUtils.currentDriveId } returns userDrive.driveId
@@ -1316,7 +1320,16 @@ class OfflineFolderMaintenanceOrchestrationTest {
         check(offlineFile.setLastModified(1_700_000_000L * 1000)) { "the intact copy must carry the basis mtime" }
         lastAnswerBody.set(bodyV2) // must never be fetched
 
-        stubDetails(hash = "hash-pin", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong(), parentId = 800_501)
+        // CONSISTENT valid metadata (RESUME-caf1 item 2): the response's path must describe
+        // the row's actual location — the default Private/... path would rewrite the row to
+        // another directory and the intact copy would no longer stand at the row's location.
+        stubDetails(
+            hash = "hash-pin",
+            modifiedAtSec = 1_700_000_000L,
+            size = bodyV1.size.toLong(),
+            parentId = 800_501,
+            path = "Other/fixture-outside/fixture-orch.bin",
+        )
         val manager = coveredManager()
         val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
         manager.cleanLastDownloadedFile() // the finish-cleanup schedule for the same transfer
@@ -2582,6 +2595,12 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // withdrawal completes, and the pin commits afterwards, observing the completed
         // operation.
         seedCoveredPendingRow()
+        // The REAL setDirectlyPinned resolves its realm through the account seam
+        // (getRealmInstance() -> UserDrive() -> AccountUtils.currentUserId/currentDriveId):
+        // without these stubs the pin writer commits into the device's real account realm,
+        // not this fixture's kDrive-951-751.realm (device-5ea2 failure 3).
+        every { AccountUtils.currentUserId } returns userDrive.userId
+        every { AccountUtils.currentDriveId } returns userDrive.driveId
         val writerAtEntry = java.util.concurrent.CountDownLatch(1)
         val writerCommitted = java.util.concurrent.CountDownLatch(1)
         var writerError: Throwable? = null
@@ -3045,12 +3064,15 @@ class OfflineFolderMaintenanceOrchestrationTest {
         plainOfflineFile.parentFile?.mkdirs()
         plainOfflineFile.writeBytes(bodyV2)
         FileController.removeFile(plainRowId, recursive = false, remoteEviction = true, userDrive = userDrive)
-        assertNull(
-            FileController.getRealmInstance(userDrive).use { realm ->
-                realm.where(File::class.java).equalTo(File::id.name, plainRowId).findFirst()
-            },
-            "the uncovered row is evicted as before",
-        )
+        FileController.getRealmInstance(userDrive).use { realm ->
+            // The existence check runs INSIDE the live realm: a managed row returned out of
+            // the .use block is invalid after the close, and an invalidated object must
+            // never be readable as deletion evidence (device-5ea2 failure 5).
+            assertNull(
+                realm.where(File::class.java).equalTo(File::id.name, plainRowId).findFirst(),
+                "the uncovered row is evicted as before",
+            )
+        }
         assertFalse(plainOfflineFile.exists(), "the uncovered row's offline bytes are evicted as before (the baseline is retained)")
 
         // THE DEFAULT-FLAG CONTROL (a SYNTHETIC invocation — FHNW-9b3b F6): calling
@@ -3060,12 +3082,13 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // are the two provider routes, the shares replacement, the shared-with-me transplant
         // (its own baseline semantics) and the recursion.
         FileController.removeFile(fileId, userDrive = userDrive)
-        assertNull(
-            FileController.getRealmInstance(userDrive).use { realm ->
-                realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()
-            },
-            "the default-flag path still deletes the row (synthetic invocation, unchanged)",
-        )
+        FileController.getRealmInstance(userDrive).use { realm ->
+            // Same live-realm rule as the eviction control above (device-5ea2 failure 5).
+            assertNull(
+                realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst(),
+                "the default-flag path still deletes the row (synthetic invocation, unchanged)",
+            )
+        }
         assertFalse(offlineFile.exists(), "the default-flag path still deletes the offline bytes (synthetic invocation, unchanged)")
     }
 
@@ -3840,7 +3863,17 @@ class OfflineFolderMaintenanceOrchestrationTest {
         cacheFile.writeBytes(bodyV1)
         check(cacheFile.setLastModified(1_700_000_000L * 1000)) { "the cache bytes must be intact against the served metadata" }
         lastAnswerBody.set(bodyV2) // must never be fetched
-        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong(), parentId = 800_501)
+        // CONSISTENT valid metadata (RESUME-caf1 item 2): the response's path must describe
+        // the row's actual location — the default Private/... path would rewrite the row to
+        // another directory and the destination judgment would never see this row's own
+        // accepted copy at its recorded location (device-5ea2 failures 1/6).
+        stubDetails(
+            hash = "hash-1",
+            modifiedAtSec = 1_700_000_000L,
+            size = bodyV1.size.toLong(),
+            parentId = 800_501,
+            path = "Other/fixture-outside/fixture-orch.bin",
+        )
         val manager = coveredManager()
         val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
 
@@ -3904,7 +3937,17 @@ class OfflineFolderMaintenanceOrchestrationTest {
         cacheFile.writeBytes(bodyV1)
         check(cacheFile.setLastModified(1_700_000_000L * 1000)) { "the cache bytes must be intact against the served metadata" }
         lastAnswerBody.set(bodyV2) // must never be fetched
-        stubDetails(hash = "hash-1", modifiedAtSec = 1_700_000_000L, size = bodyV1.size.toLong(), parentId = 800_501)
+        // CONSISTENT valid metadata (RESUME-caf1 item 2): the response's path must describe
+        // the row's actual location — the default Private/... path would rewrite the row to
+        // another directory and the destination judgment would never see this row's own
+        // accepted copy at its recorded location (device-5ea2 failures 1/6).
+        stubDetails(
+            hash = "hash-1",
+            modifiedAtSec = 1_700_000_000L,
+            size = bodyV1.size.toLong(),
+            parentId = 800_501,
+            path = "Other/fixture-outside/fixture-orch.bin",
+        )
         val manager = coveredManager()
         val result = runBlocking { manager.execute(context, File(id = fileId, driveId = userDrive.driveId)) { _, _ -> } }
 
