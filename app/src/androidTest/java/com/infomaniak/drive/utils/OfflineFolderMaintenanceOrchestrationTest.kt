@@ -170,7 +170,17 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // succeed through the cache-move with zero body fetches. Delete exactly THIS
         // class's synthetic drive cache namespace (the same synthetic ids as offlineRoot;
         // never a real account's cache tree).
-        runCatching { java.io.File(context.cacheDir, "cloud_storage/${userDrive.userId}/${userDrive.driveId}").deleteRecursively() }
+        // Failed isolation must be VISIBLE before the case runs, never a silent
+        // reproduction of order contamination: the invariant is that the namespace does
+        // not exist when the case starts (the deletion outcome is carried in the message;
+        // a deletion that cannot complete fails the case here).
+        val fixtureCacheNamespace = JavaFile(context.cacheDir, "cloud_storage/${userDrive.userId}/${userDrive.driveId}")
+        val cacheIsolationOutcome = runCatching { fixtureCacheNamespace.deleteRecursively() }
+        check(!fixtureCacheNamespace.exists()) {
+            "per-case cache isolation failed: ${fixtureCacheNamespace.path} still exists after the " +
+                "cleanup attempt (deleteRecursively -> ${cacheIsolationOutcome.getOrNull()}); " +
+                "refusing to run over order contamination"
+        }
 
         mockkObject(ApiRepository)
         mockkObject(AccountUtils)
@@ -3971,6 +3981,138 @@ class OfflineFolderMaintenanceOrchestrationTest {
             assertEquals(1_700_000_000L, row.offlineBasisModifiedAt, "the basis stands")
             assertEquals(sha256Hex(bodyV1), row.offlineContentDigest, "the digest describes the published bytes")
             assertNull(row.serverContentHash, "the cache-move's record stores an UNKNOWN identity (cache bytes are unproven against the remote)")
+        }
+    }
+
+    @Test
+    @DisplayName("removeFile's byte deletion follows the requested drive identity, not the account defaults")
+    fun removeFileByteDeletionFollowsTheRequestedDriveNotTheDefaultAccount() {
+        // FHNW (c8dfe review): removeFile resolves its ROW in the requested drive's realm,
+        // but its two byte-deletion paths called deleteCaches(context) with no drive
+        // identity — getOfflineFile defaults the USER to the account and getCacheFile
+        // defaults the whole UserDrive to the account. The account seam therefore decides
+        // whose bytes are destroyed. This case runs with an explicitly DIFFERENT synthetic
+        // account (952/752) than the target drive (951/751) and owns sentinel bytes in the
+        // alternate namespaces — the exact paths the former bug resolved and deleted.
+        // Coverage: phase A = default path x cache branch, phase B = remoteEviction path x
+        // offline branch (both call sites and both branches of deleteCaches; the other two
+        // combinations run through the same helper resolution).
+        val alternateUserId = 952
+        val alternateDriveId = 752
+        val alternateSentinelBytes = "alternate-account-sentinel".toByteArray()
+
+        // The alternate namespaces are covered by NO class-level cleanup, so every path
+        // this case creates is REFUSED if it pre-exists (foreign state — synthetic ids are
+        // not proof of ownership) and cleaned in the finally below, never silently.
+        val targetCachePath = JavaFile(context.cacheDir, "cloud_storage/${userDrive.userId}/${userDrive.driveId}/$fileId")
+        val alternateCacheSentinel = JavaFile(context.cacheDir, "cloud_storage/$alternateUserId/$alternateDriveId/$fileId")
+        val targetOfflinePath = JavaFile(File.getOfflineFolder(context), "${userDrive.userId}/${userDrive.driveId}/Private/fixture-orch.bin")
+        val alternateOfflineSentinel = JavaFile(
+            File.getOfflineFolder(context),
+            "$alternateUserId/${userDrive.driveId}/Private/fixture-orch.bin", // the former bug: user from the account stub, drive from the row
+        )
+        check(!targetCachePath.exists() && !alternateCacheSentinel.exists() && !targetOfflinePath.exists() && !alternateOfflineSentinel.exists()) {
+            "fixture collision: a byte path this case owns already exists " +
+                "(targetCache=${targetCachePath.exists()}, alternateCache=${alternateCacheSentinel.exists()}, " +
+                "targetOffline=${targetOfflinePath.exists()}, alternateOffline=${alternateOfflineSentinel.exists()}) — refusing; NO state changed"
+        }
+
+        // Deliberately varied case: the ACCOUNT defaults point at the alternate synthetic
+        // identity for the whole case — only the explicit userDrive names the target.
+        every { AccountUtils.currentUserId } returns alternateUserId
+        every { AccountUtils.currentDriveId } returns alternateDriveId
+
+        fun seedPlainRow(isOffline: Boolean) {
+            FileController.getRealmInstance(userDrive).use { realm ->
+                realm.executeTransaction { transactionRealm ->
+                    transactionRealm.createObject(File::class.java, "${fileId}_${userDrive.driveId}").apply {
+                        id = fileId
+                        driveId = userDrive.driveId
+                        name = "fixture-orch.bin"
+                        path = "Private/fixture-orch.bin"
+                        type = "file"
+                        lastModifiedAt = 1_700_000_000L
+                        isFromUploads = false
+                        this.isOffline = isOffline
+                    }
+                }
+            }
+        }
+
+        var phaseFailure: Throwable? = null
+        try {
+            // ---- Phase A: DEFAULT path x CACHE branch --------------------------------
+            seedPlainRow(isOffline = false)
+            val targetCacheFile = File(id = fileId, driveId = userDrive.driveId).getCacheFile(context, userDrive)
+            targetCacheFile.parentFile?.mkdirs()
+            targetCacheFile.writeBytes(bodyV1)
+            check(targetCacheFile.exists()) { "the target cache bytes must exist before removeFile" }
+            alternateCacheSentinel.parentFile?.mkdirs()
+            alternateCacheSentinel.writeBytes(alternateSentinelBytes)
+            check(alternateCacheSentinel.exists()) { "the alternate-account sentinel must exist before removeFile" }
+
+            FileController.removeFile(fileId, recursive = false, userDrive = userDrive)
+
+            assertFalse(targetCacheFile.exists(), "the requested drive's cache bytes were deleted")
+            assertTrue(
+                alternateCacheSentinel.exists() && alternateCacheSentinel.readBytes().contentEquals(alternateSentinelBytes),
+                "the alternate account's sentinel bytes remain (the account defaults never decide the byte path)",
+            )
+            FileController.getRealmInstance(userDrive).use { realm ->
+                assertNull(realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst(), "the row was removed with its bytes")
+            }
+
+            // ---- Phase B: remoteEviction path x OFFLINE branch -----------------------
+            seedPlainRow(isOffline = true)
+            val targetOfflineFile = getOfflineFixtureFile() // the real getOfflineFile derivation off the seeded row
+            targetOfflineFile.parentFile?.mkdirs()
+            targetOfflineFile.writeBytes(bodyV1)
+            check(targetOfflineFile.exists()) { "the target offline bytes must exist before removeFile" }
+            alternateOfflineSentinel.parentFile?.mkdirs()
+            alternateOfflineSentinel.writeBytes(alternateSentinelBytes)
+            check(alternateOfflineSentinel.exists()) { "the alternate-user sentinel must exist before removeFile" }
+
+            // A PLAIN row (no registry row, no claim, no pin): the root-preservation guard
+            // does not hold it, so the eviction reaches the byte deletion.
+            FileController.removeFile(fileId, recursive = false, remoteEviction = true, userDrive = userDrive)
+
+            assertFalse(targetOfflineFile.exists(), "the requested drive's offline bytes were deleted")
+            assertTrue(
+                alternateOfflineSentinel.exists() && alternateOfflineSentinel.readBytes().contentEquals(alternateSentinelBytes),
+                "the alternate user's sentinel bytes remain (getOfflineFile's user argument decides, not the account)",
+            )
+            FileController.getRealmInstance(userDrive).use { realm ->
+                assertNull(realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst(), "the evicted row is gone")
+            }
+        } catch (first: Throwable) {
+            phaseFailure = first
+        } finally {
+            // Delete exactly the paths this case created (each refused-if-preexisting):
+            // the alternate sentinels are covered by NO class-level cleanup, so failures
+            // propagate — a leftover makes the NEXT run refuse loudly instead of silently
+            // persisting. A phase failure takes precedence, with the cleanup outcome
+            // suppressed onto it (cleanup must never mask the evidence).
+            val cleanupOutcome = runCatching {
+                targetCachePath.delete()
+                alternateCacheSentinel.delete()
+                targetOfflinePath.delete()
+                alternateOfflineSentinel.delete()
+                check(!targetCachePath.exists() && !alternateCacheSentinel.exists() && !targetOfflinePath.exists() && !alternateOfflineSentinel.exists()) {
+                    "sentinel cleanup left bytes behind"
+                }
+                // The directories this run created (mkdirs side effects): File.delete()
+                // only removes EMPTY directories, so foreign data is structurally untouched.
+                alternateOfflineSentinel.parentFile?.delete()
+                alternateOfflineSentinel.parentFile?.parentFile?.delete()
+                alternateOfflineSentinel.parentFile?.parentFile?.parentFile?.delete()
+                alternateCacheSentinel.parentFile?.delete()
+                alternateCacheSentinel.parentFile?.parentFile?.delete()
+            }.exceptionOrNull()
+            phaseFailure?.let { failure ->
+                cleanupOutcome?.let(failure::addSuppressed)
+                throw failure
+            }
+            cleanupOutcome?.let { throw it }
         }
     }
 
