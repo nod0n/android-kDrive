@@ -629,6 +629,12 @@ class CloudStorageProviderTest {
         provider = CloudStorageProvider()
         provider.attachInfo(state.fixtureContext, ProviderInfo().apply {
             authority = appContext.getString(R.string.CLOUD_STORAGE_AUTHORITY)
+            // Mirror production manifest requirements so real
+            // DocumentsProvider.attachInfo runs its checks.
+            exported = true
+            grantUriPermissions = true
+            readPermission = android.Manifest.permission.MANAGE_DOCUMENTS
+            writePermission = android.Manifest.permission.MANAGE_DOCUMENTS
         })
         setProviderDisabled(false)
         seedFileRealm()
