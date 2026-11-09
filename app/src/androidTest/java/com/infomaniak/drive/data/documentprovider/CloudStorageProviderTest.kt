@@ -722,18 +722,36 @@ class CloudStorageProviderTest {
             }
         }
         checked("delete owned fixture preferences") {
+            // Synchronous flush barrier (android-15 framework source): the provider
+            // setter writes via apply(), whose disk write is queued, and
+            // deleteSharedPreferences does not wait for queued writes — one flushing
+            // late could recreate the deleted file. A no-op commit() blocks until all
+            // outstanding async writes for this instance are on disk before returning.
+            // Grounded in the framework source; not asserted as this fixture's
+            // historical cause.
+            val flushed = appContext
+                .getSharedPreferences(state.fixturePrefsName(PROVIDER_PREFS_NAME), Context.MODE_PRIVATE)
+                .edit()
+                .commit()
+            check(flushed) {
+                "owned fixture preferences flush barrier failed (commit=false) — deletion skipped, file preserved"
+            }
             val deleted = appContext.deleteSharedPreferences(state.fixturePrefsName(PROVIDER_PREFS_NAME))
             // Verify the resulting state on the real filesystem (the standard
             // dataDir/shared_prefs layout — the per-case UNIQUE name is the only
             // isolation SharedPreferences offers) instead of trusting only the API's
             // return value: a file this case never created is legitimately absent; one
-            // that still exists after the call is a failed deletion.
+            // that still exists after the call is a failed deletion. The XML and its
+            // write-time backup (.bak) are both checked: deleteSharedPreferences
+            // removes both, so either one lingering is a failed deletion.
             val prefsFile = PlatformFile(
                 appContext.applicationInfo.dataDir,
                 "shared_prefs/${state.fixturePrefsName(PROVIDER_PREFS_NAME)}.xml",
             )
-            check(!prefsFile.exists()) {
-                "owned fixture preferences not removable (deleteSharedPreferences=$deleted): $prefsFile"
+            val prefsBackupFile = PlatformFile(prefsFile.path + ".bak")
+            check(!prefsFile.exists() && !prefsBackupFile.exists()) {
+                "owned fixture preferences not removable (deleteSharedPreferences=$deleted): " +
+                    "$prefsFile / $prefsBackupFile"
             }
         }
 
