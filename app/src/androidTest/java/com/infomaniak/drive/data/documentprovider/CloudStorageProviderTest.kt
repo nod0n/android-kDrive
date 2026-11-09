@@ -33,6 +33,7 @@ import androidx.work.Data
 import com.infomaniak.core.sentry.SentryLog
 import com.infomaniak.drive.R
 import com.infomaniak.drive.data.cache.DriveInfosController
+import com.infomaniak.drive.data.cache.DriveMigration
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FileMigration
 import com.infomaniak.drive.data.models.AppSettings
@@ -153,8 +154,11 @@ import java.util.concurrent.atomic.AtomicInteger
  *   app's default Realm directory and has no test-only location seam (blocker +
  *   smallest production seam option recorded for the orchestrator). The provider's
  *   per-call re-read and the whole access policy stay real.
- * - [DriveInfosController.getDrives]: drive-metadata input, mocked empty so root
- *   listing never opens the real DriveInfos cache.
+ * - [DriveInfosController.getRealmInstance]: the controller's only realm-open path,
+ *   stubbed to a REAL empty drive-info Realm owned by the live case; the real
+ *   getDrives body reads it, so root listing never opens the real DriveInfos cache
+ *   and getDrives itself stays unrecorded (MockK's recording placeholder for a
+ *   concrete java.util collection return redefines the ArrayList chain on this agent).
  * - [SyncUtils.syncImmediately]: the scheduler effect is captured (counted,
  *   thread-safe) at this seam. The app's WorkManager is already initialized in-process
  *   by the default initializer, so a test driver cannot be installed; capturing the
@@ -342,7 +346,15 @@ class CloudStorageProviderTest {
             }
 
             mockkObject(DriveInfosController)
-            every { DriveInfosController.getDrives(any(), any()) } returns arrayListOf<Drive>()
+            // Drive-metadata input: the REAL getDrives body runs against a REAL empty
+            // drive-info Realm owned by the live case; getRealmInstance is the
+            // controller's only realm-open path, so this one seam captures all of its
+            // storage. getDrives is deliberately left unrecorded — MockK's recording
+            // placeholder for a concrete java.util collection return redefines the
+            // ArrayList class chain on this agent (the recorded 4daa failure).
+            every { DriveInfosController.getRealmInstance() } answers {
+                Realm.getInstance(driveInfosFixtureConfig(currentCase.ownedRoot))
+            }
 
             mockkObject(SyncUtils)
             every {
@@ -481,6 +493,16 @@ class CloudStorageProviderTest {
             .migration(UploadMigration())
             .modules(RealmModules.SyncFilesModule())
             .name("Sync.realm")
+            .directory(root)
+            .build()
+
+        /** Mirrors [DriveInfosController]'s production DrivesInfos.realm configuration,
+         *  owned directory. */
+        private fun driveInfosFixtureConfig(root: IOFile): RealmConfiguration = RealmConfiguration.Builder()
+            .schemaVersion(DriveMigration.DB_VERSION)
+            .migration(DriveMigration())
+            .modules(RealmModules.DriveFilesModule())
+            .name("DrivesInfos.realm")
             .directory(root)
             .build()
 
@@ -664,7 +686,10 @@ class CloudStorageProviderTest {
         // touch a preserved root: they create their own exclusively created unique roots.
         var allOwnedRealmsDeleted = true
         if (state.hasOwnedRoot) {
-            (fileFixtureConfigs.values + syncFixtureConfig(state.ownedRoot)).forEach { config ->
+            val ownedRealmConfigs = fileFixtureConfigs.values +
+                syncFixtureConfig(state.ownedRoot) +
+                driveInfosFixtureConfig(state.ownedRoot)
+            ownedRealmConfigs.forEach { config ->
                 val realmFile = PlatformFile(config.path)
                 checked("delete owned fixture realm ${realmFile.name}") {
                     try {
@@ -867,7 +892,8 @@ class CloudStorageProviderTest {
     @Test
     fun searchWithoutABrowsedDriveParentReportsTheRealContractError() {
         // Order-independence: perform one real root query first so the provider's
-        // browsed-parent state points at a root id (DriveInfos are a mocked empty input),
+        // browsed-parent state points at a root id (DriveInfos are the real empty owned
+        // drive-info Realm input),
         // then assert the real contract error for a search without a browsed drive.
         provider.queryChildDocuments(rootDocId(), null as Array<out String>?, null as String?).use { }
         provider.querySearchDocuments(rootDocId(), "query", null).use { cursor ->
@@ -917,8 +943,8 @@ class CloudStorageProviderTest {
         // production-seam option (an injectable exception boundary around the fill
         // launch, or an injectable offline branch gate) is recorded for the orchestrator.
         provider.queryChildDocuments(rootDocId(), null as Array<out String>?, null as String?).use { cursor ->
-            // DriveInfos are a mocked empty input: no drive rows, only the two virtual
-            // containers the provider itself adds, synchronously.
+            // DriveInfos are the real empty owned drive-info Realm: no drive rows, only
+            // the two virtual containers the provider itself adds, synchronously.
             assertEquals(2, cursor.count)
             assertTrue(cursor.extras?.getBoolean(DocumentsContract.EXTRA_LOADING) == true)
             assertEquals(
