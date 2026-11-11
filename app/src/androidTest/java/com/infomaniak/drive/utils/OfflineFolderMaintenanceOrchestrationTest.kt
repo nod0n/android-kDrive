@@ -146,6 +146,13 @@ class OfflineFolderMaintenanceOrchestrationTest {
     /** Counted down by the transport stub at the moment the park begins (cancellable delay). */
     private var bodyParkReached = java.util.concurrent.CountDownLatch(1)
 
+    /** The fixture folder ids of bulk enqueues this class intercepted (see the
+     *  WORKMANAGER SEAM BOUNDARY note in setUp): recorded instead of reaching the
+     *  global WorkManager.  Zero after a run means the production path never
+     *  tried to enqueue; a nonzero list is visible fixture-owned evidence. */
+    private val recordedBulkEnqueues = java.util.Collections.synchronizedList(
+        mutableListOf<Int>())
+
     @BeforeAll
     fun initRealm() {
         Realm.init(context)
@@ -207,6 +214,23 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 delay(45_000) // cancellable: the cancellation case cancels the worker mid-park
             }
             fakeBodyResponse(lastAnswerBody.get())
+        }
+        recordedBulkEnqueues.clear()
+        // WORKMANAGER SEAM BOUNDARY (REMAINING68 device-20261111): the REAL
+        // markFolderOffline path enqueues BulkDownloadWorker through the GLOBAL
+        // WorkManager under the PRODUCTION unique name with APPEND_OR_REPLACE
+        // (OfflineFolderSyncUtils.kt:397 -> Utils.kt:439).  The async in-process
+        // worker's finish clears covered rows' pending markers
+        // (BulkDownloadWorker.kt:78), which raced this class's assertion windows
+        // (the 2026-11-11 device run's sameRowClaim failure: claim kept at :3659,
+        // pending marker read false at :3660) and left two SUCCEEDED fixture rows
+        // in the production workdb.  This class exercises the REAL bulk worker
+        // DIRECTLY (the TestListenableWorkerBuilder cases); the incidental global
+        // enqueue is intercepted here — recorded, never executed — so mark/unmark/
+        // walk/pass stay fully real while NO fixture work reaches the shared queue.
+        mockkObject(Utils)
+        every { Utils.enqueueBulkDownloadWorker(any(), any(), any()) } answers {
+            recordedBulkEnqueues.add(firstArg())
         }
     }
 
