@@ -567,6 +567,7 @@ object PhotoTrashController {
      * catch-up. Returns the number of propagated trashes.
      */
     suspend fun runLocalReconciliation(context: Context, customRealmConfig: RealmConfiguration? = null): Int = withContext(Dispatchers.IO) {
+        val passScope = AccountUtils.captureCurrentScope()
         val settingsAtStart = UploadFile.getAppSyncSettings()
         if (settingsAtStart?.photoTrashSyncEnabled != true) return@withContext 0
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@withContext 0
@@ -576,7 +577,7 @@ object PhotoTrashController {
         val passEpoch = settingsAtStart.photoTrashActivationEpoch
 
         var propagated = 0
-        val okHttpClient = AccountUtils.getHttpClient(AccountUtils.currentUserId, null)
+        val okHttpClient = AccountUtils.getHttpClient(passScope.userId, null)
         getPairings(customRealmConfig).forEach { pairing ->
             ensureActive()
             ensurePairingBaseline(context, pairing, passEpoch, customRealmConfig)
@@ -630,21 +631,42 @@ object PhotoTrashController {
                             val settingsNow = UploadFile.getAppSyncSettings()
                             val stillAuthorized = settingsNow?.photoTrashSyncEnabled == true &&
                                 settingsNow.photoTrashActivationEpoch == passEpoch &&
-                                pairing.userId == AccountUtils.currentUserId
+                                pairing.userId == passScope.userId
+                            val bindingAtRead = bindingGeneration(pairing.uri)
                             val liveRowUnchanged = withPairingRealm(customRealmConfig) { realm ->
+                                realm.refresh()
                                 realm.where(PhotoPairing::class.java)
                                     .equalTo(PhotoPairing::uri.name, pairing.uri)
                                     .findFirst()?.stillIs(pairing) ?: false
                             }
                             val remoteFile = remote.file
-                            when {
-                                !stillAuthorized || !liveRowUnchanged -> return@withContext propagated
-                                remoteFile == null -> markInconclusive(pairing, customRealmConfig)
-                                ApiRepository.deleteFile(remoteFile).isSuccess() -> {
+                            if (!stillAuthorized || !liveRowUnchanged) return@withContext propagated
+                            if (remoteFile == null) {
+                                markInconclusive(pairing, customRealmConfig)
+                            } else {
+                                val result = ApiRepository.trashPairedPhoto(remoteFile, okHttpClient) { enqueue ->
+                                    AccountUtils.withCurrentScope {
+                                        if (passScope != AccountUtils.captureCurrentScope() || !tryBeginLaunchSection()) {
+                                            false
+                                        } else try {
+                                            val witness = captureLaunchWitness(pairing.uri)
+                                            val activation = witness.activationSnapshot
+                                            if (!witness.activationSettled || !witness.bindingSettled ||
+                                                witness.bindingGeneration != bindingAtRead ||
+                                                activation == null || activation.userId != pairing.userId || !activation.optIn ||
+                                                activation.activationEpoch != passEpoch || pairing.activationEpoch != passEpoch
+                                            ) false else enqueue()
+                                        } finally {
+                                            endLaunchSection()
+                                        }
+                                    }
+                                } ?: return@withContext propagated
+                                if (result.isSuccess()) {
                                     markLocalTrashReconciled(pairing, observedTrashed = true, customRealmConfig = customRealmConfig)
                                     propagated++
+                                } else {
+                                    markInconclusive(pairing, customRealmConfig)
                                 }
-                                else -> markInconclusive(pairing, customRealmConfig)
                             }
                         }
                     }

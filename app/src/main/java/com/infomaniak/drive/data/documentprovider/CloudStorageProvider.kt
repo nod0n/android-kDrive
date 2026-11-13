@@ -290,15 +290,11 @@ class CloudStorageProvider : DocumentsProvider() {
             }
             isSharedWithMeFolder -> {
                 runOnPlatformAdaptively(cursor.job) {
-                    FileController.getRealmInstance(userDrive).use { realm ->
-                        FolderFilesProvider.getCloudStorageFiles(
-                            realm = realm,
-                            folderId = Utils.ROOT_ID,
-                            userDrive = UserDrive(AccountUtils.currentUserId, AccountUtils.currentDriveId, sharedWithMe = true),
-                            sortType = sortType,
-                            transaction = cursor.addFiles(parentDocumentId, uri, isSharedWithMeFolder = true)
-                        )
-                    }
+                    loadSharedWithMeChildren(
+                        parentDocumentId,
+                        sortType,
+                        cursor.addFiles(parentDocumentId, uri, isSharedWithMeFolder = true),
+                    )
                 }
             }
             isMySharesDrive -> cursor.addRootDrives(userId, MY_SHARES_FOLDER_ID)
@@ -328,6 +324,17 @@ class CloudStorageProvider : DocumentsProvider() {
         cursor.extras = bundleOf(DocumentsContract.EXTRA_LOADING to true)
         cursor.setNotificationUri(context?.contentResolver, uri)
         return cursor
+    }
+
+    internal fun loadSharedWithMeChildren(
+        parentDocumentId: String,
+        sortType: File.SortType,
+        transaction: (ArrayList<File>) -> Unit,
+    ) {
+        val userDrive = createUserDrive(parentDocumentId)
+        FileController.getRealmInstance(userDrive).use { realm ->
+            FolderFilesProvider.getCloudStorageFiles(realm, Utils.ROOT_ID, userDrive, sortType, transaction = transaction)
+        }
     }
 
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
@@ -614,14 +621,17 @@ class CloudStorageProvider : DocumentsProvider() {
         SentryLog.d(TAG, "copyDocument(), sourceId=$sourceDocumentId, targetParentId=$targetParentDocumentId")
         ensureExternalAccessAllowed()
 
-        return FileController.getRealmInstance(createUserDrive(sourceDocumentId)).use { realm ->
+        val userDrive = requireSameMutationScope(sourceDocumentId, targetParentDocumentId)
+        return FileController.getRealmInstance(userDrive).use { realm ->
 
             val fileId = getFileIdFromDocumentId(sourceDocumentId)
             val file =
-                FileController.getFileProxyById(fileId, customRealm = realm) ?: throw IllegalStateException("File not found")
+                mutationFile(realm, fileId, userDrive) ?: throw IllegalStateException("File not found")
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
+            mutationFile(realm, targetParentFileId, userDrive) ?: throw IllegalStateException("Target folder not found")
 
-            val apiResponse = ApiRepository.duplicateFile(file, targetParentFileId)
+            val client = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+            val apiResponse = ApiRepository.duplicateFile(file, targetParentFileId, client)
 
             if (apiResponse.isSuccess()) {
 
@@ -648,19 +658,23 @@ class CloudStorageProvider : DocumentsProvider() {
         )
         ensureExternalAccessAllowed()
 
-        val userDrive = createUserDrive(sourceDocumentId)
+        val userDrive = requireSameMutationScope(sourceDocumentId, sourceParentDocumentId, targetParentDocumentId)
         return FileController.getRealmInstance(userDrive).use { realm ->
 
             val fileNotFoundException = IllegalStateException("File not found")
 
             val fileId = getFileIdFromDocumentId(sourceDocumentId)
-            val file = FileController.getFileProxyById(fileId, customRealm = realm) ?: throw fileNotFoundException
+            val file = mutationFile(realm, fileId, userDrive) ?: throw fileNotFoundException
+            if (file.parentId != getFileIdFromDocumentId(sourceParentDocumentId)) {
+                throw SecurityException("The source parent does not match the document")
+            }
 
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
             val targetParentFile =
-                FileController.getFileProxyById(targetParentFileId, customRealm = realm) ?: throw fileNotFoundException
+                mutationFile(realm, targetParentFileId, userDrive) ?: throw fileNotFoundException
 
-            val apiResponse = ApiRepository.moveFile(file, targetParentFile)
+            val client = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+            val apiResponse = ApiRepository.moveFile(file, targetParentFile, client)
 
             if (apiResponse.isSuccess()) {
                 // FHNW-33dd item 1: the row delete is a PREDICATE writer — it must never
@@ -694,6 +708,19 @@ class CloudStorageProvider : DocumentsProvider() {
             }
         }
     }
+
+    private fun requireSameMutationScope(source: String, vararg otherDocuments: String): UserDrive {
+        val scope = createUserDrive(source)
+        if (otherDocuments.any { createUserDrive(it) != scope }) {
+            throw SecurityException("Cross-scope document mutations are unavailable")
+        }
+        return scope
+    }
+
+    private fun mutationFile(realm: Realm, fileId: Int, scope: UserDrive): File? = realm.where(File::class.java)
+        .equalTo(File::id.name, fileId)
+        .equalTo(File::driveId.name, scope.driveId)
+        .findFirst()
 
     private fun createNewFolder(parentDocumentId: String, displayName: String): String {
 

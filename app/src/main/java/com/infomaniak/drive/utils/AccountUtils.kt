@@ -78,15 +78,40 @@ object AccountUtils : CredentialManager(
         Sentry.setUser(io.sentry.protocol.User().apply { id = currentUserId.toString() })
     }
 
+    private val currentScopeLock = Any()
+    private var scopeRevision = 0L
+
+    internal data class CurrentScope(val userId: Int, val driveId: Int, val revision: Long)
+
+    internal fun <T> withCurrentScope(block: () -> T): T = synchronized(currentScopeLock, block)
+
+    internal fun updateCurrentScope(change: () -> Boolean) = withCurrentScope {
+        if (change()) scopeRevision++
+    }
+
+    internal fun captureCurrentScope(): CurrentScope = withCurrentScope {
+        CurrentScope(currentUserId, currentDriveId, scopeRevision)
+    }
+
+    @Volatile
     override var currentUserId: Int = AppSettings.getAppSettings()._currentUserId
         set(userId) {
-            field = userId
+            updateCurrentScope {
+                val changed = field != userId
+                field = userId
+                changed
+            }
             AppSettings.updateAppSettings(scope) { if (isValid) _currentUserId = userId }
         }
 
+    @Volatile
     var currentDriveId: Int = AppSettings.getAppSettings()._currentDriveId
         set(driveId) {
-            field = driveId
+            updateCurrentScope {
+                val changed = field != driveId
+                field = driveId
+                changed
+            }
             AppSettings.updateAppSettings(scope) { if (isValid) _currentDriveId = driveId }
         }
 

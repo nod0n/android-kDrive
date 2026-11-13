@@ -66,6 +66,13 @@ import com.infomaniak.drive.data.models.upload.UploadSession.StartUploadSession
 import com.infomaniak.drive.data.models.upload.ValidChunks
 import com.infomaniak.drive.utils.AccountUtils
 import okhttp3.OkHttpClient
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Response
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import java.io.IOException
+import kotlin.coroutines.resumeWithException
 import java.util.Date
 import com.infomaniak.core.ksuite.myksuite.ui.network.ApiRoutes as MyKSuiteApiRoutes
 
@@ -304,6 +311,44 @@ object ApiRepository : ApiRepositoryCore() {
         return callApi(ApiRoutes.fileURLV2(file), DELETE)
     }
 
+    /** Photo-only dispatch: the authorization section invokes enqueue itself, never a later caller. */
+    internal suspend fun trashPairedPhoto(
+        file: File,
+        okHttpClient: OkHttpClient,
+        enqueueIfAuthorized: (() -> Boolean) -> Boolean,
+    ): ApiResponse<CancellableAction>? {
+        return try {
+            val call = okHttpClient.newCall(
+                ApiController.createRequest(ApiRoutes.fileURLV2(file), DELETE, ApiController.generateRequestBody(null)),
+            )
+            val response = suspendCancellableCoroutine<Response?> { continuation ->
+                continuation.invokeOnCancellation { call.cancel() }
+                val callback = object : Callback {
+                    override fun onFailure(call: Call, e: IOException) = continuation.resumeWithException(e)
+                    override fun onResponse(call: Call, response: Response) {
+                        continuation.resume(response) { _, value, _ -> value?.close() }
+                    }
+                }
+                val dispatched = enqueueIfAuthorized {
+                    if (!continuation.isActive) false else {
+                        call.enqueue(callback)
+                        true
+                    }
+                }
+                if (!dispatched) continuation.resume(null) { _, _, _ -> }
+            } ?: return null
+            // The dispatch section has ended before any response body is read or parsed.
+            response.use {
+                if (!it.isSuccessful) ApiResponse(result = ApiResponseStatus.ERROR)
+                else ApiController.createApiResponse(false, it.body.string(), it.headers)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            ApiResponse(result = ApiResponseStatus.ERROR)
+        }
+    }
+
     fun renameFile(file: File, newName: String): ApiResponse<CancellableAction> {
         return callApi(ApiRoutes.renameFile(file), POST, mapOf("name" to newName))
     }
@@ -312,8 +357,12 @@ object ApiRepository : ApiRepositoryCore() {
         return callApi(ApiRoutes.updateFolderColor(file), POST, mapOf("color" to color))
     }
 
-    fun duplicateFile(file: File, destinationId: Int): ApiResponse<File> {
-        return callApi(ApiRoutes.duplicateFile(file, destinationId), POST)
+    fun duplicateFile(
+        file: File,
+        destinationId: Int,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<File> {
+        return callApi(ApiRoutes.duplicateFile(file, destinationId), POST, okHttpClient = okHttpClient)
     }
 
     fun copyFileToAnotherDrive(
@@ -330,8 +379,12 @@ object ApiRepository : ApiRepositoryCore() {
         return callApi(ApiRoutes.importKDrive(destinationDriveId), POST, body)
     }
 
-    fun moveFile(file: File, newParent: File): ApiResponse<CancellableAction> {
-        return callApi(ApiRoutes.moveFile(file, newParent.id), POST)
+    fun moveFile(
+        file: File,
+        newParent: File,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<CancellableAction> {
+        return callApi(ApiRoutes.moveFile(file, newParent.id), POST, okHttpClient = okHttpClient)
     }
 
     fun getFileShare(okHttpClient: OkHttpClient, file: File): ApiResponse<Share> {

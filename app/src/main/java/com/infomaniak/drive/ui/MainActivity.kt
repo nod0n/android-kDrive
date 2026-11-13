@@ -536,44 +536,46 @@ class MainActivity : BaseActivity() {
                 }
                 .getOrDefault(false)
             withContext(Dispatchers.Main) {
-                if (!stillPending) {
-                    photoTrashConsentQueue.onValidationFailed()
-                    drainPhotoTrashConsentsOnMain() // the request expired: surface the next one
-                    return@withContext
-                }
-                if (!PhotoTrashController.tryBeginLaunchSection()) {
-                    photoTrashConsentQueue.onValidationFailed()
-                    return@withContext
-                }
-                try {
-                    if (!PhotoTrashConsentUiQueue.launchAllowedNow(
-                            request = request,
-                            currentUserId = AccountUtils.currentUserId,
-                            activationWitness = PhotoTrashController.captureLaunchWitness(request.uri),
-                            lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
-                        )
-                    ) {
-                        // Scope/opt-in/activation/binding changed after the IO verdict, or
-                        // the captured authority bundle is unsettled/incoherent: nothing
-                        // launches, nothing is erased — the durable row stays armed for a
-                        // later drain.
+                AccountUtils.withCurrentScope {
+                    if (!stillPending) {
                         photoTrashConsentQueue.onValidationFailed()
-                        return@withContext
+                        drainPhotoTrashConsentsOnMain() // the request expired: surface the next one
+                        return@withCurrentScope
                     }
-                    runCatching {
-                        val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(request.uri.toUri()), true)
-                        photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
-                        // The system accepted the launch: from here the result (or process death)
-                        // owns the LAUNCHED identity. Set only after launch returned on Main — a
-                        // result callback can only run on a LATER main-loop pass, so the identity
-                        // is in place before any result; a throwing launch leaves nothing set.
-                        photoTrashConsentQueue.onValidationLaunched(request)
-                    }.onFailure { exception ->
+                    if (!PhotoTrashController.tryBeginLaunchSection()) {
                         photoTrashConsentQueue.onValidationFailed()
-                        SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
+                        return@withCurrentScope
                     }
-                } finally {
-                    PhotoTrashController.endLaunchSection()
+                    try {
+                        if (!PhotoTrashConsentUiQueue.launchAllowedNow(
+                                request = request,
+                                currentUserId = AccountUtils.currentUserId,
+                                activationWitness = PhotoTrashController.captureLaunchWitness(request.uri),
+                                lifecycleStarted = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED),
+                            )
+                        ) {
+                            // Scope/opt-in/activation/binding changed after the IO verdict, or
+                            // the captured authority bundle is unsettled/incoherent: nothing
+                            // launches, nothing is erased — the durable row stays armed for a
+                            // later drain.
+                            photoTrashConsentQueue.onValidationFailed()
+                            return@withCurrentScope
+                        }
+                        runCatching {
+                            val pendingIntent = MediaStore.createTrashRequest(contentResolver, listOf(request.uri.toUri()), true)
+                            photoTrashConsentResult.launch(IntentSenderRequest.Builder(pendingIntent.intentSender).build())
+                            // The system accepted the launch: from here the result (or process death)
+                            // owns the LAUNCHED identity. Set only after launch returned on Main — a
+                            // result callback can only run on a LATER main-loop pass, so the identity
+                            // is in place before any result; a throwing launch leaves nothing set.
+                            photoTrashConsentQueue.onValidationLaunched(request)
+                        }.onFailure { exception ->
+                            photoTrashConsentQueue.onValidationFailed()
+                            SentryLog.e("PhotoTrash", "createTrashRequest failed", exception)
+                        }
+                    } finally {
+                        PhotoTrashController.endLaunchSection()
+                    }
                 }
             }
         }

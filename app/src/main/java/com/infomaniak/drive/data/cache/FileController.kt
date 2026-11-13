@@ -882,6 +882,8 @@ object FileController {
         return customRealm?.let(operation) ?: getRealmInstance().use(operation)
     }
 
+    fun getGalleryDrive(userDrive: UserDrive): ArrayList<File> = getRealmInstance(userDrive).use { getGalleryDrive(it) }
+
     fun getRecentChanges(): ArrayList<File> {
         return getRealmInstance().use { realm ->
             realm.where(File::class.java).equalTo(File::id.name, RecentChanges.id).findFirst()?.let { folder ->
@@ -947,6 +949,14 @@ object FileController {
             }
         }
         customRealm?.let(block) ?: getRealmInstance().use(block)
+    }
+
+    fun storeGalleryDrive(mediaList: List<File>, isFirstPage: Boolean, userDrive: UserDrive) {
+        getRealmInstance(userDrive).use { storeGalleryDrive(mediaList, isFirstPage, customRealm = it) }
+    }
+
+    fun removeOrphanFiles(userDrive: UserDrive) {
+        getRealmInstance(userDrive).use { removeOrphanFiles(customRealm = it) }
     }
 
     private fun RealmList<File>.addAll(realm: Realm, files: List<File>) {

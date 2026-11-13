@@ -192,7 +192,7 @@ class GalleryFragment : MultiSelectFragment(
 
             page?.let {
                 // A queued result of a superseded request must not reach the UI
-                if (it.generation != galleryViewModel.currentLoadGeneration) return@observe
+                if (!galleryViewModel.isPageCurrent(it)) return@observe
 
                 galleryAdapter.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.PREVENT_WHEN_EMPTY
                 if (dataAlreadyLoaded) {

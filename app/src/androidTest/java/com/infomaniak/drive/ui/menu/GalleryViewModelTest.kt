@@ -18,6 +18,8 @@
 package com.infomaniak.drive.ui.menu
 
 import android.util.Log
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
 import androidx.arch.core.executor.ArchTaskExecutor
 import androidx.arch.core.executor.TaskExecutor
 import androidx.lifecycle.viewModelScope
@@ -25,8 +27,13 @@ import com.infomaniak.core.network.models.ApiResponseStatus
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.CursorApiResponse
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.FileMigration
+import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.utils.RealmModules
+import io.realm.Realm
+import io.realm.RealmConfiguration
 import io.mockk.MockKAnnotations
 import io.mockk.every
 import io.mockk.mockkObject
@@ -58,6 +65,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.nio.file.Files
 
 /**
  * Orchestration tests for the gallery filter: delayed and reordered responses through the real
@@ -159,8 +167,8 @@ class GalleryViewModelTest {
         // case must bring the Offline suite's synthetic-realm setup instead of this stub. The
         // Unit-returning stubs below stay: no concrete collection return is recorded, which the
         // Consent/Upload device runs show to be safe on object mocks.
-        every { FileController.storeGalleryDrive(any(), any()) } returns Unit
-        every { FileController.removeOrphanFiles() } returns Unit
+        every { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) } returns Unit
+        every { FileController.removeOrphanFiles(any<UserDrive>()) } returns Unit
 
         mockkObject(ApiRepository)
         mark("setUp done")
@@ -295,8 +303,8 @@ class GalleryViewModelTest {
             joinReleasedLoads("the stale all-media load", staleLoadJobs)
 
             assertFalse(answerTimedOut.get(), "the harness released the parked response only via timeout: the ordering claims above are void")
-            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) } // VIDEOS never writes; stale ALL was dropped
-            verify(exactly = 0) { FileController.removeOrphanFiles() }
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) } // VIDEOS never writes; stale ALL was dropped
+            verify(exactly = 0) { FileController.removeOrphanFiles(any<UserDrive>()) }
             assertEquals("fresh-cursor", vm.currentCursor)
             assertEquals(3, vm.galleryApiResult.value?.generation)
             assertTrue(
@@ -349,7 +357,7 @@ class GalleryViewModelTest {
             assertEquals("newer-cursor", vm.currentCursor)
             assertEquals(2, vm.galleryApiResult.value?.files?.singleOrNull()?.id)
             assertEquals(2, vm.galleryApiResult.value?.generation)
-            verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 1 && it.first().id == 2 }, isFirstPage = true) }
+            verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 1 && it.first().id == 2 }, isFirstPage = true, userDrive = UserDrive(USER_ID, DRIVE_ID)) }
         } finally {
             blockedOld.countDown()
             cancelAndJoinLoads(vm)
@@ -401,8 +409,8 @@ class GalleryViewModelTest {
             assertFalse(answerTimedOut.get(), "the harness released a handshake only via timeout: the ordering claims above are void")
             assertTrue(vm.galleryApiResult.value == null, "the stale response was never applied")
             assertNull(vm.currentCursor, "the stale cursor was never taken")
-            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) }
-            verify(exactly = 0) { FileController.removeOrphanFiles() }
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) }
+            verify(exactly = 0) { FileController.removeOrphanFiles(any<UserDrive>()) }
         } finally {
             branchMayDecide.countDown()
             blockedResponse.countDown()
@@ -432,8 +440,8 @@ class GalleryViewModelTest {
             val page = vm.galleryApiResult.value!!
             assertEquals(listOf(2), page.files.map { it.id }, "only videos survive the local match")
             assertEquals(false, page.isComplete)
-            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any()) }
-            verify(exactly = 0) { FileController.removeOrphanFiles() }
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) }
+            verify(exactly = 0) { FileController.removeOrphanFiles(any<UserDrive>()) }
         } finally {
             cancelAndJoinLoads(vm)
         }
@@ -455,11 +463,85 @@ class GalleryViewModelTest {
 
             assertTrue(awaitTrue { vm.galleryApiResult.value != null }, "the load applied")
 
-            verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 2 }, isFirstPage = true) }
-            verify(exactly = 1) { FileController.removeOrphanFiles() }
+            verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 2 }, isFirstPage = true, userDrive = UserDrive(USER_ID, DRIVE_ID)) }
+            verify(exactly = 1) { FileController.removeOrphanFiles(any<UserDrive>()) }
             assertEquals(true, vm.galleryApiResult.value?.isComplete)
         } finally {
             cancelAndJoinLoads(vm)
+        }
+    }
+
+    @Test
+    @DisplayName("an accepted gallery commit pins both real cache opens before a queued account switch")
+    fun acceptedCommitPinsBothCacheOpensBeforeAccountSwitch() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        Realm.init(context)
+        val directory = Files.createTempDirectory(context.cacheDir.toPath(), "gallery-scope-").toFile()
+        val user = AtomicInteger(USER_ID)
+        every { AccountUtils.currentUserId } answers { user.get() }
+        fun configuration(scope: UserDrive) = RealmConfiguration.Builder()
+            .directory(directory).name("${scope.userId}-${scope.driveId}.realm")
+            .schemaVersion(FileMigration.DB_VERSION).migration(FileMigration())
+            .modules(RealmModules.LocalFilesModule()).build()
+        val configScope = mutableListOf<UserDrive>()
+        val writerEntered = CountDownLatch(1)
+        val writerFinished = CountDownLatch(1)
+        val writer = Thread {
+            writerEntered.countDown()
+            AccountUtils.updateCurrentScope { user.set(USER_ID + 1); true }
+            writerFinished.countDown()
+        }
+        var firstOpen = true
+        every { FileController.getRealmConfiguration(any()) } answers {
+            val scope = firstArg<UserDrive?>() ?: error("default Realm resolution is forbidden")
+            configScope.add(scope)
+            if (firstOpen) {
+                firstOpen = false
+                writer.start() // applyLoad's scope check has ALREADY accepted this response
+                assertTrue(writerEntered.await(5, TimeUnit.SECONDS))
+                assertTrue(awaitTrue { writer.state == Thread.State.BLOCKED }, "scope writer must queue at the real monitor")
+                assertEquals(1L, writerFinished.count, "the switch cannot finish inside the accepted cache commit")
+            }
+            configuration(scope)
+        }
+        // Let the actual scoped stores, Realm opens, transactions and orphan cleanup run.
+        every { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) } answers { callOriginal() }
+        every { FileController.removeOrphanFiles(any<UserDrive>()) } answers { callOriginal() }
+        val responseFile = file(1, ExtensionTypes.IMAGE).apply { initUid() }
+        val responseEntered = CountDownLatch(1)
+        val releaseResponse = CountDownLatch(1)
+        every { ApiRepository.getLastGallery(DRIVE_ID, any(), null) } answers {
+            responseEntered.countDown()
+            assertTrue(releaseResponse.await(5, TimeUnit.SECONDS))
+            apiPage(listOf(responseFile), null, false)
+        }
+        val vm = GalleryViewModel()
+        try {
+            vm.loadLastGallery(DRIVE_ID, false)
+            assertTrue(responseEntered.await(5, TimeUnit.SECONDS))
+            val jobs = capturedLoadJobs(vm)
+            releaseResponse.countDown()
+            assertTrue(writerFinished.await(5, TimeUnit.SECONDS), "the accepted commit and the queued scope writer complete")
+            joinReleasedLoads("accepted scoped load", jobs)
+            assertEquals(listOf(UserDrive(USER_ID, DRIVE_ID), UserDrive(USER_ID, DRIVE_ID)), configScope)
+            Realm.getInstance(configuration(UserDrive(USER_ID, DRIVE_ID))).use { realm ->
+                assertEquals(1L, realm.where(File::class.java).equalTo(File::id.name, 1).count())
+            }
+            Realm.getInstance(configuration(UserDrive(USER_ID + 1, DRIVE_ID))).use { realm ->
+                assertEquals(0L, realm.where(File::class.java).count())
+            }
+            assertFalse(vm.isPageCurrent(vm.galleryApiResult.value!!), "queued old-account UI delivery is refused")
+        } finally {
+            releaseResponse.countDown()
+            cancelAndJoinLoads(vm)
+            if (writer.state != Thread.State.NEW) writer.join(5_000)
+            assertFalse(writer.isAlive, "scope writer must terminate before fixture teardown")
+            directory.listFiles()?.filter { it.name.endsWith(".realm") }?.forEach { file ->
+                Realm.deleteRealm(RealmConfiguration.Builder().directory(directory).name(file.name)
+                    .schemaVersion(FileMigration.DB_VERSION).migration(FileMigration())
+                    .modules(RealmModules.LocalFilesModule()).build())
+            }
+            assertTrue(directory.deleteRecursively())
         }
     }
 

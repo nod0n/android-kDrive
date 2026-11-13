@@ -38,11 +38,20 @@ import io.realm.Realm
 import io.realm.RealmConfiguration
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -177,9 +186,16 @@ class PhotoTrashOrchestrationTest {
                 photoTrashActivationEpoch = settingsActivationEpoch.get(),
             )
         }
-        every { ApiRepository.deleteFile(any()) } answers {
-            deleteRequests.incrementAndGet()
-            ApiResponse(result = ApiResponseStatus.SUCCESS)
+        coEvery { ApiRepository.trashPairedPhoto(any(), any(), any()) } answers {
+            val issue = thirdArg<(() -> Boolean) -> Boolean>()
+            if (issue { deleteRequests.incrementAndGet(); true }) ApiResponse(result = ApiResponseStatus.SUCCESS)
+            else null
+        }
+        val revision = PhotoTrashController.beginActivationWrite()
+        try {
+            PhotoTrashController.noteActivationWritten(userId, 0L, true, revision)
+        } finally {
+            PhotoTrashController.endActivationWrite()
         }
         every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
             remoteQueryGate()
@@ -281,6 +297,127 @@ class PhotoTrashOrchestrationTest {
         fileSize = mediaSize,
         fileModifiedAt = Date(mediaModifiedSec * 1_000L),
     )
+
+    private fun useRealTrashDispatch(beforeCall: () -> Unit = {}, onEnqueue: (Call, Callback, Request) -> Unit) {
+        val client = mockk<OkHttpClient>()
+        val call = mockk<Call>()
+        lateinit var request: Request
+        every { client.newCall(any()) } answers {
+            request = firstArg()
+            beforeCall()
+            call
+        }
+        every { call.cancel() } returns Unit
+        every { call.enqueue(any()) } answers {
+            deleteRequests.incrementAndGet()
+            onEnqueue(call, firstArg(), request)
+        }
+        coEvery { AccountUtils.getHttpClient(userId, null, any(), any()) } returns client
+        coEvery { ApiRepository.trashPairedPhoto(any(), any(), any()) } coAnswers { callOriginal() }
+    }
+
+    private fun successfulTrashResponse(request: Request) = Response.Builder().request(request)
+        .protocol(Protocol.HTTP_1_1).code(200).message("OK")
+        .body("{\"result\":\"success\"}".toResponseBody()).build()
+
+    private fun writeFixtureSettings(enabled: Boolean) {
+        syncSettingsEnabled.set(enabled)
+        realm().use { realm ->
+            UploadFile.setAppSyncSettings(
+                SyncSettings(userId = userId, driveId = driveId, photoTrashSyncEnabled = enabled),
+                customRealm = realm,
+            )
+        }
+    }
+
+    @Test
+    @DisplayName("completed opt-out, rebinding, activation and account changes after validation each prevent actual enqueue")
+    fun invalidationsAfterValidationPreventActualEnqueue() {
+        val currentUser = AtomicInteger(userId)
+        every { AccountUtils.currentUserId } answers { currentUser.get() }
+        val invalidations = listOf<() -> Unit>(
+            { writeFixtureSettings(false) },
+            {
+                PhotoTrashController.recordPairing(
+                    mockContext, uploadFile(),
+                    File(id = remoteFileId, driveId = driveId).apply { serverContentHash = pairingHash },
+                    sha256Hex(contentA), config,
+                )
+            },
+            { writeFixtureSettings(false); writeFixtureSettings(true) },
+            { AccountUtils.updateCurrentScope { currentUser.set(userId + 1); true } },
+            {
+                AccountUtils.updateCurrentScope { currentUser.set(userId + 1); true }
+                AccountUtils.updateCurrentScope { currentUser.set(userId); true }
+            },
+        )
+        invalidations.forEachIndexed { index, invalidate ->
+            realm().use { realm -> realm.executeTransaction { it.deleteAll() } }
+            currentUser.set(userId)
+            settingsActivationEpoch.set(0L)
+            writeFixtureSettings(true)
+            // First activation of a fresh settings row is epoch1; the pass and pairing agree.
+            settingsActivationEpoch.set(1L)
+            seedPairing().also {
+                realm().use { realm -> realm.executeTransaction {
+                    it.where(PhotoPairing::class.java).findFirst()!!.activationEpoch = 1L
+                } }
+            }
+            mediaTrashed.set(true)
+            deleteRequests.set(0)
+            useRealTrashDispatch(beforeCall = invalidate) { call, callback, request ->
+                callback.onResponse(call, successfulTrashResponse(request)) // a broken gate fails, never hangs
+            }
+            val propagated = runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+            assertEquals(0, propagated, "invalidation $index completed after the old row checks")
+            assertEquals(0L, deleteRequests.get(), "invalidation $index must prevent Call.enqueue itself")
+        }
+    }
+
+    @Test
+    @DisplayName("actual enqueue precedes a queued invalidation without holding the gate over the response wait")
+    fun enqueueWinsBeforeInvalidationButDoesNotWaitForItsResponse() = runBlocking {
+        seedPairing()
+        mediaTrashed.set(true)
+        val queued = CountDownLatch(1)
+        val writerEntered = CountDownLatch(1)
+        val writerDone = CountDownLatch(1)
+        val responseCallback = AtomicReference<Callback>()
+        val responseCall = AtomicReference<Call>()
+        val responseRequest = AtomicReference<Request>()
+        val writer = Thread {
+            writerEntered.countDown()
+            PhotoTrashController.removeAllPairings(config)
+            writeFixtureSettings(false)
+            writerDone.countDown()
+        }
+        useRealTrashDispatch { call, callback, request ->
+            responseCall.set(call)
+            responseCallback.set(callback)
+            responseRequest.set(request)
+            writer.start()
+            assertTrue(writerEntered.await(5, TimeUnit.SECONDS))
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (writer.state != Thread.State.WAITING && System.nanoTime() < deadline) Thread.yield()
+            assertEquals(Thread.State.WAITING, writer.state)
+            assertTrue(writer.stackTrace.any { it.methodName == "beginBindingWrite" }, "the real invalidation waits at the issue gate")
+            assertEquals(1L, writerDone.count)
+            queued.countDown()
+        }
+        val pass = async(Dispatchers.IO) { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+        try {
+            assertTrue(queued.await(5, TimeUnit.SECONDS))
+            assertTrue(writerDone.await(5, TimeUnit.SECONDS), "invalidation finishes while the issued request still awaits its response")
+            assertFalse(pass.isCompleted)
+            responseCallback.get().onResponse(responseCall.get(), successfulTrashResponse(responseRequest.get()))
+            assertEquals(1, withTimeout(5_000) { pass.await() }, "the already-issued request may succeed after disable")
+            assertEquals(1L, deleteRequests.get())
+        } finally {
+            pass.cancelAndJoin()
+            if (writer.state != Thread.State.NEW) writer.join(5_000)
+            assertFalse(writer.isAlive, "the invalidation must finish before fixture teardown")
+        }
+    }
 
     @Test
     @DisplayName("a trash after pairing and before the first pass is a transition, not a baseline")

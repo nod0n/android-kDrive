@@ -31,11 +31,15 @@ import android.database.ContentObserver
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.Data
 import com.infomaniak.core.sentry.SentryLog
+import com.infomaniak.core.network.models.ApiResponse
+import com.infomaniak.core.network.models.ApiResponseStatus
 import com.infomaniak.drive.R
+import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.cache.DriveInfosController
 import com.infomaniak.drive.data.cache.DriveMigration
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FileMigration
+import com.infomaniak.drive.data.cache.FolderFilesProvider
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.data.models.drive.Drive
 import com.infomaniak.drive.data.models.File
@@ -50,11 +54,14 @@ import com.infomaniak.drive.utils.Utils
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.just
+import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.mockkStatic
 import io.mockk.runs
 import io.mockk.unmockkObject
 import io.mockk.unmockkStatic
+import io.mockk.verify
+import okhttp3.OkHttpClient
 import io.realm.Realm
 import io.realm.RealmConfiguration
 import io.sentry.ScopeCallback
@@ -929,6 +936,87 @@ class CloudStorageProviderTest {
     }
 
     // ---- scoped queries ------------------------------------------------------------
+
+    @Test
+    fun sharedChildrenKeepTheDocumentUsersRealmAndTransportScope() {
+        val originalUser = AccountUtils.currentUserId
+        val originalDrive = AccountUtils.currentDriveId
+        val documentScope = UserDrive(USER_ID, -1, sharedWithMe = true)
+        every { AccountUtils.currentUserId } returns USER_ID + 1
+        every { AccountUtils.currentDriveId } returns OTHER_DRIVE_ID
+        mockkObject(FolderFilesProvider)
+        var reached = false
+        every { FolderFilesProvider.getCloudStorageFiles(any(), any(), any(), any(), any(), any(), any()) } answers {
+            val realm = firstArg<Realm>()
+            assertEquals(documentScope, thirdArg<UserDrive>())
+            assertEquals(FileController.getRealmConfiguration(documentScope).path, realm.path)
+            reached = true
+        }
+        try {
+            // The synchronous production fill seam is also called by queryChildDocuments;
+            // no asynchronous provider job or real transport is started here.
+            provider.loadSharedWithMeChildren("$USER_ID/-2", File.SortType.NAME_AZ) { }
+            assertTrue(reached)
+        } finally {
+            unmockkObject(FolderFilesProvider)
+            every { AccountUtils.currentUserId } returns originalUser
+            every { AccountUtils.currentDriveId } returns originalDrive
+        }
+    }
+
+    @Test
+    fun copyAndMoveRejectCollidingIdsFromOtherScopesBeforeTransport() {
+        mockkObject(ApiRepository)
+        every { ApiRepository.duplicateFile(any(), any(), any()) } answers { error("unexpected copy dispatch") }
+        every { ApiRepository.moveFile(any(), any(), any()) } answers { error("unexpected move dispatch") }
+        try {
+            val foreignTargets = listOf(
+                otherDriveDocId(PARENT_ID),
+                "${USER_ID + 1}/${DRIVE_NAME}@$DRIVE_ID/$PARENT_ID",
+                "$USER_ID/-2/${DRIVE_NAME}@$DRIVE_ID/$PARENT_ID",
+            )
+            foreignTargets.forEach { target ->
+                assertSecurityException(fileDocId()) { provider.copyDocument(it, target) }
+                assertSecurityException(fileDocId()) { provider.moveDocument(it, folderDocId(), target) }
+                assertSecurityException(fileDocId()) { provider.moveDocument(it, target, folderDocId()) }
+            }
+            verify(exactly = 0) { ApiRepository.duplicateFile(any(), any(), any()) }
+            verify(exactly = 0) { ApiRepository.moveFile(any(), any(), any()) }
+        } finally {
+            unmockkObject(ApiRepository)
+        }
+    }
+
+    @Test
+    fun sameScopeCopyAndMoveUseTheDocumentsClientAndRows() {
+        val client = mockk<OkHttpClient>()
+        mockkObject(ApiRepository)
+        coEvery { AccountUtils.getHttpClient(USER_ID) } returns client
+        every { ApiRepository.duplicateFile(any(), any(), client) } answers {
+            assertEquals(FILE_ID, firstArg<File>().id)
+            assertEquals(DRIVE_ID, firstArg<File>().driveId)
+            ApiResponse(result = ApiResponseStatus.SUCCESS)
+        }
+        every { ApiRepository.moveFile(any(), any(), client) } answers {
+            assertEquals(FILE_ID, firstArg<File>().id)
+            assertEquals(DRIVE_ID, firstArg<File>().driveId)
+            assertEquals(PARENT_ID, secondArg<File>().id)
+            ApiResponse(result = ApiResponseStatus.SUCCESS)
+        }
+        try {
+            provider.copyDocument(fileDocId(), folderDocId())
+            provider.moveDocument(fileDocId(), folderDocId(), folderDocId())
+            verify(exactly = 1) {
+                ApiRepository.duplicateFile(any(), PARENT_ID, client)
+            }
+            verify(exactly = 1) {
+                ApiRepository.moveFile(any(), any(), client)
+            }
+        } finally {
+            coEvery { AccountUtils.getHttpClient(USER_ID) } throws IOException(NETWORK_BOUNDARY_MESSAGE)
+            unmockkObject(ApiRepository)
+        }
+    }
 
     @Test
     fun aScopedQueryServesSeededRowsAndKeepsOtherScopesEmpty() {
