@@ -18,10 +18,17 @@
 package com.infomaniak.drive.utils
 
 import androidx.test.core.app.ApplicationProvider
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.Observer
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.viewModelScope
 import androidx.work.testing.TestListenableWorkerBuilder
 import androidx.work.workDataOf
 import com.infomaniak.core.network.models.ApiResponseStatus
 import com.infomaniak.core.network.models.ApiResponse
+import com.infomaniak.core.network.NetworkAvailability
+import com.infomaniak.drive.MainApplication
+import com.infomaniak.drive.ui.MainViewModel
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.CursorApiResponse
 import com.infomaniak.drive.data.cache.DriveInfosController
@@ -40,11 +47,18 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkAll
+import io.mockk.unmockkObject
 import io.realm.Realm
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.job
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlin.coroutines.cancellation.CancellationException
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -4144,8 +4158,282 @@ class OfflineFolderMaintenanceOrchestrationTest {
         realm.copyFromRealm(realm.where(File::class.java).equalTo(File::id.name, folderId).findFirst()!!, 0)
     }
 
+    private fun selectedOfflineCopy(): File = FileController.getRealmInstance(userDrive).use { realm ->
+        realm.copyFromRealm(realm.where(File::class.java).equalTo(File::id.name, fileId).findFirst()!!, 0)
+    }
+
+    private fun seedRemovableRootCopy(): JavaFile {
+        seedCoveredPendingRow()
+        publishSeededRow("hash-1")
+        return getOfflineFixtureFile().also { check(it.setLastModified(1_700_000_000_000L)) }
+    }
+
+    private fun moveClaimOutsideRoot() {
+        seedFolderRow(800_402, "fixture-outside", "Other")
+        FileController.updateFile(fileId, userDrive = userDrive) { it.parentId = 800_402 }
+        FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.setDirectlyPinned(customRealm = realm, fileId = fileId, isDirectlyPinned = true)
+        }
+    }
+
+    private suspend fun withRemovalViewModel(block: suspend (MainViewModel) -> Unit) {
+        // Constructor subscription is replaced before construction: no connectivity callback,
+        // account refresh, WorkManager trigger or cloud operation can run in this fixture.
+        mockkObject(NetworkAvailability)
+        every { NetworkAvailability.isNetworkAvailable } returns MutableSharedFlow()
+        val vm = MainViewModel(ApplicationProvider.getApplicationContext<MainApplication>(), SavedStateHandle())
+        try {
+            block(vm)
+        } finally {
+            withTimeout(5_000) { vm.viewModelScope.coroutineContext.job.cancelAndJoin() }
+            unmockkObject(NetworkAvailability)
+        }
+    }
+
+    @Test
+    @DisplayName("per-file removal preserves an edited ended root claim and reports its durable status")
+    fun perFileRemovalPreservesEditedClaimAndReportsAttention() = runBlocking {
+        val copy = seedRemovableRootCopy()
+        moveClaimOutsideRoot()
+        copy.writeBytes(editedBody)
+        check(copy.setLastModified(1_700_000_000_000L))
+        var callbacks = 0
+        withRemovalViewModel { vm ->
+            val result = vm.removeOfflineFile(selectedOfflineCopy(), userDrive) { callbacks++ }
+            assertEquals(OfflineFolderSyncUtils.RemovalResult.PRESERVED, result)
+            assertTrue(result.completed && result.needsAttention)
+        }
+        assertEquals(1, callbacks)
+        assertTrue(copy.readBytes().contentEquals(editedBody))
+        val row = selectedOfflineCopy()
+        assertFalse(row.isOffline || row.isMarkedAsOffline || row.isDirectlyPinned || row.offlineOwnedByRoot)
+        assertTrue(row.offlineNeedsAttention)
+        assertTrue(OfflineFolderSyncUtils.folderNeedsAttention(userDrive, 800_402))
+    }
+
+    @Test
+    @DisplayName("per-file removal preserves unknown ended-root bytes without manufacturing an accepted basis")
+    fun perFileRemovalPreservesUnknownClaim() = runBlocking {
+        val copy = seedRemovableRootCopy()
+        moveClaimOutsideRoot()
+        FileController.updateFile(fileId, userDrive = userDrive) {
+            it.offlineBasisModifiedAt = 0L
+            it.offlineBasisSize = null
+            it.offlineContentDigest = null
+        }
+        withRemovalViewModel { vm ->
+            assertEquals(OfflineFolderSyncUtils.RemovalResult.PRESERVED, vm.removeOfflineFile(selectedOfflineCopy(), userDrive))
+        }
+        assertTrue(copy.readBytes().contentEquals(bodyV1))
+        assertTrue(selectedOfflineCopy().offlineNeedsAttention)
+        assertNull(selectedOfflineCopy().offlineContentDigest)
+    }
+
+    @Test
+    @DisplayName("per-file unpin keeps overlapping live roots and withdraws only its independent pin")
+    fun perFileUnpinKeepsOverlappingRoots() = runBlocking {
+        val copy = seedRemovableRootCopy()
+        seedFolderRow(800_400, "fixture-ancestor", "Private")
+        FileController.updateFile(coveredFolderId, userDrive = userDrive) { it.parentId = 800_400 }
+        seedRootRegistry(800_400)
+        FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.setDirectlyPinned(realm, fileId, true)
+        }
+        var callbacks = 0
+        withRemovalViewModel { vm ->
+            assertEquals(OfflineFolderSyncUtils.RemovalResult.RETAINED, vm.removeOfflineFile(selectedOfflineCopy(), userDrive) { callbacks++ })
+        }
+        assertEquals(0, callbacks)
+        assertTrue(copy.readBytes().contentEquals(bodyV1))
+        assertTrue(selectedOfflineCopy().isOffline)
+        assertFalse(selectedOfflineCopy().isDirectlyPinned)
+        assertFalse(OfflineFolderSyncUtils.folderNeedsAttention(userDrive, coveredFolderId))
+        assertTrue(OfflineFolderSyncUtils.unmarkFolderOffline(context, folderRow(coveredFolderId), userDrive))
+        assertTrue(copy.readBytes().contentEquals(bodyV1), "the other root still owns the copy")
+    }
+
+    @Test
+    @DisplayName("a same-stat edit retained by a live root is reported through actual per-file unpin")
+    fun perFileUnpinReportsSameStatEditUnderLiveRoot() = runBlocking {
+        val copy = seedRemovableRootCopy()
+        copy.writeBytes(editedBody)
+        check(copy.setLastModified(1_700_000_000_000L))
+        FileController.getRealmInstance(userDrive).use { realm ->
+            FileController.setDirectlyPinned(realm, fileId, true)
+        }
+        withRemovalViewModel { vm ->
+            assertEquals(OfflineFolderSyncUtils.RemovalResult.RETAINED_WITH_ATTENTION, vm.removeOfflineFile(selectedOfflineCopy(), userDrive))
+        }
+        assertTrue(copy.readBytes().contentEquals(editedBody))
+        assertTrue(selectedOfflineCopy().isOffline)
+        assertFalse(selectedOfflineCopy().isDirectlyPinned)
+        assertTrue(OfflineFolderSyncUtils.folderNeedsAttention(userDrive, coveredFolderId))
+    }
+
+    @Test
+    @DisplayName("per-file removal deletes a verified clean ended-root copy and confirms completion afterwards")
+    fun perFileRemovalDeletesCleanEndedClaim() = runBlocking {
+        val copy = seedRemovableRootCopy()
+        moveClaimOutsideRoot()
+        var callbacks = 0
+        withRemovalViewModel { vm ->
+            assertEquals(OfflineFolderSyncUtils.RemovalResult.REMOVED, vm.removeOfflineFile(selectedOfflineCopy(), userDrive) {
+                assertFalse(copy.exists(), "callback follows actual deletion")
+                callbacks++
+            })
+        }
+        assertEquals(1, callbacks)
+        assertFalse(copy.exists())
+        val row = selectedOfflineCopy()
+        assertFalse(row.isOffline || row.isMarkedAsOffline || row.isDirectlyPinned || row.offlineOwnedByRoot || row.offlineNeedsAttention)
+    }
+
+    @Test
+    @DisplayName("refused per-file deletion retains bytes and every recoverable pin and pending signal, without success callback")
+    fun perFileRemovalRefusalKeepsRecoverableIntent() = runBlocking {
+        val copy = seedRemovableRootCopy()
+        moveClaimOutsideRoot()
+        var deleteAttempts = 0
+        var callbacks = 0
+        OfflineFolderSyncUtils.deleteCopyOverride = {
+            assertEquals(copy.path, it.path)
+            deleteAttempts++
+            false // only the filesystem primitive fails; real digest and Realm decisions run
+        }
+        try {
+            withRemovalViewModel { vm ->
+                assertEquals(OfflineFolderSyncUtils.RemovalResult.REFUSED, vm.removeOfflineFile(selectedOfflineCopy(), userDrive) { callbacks++ })
+            }
+        } finally {
+            OfflineFolderSyncUtils.deleteCopyOverride = null
+        }
+        assertEquals(1, deleteAttempts)
+        assertEquals(0, callbacks)
+        assertTrue(copy.readBytes().contentEquals(bodyV1))
+        val row = selectedOfflineCopy()
+        assertTrue(row.isOffline && row.isMarkedAsOffline && row.isDirectlyPinned && row.offlineOwnedByRoot)
+        assertTrue(row.offlineNeedsAttention)
+        assertEquals(sha256Hex(bodyV1), row.offlineContentDigest)
+    }
+
+    @Test
+    @DisplayName("ordinary never-root explicit removal still removes edited bytes through the actual ViewModel entry")
+    fun ordinaryPerFileRemovalKeepsUpstreamSemantics() = runBlocking {
+        seedAcceptedPublication(bodyV1, 1_700_000_000L, "hash-1")
+        val copy = getOfflineFixtureFile()
+        copy.writeBytes(editedBodyOtherLength)
+        withRemovalViewModel { vm ->
+            assertEquals(OfflineFolderSyncUtils.RemovalResult.REMOVED, vm.removeOfflineFile(selectedOfflineCopy(), userDrive))
+        }
+        assertFalse(copy.exists())
+        assertFalse(selectedOfflineCopy().isOffline)
+    }
+
+    @Test
+    @DisplayName("bulk removal emits one outcome per file and never counts refused deletion as success")
+    fun bulkRemovalEmitsEachActualOutcome() = runBlocking {
+        val copy = seedRemovableRootCopy()
+        moveClaimOutsideRoot()
+        copy.writeBytes(editedBody)
+        val otherId = fileId + 1
+        FileController.getRealmInstance(userDrive).use { realm ->
+            realm.executeTransaction { mutable ->
+                mutable.createObject(File::class.java, "${otherId}_${userDrive.driveId}").apply {
+                    id = otherId
+                    driveId = userDrive.driveId
+                    parentId = 800_402
+                    name = "fixture-kept.bin"
+                    path = "Private/fixture-kept.bin"
+                    type = "file"
+                    isOffline = true
+                    isMarkedAsOffline = true
+                    isDirectlyPinned = true
+                    offlineOwnedByRoot = true
+                    offlineBasisModifiedAt = 1_700_000_000L
+                    offlineBasisSize = bodyV1.size.toLong()
+                    offlineContentDigest = sha256Hex(bodyV1)
+                }
+            }
+        }
+        val other = FileController.getFileByUidOrId(otherId, userDrive)!!
+        val otherCopy = other.getOfflineFile(context, userDrive.userId)!!
+        otherCopy.parentFile!!.mkdirs()
+        otherCopy.writeBytes(bodyV1)
+        check(otherCopy.setLastModified(1_700_000_000_000L))
+        FileController.updateFile(otherId, userDrive = userDrive) { it.offlinePublishedPath = otherCopy.path }
+        val selection = listOf(selectedOfflineCopy(), FileController.getFileByUidOrId(otherId, userDrive)!!)
+        val results = mutableListOf<MainViewModel.FileResult>()
+        val completed = java.util.concurrent.CountDownLatch(2)
+        val callbacks = AtomicLong(0)
+        val refusedDeletes = AtomicLong(0)
+        OfflineFolderSyncUtils.deleteCopyOverride = { target ->
+            if (target.path == otherCopy.path) { refusedDeletes.incrementAndGet(); false } else target.delete()
+        }
+        withRemovalViewModel { vm ->
+            lateinit var source: LiveData<MainViewModel.FileResult>
+            val observer = Observer<MainViewModel.FileResult> { result ->
+                results.add(result)
+                completed.countDown()
+            }
+            withContext(Dispatchers.Main) {
+                source = vm.removeSelectedFilesFromOffline(selection, { callbacks.incrementAndGet() }, userDrive)
+                source.observeForever(observer)
+            }
+            try {
+                assertTrue(completed.await(5, java.util.concurrent.TimeUnit.SECONDS), "both operations must emit; one aggregate event is insufficient")
+                assertEquals(listOf(true, false), results.map { it.isSuccess })
+                assertEquals(listOf(OfflineFolderSyncUtils.RemovalResult.PRESERVED, OfflineFolderSyncUtils.RemovalResult.REFUSED), results.map { it.data })
+                assertNotNull(results[0].noticeResId)
+                assertNotNull(results[1].errorResId)
+                assertEquals(1L, callbacks.get())
+                assertEquals(1L, refusedDeletes.get())
+                assertTrue(copy.readBytes().contentEquals(editedBody))
+                assertTrue(otherCopy.readBytes().contentEquals(bodyV1))
+            } finally {
+                withContext(Dispatchers.Main) { source.removeObserver(observer) }
+                OfflineFolderSyncUtils.deleteCopyOverride = null
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("unchanged-server same-stat local edits are durably reported and clear only after verified restoration")
+    fun sameStatLocalEditReportsPersistentAttention() {
+        val copy = seedRemovableRootCopy()
+        copy.writeBytes(editedBody)
+        check(copy.setLastModified(1_700_000_000_000L))
+        stubDetails("hash-1", 1_700_000_000L, bodyV1.size.toLong())
+        refresh()
+        assertEquals(1L, detailsRequests.get())
+        assertEquals(0L, bodyRequests.get())
+        assertTrue(copy.readBytes().contentEquals(editedBody))
+        assertTrue(selectedOfflineCopy().offlineNeedsAttention)
+        assertTrue(OfflineFolderSyncUtils.folderNeedsAttention(userDrive, coveredFolderId))
+        copy.writeBytes(bodyV1)
+        check(copy.setLastModified(1_700_000_000_000L))
+        refresh()
+        assertFalse(selectedOfflineCopy().offlineNeedsAttention)
+        assertFalse(OfflineFolderSyncUtils.folderNeedsAttention(userDrive, coveredFolderId))
+    }
+
+    @Test
+    @DisplayName("unknown preserved root copies report needs-attention without details or body transfer")
+    fun unknownRootCopyReportsAttentionWithoutTransfer() {
+        seedCoveredPendingRow()
+        val copy = getOfflineFixtureFile()
+        copy.parentFile!!.mkdirs()
+        copy.writeBytes(bodyV1)
+        refresh()
+        assertEquals(0L, detailsRequests.get())
+        assertEquals(0L, bodyRequests.get())
+        assertTrue(copy.readBytes().contentEquals(bodyV1))
+        assertTrue(selectedOfflineCopy().offlineNeedsAttention)
+        assertTrue(OfflineFolderSyncUtils.folderNeedsAttention(userDrive, coveredFolderId))
+    }
+
     @AfterEach
     fun tearDown() {
+        OfflineFolderSyncUtils.deleteCopyOverride = null
         try {
             unmockkAll()
         } finally {

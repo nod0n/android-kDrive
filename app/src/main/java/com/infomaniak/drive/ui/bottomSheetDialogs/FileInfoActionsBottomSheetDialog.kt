@@ -115,6 +115,7 @@ class FileInfoActionsBottomSheetDialog : EdgeToEdgeBottomSheetDialog(), FileInfo
                 selectFolderResultLauncher = selectFolderResultLauncher,
                 isSharedWithMe = navigationArgs.userDrive.sharedWithMe,
                 hideActions = navigationArgs.hideActions,
+                userDrive = navigationArgs.userDrive,
             )
             updateCurrentFile(currentFile, mainViewModel.hasEligibleDestinationDrives(currentFile))
             setPrintVisibility(isGone = true)
@@ -273,10 +274,12 @@ class FileInfoActionsBottomSheetDialog : EdgeToEdgeBottomSheetDialog(), FileInfo
 
     override fun removeOfflineFile(offlineLocalPath: IOFile?, cacheFile: IOFile) {
         lifecycleScope.launch {
-            if (offlineLocalPath != null) mainViewModel.removeOfflineFile(currentFile, offlineLocalPath, cacheFile)
+            val result = mainViewModel.removeOfflineFile(currentFile, navigationArgs.userDrive)
             withContext(Dispatchers.Main) {
-                currentFile.isOffline = false
-                if (findNavController().previousBackStackEntry?.destination?.id == R.id.offlineFileFragment) {
+                currentFile.isOffline = result.keepsOfflineIntent
+                currentFile.offlineNeedsAttention = result.needsAttention
+                result.messageResId?.let { showSnackbar(it, showAboveFab = true) }
+                if (result.completed && findNavController().previousBackStackEntry?.destination?.id == R.id.offlineFileFragment) {
                     findNavController().popBackStack()
                 } else {
                     binding.fileInfoActionsView.refreshBottomSheetUi(currentFile)

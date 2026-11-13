@@ -155,6 +155,7 @@ class DownloadOfflineFileManager(
             OfflineFolderSyncUtils.isRootCoveredCopy(file, realm, userDrive)
         } || gate.rootOwned
         if (offlineFile.exists() && coveredByRoot) {
+            OfflineFolderSyncUtils.noteExistingRootCopy(context, userDrive, file.id)
             // The preserved bytes are NOT blessed with the new remote identity: no accepted
             // transfer happened here, so no publication evidence may be recorded.
             filesDownloaded += 1

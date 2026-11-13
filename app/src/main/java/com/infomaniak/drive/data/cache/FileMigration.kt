@@ -507,6 +507,13 @@ class FileMigration : RealmMigration {
 
             oldVersionTemp = 19L
         }
+
+        if (oldVersionTemp == 19L) {
+            schema[File::class.java.simpleName]!!.addField(
+                File::offlineNeedsAttention.name, Boolean::class.java, FieldAttribute.REQUIRED,
+            )
+            oldVersionTemp = 20L
+        }
     }
 
     /**
@@ -567,7 +574,7 @@ class FileMigration : RealmMigration {
     }
 
     companion object {
-        const val DB_VERSION = 19L // Must be bumped when the schema changes
+        const val DB_VERSION = 20L // Must be bumped when the schema changes
         const val LOGOUT_CURRENT_USER_TAG = "logout_current_user_tag"
     }
 }

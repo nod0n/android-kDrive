@@ -434,7 +434,8 @@ abstract class MultiSelectFragment(private val matomoCategory: MatomoCategory) :
         mediator.addSource(
             mainViewModel.removeSelectedFilesFromOffline(
                 files = selectedFiles,
-                onSuccess = { onIndividualActionSuccess(type) }
+                onSuccess = { onIndividualActionSuccess(type) },
+                userDrive = userDrive ?: UserDrive(),
             ),
             mainViewModel.updateMultiSelectMediator(mediator),
         )
@@ -573,7 +574,7 @@ abstract class MultiSelectFragment(private val matomoCategory: MatomoCategory) :
             val errorResId = state.errorResId
             if (state.totalOfActions == fileCount) {
                 dialog?.dismiss()
-                handleIndividualActionsResult(success, errorResId, type, destinationFolder)
+                handleIndividualActionsResult(success, errorResId, type, destinationFolder, state.noticeResId)
             }
         }
     }
@@ -583,8 +584,12 @@ abstract class MultiSelectFragment(private val matomoCategory: MatomoCategory) :
         errorResId: Int?,
         type: BulkOperationType,
         destinationFolder: File?,
+        noticeResId: Int? = null,
     ) {
         val title = when {
+            type == BulkOperationType.REMOVE_OFFLINE && noticeResId != null && errorResId != null -> getString(R.string.offlineCopiesKept)
+            type == BulkOperationType.REMOVE_OFFLINE && errorResId != null -> getString(errorResId)
+            noticeResId != null -> getString(noticeResId)
             errorResId == R.string.errorFilesLimitExceeded -> getString(errorResId)
             success == 0 -> getString(errorResId ?: R.string.anErrorHasOccurred)
             type == BulkOperationType.COPY_TO_DRIVE -> getString(R.string.copyToDriveStarted, pendingCopyToDriveData?.fileName)

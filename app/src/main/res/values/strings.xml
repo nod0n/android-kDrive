@@ -577,6 +577,11 @@
     <string name="photoTrashSyncDescription">When a synced photo is trashed in kDrive or on this phone, the trash is propagated to the other side after confirmation. Trashed photos stay recoverable; nothing is permanently deleted.</string>
     <string name="photoTrashSyncStatus">Some paired photos need attention: %1$d with detected changes, %2$d uncertain, %3$d declined.</string>
     <string name="photoTrashSyncTitle">Sync photo trash</string>
+    <string name="offlineCopyPreserved">Local changes or unverified copies were kept on this device. Check them in your device file explorer.</string>
+    <string name="offlineCopyRetainedByFolder">This file stays available offline because a folder keeps it.</string>
+    <string name="offlineRemovalRefused">Some offline copies could not be removed. They were kept; try again.</string>
+    <string name="offlineFolderNeedsAttention">Offline copies need attention</string>
+    <string name="offlineCopiesKept">Some copies were kept. Check local changes, unverified files and the folder’s offline setting before trying again.</string>
     <string name="picturesNoFile">No photo at this time</string>
     <plurals name="preparingToUpload">
         <item quantity="one">Preparing to upload %d file</item>

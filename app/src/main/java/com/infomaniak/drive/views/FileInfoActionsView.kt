@@ -89,6 +89,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
+import io.realm.RealmObject
 
 class FileInfoActionsView @JvmOverloads constructor(
     context: Context,
@@ -108,6 +111,8 @@ class FileInfoActionsView @JvmOverloads constructor(
     private lateinit var selectFolderResultLauncher: ActivityResultLauncher<Intent>
     private var isSharedWithMe = false
     private var hasNetwork = true
+    private var offlineUserScope: UserDrive? = null
+    private var folderOfflineJob: Job? = null
 
     private val canCreateDropbox by lazy { AccountUtils.getCurrentDrive(forceRefresh = true)?.canCreateDropbox == true }
 
@@ -123,6 +128,7 @@ class FileInfoActionsView @JvmOverloads constructor(
         selectFolderResultLauncher: ActivityResultLauncher<Intent>,
         isSharedWithMe: Boolean = false,
         hideActions: Boolean,
+        userDrive: UserDrive = UserDrive(),
     ) {
         this.isSharedWithMe = isSharedWithMe
         this.mainViewModel = mainViewModel
@@ -132,6 +138,7 @@ class FileInfoActionsView @JvmOverloads constructor(
         this.ownerFragment = ownerFragment
         this.selectFolderResultLauncher = selectFolderResultLauncher
         this.hideActions = hideActions
+        this.offlineUserScope = userDrive
         initOnClickListeners()
     }
 
@@ -240,7 +247,6 @@ class FileInfoActionsView @JvmOverloads constructor(
             sendCopyText.setText(R.string.buttonAdd)
             openWith.isGone = true
             setupColoredFolderVisibility(drive)
-            setupFolderOfflineState(currentFile)
         }
     }
 
@@ -249,15 +255,22 @@ class FileInfoActionsView @JvmOverloads constructor(
      * root record instead of the per-file pin used for files.
      */
     private fun setupFolderOfflineState(folder: File) {
-        binding.availableOffline.isGone = folder.isSharedWithMe()
-        CoroutineScope(Dispatchers.IO).launch {
-            val hasRoot = FileController.getRealmInstance(UserDrive(driveId = folder.driveId)).use { realm ->
+        val folderId = folder.id
+        val scope = (offlineUserScope ?: UserDrive()).copy(driveId = folder.driveId)
+        binding.availableOffline.isGone = isSharedWithMe
+        folderOfflineJob?.cancel()
+        folderOfflineJob = ownerFragment.viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            val hasRoot = FileController.getRealmInstance(scope).use { realm ->
                 realm.where(OfflineFolderRoot::class.java)
-                    .equalTo(OfflineFolderRoot::folderId.name, folder.id)
+                    .equalTo(OfflineFolderRoot::folderId.name, folderId)
                     .count() > 0
             }
-            CoroutineScope(Dispatchers.Main).launch {
-                if (currentFile?.id == folder.id) binding.availableOfflineSwitch.isChecked = hasRoot
+            val needsAttention = OfflineFolderSyncUtils.folderNeedsAttention(scope, folderId)
+            withContext(Dispatchers.Main) {
+                if (currentFile.id == folderId && currentFile.driveId == scope.driveId && offlineUserScope?.userId == scope.userId) {
+                    binding.availableOfflineSwitch.isChecked = hasRoot
+                    binding.availableOfflineText.setText(if (needsAttention) R.string.offlineFolderNeedsAttention else R.string.buttonAvailableOffline)
+                }
             }
         }
     }
@@ -270,17 +283,28 @@ class FileInfoActionsView @JvmOverloads constructor(
      * not hold.
      */
     fun toggleFolderOfflineRoot(folder: File, isChecked: Boolean) {
-        CoroutineScope(Dispatchers.IO).launch {
-            val userDrive = UserDrive(driveId = folder.driveId)
-            val confirmed = if (isChecked) {
-                OfflineFolderSyncUtils.markFolderOffline(context, folder, userDrive)
-            } else {
-                OfflineFolderSyncUtils.unmarkFolderOffline(context, folder, userDrive)
+        val snapshot: File = if (RealmObject.isManaged(folder)) folder.freeze() else folder
+        val userDrive = (offlineUserScope ?: UserDrive()).copy(driveId = folder.driveId)
+        ownerFragment.viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            val confirmed = try {
+                if (isChecked) OfflineFolderSyncUtils.markFolderOffline(context, snapshot, userDrive)
+                else OfflineFolderSyncUtils.unmarkFolderOffline(context, snapshot, userDrive)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
             }
+            val needsAttention = OfflineFolderSyncUtils.folderNeedsAttention(userDrive, snapshot.id)
             if (!confirmed) {
-                SentryLog.w(TAG, "Offline folder operation incomplete for root ${folder.id}_${folder.driveId}")
-                CoroutineScope(Dispatchers.Main).launch {
-                    if (currentFile?.id == folder.id) setupFolderOfflineState(folder)
+                SentryLog.w(TAG, "Offline folder operation incomplete")
+            }
+            withContext(Dispatchers.Main) {
+                if (currentFile.id == snapshot.id && currentFile.driveId == snapshot.driveId) {
+                    setupFolderOfflineState(snapshot)
+                    when {
+                        !confirmed -> ownerFragment.showSnackbar(if (isChecked) R.string.anErrorHasOccurred else R.string.offlineRemovalRefused)
+                        needsAttention -> ownerFragment.showSnackbar(R.string.offlineCopyPreserved)
+                    }
                 }
             }
         }
@@ -546,6 +570,8 @@ class FileInfoActionsView @JvmOverloads constructor(
         sharePublicLinkText.setText(if (file.shareLink == null) R.string.buttonCreatePublicLink else R.string.buttonSharePublicLink)
 
         setOfflineItemUi(file, isOfflineProgress)
+        if (file.isFolder()) setupFolderOfflineState(file)
+        else availableOfflineText.setText(if (file.offlineNeedsAttention) R.string.offlineFolderNeedsAttention else R.string.buttonAvailableOffline)
     }
 
     private val fileToShowFlow = MutableSharedFlow<File>(extraBufferCapacity = 1)
@@ -577,7 +603,7 @@ class FileInfoActionsView @JvmOverloads constructor(
         val isItemAvailable = hasNetwork || file.isOffline
         setOfflineControlsEnabled(isItemInteractable && isItemAvailable)
 
-        val isOfflineFile = file.isOfflineFile(context)
+        val isOfflineFile = file.isOfflineFile(context, offlineUserScope?.userId ?: AccountUtils.currentUserId)
         if (isItemInteractable) availableOfflineSwitch.isChecked = isOfflineFile
 
         when {

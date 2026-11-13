@@ -47,7 +47,7 @@ import java.util.UUID
  *      first draft self-assigned `driveId = driveId` inside receiver apply blocks, which
  *      javap proved writes the receiver's own default back — every fixture value is now a
  *      distinct parameter name, and the scope is asserted before and after the migration),
- *  (C) reopen at [FileMigration.DB_VERSION] (19) with the REAL [FileMigration] and the FULL
+ *  (C) reopen at [FileMigration.DB_VERSION] (20) with the REAL [FileMigration] and the FULL
  *      production module — exactly what a production upgrade executes — and audit the
  *      18→19 difference: the provenance column is added; rows carrying an offline signal
  *      whose cached parent chain reaches a live root folder of the SAME DRIVE derive
@@ -249,10 +249,12 @@ class FileMigration18to19Test {
                     "the phase-A module schema must carry the new column (the class already declares it)"
                 }
                 fileSchema.removeField(File::offlineOwnedByRoot.name)
+                fileSchema.removeField(File::offlineNeedsAttention.name)
             }
             val fileSchema = dynamic.schema.get("File")
             check(fileSchema != null)
             assertFalse(fileSchema.hasField(File::offlineOwnedByRoot.name), "the true v18 shape has no provenance column")
+            assertFalse(fileSchema.hasField(File::offlineNeedsAttention.name), "the true v18 shape has no future status column")
             assertEquals(13L, dynamic.where("File").count(), "five folders + eight files across both drives, exactly as seeded")
             assertEquals(1L, dynamic.where("OfflineFolderRoot").count())
 
@@ -274,12 +276,14 @@ class FileMigration18to19Test {
             assertEquals(driveUnregistered, twinRoot.getInt("driveId"))
         }
 
-        // ---- PHASE C: reopen at 19 with the REAL migration + the full module; audit ONLY
-        // the 18→19 difference.
+        // ---- PHASE C: reopen at current20 with the REAL migration + the full module;
+        // audit the 18→19 provenance and the default for the subsequent status column.
         Realm.getInstance(configAt19).use { realm ->
             val fileSchema = realm.schema.get("File")
             check(fileSchema != null)
             assertTrue(fileSchema.hasField(File::offlineOwnedByRoot.name), "the migration adds the provenance column")
+            assertFalse(fileSchema.isNullable(File::offlineNeedsAttention.name))
+            assertEquals(0L, realm.where(File::class.java).equalTo(File::offlineNeedsAttention.name, true).count())
 
             val pendingCovered = realm.where(File::class.java).equalTo("uid", "900301_$driveRegistered").findFirst()!!
             assertTrue(pendingCovered.offlineOwnedByRoot, "a PENDING row inside a live root's subtree derives root ownership")

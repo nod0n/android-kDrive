@@ -20,6 +20,7 @@ package com.infomaniak.drive.utils
 import android.content.Context
 import androidx.annotation.VisibleForTesting
 import com.infomaniak.core.sentry.SentryLog
+import com.infomaniak.drive.R
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.ApiRoutes
 import com.infomaniak.drive.data.api.ErrorCode
@@ -164,6 +165,93 @@ object OfflineFolderSyncUtils {
      */
     @VisibleForTesting
     internal var preWithdrawalDecisionGate: (() -> Unit)? = null
+
+    @VisibleForTesting
+    internal var deleteCopyOverride: ((JavaFile) -> Boolean)? = null
+
+    enum class RemovalResult {
+        REMOVED, PRESERVED, RETAINED, RETAINED_WITH_ATTENTION, REFUSED;
+
+        val completed get() = this == REMOVED || this == PRESERVED
+        val keepsOfflineIntent get() = this == RETAINED || this == RETAINED_WITH_ATTENTION || this == REFUSED
+        val needsAttention get() = this == PRESERVED || this == RETAINED_WITH_ATTENTION || this == REFUSED
+        val messageResId: Int? get() = when (this) {
+            REMOVED -> null
+            PRESERVED, RETAINED_WITH_ATTENTION -> R.string.offlineCopyPreserved
+            RETAINED -> R.string.offlineCopyRetainedByFolder
+            REFUSED -> R.string.offlineRemovalRefused
+        }
+    }
+
+    private fun deleteCopy(file: JavaFile): Boolean = try {
+        deleteCopyOverride?.invoke(file) ?: file.delete()
+    } catch (_: SecurityException) {
+        false
+    }
+
+    private fun scopedFile(realm: Realm, fileId: Int, userDrive: UserDrive): File? = realm.where(File::class.java)
+        .equalTo(File::id.name, fileId).equalTo(File::driveId.name, userDrive.driveId).findFirst()
+
+    /** Explicit file unpin: a live root retains its copy; ended root claims use checked withdrawal. */
+    suspend fun removeOfflineCopy(context: Context, selectedFile: File, userDrive: UserDrive): RemovalResult =
+        withContext(Dispatchers.IO) {
+            if (selectedFile.driveId != userDrive.driveId || selectedFile.isFolder()) return@withContext RemovalResult.REFUSED
+            val (immediate, requestGeneration) = OfflineCommitAuthority.withCommitAuthorityForEvidence {
+                val result = certifiedFreshRealm(userDrive).use { realm ->
+                    val row = scopedFile(realm, selectedFile.id, userDrive) ?: return@use RemovalResult.PRESERVED
+                    val covered = isRootCoveredCopy(row, realm, userDrive)
+                    when {
+                        covered || row.offlineOwnedByRoot || selectedFile.offlineOwnedByRoot || row.offlineNeedsAttention -> null
+                        else -> OfflineCommitAuthority.withCommitAuthority {
+                            // Ordinary explicit unpin still removes edited bytes. Failure
+                            // retains the original intent so the UI can offer a real retry.
+                            val offline = row.getOfflineFile(context, userDrive.userId)
+                            val cache = row.getCacheFile(context, userDrive)
+                            if ((offline?.exists() == true && !deleteCopy(offline)) || (cache.exists() && !cache.delete())) {
+                                return@withCommitAuthority RemovalResult.REFUSED
+                            }
+                            if (row.isMedia()) row.deleteInMediaScan(context, userDrive)
+                            realm.executeTransaction {
+                                row.isOffline = false
+                                row.isMarkedAsOffline = false
+                                row.isDirectlyPinned = false
+                            }
+                            RemovalResult.REMOVED
+                        }
+                    }
+                }
+                result to OfflineCommitAuthority.currentGenerationUnderAuthority()
+            }
+            immediate ?: withdrawSingleCopyInHold(
+                context, userDrive, selectedFile.id, otherRootSubtreeIds = null,
+                excludedRootFolderId = null, atRecordedPath = true, keepLiveRootCoverage = true,
+                withdrawDirectPin = true, requestGeneration = requestGeneration,
+            )
+        }
+
+    private fun setNeedsAttention(userDrive: UserDrive, fileId: Int, needsAttention: Boolean) {
+        OfflineCommitAuthority.withCommitAuthority {
+            certifiedFreshRealm(userDrive).use { realm ->
+                val row = scopedFile(realm, fileId, userDrive) ?: return@withCommitAuthority
+                if (row.offlineNeedsAttention != needsAttention) realm.executeTransaction { row.offlineNeedsAttention = needsAttention }
+            }
+        }
+    }
+
+    fun folderNeedsAttention(userDrive: UserDrive, folderId: Int): Boolean {
+        val ids = collectSubtreeIdsFromCache(userDrive, folderId) + folderId
+        return certifiedFreshRealm(userDrive).use { realm ->
+            realm.where(File::class.java).equalTo(File::driveId.name, userDrive.driveId)
+                .equalTo(File::offlineNeedsAttention.name, true).findAll().any { it.id in ids }
+        }
+    }
+
+    internal suspend fun noteExistingRootCopy(context: Context, userDrive: UserDrive, fileId: Int) = withContext(Dispatchers.IO) {
+        val state = certifiedFreshRealm(userDrive).use { realm ->
+            scopedFile(realm, fileId, userDrive)?.let { readWithdrawalSnapshot(context, it, userDrive, atRecordedPath = true).localState }
+        }
+        if (state == LocalCopyState.LOCALLY_EDITED || state == LocalCopyState.UNKNOWN) setNeedsAttention(userDrive, fileId, true)
+    }
 
     private const val TAG = "OfflineFolderSync"
 
@@ -356,7 +444,8 @@ object OfflineFolderSyncUtils {
                 while (queue.isNotEmpty()) {
                     val current = queue.removeFirst()
                     if (!visited.add(current)) continue
-                    realm.where(File::class.java).equalTo(File::parentId.name, current).findAll().forEach { child ->
+                    realm.where(File::class.java).equalTo(File::parentId.name, current)
+                        .equalTo(File::driveId.name, userDrive.driveId).findAll().forEach { child ->
                         if (!child.isFolder()) child.path.takeIf { it.isNotBlank() }?.let(paths::add)
                         if (child.isFolder()) queue.add(child.id)
                     }
@@ -441,7 +530,7 @@ object OfflineFolderSyncUtils {
                 excludedRootFolderId = null,
                 atRecordedPath = false,
             )
-            if (refusal) allDeletionsConfirmed = false
+            if (refusal == RemovalResult.REFUSED) allDeletionsConfirmed = false
         }
 
         // BEYOND-SUBTREE OWNERSHIP RELEASE: rows the root contract owned whose cached row
@@ -519,7 +608,7 @@ object OfflineFolderSyncUtils {
                                 FileController.getFileProxyById(claimOnlyId, customRealm = mutableRealm)
                                     ?.offlineOwnedByRoot = false
                             }
-                            bytelessToClear.forEach { clearedId -> clearClaimedRowFields(mutableRealm, clearedId) }
+                            bytelessToClear.forEach { clearedId -> clearClaimedRowFields(mutableRealm, clearedId, userDrive) }
                         }
                     }
                 }
@@ -543,11 +632,11 @@ object OfflineFolderSyncUtils {
     }
 
     /** The claimed-row state clear shared by every withdrawal/release path. */
-    private fun clearClaimedRowFields(realm: Realm, fileId: Int) {
-        FileController.getFileProxyById(fileId, customRealm = realm)?.let { proxy ->
+    private fun clearClaimedRowFields(realm: Realm, fileId: Int, userDrive: UserDrive, clearDirectPin: Boolean = false) {
+        scopedFile(realm, fileId, userDrive)?.let { proxy ->
             proxy.isMarkedAsOffline = false
             proxy.isOffline = false
-            if (!proxy.isDirectlyPinned) proxy.isDirectlyPinned = false
+            if (clearDirectPin) proxy.isDirectlyPinned = false
             proxy.offlineOwnedByRoot = false
             proxy.offlineBasisModifiedAt = 0L
             proxy.offlineBasisSize = null
@@ -616,9 +705,8 @@ object OfflineFolderSyncUtils {
      * contract, re-reads the generation (a participating mutation between the snapshot and
      * the acquisition invalidates the evidence — the attempt retries once, a second
      * invalidation PRESERVES), re-stats the evidence, and performs the checked deletion and
-     * the state clear. Returns TRUE only for a REFUSAL (a deletion the filesystem refused —
-     * the claim stays and the caller reports a retriable unmark); skips, preserved releases
-     * and confirmed deletions return false.
+     * the state clear. Refusal retains recoverable intent; preservation releases the
+     * ended claim while keeping the bytes and recording that they need attention.
      *
      * @param otherRootSubtreeIds the in-subtree loop's pre-computed other-roots snapshot
      *   (overlapping-roots check); null selects the sweep's live registry check against
@@ -635,22 +723,34 @@ object OfflineFolderSyncUtils {
         otherRootSubtreeIds: Set<Int>?,
         excludedRootFolderId: Int?,
         atRecordedPath: Boolean,
-    ): Boolean {
+        keepLiveRootCoverage: Boolean = false,
+        withdrawDirectPin: Boolean = false,
+        requestGeneration: Long? = null,
+    ): RemovalResult {
         var attempt = 0
         while (true) {
             // Snapshot hold (OBSERVATION — an evidence capture never advances the
             // generation, RESUME-962c item 1): the row fields, the byte stat and the
             // generation, together.
+            var requestInvalidated = false
             val snapshot = OfflineCommitAuthority.withCommitAuthorityForEvidence {
+                if (requestGeneration != null && OfflineCommitAuthority.currentGenerationUnderAuthority() != requestGeneration) {
+                    requestInvalidated = true
+                    return@withCommitAuthorityForEvidence null
+                }
                 certifiedFreshRealm(userDrive).use { realm ->
-                    FileController.getFileProxyById(fileId, customRealm = realm)?.let { row ->
+                    scopedFile(realm, fileId, userDrive)?.let { row ->
                         if (row.isFolder()) null
                         else readWithdrawalSnapshot(context, row, userDrive, atRecordedPath) to
                             OfflineCommitAuthority.currentGenerationUnderAuthority()
                     }
                 }
-            } ?: return false // vanished row or folder: nothing to release
-            val (evidence, snapshotGeneration) = snapshot
+            }
+            if (requestInvalidated) {
+                setNeedsAttention(userDrive, fileId, true)
+                return RemovalResult.REFUSED
+            }
+            val (evidence, snapshotGeneration) = snapshot ?: return RemovalResult.PRESERVED
 
             // The digest verdict, OUTSIDE the hold (unbounded IO): a same-size/same-mtime
             // edit still diverges from the accepted digest, so the accepted identity is
@@ -671,17 +771,18 @@ object OfflineFolderSyncUtils {
                         // authorize a destructive step.
                         if (OfflineCommitAuthority.currentGenerationUnderAuthority() != snapshotGeneration) {
                             evidenceInvalidated = true
-                            return@withCommitAuthority false
+                            return@withCommitAuthority RemovalResult.REFUSED
                         }
-                        val file = FileController.getFileProxyById(fileId, customRealm = realm)
-                            ?: return@withCommitAuthority false // the row is gone: nothing left to release
-                        if (file.isFolder()) return@withCommitAuthority false // walkSubtree never claims folders
+                        val file = scopedFile(realm, fileId, userDrive)
+                            ?: return@withCommitAuthority RemovalResult.PRESERVED
+                        if (file.isFolder()) return@withCommitAuthority RemovalResult.REFUSED
                         val coveredByOtherRoot = when {
+                            keepLiveRootCoverage -> isRootCoveredCopy(file, realm, userDrive)
                             otherRootSubtreeIds != null -> fileId in otherRootSubtreeIds
                             excludedRootFolderId != null -> isCoveredByRoot(file, realm, userDrive, excludedRootFolderId)
                             else -> false
                         }
-                        if (file.isDirectlyPinned || coveredByOtherRoot) {
+                        if ((!withdrawDirectPin && file.isDirectlyPinned) || coveredByOtherRoot) {
                             if (excludedRootFolderId != null && file.isDirectlyPinned && !coveredByOtherRoot) {
                                 // Explicit direct retention keeps its own contract (bytes, pin
                                 // and offline state untouched): only the root's claim is
@@ -690,7 +791,15 @@ object OfflineFolderSyncUtils {
                                     FileController.getFileProxyById(fileId, customRealm = mutableRealm)?.offlineOwnedByRoot = false
                                 }
                             }
-                            return@withCommitAuthority false
+                            if (withdrawDirectPin || (evidence.localExists && snapshotPreservesBytes)) {
+                                realm.executeTransaction {
+                                    if (withdrawDirectPin) file.isDirectlyPinned = false
+                                    if (evidence.localExists && snapshotPreservesBytes) file.offlineNeedsAttention = true
+                                }
+                            }
+                            return@withCommitAuthority if (file.offlineNeedsAttention) {
+                                RemovalResult.RETAINED_WITH_ATTENTION
+                            } else RemovalResult.RETAINED
                         }
 
                         // The evidence re-stat: an unchanged stat keeps the pre-hold evidence
@@ -712,9 +821,10 @@ object OfflineFolderSyncUtils {
                                 SentryLog.w(TAG, "Unmark evidence went stale under the coordination for file ${file.id}; bytes preserved")
                             }
                             realm.executeTransaction { mutableRealm ->
-                                clearClaimedRowFields(mutableRealm, fileId)
+                                clearClaimedRowFields(mutableRealm, fileId, userDrive, clearDirectPin = withdrawDirectPin)
+                                scopedFile(mutableRealm, fileId, userDrive)?.offlineNeedsAttention = true
                             }
-                            return@withCommitAuthority false
+                            return@withCommitAuthority RemovalResult.PRESERVED
                         }
 
                         // Test seam (FHNW-1189 E1): the real pin writer can be launched and
@@ -726,26 +836,29 @@ object OfflineFolderSyncUtils {
                         // this authority), so the pre-hold pin reads above are final; the
                         // in-transaction flag re-check below stays as defense-in-depth only.
                         val copyGone = if (evidence.localExists && evidence.offlineFile != null) {
-                            evidence.offlineFile.delete()
+                            deleteCopy(evidence.offlineFile)
                         } else {
                             true
                         }
                         if (!copyGone) {
                             SentryLog.w(TAG, "Offline copy deletion refused, keeping pin for file ${file.id}")
-                            return@withCommitAuthority true
+                            realm.executeTransaction { file.offlineNeedsAttention = true }
+                            return@withCommitAuthority RemovalResult.REFUSED
                         }
                         if (file.isMedia()) file.deleteInMediaScan(context, userDrive)
                         realm.executeTransaction { mutableRealm ->
-                            clearClaimedRowFields(mutableRealm, fileId)
+                            clearClaimedRowFields(mutableRealm, fileId, userDrive, clearDirectPin = withdrawDirectPin)
+                            scopedFile(mutableRealm, fileId, userDrive)?.offlineNeedsAttention = false
                         }
-                        false
+                        RemovalResult.REMOVED
                     }
                 }
             }
-            if (evidenceInvalidated && attempt == 0) {
+            if (evidenceInvalidated && attempt == 0 && !withdrawDirectPin) {
                 attempt = 1
                 continue // one retry with a fresh snapshot; a second invalidation preserves
             }
+            if (evidenceInvalidated) setNeedsAttention(userDrive, fileId, true)
             return refusal
         }
     }
@@ -798,7 +911,7 @@ object OfflineFolderSyncUtils {
                 excludedRootFolderId = withdrawnRootFolderId,
                 atRecordedPath = true,
             )
-            if (refusal) allConfirmed = false
+            if (refusal == RemovalResult.REFUSED) allConfirmed = false
         }
         return allConfirmed
     }
@@ -1008,7 +1121,7 @@ object OfflineFolderSyncUtils {
                                     if (job?.isActive == false) return@executeTransaction
                                     val proxy = FileController.getFileProxyById(fileId, customRealm = mutableRealm)
                                         ?: continue
-                                    clearClaimedRowFields(mutableRealm, fileId)
+                                    clearClaimedRowFields(mutableRealm, fileId, userDrive)
                                 }
                             }
                         }
@@ -1039,7 +1152,7 @@ object OfflineFolderSyncUtils {
                                     val proxy = FileController.getFileProxyById(fileId, customRealm = mutableRealm)
                                         ?: continue
                                     if (proxy.isFolder() || proxy.isDirectlyPinned) continue
-                                    clearClaimedRowFields(mutableRealm, fileId)
+                                    clearClaimedRowFields(mutableRealm, fileId, userDrive)
                                 }
                             }
                         }
@@ -1260,7 +1373,8 @@ object OfflineFolderSyncUtils {
             while (queue.isNotEmpty()) {
                 val current = queue.removeFirst()
                 if (!visited.add(current)) continue
-                realm.where(File::class.java).equalTo(File::parentId.name, current).findAll().forEach { child ->
+                realm.where(File::class.java).equalTo(File::parentId.name, current)
+                    .equalTo(File::driveId.name, userDrive.driveId).findAll().forEach { child ->
                     if (ids.add(child.id)) queue.add(child.id)
                 }
             }
@@ -1315,7 +1429,10 @@ object OfflineFolderSyncUtils {
         }
 
         when (decideFromListing(basis, localState)) {
-            ListingDecision.SKIP_LOCAL_EDIT -> return
+            ListingDecision.SKIP_LOCAL_EDIT -> {
+                setNeedsAttention(userDrive, fileId, true)
+                return
+            }
             ListingDecision.DOWNLOAD -> {
                 // The body is fetched without a response that establishes its hash identity:
                 // the snapshot's hash (a preserved listing value) is NOT evidence for this
@@ -1486,9 +1603,19 @@ object OfflineFolderSyncUtils {
                 SentryLog.w(TAG, "Offline intent withdrawn before metadata adoption for file $fileId; adoption skipped")
                 return false
             }
+            val digestMatches = verifiedBytes?.digest != null && verifiedBytes.digest == proxy.offlineContentDigest &&
+                offlineFile?.exists() == true && verifiedBytes.length == offlineFile.length() &&
+                verifiedBytes.modifiedSec == offlineFile.lastModified().div(1_000L)
+            if (!digestMatches && offlineFile?.exists() == true) {
+                setNeedsAttention(userDrive, fileId, true)
+                return true // unchanged remote metadata never blesses changed/unverifiable local bytes
+            }
             val metadataUnchanged = proxy.offlineBasisModifiedAt == remoteFile.lastModifiedAt &&
                 (remoteFile.size == null || proxy.offlineBasisSize == null || proxy.offlineBasisSize == remoteFile.size)
             if (metadataUnchanged) {
+                if (digestMatches && proxy.offlineNeedsAttention) {
+                    realm.executeTransaction { proxy.offlineNeedsAttention = false }
+                }
                 // The basis fields are already consistent — a no-op for them, not a
                 // withdrawal. The server IDENTITY may still be missing though: a missing-copy
                 // restore records an unknown identity by design, and the conservative
@@ -1533,7 +1660,7 @@ object OfflineFolderSyncUtils {
                     return true // preserved bytes are consistent with THEIR basis; not a withdrawal
                 }
                 if (proxy.offlineContentDigest != null) {
-                    val evidenceDigest = verifiedBytes?.digest
+                    val evidenceDigest = verifiedBytes.digest
                     if (evidenceDigest == null || evidenceDigest != proxy.offlineContentDigest) {
                         SentryLog.w(TAG, "Local bytes diverge from the accepted digest for file $fileId; metadata-only adoption skipped")
                         return true // preserved bytes are consistent with THEIR basis; not a withdrawal
@@ -1561,6 +1688,7 @@ object OfflineFolderSyncUtils {
                     remoteFile.serverContentHash?.let { row.serverContentHash = it }
                     row.offlineBasisModifiedAt = remoteFile.lastModifiedAt
                     row.offlineBasisSize = remoteFile.size
+                    row.offlineNeedsAttention = false
                     offlineFile?.let { row.offlinePublishedPath = it.path }
                     recorded = true
                 }
@@ -1757,6 +1885,7 @@ object OfflineFolderSyncUtils {
                 )) {
                     PublicationDecision.PRESERVE_EXISTING -> {
                         SentryLog.w(TAG, "Existing copy edited, unknown or unverifiable for file ${file.id}; replacement aborted")
+                        setNeedsAttention(userDrive, file.id, true)
                         return@withPublicationLock StagedPublication.PRESERVED_EXISTING
                     }
                     PublicationDecision.ADOPT_METADATA_ONLY -> {
@@ -1862,6 +1991,7 @@ object OfflineFolderSyncUtils {
                             proxy.offlineBasisModifiedAt = file.lastModifiedAt
                             proxy.offlineBasisSize = file.size
                             proxy.offlineContentDigest = digest
+                            proxy.offlineNeedsAttention = false
                             proxy.offlinePublishedPath = offlineFile.path
                             // A publication under live root coverage records the root contract
                             // as the owner: the provenance survives later cached tree updates
@@ -1885,6 +2015,7 @@ object OfflineFolderSyncUtils {
                     attempt = 1
                     continue // one retry with a fresh snapshot; a second invalidation preserves
                 }
+                if (evidenceInvalidated) setNeedsAttention(userDrive, file.id, true)
                 return@withContext publicationOutcome
             }
             // Unreachable: the attempt loop only continues (one retry) or returns the
@@ -2022,6 +2153,7 @@ object OfflineFolderSyncUtils {
                     row.offlineBasisModifiedAt = remoteFile.lastModifiedAt
                     row.offlineBasisSize = remoteFile.size
                     row.offlineContentDigest = acceptedDigest
+                    row.offlineNeedsAttention = false
                     row.offlinePublishedPath = offlineFile.path
                     // A publication under live root coverage records the root contract as
                     // the owner (see the staged record above).

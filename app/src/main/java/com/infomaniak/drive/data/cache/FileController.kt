@@ -1252,6 +1252,7 @@ object FileController {
         // refresh must not silently release the root contract's claim (a moved-out row would
         // otherwise lose its recorded ownership exactly when the refresh rewrites its parent).
         offlineOwnedByRoot = oldFile.offlineOwnedByRoot
+        offlineNeedsAttention = oldFile.offlineNeedsAttention
         offlinePublishedPath = oldFile.offlinePublishedPath
         // serverContentHash is the identity OF THE ACCEPTED BYTES (the publication basis), not
         // the current remote metadata: it must survive every listing/details refresh unchanged

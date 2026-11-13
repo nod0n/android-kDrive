@@ -72,18 +72,18 @@ import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.FileId
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.OfflineFolderSyncUtils
-import com.infomaniak.drive.utils.MediaUtils.deleteInMediaScan
-import com.infomaniak.drive.utils.MediaUtils.isMedia
 import com.infomaniak.drive.utils.SyncOfflineUtils
 import com.infomaniak.drive.utils.SyncUtils.isSyncScheduled
 import com.infomaniak.drive.utils.SyncUtils.syncImmediately
 import com.infomaniak.drive.utils.Utils
 import com.infomaniak.drive.utils.find
 import io.realm.Realm
+import io.realm.RealmObject
 import io.sentry.Breadcrumb
 import io.sentry.Sentry
 import io.sentry.SentryLevel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -250,6 +250,7 @@ class MainViewModel(
             numberOfSuccessfulActions,
             totalOfActions,
             errorResId = currentErrorResId ?: fileRequest.errorResId.takeIf { !fileRequest.isSuccess },
+            noticeResId = mediator.value!!.noticeResId ?: fileRequest.noticeResId,
         )
     }
 
@@ -536,73 +537,45 @@ class MainViewModel(
         }
     }
 
-    fun removeSelectedFilesFromOffline(files: List<File>, onSuccess: (() -> Unit)? = null) = liveData {
-        val filesId = files.map { it.id }
-        val deletions = files.mapNotNull {
-            val file: File = it.freeze()
-            if (!file.isFolder() && file.isOffline) {
-                Triple(file, file.getOfflineFile(getApplication()), file.getCacheFile(getApplication()))
-            } else {
-                null
+    fun removeSelectedFilesFromOffline(
+        files: List<File>,
+        onSuccess: (() -> Unit)? = null,
+        userDrive: UserDrive = UserDrive(),
+    ): LiveData<FileResult> {
+        val snapshots = files.map(::offlineFileSnapshot)
+        return liveData(Dispatchers.IO) {
+            for (file in snapshots) {
+                val result = removeOfflineFile(file, userDrive.copy(driveId = file.driveId), onSuccess)
+                emit(FileResult(
+                    isSuccess = result.completed,
+                    errorResId = result.messageResId.takeUnless { result.completed },
+                    noticeResId = result.messageResId.takeIf { result.completed },
+                    data = result,
+                ))
             }
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            // The WHOLE withdrawal — intent mutation AND the actual filesystem deletion —
-            // runs inside the publication critical section and COMPLETES before this job
-            // can be observed as done: no publication's check-to-publish interval can
-            // resurrect offline status, and the function never returns before the bytes
-            // are actually gone.
-            OfflineFolderSyncUtils.withPublicationLock {
-                FileController.updateIsOfflineForFiles(fileIds = filesId, isOffline = false)
-                deletions.forEach { (file, offlineFile, cacheFile) ->
-                    if (offlineFile != null) deleteOfflineArtifacts(file, offlineFile, cacheFile)
-                }
-            }
-            onSuccess?.invoke()
-            emit(FileResult(isSuccess = true))
         }
     }
 
-    fun removeOfflineFile(
+    suspend fun removeOfflineFile(
         file: File,
-        offlineFile: IOFile,
-        cacheFile: IOFile,
-        userDrive: UserDrive = UserDrive(),
+        userDrive: UserDrive = UserDrive(driveId = file.driveId),
         onFileRemovedFromOffline: (() -> Unit)? = null,
-    ) {
-        // We need to call this method outside the UI thread
-        viewModelScope.launch(Dispatchers.IO) {
-            // The WHOLE withdrawal participates in the publication critical section — the
-            // three signal clears AND the actual byte deletion run inside one section, in
-            // the clear-then-delete order, so a deletion can neither run during a
-            // publication nor before the withdrawal's own intent mutation is committed.
-            OfflineFolderSyncUtils.withPublicationLock {
-                FileController.updateOfflineStatus(file.id, isOffline = false)
-                FileController.setDirectlyPinned(fileId = file.id, isDirectlyPinned = false) // direct pin intent withdrawn
-                // A surviving pending marker would authorize stale queued work to resurrect the
-                // copy the user just removed.
-                FileController.markFileAsOffline(fileId = file.id, isMarkedAsOffline = false)
-                deleteOfflineArtifacts(file, offlineFile, cacheFile, userDrive)
-            }
-            // The callback stays on Main (as the previous dedicated launch delivered it).
-            withContext(Dispatchers.Main) { onFileRemovedFromOffline?.invoke() }
+    ): OfflineFolderSyncUtils.RemovalResult {
+        val snapshot = offlineFileSnapshot(file)
+        val result = try {
+            OfflineFolderSyncUtils.removeOfflineCopy(getContext(), snapshot, userDrive)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            OfflineFolderSyncUtils.RemovalResult.REFUSED
         }
+        if (result.completed && onFileRemovedFromOffline != null) {
+            withContext(Dispatchers.Main) { onFileRemovedFromOffline() }
+        }
+        return result
     }
 
-    /** The actual filesystem effects of one offline-copy removal (blocking, no callbacks). */
-    private fun deleteOfflineArtifacts(
-        file: File,
-        offlineFile: IOFile,
-        cacheFile: IOFile,
-        userDrive: UserDrive = UserDrive(),
-    ) {
-        if (file.isMedia()) file.deleteInMediaScan(getContext(), userDrive)
-        if (cacheFile.exists()) cacheFile.delete()
-        if (offlineFile.exists()) {
-            offlineFile.delete()
-        }
-    }
+    private fun offlineFileSnapshot(file: File): File = if (RealmObject.isManaged(file)) file.freeze() else file
 
     fun syncOfflineFiles() {
         syncOfflineFilesJob?.cancel()
@@ -764,6 +737,7 @@ class MainViewModel(
         val data: Any? = null,
         val errorCode: String? = null,
         val fileName: String? = null,
+        val noticeResId: Int? = null,
     )
 
     data class CopyToDriveResult(val isSuccess: Boolean, val fileName: String)
@@ -772,6 +746,7 @@ class MainViewModel(
         var numberOfSuccessfulActions: Int,
         var totalOfActions: Int,
         var errorResId: Int? = null,
+        var noticeResId: Int? = null,
     )
 
     companion object {

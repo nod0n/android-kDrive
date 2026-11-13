@@ -110,6 +110,7 @@ class PreviewSliderFragment : BasePreviewSliderFragment(), FileInfoActionsView.O
             selectFolderResultLauncher = selectFolderResultLauncher,
             isSharedWithMe = userDrive.sharedWithMe,
             hideActions = false,
+            userDrive = userDrive,
         )
         bottomSheetView.updateCurrentFile(currentFile, mainViewModel.hasEligibleDestinationDrives(currentFile))
 
@@ -214,12 +215,12 @@ class PreviewSliderFragment : BasePreviewSliderFragment(), FileInfoActionsView.O
 
     override fun removeOfflineFile(offlineLocalPath: IOFile?, cacheFile: IOFile) {
         lifecycleScope.launch {
-            if (offlineLocalPath != null) {
-                mainViewModel.removeOfflineFile(currentFile, offlineLocalPath, cacheFile, userDrive)
-            }
-            previewSliderAdapter.updateFile(currentFile.id) { file -> file.isOffline = false }
+            val result = mainViewModel.removeOfflineFile(currentFile, userDrive)
+            previewSliderAdapter.updateFile(currentFile.id) { file -> file.isOffline = result.keepsOfflineIntent }
 
-            currentFile.isOffline = false
+            currentFile.isOffline = result.keepsOfflineIntent
+            currentFile.offlineNeedsAttention = result.needsAttention
+            result.messageResId?.let { showSnackbar(it) }
             binding.bottomSheetFileInfos.refreshBottomSheetUi(currentFile)
         }
     }

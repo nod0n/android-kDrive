@@ -52,10 +52,10 @@ import java.util.UUID
  *  (B) open the SAME file as a [DynamicRealm] at 17 and shape-correct it to the TRUE v17
  *      schema (remove this branch's four columns and table, add the dev columns, recreate the
  *      dev OfflineRoot table and seed it), every step verified before closing,
- *  (C) reopen at [FileMigration.DB_VERSION] (now 19: the migration runs through 18→19, whose
+ *  (C) reopen at [FileMigration.DB_VERSION] (now 20: the migration runs through 18→19, whose
  *      added provenance column this fixture therefore also removes in phase B and audits for
  *      presence and default in phase C — the per-row 18→19 DERIVATION is [FileMigration18to19Test]'s
- *      audit) with the REAL [FileMigration] and the FULL
+ *      audit; the future local-attention column is removed in phase B too) with the REAL [FileMigration] and the FULL
  *      production module — exactly what a production upgrade executes — and audit ONLY the
  *      17→18 difference: OfflineRoot rows are TRANSFORMED into OfflineFolderRoot rows (new
  *      three-part uid), the dev table is gone, the undeclared dev File fields are removed
@@ -96,6 +96,7 @@ class FileMigration17to18Test {
         File::offlineContentDigest.name,
         File::offlinePublishedPath.name,
         File::offlineOwnedByRoot.name,
+        File::offlineNeedsAttention.name,
     )
 
     /** The dev columns that v17 HAD and this branch's schema does not declare. */

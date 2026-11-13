@@ -44,10 +44,10 @@ import java.util.UUID
  *  (A) create a disposable TYPED realm at the FULL current module schema STAMPED 11,
  *  (B) open the SAME file as a [DynamicRealm] at 11 and remove ONLY this branch's additions —
  *      the file then holds the TRUE v11 shape, verified by a schema audit before closing,
- *  (C) reopen at [FileMigration.DB_VERSION] (now 19: the migration runs through 18→19, whose
+ *  (C) reopen at [FileMigration.DB_VERSION] (now 20: the migration runs through 18→19, whose
  *      added provenance column this fixture therefore also removes in phase B and audits for
  *      presence and default in phase C — the per-row 18→19 DERIVATION is [FileMigration18to19Test]'s
- *      audit) with the REAL [FileMigration] and the FULL
+ *      audit; the future local-attention column is removed in phase B too) with the REAL [FileMigration] and the FULL
  *      production module — exactly what a production upgrade executes — and audit ONLY the
  *      11→18 difference: the seven columns exist with the right nullability, the registered
  *      OfflineFolderRoot table exists empty, the pre-existing pin reads back as a direct pin,
@@ -117,6 +117,7 @@ class FileMigration11to18Test {
         File::serverContentHash.name,
         File::offlinePublishedPath.name,
         File::offlineOwnedByRoot.name,
+        File::offlineNeedsAttention.name,
     )
 
     /** A baseline pin: the persistent state in the public baseline is isOffline (not the
