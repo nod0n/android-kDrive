@@ -83,19 +83,21 @@ import java.nio.file.Files
  * ensureActive/scope guard would have applied its stale data before the join returned, so the
  * zero-effect claims underneath are sensitive to the guards' removal. A drop branch's REACH
  * is proven at a production boundary the branch itself must cross (case 3: the scope check's
- * account read, held and released by the test), never by a timer and never by the absence of
+ * witness read, held and released by the test), never by a timer and never by the absence of
  * an assertion failure; its DECISION is the guard's own — superseded-by-cancellation cases
  * (1, 2) claim only what the guards make true, never the scope-mismatch branch. Cleanup
  * cancellation is separate and never the mechanism a claim rests on: every parked latch is
  * hoisted and released in finally BEFORE the bounded cancel+join, and the last assertions run
  * after the released loads have actually finished.
  *
- * Evidence level: JVM orchestration guarantees only. The class has never yet completed a
- * case on device: the 9118 (240 s), 8ad8 (90 s) and 6f85 (90 s) runs all timed out in setUp,
- * and DEVICE-6f85-RESULT-2045 localized the hang to the collection-returning getGalleryDrive
- * stub recording with the MockK core-collection recursion captured — the corrected harness
- * (that stub removed; the tested flows never reach it) is COMPILED, NOT EXECUTED until a
- * device run records one. ActivityResult/lifecycle wiring is out of scope here.
+ * Device history: 9118/8ad8/6f85 timed out in setup; 6f85 localized MockK recursion while
+ * recording a collection-returning getGalleryDrive stub, which was removed. At a1d66 the
+ * class completed six cases with six assertion failures and zero passes. Existing compiled
+ * captureCurrentScope code calls the user getter but reads the drive backing field directly;
+ * getter mocks alone did not control that witness. Actual device scope values were not traced.
+ * This correction controls the captured synthetic witness under the real scope monitor and
+ * has no device pass credit until separately executed. ActivityResult/UI lifecycle is outside
+ * this fixture's scope.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class GalleryViewModelTest {
@@ -112,8 +114,8 @@ class GalleryViewModelTest {
      * Advice.isOverridden) — a child-mock instrumentation of the FINAL core collection return
      * whose own comparison path then dispatches back through the instrumented collection.
      * The correction removes that stub (the tested flows never reach getGalleryDrive) and the
-     * now-understood diagnostic noise; the class has never yet completed a case on device, so
-     * the phase marks stay.
+     * now-understood diagnostic noise. The later a1d66 run completed six failed cases;
+     * phase marks remain useful for separately authorized corrected runs.
      */
     @RegisterExtension
     @JvmField
@@ -138,6 +140,19 @@ class GalleryViewModelTest {
 
     private val testMainDispatcher = StandardTestDispatcher()
 
+    // All witness reads/writes use the production monitor. Never mutate real account fields
+    // or preferences: the capture seam, not a default getter, owns this synthetic epoch.
+    private var fixtureScope = AccountUtils.CurrentScope(USER_ID, DRIVE_ID, 0L)
+
+    private fun currentFixtureScope() = AccountUtils.withCurrentScope { fixtureScope }
+
+    private fun changeFixtureScope(userId: Int, driveId: Int = DRIVE_ID) = AccountUtils.withCurrentScope {
+        if (fixtureScope.userId != userId || fixtureScope.driveId != driveId) {
+            fixtureScope = AccountUtils.CurrentScope(userId, driveId, fixtureScope.revision + 1)
+        }
+        fixtureScope
+    }
+
     /** Synchronous executor: LiveData delivery on the calling thread (plain JVM has no main looper). */
     private val synchronousTaskExecutor = object : TaskExecutor() {
         override fun executeOnDiskIO(runnable: Runnable) = runnable.run()
@@ -153,8 +168,10 @@ class GalleryViewModelTest {
         ArchTaskExecutor.getInstance().setDelegate(synchronousTaskExecutor)
 
         mockkObject(AccountUtils)
-        every { AccountUtils.currentUserId } returns USER_ID
-        every { AccountUtils.currentDriveId } returns DRIVE_ID
+        AccountUtils.withCurrentScope { fixtureScope = AccountUtils.CurrentScope(USER_ID, DRIVE_ID, 0L) }
+        every { AccountUtils.captureCurrentScope() } answers { currentFixtureScope() }
+        every { AccountUtils.currentUserId } answers { currentFixtureScope().userId }
+        every { AccountUtils.currentDriveId } answers { currentFixtureScope().driveId }
 
         mockkObject(FileController)
         // DEVICE-6f85 EVIDENCE: recording `every { FileController.getGalleryDrive() } returns
@@ -386,15 +403,14 @@ class GalleryViewModelTest {
             assertTrue(oldRequestEntered.await(5, TimeUnit.SECONDS), "the old request reached the seam before the account switch")
             val staleLoadJobs = capturedLoadJobs(vm)
 
-            // Account switches while the response is in flight. The post-switch account stub
-            // is a HANDSHAKE, not a timer: the drop branch's scope check must READ the
-            // account here; the test observes the read, then lets the branch decide. The
-            // decision value is fixed (USER_ID + 1 -> mismatch), so the zero-effect asserts
-            // below cannot race a side effect that the branch can never produce.
-            every { AccountUtils.currentUserId } answers {
+            // Change the same coherent witness that the real guard reads. The capture
+            // handshake proves the guard was reached without replacing its decision.
+            changeFixtureScope(USER_ID + 1)
+            every { AccountUtils.captureCurrentScope() } answers {
+                val snapshot = currentFixtureScope()
                 branchReachedScopeCheck.countDown()
                 if (!branchMayDecide.await(5, TimeUnit.SECONDS)) answerTimedOut.set(true)
-                USER_ID + 1
+                snapshot
             }
             blockedResponse.countDown()
             assertTrue(branchReachedScopeCheck.await(5, TimeUnit.SECONDS), "the stale branch reached the production scope check (the drop ran)")
@@ -419,6 +435,42 @@ class GalleryViewModelTest {
     }
 
     @Test
+    @DisplayName("returning to the same account and drive still rejects an older gallery revision")
+    fun returningToSameScopeRejectsAnOlderRevision() {
+        val vm = GalleryViewModel()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val answerTimedOut = AtomicBoolean(false)
+        val initial = currentFixtureScope()
+        every { ApiRepository.getLastGallery(DRIVE_ID, any(), null) } answers {
+            entered.countDown()
+            if (!release.await(5, TimeUnit.SECONDS)) answerTimedOut.set(true)
+            apiPage(listOf(file(1, ExtensionTypes.IMAGE)), "old-revision", false)
+        }
+        try {
+            vm.loadLastGallery(DRIVE_ID, false)
+            assertTrue(entered.await(5, TimeUnit.SECONDS), "the requested drive reached the API before invalidation")
+            val jobs = capturedLoadJobs(vm)
+            changeFixtureScope(USER_ID + 1)
+            val returned = changeFixtureScope(USER_ID)
+            assertEquals(initial.userId, returned.userId)
+            assertEquals(initial.driveId, returned.driveId)
+            assertEquals(initial.revision + 2, returned.revision)
+            assertEquals(returned, changeFixtureScope(USER_ID), "a no-op write must not invent a revision")
+            release.countDown()
+            joinReleasedLoads("the stale ABA load", jobs)
+            assertFalse(answerTimedOut.get())
+            assertNull(vm.galleryApiResult.value, "same IDs do not authorize an earlier revision")
+            assertNull(vm.currentCursor)
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) }
+            verify(exactly = 0) { FileController.removeOrphanFiles(any<UserDrive>()) }
+        } finally {
+            release.countDown()
+            cancelAndJoinLoads(vm)
+        }
+    }
+
+    @Test
     @DisplayName("filtered responses are locally matched and never write the shared cache")
     fun filteredResponsesAreLocallyMatchedAndNeverWriteTheSharedCache() {
         val vm = GalleryViewModel()
@@ -436,6 +488,7 @@ class GalleryViewModelTest {
             vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
 
             assertTrue(awaitTrue { vm.galleryApiResult.value != null }, "the filtered load applied")
+            verify(exactly = 1) { ApiRepository.getLastGallery(DRIVE_ID, any(), null) }
 
             val page = vm.galleryApiResult.value!!
             assertEquals(listOf(2), page.files.map { it.id }, "only videos survive the local match")
@@ -462,6 +515,7 @@ class GalleryViewModelTest {
             vm.loadLastGallery(DRIVE_ID, ignoreCloud = false)
 
             assertTrue(awaitTrue { vm.galleryApiResult.value != null }, "the load applied")
+            verify(exactly = 1) { ApiRepository.getLastGallery(DRIVE_ID, any(), null) }
 
             verify(exactly = 1) { FileController.storeGalleryDrive(match { it.size == 2 }, isFirstPage = true, userDrive = UserDrive(USER_ID, DRIVE_ID)) }
             verify(exactly = 1) { FileController.removeOrphanFiles(any<UserDrive>()) }
@@ -477,8 +531,6 @@ class GalleryViewModelTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         Realm.init(context)
         val directory = Files.createTempDirectory(context.cacheDir.toPath(), "gallery-scope-").toFile()
-        val user = AtomicInteger(USER_ID)
-        every { AccountUtils.currentUserId } answers { user.get() }
         fun configuration(scope: UserDrive) = RealmConfiguration.Builder()
             .directory(directory).name("${scope.userId}-${scope.driveId}.realm")
             .schemaVersion(FileMigration.DB_VERSION).migration(FileMigration())
@@ -488,7 +540,7 @@ class GalleryViewModelTest {
         val writerFinished = CountDownLatch(1)
         val writer = Thread {
             writerEntered.countDown()
-            AccountUtils.updateCurrentScope { user.set(USER_ID + 1); true }
+            changeFixtureScope(USER_ID + 1)
             writerFinished.countDown()
         }
         var firstOpen = true
@@ -523,6 +575,7 @@ class GalleryViewModelTest {
             releaseResponse.countDown()
             assertTrue(writerFinished.await(5, TimeUnit.SECONDS), "the accepted commit and the queued scope writer complete")
             joinReleasedLoads("accepted scoped load", jobs)
+            assertEquals(AccountUtils.CurrentScope(USER_ID + 1, DRIVE_ID, 1L), currentFixtureScope())
             assertEquals(listOf(UserDrive(USER_ID, DRIVE_ID), UserDrive(USER_ID, DRIVE_ID)), configScope)
             Realm.getInstance(configuration(UserDrive(USER_ID, DRIVE_ID))).use { realm ->
                 assertEquals(1L, realm.where(File::class.java).equalTo(File::id.name, 1).count())
