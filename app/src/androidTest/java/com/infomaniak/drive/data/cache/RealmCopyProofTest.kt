@@ -4,6 +4,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.infomaniak.drive.utils.RealmModules
 import io.realm.DynamicRealm
 import io.realm.DynamicRealmObject
+import io.realm.Realm
 import io.realm.RealmConfiguration
 import io.realm.RealmFieldType
 import io.realm.RealmResults
@@ -12,11 +13,11 @@ import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.io.File
+import java.io.FileNotFoundException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.attribute.PosixFileAttributes
 import java.security.MessageDigest
-import java.util.Date
 
 /**
  * androidTest-only, READ-ONLY proof helper: asserts that the BEFORE and AFTER
@@ -34,7 +35,10 @@ import java.util.Date
  * Realm access: readOnly configuration (name/directory/schemaVersion/
  * DriveFilesModule), no migration, no compaction, no write transaction, both
  * Realms closed via nested Closeable.use. Library exceptions are sanitized:
- * only the exception CLASS NAME is ever emitted, never its message.
+ * only the exception class and a fixed phase/class label are emitted, never its message.
+ * The pinned library requires assetFile even for existing read-only files.
+ * Its cache skips asset copying when the target exists; an explicitly absent
+ * asset prevents fallback from supplying bytes if an input disappears.
  *
  * Comparison: schema-driven over each copy's own schema (class, field, type,
  * primary-key, required, nullable - see schema_covers in the output for the
@@ -57,6 +61,9 @@ class RealmCopyProofTest {
     private val classReports = mutableListOf<Map<String, Any?>>()
     private val unsupported = mutableListOf<String>()
     private lateinit var infos: Map<String, ClassInfo>
+    private var phase = "inputs"
+    private var rowClass: String? = null
+    private var assetFallbackDisabled = false
 
     @Test
     fun beforeAfterRealmCopiesAreRowIdentical() {
@@ -71,7 +78,8 @@ class RealmCopyProofTest {
             throw AssertionError("FAIL_CLOSED: beforeSha/afterSha missing/malformed (expected 64-hex)")
         }
 
-        val filesDir = InstrumentationRegistry.getInstrumentation().targetContext.filesDir
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val filesDir = context.filesDir
         val fixtureRoot = File(filesDir, "realm-copy-proof-$stamp")
         val expectedCanonical = File(filesDir.canonicalFile, "realm-copy-proof-$stamp").canonicalFile
         if (fixtureRoot.canonicalFile.path != expectedCanonical.path) {
@@ -90,30 +98,49 @@ class RealmCopyProofTest {
         var verdict = VERDICT_FAIL_CLOSED
         var schemaEqual = false
         var errorClass: String? = null
+        var errorPhase: String? = null
+        var errorRowClass: String? = null
         var shaAfter: Map<String, String> = emptyMap()
         try {
-            openReadOnly(before).use { beforeRealm ->
-                openReadOnly(after).use { afterRealm ->
+            phase = "init"
+            Realm.init(context) // Idempotent library initialization; no production Realm is opened here.
+            phase = "config-build"
+            requireAbsentFallbackAsset()
+            val beforeConfig = readOnlyConfiguration(before)
+            val afterConfig = readOnlyConfiguration(after)
+            // Regression for the pinned builder's assetFile precondition.
+            // Building configurations never opens or writes either input.
+            check(runCatching { copyConfiguration(before).readOnly().build() }.exceptionOrNull() is IllegalStateException)
+            check(beforeConfig.isReadOnly && afterConfig.isReadOnly)
+            check(before.canonicalPath == beforeConfig.path && after.canonicalPath == afterConfig.path)
+            phase = "open-before"
+            DynamicRealm.getInstance(beforeConfig).use { beforeRealm ->
+                phase = "open-after"
+                DynamicRealm.getInstance(afterConfig).use { afterRealm ->
+                    phase = "schema"
                     infos = buildClassInfos(beforeRealm)
                     schemaEqual = compareSchemas(beforeRealm, afterRealm)
                     verdict = if (!schemaEqual) VERDICT_DIFFER else compareClasses(beforeRealm, afterRealm)
+                    phase = "close"
                 }
             }
         } catch (e: Exception) {
             // Sanitized: class name only. Library exception messages can embed
             // paths or schema text and are never emitted.
             errorClass = e.javaClass.simpleName
+            errorPhase = phase
+            errorRowClass = rowClass.takeIf { phase == "rowclass" }
             verdict = VERDICT_FAIL_CLOSED
         } finally {
             shaAfter = mapOf("before" to sha256(before), "after" to sha256(after))
         }
         val copiesUnchanged = shaBefore == shaAfter
 
-        emitJson(verdict, schemaEqual, copiesUnchanged, errorClass, shaBefore, shaAfter)
+        emitJson(verdict, schemaEqual, copiesUnchanged, errorClass, shaBefore, shaAfter, errorPhase, errorRowClass)
 
         val failure = StringBuilder()
         if (verdict != VERDICT_EQUAL) failure.append("verdict=$verdict; ")
-        if (errorClass != null) failure.append("errorClass=$errorClass; ")
+        if (errorClass != null) failure.append("errorClass=$errorClass; phase=$errorPhase; rowClass=$errorRowClass; ")
         if (!copiesUnchanged) failure.append("a copy was modified by the read; ")
         if (verdicts.isNotEmpty()) failure.append("diffs=${verdicts.take(20)}; ")
         if (unsupported.isNotEmpty()) failure.append("unsupported=${unsupported.take(20)}; ")
@@ -179,15 +206,33 @@ class RealmCopyProofTest {
         }
     }
 
-    private fun openReadOnly(copy: File): DynamicRealm {
-        val config = RealmConfiguration.Builder()
+    private fun copyConfiguration(copy: File): RealmConfiguration.Builder =
+        RealmConfiguration.Builder()
             .name(copy.name)
-            .directory(copy.parentFile)
+            .directory(requireNotNull(copy.parentFile))
             .schemaVersion(DriveMigration.DB_VERSION)
             .modules(RealmModules.DriveFilesModule())
+
+    private fun requireAbsentFallbackAsset() {
+        try {
+            InstrumentationRegistry.getInstrumentation().targetContext.assets.open(NO_FALLBACK_ASSET).use {
+                error("COPY proof fallback asset must not exist")
+            }
+        } catch (_: FileNotFoundException) {
+            assetFallbackDisabled = true
+        }
+    }
+
+    private fun readOnlyConfiguration(copy: File): RealmConfiguration {
+        check(assetFallbackDisabled && copy.isFile)
+        // Realm 11.0.1: RealmCache.copyFileIfNeeded returns before asset IO
+        // for an existing target. For a missing target it opens the asset
+        // BEFORE FileOutputStream; our absent asset makes that path fail.
+        // Public readOnly propagates SCHEMA_MODE_READONLY to native config.
+        return copyConfiguration(copy)
+            .assetFile(NO_FALLBACK_ASSET)
             .readOnly()
             .build()
-        return DynamicRealm.getInstance(config)
     }
 
     // ------------------------------------------------------------------
@@ -253,6 +298,8 @@ class RealmCopyProofTest {
         val classNames = beforeRealm.getSchema().getAll().map { it.getClassName() }.sorted()
         var allEqual = true
         for (name in classNames) {
+            phase = "rowclass"
+            rowClass = name
             val info = infos.getValue(name)
             val before = beforeRealm.where(name).findAll()
             val after = afterRealm.where(name).findAll()
@@ -407,7 +454,7 @@ class RealmCopyProofTest {
                 obj.getList(field).map { linkToken(it.type, identityToken(it, depth + 1)) }
             )
             RealmFieldType.INTEGER_LIST -> listTokenFromParts(
-                obj.getList(field, java.lang.Integer::class.java).map { str('i', it.toString()) }
+                obj.getList(field, Int::class.javaObjectType).map { str('i', it.toString()) }
             )
             RealmFieldType.INTEGER -> if (obj.isNull(field)) NULL_ATOM else str('i', obj.getLong(field).toString())
             RealmFieldType.BOOLEAN -> if (obj.isNull(field)) NULL_ATOM else if (obj.getBoolean(field)) "B1" else "B0"
@@ -431,6 +478,8 @@ class RealmCopyProofTest {
         errorClass: String?,
         shaBefore: Map<String, String>,
         shaAfter: Map<String, String>?,
+        errorPhase: String? = null,
+        errorRowClass: String? = null,
     ) {
         val json = buildString {
             append("{\"verdict\":\"").append(verdict).append('"')
@@ -438,6 +487,10 @@ class RealmCopyProofTest {
             append(",\"copies_unchanged\":").append(copiesUnchanged)
             append(",\"sha_args_pinned\":true")
             append(",\"error_class\":").append(errorClass?.let { "\"$it\"" } ?: "null")
+            append(",\"error_phase\":").append(errorPhase?.let { "\"$it\"" } ?: "null")
+            append(",\"error_row_class\":").append(errorRowClass?.let { "\"${jsonSafe(it)}\"" } ?: "null")
+            append(",\"access_mode\":\"read-only-existing-input\"")
+            append(",\"asset_fallback_disabled\":").append(assetFallbackDisabled)
             append(",\"schema_covers\":\"class,field,type,pk,required,nullable; index-status and schema-level")
             append(" link-targets not introspectable in pinned fork; link targets verified in row tokens\"")
             append(",\"diff_count\":").append(verdicts.size)
@@ -501,6 +554,7 @@ class RealmCopyProofTest {
         private const val MAX_LINK_DEPTH = 8
         private const val UNSUPPORTED_TOKEN = "UNSUPPORTED"
         private const val NULL_ATOM = "N"
+        private const val NO_FALLBACK_ASSET = "__realm_copy_proof_no_fallback__.realm"
 
         private val STAMP_REGEX = Regex("^[A-Za-z0-9_-]{1,64}$")
         private val HEX64_REGEX = Regex("^[0-9a-f]{64}$")
