@@ -150,17 +150,32 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 drivesRealm.refresh()
                 requireNoFixtureDriveCollision(drivesRealm)
                 if (!owned) {
-                    check(!Files.exists(offline.toPath(), NOFOLLOW_LINKS) && !Files.exists(cache.toPath(), NOFOLLOW_LINKS)) {
+                    check(Files.notExists(offline.toPath(), NOFOLLOW_LINKS)) {
                         "Pre-existing fixture root; no paths may be removed"
                     }
+                    val emptyCache = inspectEmptyCache()
                     val realmFile = JavaFile(config.path)
                     val family = checkNotNull(realmFile.parentFile?.listFiles()) { "Cannot inspect fixture realm family" }
                         .filter { it.name.startsWith(realmFile.name) }
                     check(family.all { it.name == "${realmFile.name}.lock" && isReviewedFixtureLock(it) }) {
                         "Unowned fixture realm family; no paths may be removed"
                     }
+                    // Every path/family/Drive identity check precedes the first removal.
+                    // Never recursively adopt an existing leaf based on its numeric IDs.
+                    if (emptyCache != null) {
+                        val current = checkNotNull(inspectEmptyCache()) { "Empty cache fixture disappeared" }
+                        check(current.st_dev == emptyCache.st_dev && current.st_ino == emptyCache.st_ino) {
+                            "Empty cache fixture identity changed"
+                        }
+                        Files.delete(cache.toPath()) // nonrecursive; a concurrent population makes deletion fail
+                        check(Files.notExists(cache.toPath(), NOFOLLOW_LINKS)) { "Empty cache fixture removal failed" }
+                    }
+                    check(Files.notExists(offline.toPath(), NOFOLLOW_LINKS) && Files.notExists(cache.toPath(), NOFOLLOW_LINKS)) {
+                        "Fixture root appeared during preflight; paths are retained"
+                    }
+                    owned = true
+                    return // first use never recursively deletes a pre-existing input
                 }
-                owned = true
                 if (JavaFile(config.path).exists()) {
                     check(Realm.deleteRealm(config) && !JavaFile(config.path).exists()) { "Owned fixture realm deletion failed" }
                 }
@@ -174,6 +189,15 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 refused = true // even @AfterAll must not delete after a failed setup/reset
                 throw failure
             }
+        }
+
+        private fun inspectEmptyCache(): android.system.StructStat? {
+            if (Files.notExists(cache.toPath(), NOFOLLOW_LINKS)) return null
+            val stat = Os.lstat(cache.path)
+            check(OsConstants.S_ISDIR(stat.st_mode) && stat.st_uid == Os.getuid() &&
+                (stat.st_mode and 0xfff) == 0x1c0 && checkNotNull(cache.listFiles()).isEmpty()
+            ) { "Pre-existing cache fixture is not an owned empty directory" }
+            return stat
         }
 
         private fun isReviewedFixtureLock(file: JavaFile): Boolean {
@@ -4519,6 +4543,47 @@ class OfflineFolderMaintenanceOrchestrationTest {
             }
         } finally {
             check(directory.deleteRecursively()) // exclusively created by this method, never the fixed namespaces
+        }
+    }
+
+    @Test
+    @DisplayName("fixture reset admits only an owned empty cache after all identity checks")
+    fun fixtureEmptyCachePreflightPreservesNonemptyAndConflictingInputs() {
+        val directory = Files.createTempDirectory(context.cacheDir.toPath(), "offline-empty-cache-").toFile()
+        try {
+            for (scenario in listOf("nonempty", "empty", "realm-conflict", "identity-conflict")) {
+                val caseDirectory = JavaFile(directory, scenario).apply { check(mkdir()) }
+                val config = RealmConfiguration.Builder().directory(caseDirectory).name("files.realm")
+                    .schemaVersion(FileMigration.DB_VERSION).modules(RealmModules.LocalFilesModule()).build()
+                val drivesConfig = RealmConfiguration.Builder().directory(caseDirectory).name("drives.realm")
+                    .schemaVersion(DriveMigration.DB_VERSION).modules(RealmModules.DriveFilesModule()).build()
+                val offline = JavaFile(caseDirectory, "offline")
+                val cache = JavaFile(caseDirectory, "cache")
+                Os.mkdir(cache.path, 0x1c0) // only this newly created, owned test namespace
+                val sentinel = JavaFile(cache, "sentinel")
+                if (scenario == "nonempty") sentinel.writeBytes(bodyV1)
+                if (scenario == "realm-conflict") JavaFile(config.path).writeBytes(bodyV1)
+                val paths = FixturePaths(config, offline, cache)
+                Realm.getInstance(drivesConfig).use { realm ->
+                    if (scenario == "identity-conflict") realm.executeTransaction { it.copyToRealm(fixtureDrive()) }
+                    if (scenario == "empty") {
+                        paths.reset(realm)
+                        assertTrue(paths.canCleanup)
+                        assertTrue(Files.notExists(cache.toPath(), NOFOLLOW_LINKS))
+                    } else {
+                        assertThrows(IllegalStateException::class.java) { paths.reset(realm) }
+                        assertFalse(paths.canCleanup)
+                        paths.cleanup(realm) // the refusal latch prevents a later removal
+                        assertTrue(cache.isDirectory, "every conflict must precede empty-leaf deletion")
+                        if (scenario == "nonempty") assertTrue(sentinel.readBytes().contentEquals(bodyV1))
+                        if (scenario == "realm-conflict") assertTrue(JavaFile(config.path).readBytes().contentEquals(bodyV1))
+                        assertThrows(IllegalStateException::class.java) { paths.reset(realm) }
+                    }
+                }
+            }
+        } finally {
+            // Only the exclusive temporary namespace created by this case, never operator cleanup.
+            assertTrue(directory.deleteRecursively())
         }
     }
 
