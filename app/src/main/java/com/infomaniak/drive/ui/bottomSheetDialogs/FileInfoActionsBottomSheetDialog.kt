@@ -273,9 +273,12 @@ class FileInfoActionsBottomSheetDialog : EdgeToEdgeBottomSheetDialog(), FileInfo
     }
 
     override fun removeOfflineFile(offlineLocalPath: IOFile?, cacheFile: IOFile) {
-        lifecycleScope.launch {
-            val result = mainViewModel.removeOfflineFile(currentFile, navigationArgs.userDrive)
+        val selectedFile = currentFile
+        val selectedScope = navigationArgs.userDrive
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = mainViewModel.removeOfflineFile(selectedFile, selectedScope)
             withContext(Dispatchers.Main) {
+                if (currentFile.id != selectedFile.id || currentFile.driveId != selectedScope.driveId) return@withContext
                 currentFile.isOffline = result.keepsOfflineIntent
                 currentFile.offlineNeedsAttention = result.needsAttention
                 result.messageResId?.let { showSnackbar(it, showAboveFab = true) }

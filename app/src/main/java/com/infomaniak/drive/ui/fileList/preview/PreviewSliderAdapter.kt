@@ -27,6 +27,7 @@ import com.infomaniak.drive.data.models.ExtensionType
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.ui.fileList.preview.playback.PreviewPlaybackFragment
+import com.infomaniak.drive.utils.OfflineFolderSyncUtils.RemovalResult
 
 class PreviewSliderAdapter(
     manager: FragmentManager,
@@ -65,6 +66,25 @@ class PreviewSliderAdapter(
     fun updateFile(fileId: Int, transaction: (file: File) -> Unit) {
         val filePosition = files.indexOfFirst { it.id == fileId }
         if (filePosition >= 0) transaction(files[filePosition])
+    }
+
+    /** Updates the selected row; a later page or account must not receive its completion UI. */
+    internal fun applyOfflineRemoval(
+        selectedFileId: Int,
+        selectedScope: UserDrive,
+        currentScope: UserDrive,
+        visibleFile: File,
+        result: RemovalResult,
+    ): Boolean {
+        if (userDrive != selectedScope || currentScope != selectedScope) return false
+        updateFile(selectedFileId) {
+            it.isOffline = result.keepsOfflineIntent
+            it.offlineNeedsAttention = result.needsAttention
+        }
+        if (visibleFile.id != selectedFileId || visibleFile.driveId != selectedScope.driveId) return false
+        visibleFile.isOffline = result.keepsOfflineIntent
+        visibleFile.offlineNeedsAttention = result.needsAttention
+        return true
     }
 
     fun addFile(file: File) {

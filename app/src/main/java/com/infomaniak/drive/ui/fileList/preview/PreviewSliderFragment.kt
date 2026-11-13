@@ -214,12 +214,14 @@ class PreviewSliderFragment : BasePreviewSliderFragment(), FileInfoActionsView.O
     }
 
     override fun removeOfflineFile(offlineLocalPath: IOFile?, cacheFile: IOFile) {
-        lifecycleScope.launch {
-            val result = mainViewModel.removeOfflineFile(currentFile, userDrive)
-            previewSliderAdapter.updateFile(currentFile.id) { file -> file.isOffline = result.keepsOfflineIntent }
-
-            currentFile.isOffline = result.keepsOfflineIntent
-            currentFile.offlineNeedsAttention = result.needsAttention
+        val selectedFile = currentFile
+        val selectedFileId = selectedFile.id
+        val selectedScope = userDrive
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = mainViewModel.removeOfflineFile(selectedFile, selectedScope)
+            if (!previewSliderAdapter.applyOfflineRemoval(selectedFileId, selectedScope, userDrive, currentFile, result)) {
+                return@launch
+            }
             result.messageResId?.let { showSnackbar(it) }
             binding.bottomSheetFileInfos.refreshBottomSheetUi(currentFile)
         }
