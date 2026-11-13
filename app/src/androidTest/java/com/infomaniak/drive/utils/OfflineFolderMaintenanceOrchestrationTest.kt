@@ -18,6 +18,8 @@
 package com.infomaniak.drive.utils
 
 import androidx.test.core.app.ApplicationProvider
+import android.system.Os
+import android.system.OsConstants
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.Observer
 import androidx.lifecycle.LiveData
@@ -32,7 +34,9 @@ import com.infomaniak.drive.ui.MainViewModel
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.api.CursorApiResponse
 import com.infomaniak.drive.data.cache.DriveInfosController
+import com.infomaniak.drive.data.cache.DriveMigration
 import com.infomaniak.drive.data.cache.FileController
+import com.infomaniak.drive.data.cache.FileMigration
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.FileActivityType
 import com.infomaniak.drive.data.models.OfflineFolderRoot
@@ -49,6 +53,7 @@ import io.mockk.mockkObject
 import io.mockk.unmockkAll
 import io.mockk.unmockkObject
 import io.realm.Realm
+import io.realm.RealmConfiguration
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -73,6 +78,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
@@ -80,6 +86,8 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import java.io.File as JavaFile
 import java.util.concurrent.atomic.AtomicLong
+import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 
 /**
  * THE REAL OFFLINE MAINTENANCE ORCHESTRATION (androidTest instrumentation — the row store is
@@ -115,6 +123,67 @@ class OfflineFolderMaintenanceOrchestrationTest {
         File.getOfflineFolder(context),
         "${userDrive.userId}/${userDrive.driveId}",
     )
+    private val fixturePaths by lazy {
+        FixturePaths(
+            FileController.getRealmConfiguration(userDrive), offlineRoot,
+            JavaFile(context.cacheDir, "cloud_storage/${userDrive.userId}/${userDrive.driveId}"),
+        )
+    }
+
+    /** Only a successful first-use preflight can grant this instance cleanup ownership. */
+    private inner class FixturePaths(
+        private val config: RealmConfiguration,
+        private val offline: JavaFile,
+        private val cache: JavaFile,
+    ) {
+        private var owned = false
+        private var refused = false
+        val canCleanup get() = owned && !refused
+
+        fun cleanup(drivesRealm: Realm) {
+            if (canCleanup) reset(drivesRealm)
+        }
+
+        fun reset(drivesRealm: Realm) {
+            check(!refused) { "Fixture ownership was refused; paths are retained" }
+            try {
+                drivesRealm.refresh()
+                requireNoFixtureDriveCollision(drivesRealm)
+                if (!owned) {
+                    check(!Files.exists(offline.toPath(), NOFOLLOW_LINKS) && !Files.exists(cache.toPath(), NOFOLLOW_LINKS)) {
+                        "Pre-existing fixture root; no paths may be removed"
+                    }
+                    val realmFile = JavaFile(config.path)
+                    val family = checkNotNull(realmFile.parentFile?.listFiles()) { "Cannot inspect fixture realm family" }
+                        .filter { it.name.startsWith(realmFile.name) }
+                    check(family.all { it.name == "${realmFile.name}.lock" && isReviewedFixtureLock(it) }) {
+                        "Unowned fixture realm family; no paths may be removed"
+                    }
+                }
+                owned = true
+                if (JavaFile(config.path).exists()) {
+                    check(Realm.deleteRealm(config) && !JavaFile(config.path).exists()) { "Owned fixture realm deletion failed" }
+                }
+                if (Files.exists(offline.toPath(), NOFOLLOW_LINKS)) {
+                    check(offline.deleteRecursively() && !offline.exists()) { "Owned offline fixture deletion failed" }
+                }
+                if (Files.exists(cache.toPath(), NOFOLLOW_LINKS)) {
+                    check(cache.deleteRecursively() && !cache.exists()) { "Owned cache fixture deletion failed" }
+                }
+            } catch (failure: Throwable) {
+                refused = true // even @AfterAll must not delete after a failed setup/reset
+                throw failure
+            }
+        }
+
+        private fun isReviewedFixtureLock(file: JavaFile): Boolean {
+            // Exact saved post-deleteRealm residue, not ownership inferred from numeric IDs.
+            val stat = Os.lstat(file.path)
+            return OsConstants.S_ISREG(stat.st_mode) && (stat.st_mode and 0x1ff) == 0x180 &&
+                stat.st_size == 1_456L && sha256Hex(file.readBytes()) ==
+                "f7b7dbf2b33af51f0f6bd2a2f8d1453a48f900664fbd01ecc1043423c5f0d60d"
+        }
+    }
 
     private val bodyV1 = "fixture-body-v1".toByteArray()
     // Same length as bodyV1 ON PURPOSE: a changed-hash-under-unchanged-metadata remote still
@@ -174,6 +243,8 @@ class OfflineFolderMaintenanceOrchestrationTest {
 
     @BeforeEach
     fun setUp() {
+        // Refusal precedes every fixed-path delete, including later class cleanup.
+        DriveInfosController.getRealmInstance().use { fixturePaths.reset(it) }
         MockKAnnotations.init(this)
         detailsRequests.set(0)
         bodyRequests.set(0)
@@ -183,26 +254,6 @@ class OfflineFolderMaintenanceOrchestrationTest {
         deliverBodyAfterUnmark = false
         parkWhenServingBody = null
         bodyParkReached = java.util.concurrent.CountDownLatch(1)
-        runCatching { Realm.deleteRealm(FileController.getRealmConfiguration(userDrive)) }
-        runCatching { offlineRoot.deleteRecursively() }
-        // Per-case CACHE isolation (device-5ea2 failure 4): the offline root above does not
-        // cover the app-cache side, and several cases intentionally PRESERVE cache bytes at
-        // the fixture file id — a leftover intact cache made the covered initial download
-        // succeed through the cache-move with zero body fetches. Delete exactly THIS
-        // class's synthetic drive cache namespace (the same synthetic ids as offlineRoot;
-        // never a real account's cache tree).
-        // Failed isolation must be VISIBLE before the case runs, never a silent
-        // reproduction of order contamination: the invariant is that the namespace does
-        // not exist when the case starts (the deletion outcome is carried in the message;
-        // a deletion that cannot complete fails the case here).
-        val fixtureCacheNamespace = JavaFile(context.cacheDir, "cloud_storage/${userDrive.userId}/${userDrive.driveId}")
-        val cacheIsolationOutcome = runCatching { fixtureCacheNamespace.deleteRecursively() }
-        check(!fixtureCacheNamespace.exists()) {
-            "per-case cache isolation failed: ${fixtureCacheNamespace.path} still exists after the " +
-                "cleanup attempt (deleteRecursively -> ${cacheIsolationOutcome.getOrNull()}); " +
-                "refusing to run over order contamination"
-        }
-
         mockkObject(ApiRepository)
         mockkObject(AccountUtils)
         coEvery { AccountUtils.getHttpClient(any(), any(), any(), any()) } returns OkHttpClient()
@@ -478,22 +529,17 @@ class OfflineFolderMaintenanceOrchestrationTest {
             // The reads see the write transaction's own fresh snapshot, so the refusal
             // is atomic with the insertion (a collision throws -> Realm rolls back).
             realm.executeTransaction { transactionRealm ->
-                val cohortCount = transactionRealm.where(Drive::class.java)
-                    .equalTo(Drive::userId.name, userDrive.userId)
-                    .count()
-                val pkCount = transactionRealm.where(Drive::class.java)
-                    .equalTo(Drive::objectId.name, fixtureDriveObjectId())
-                    .count()
-                check(cohortCount == 0L && pkCount == 0L) {
-                    "DriveInfos collision: $cohortCount drive(s) for synthetic userId " +
-                        "${userDrive.userId}, $pkCount row(s) with fixture pk " +
-                        "${fixtureDriveObjectId()} — refusing to seed; NO state was changed " +
-                        "(a crash-leftover requires explicit orchestrator recovery)"
-                }
+                requireNoFixtureDriveCollision(transactionRealm)
                 transactionRealm.copyToRealm(fixtureDrive())
             }
             fixtureDriveOwned = true // only a COMMITTED insertion is owned
         }
+    }
+
+    private fun requireNoFixtureDriveCollision(realm: Realm) {
+        val cohortCount = realm.where(Drive::class.java).equalTo(Drive::userId.name, userDrive.userId).count()
+        val pkCount = realm.where(Drive::class.java).equalTo(Drive::objectId.name, fixtureDriveObjectId()).count()
+        check(cohortCount == 0L && pkCount == 0L) { "Fixture drive identity collision; no reset or seed is permitted" }
     }
 
     private fun fixtureDriveObjectId() = "${userDrive.driveId}_${userDrive.userId}"
@@ -4431,6 +4477,51 @@ class OfflineFolderMaintenanceOrchestrationTest {
         assertTrue(OfflineFolderSyncUtils.folderNeedsAttention(userDrive, coveredFolderId))
     }
 
+    @Test
+    @DisplayName("fixture reset refuses foreign paths and drive identities before deleting, including class cleanup")
+    fun fixtureOwnershipRefusalPreservesPathsThroughCleanup() {
+        val directory = Files.createTempDirectory(context.cacheDir.toPath(), "offline-ownership-").toFile()
+        try {
+            for (collision in listOf("paths", "realm", "identity")) {
+                val identityCollision = collision == "identity"
+                val caseDirectory = JavaFile(directory, collision).apply { check(mkdir()) }
+                val config = RealmConfiguration.Builder().directory(caseDirectory).name("files.realm")
+                    .schemaVersion(FileMigration.DB_VERSION).modules(RealmModules.LocalFilesModule()).build()
+                val drivesConfig = RealmConfiguration.Builder().directory(caseDirectory).name("drives.realm")
+                    .schemaVersion(DriveMigration.DB_VERSION).modules(RealmModules.DriveFilesModule()).build()
+                val offline = JavaFile(caseDirectory, "offline")
+                val cache = JavaFile(caseDirectory, "cache")
+                val protectedFiles = mutableListOf(JavaFile(config.path))
+                if (collision != "realm") {
+                    check(offline.mkdir() && cache.mkdir())
+                    protectedFiles += listOf(JavaFile(offline, "sentinel"), JavaFile(cache, "sentinel"))
+                }
+                protectedFiles.forEach { it.writeBytes(bodyV1) }
+                val paths = FixturePaths(config, offline, cache)
+                Realm.getInstance(drivesConfig).use { realm ->
+                    if (identityCollision) realm.executeTransaction { it.copyToRealm(fixtureDrive()) }
+                    val failure = assertThrows(IllegalStateException::class.java) { paths.reset(realm) }
+                    assertEquals(
+                        when (collision) {
+                            "identity" -> "Fixture drive identity collision; no reset or seed is permitted"
+                            "realm" -> "Unowned fixture realm family; no paths may be removed"
+                            else -> "Pre-existing fixture root; no paths may be removed"
+                        },
+                        failure.message,
+                    )
+                    // Exercise the same cleanup guard as @AfterAll after a refused setup.
+                    paths.cleanup(realm)
+                    assertThrows(IllegalStateException::class.java) { paths.reset(realm) }
+                    protectedFiles.forEach { assertTrue(it.readBytes().contentEquals(bodyV1)) }
+                    assertEquals(if (identityCollision) 1L else 0L, realm.where(Drive::class.java).count())
+                }
+                check(Realm.deleteRealm(drivesConfig))
+            }
+        } finally {
+            check(directory.deleteRecursively()) // exclusively created by this method, never the fixed namespaces
+        }
+    }
+
     @AfterEach
     fun tearDown() {
         OfflineFolderSyncUtils.deleteCopyOverride = null
@@ -4444,10 +4535,8 @@ class OfflineFolderMaintenanceOrchestrationTest {
 
     @AfterAll
     fun cleanup() {
-        // ONLY the synthetic fixture realm and the synthetic offline directory are deleted —
-        // never any other realm, never any owner data.
-        runCatching { Realm.deleteRealm(FileController.getRealmConfiguration(userDrive)) }
-        runCatching { offlineRoot.deleteRecursively() }
+        if (!fixturePaths.canCleanup) return
+        DriveInfosController.getRealmInstance().use { fixturePaths.cleanup(it) }
     }
 
     private fun sha256Hex(bytes: ByteArray): String {
