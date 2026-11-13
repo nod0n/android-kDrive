@@ -104,15 +104,20 @@ class RealmCopyProofTest {
         try {
             phase = "init"
             Realm.init(context) // Idempotent library initialization; no production Realm is opened here.
-            phase = "config-build"
+            phase = "asset-guard"
             requireAbsentFallbackAsset()
+            phase = "before-config-build"
             val beforeConfig = readOnlyConfiguration(before)
+            phase = "after-config-build"
             val afterConfig = readOnlyConfiguration(after)
             // Regression for the pinned builder's assetFile precondition.
             // Building configurations never opens or writes either input.
+            phase = "negative-contract-check"
             check(runCatching { copyConfiguration(before).readOnly().build() }.exceptionOrNull() is IllegalStateException)
+            phase = "readonly-flag-check"
             check(beforeConfig.isReadOnly && afterConfig.isReadOnly)
-            check(before.canonicalPath == beforeConfig.path && after.canonicalPath == afterConfig.path)
+            phase = "path-identity-check"
+            check(before.canonicalFile == File(beforeConfig.path).canonicalFile && after.canonicalFile == File(afterConfig.path).canonicalFile)
             phase = "open-before"
             DynamicRealm.getInstance(beforeConfig).use { beforeRealm ->
                 phase = "open-after"
@@ -209,7 +214,7 @@ class RealmCopyProofTest {
     private fun copyConfiguration(copy: File): RealmConfiguration.Builder =
         RealmConfiguration.Builder()
             .name(copy.name)
-            .directory(requireNotNull(copy.parentFile))
+            .directory(requireNotNull(copy.parentFile).canonicalFile)
             .schemaVersion(DriveMigration.DB_VERSION)
             .modules(RealmModules.DriveFilesModule())
 
