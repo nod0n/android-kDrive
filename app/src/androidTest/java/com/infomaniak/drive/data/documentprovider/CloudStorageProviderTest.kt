@@ -52,6 +52,7 @@ import com.infomaniak.drive.utils.RealmModules
 import com.infomaniak.drive.utils.SyncUtils
 import com.infomaniak.drive.utils.Utils
 import io.mockk.coEvery
+import io.mockk.clearMocks
 import io.mockk.every
 import io.mockk.just
 import io.mockk.mockk
@@ -990,12 +991,13 @@ class CloudStorageProviderTest {
     @Test
     fun sameScopeCopyAndMoveUseTheDocumentsClientAndRows() {
         val client = mockk<OkHttpClient>()
+        val copiedId = FILE_ID + 10
         mockkObject(ApiRepository)
         coEvery { AccountUtils.getHttpClient(USER_ID) } returns client
         every { ApiRepository.duplicateFile(any(), any(), client) } answers {
             assertEquals(FILE_ID, firstArg<File>().id)
             assertEquals(DRIVE_ID, firstArg<File>().driveId)
-            ApiResponse(result = ApiResponseStatus.SUCCESS)
+            ApiResponse(result = ApiResponseStatus.SUCCESS, data = File(id = copiedId, driveId = DRIVE_ID))
         }
         every { ApiRepository.moveFile(any(), any(), client) } answers {
             assertEquals(FILE_ID, firstArg<File>().id)
@@ -1004,7 +1006,9 @@ class CloudStorageProviderTest {
             ApiResponse(result = ApiResponseStatus.SUCCESS)
         }
         try {
-            provider.copyDocument(fileDocId(), folderDocId())
+            val copiedDocumentId = provider.copyDocument(fileDocId(), folderDocId())
+            assertEquals("$USER_ID/${DRIVE_NAME}@$DRIVE_ID/$copiedId", copiedDocumentId)
+            assertFalse("a successful copy has a new identity", copiedDocumentId == fileDocId())
             provider.moveDocument(fileDocId(), folderDocId(), folderDocId())
             verify(exactly = 1) {
                 ApiRepository.duplicateFile(any(), PARENT_ID, client)
@@ -1014,6 +1018,84 @@ class CloudStorageProviderTest {
             }
         } finally {
             coEvery { AccountUtils.getHttpClient(USER_ID) } throws IOException(NETWORK_BOUNDARY_MESSAGE)
+            unmockkObject(ApiRepository)
+        }
+    }
+
+    @Test
+    fun copiedIdentityKeepsTheCompleteSharedTargetNamespace() {
+        val scope = USER_DRIVE.copy(sharedWithMe = true)
+        val rows = FileController.getRealmInstance(USER_DRIVE).use { realm ->
+            realm.copyFromRealm(realm.where(File::class.java).findAll())
+        }
+        FileController.getRealmInstance(scope).use { realm ->
+            realm.executeTransaction { it.copyToRealm(rows) }
+        }
+        val client = mockk<OkHttpClient>()
+        val copiedId = FILE_ID + 10
+        val prefix = "$USER_ID/-2/${DRIVE_NAME}@$DRIVE_ID"
+        mockkObject(ApiRepository)
+        coEvery { AccountUtils.getHttpClient(USER_ID) } returns client
+        every { ApiRepository.duplicateFile(any(), PARENT_ID, client) } returns
+            ApiResponse(result = ApiResponseStatus.SUCCESS, data = File(id = copiedId, driveId = DRIVE_ID))
+        try {
+            val result = provider.copyDocument("$prefix/$FILE_ID", "$prefix/$PARENT_ID")
+            assertEquals("$prefix/$copiedId", result)
+            assertFalse(result == "$prefix/$FILE_ID")
+            verify(exactly = 1) { ApiRepository.duplicateFile(any(), PARENT_ID, client) }
+        } finally {
+            coEvery { AccountUtils.getHttpClient(USER_ID) } throws IOException(NETWORK_BOUNDARY_MESSAGE)
+            unmockkObject(ApiRepository)
+        }
+    }
+
+    @Test
+    fun successfulCopyWithoutAValidNewIdentityIsRejectedWithoutReplay() {
+        val client = mockk<OkHttpClient>()
+        mockkObject(ApiRepository)
+        coEvery { AccountUtils.getHttpClient(USER_ID) } returns client
+        val invalidCopies = listOf(
+            null,
+            File(id = 0, driveId = DRIVE_ID),
+            File(id = -1, driveId = DRIVE_ID),
+            File(id = Utils.ROOT_ID, driveId = DRIVE_ID),
+            File(id = FILE_ID, driveId = DRIVE_ID),
+            File(id = FILE_ID + 10, driveId = OTHER_DRIVE_ID),
+        )
+        try {
+            invalidCopies.forEach { returnedFile ->
+                clearMocks(ApiRepository, answers = false)
+                every { ApiRepository.duplicateFile(any(), PARENT_ID, client) } returns
+                    ApiResponse(result = ApiResponseStatus.SUCCESS, data = returnedFile)
+                try {
+                    provider.copyDocument(fileDocId(), folderDocId())
+                    fail("missing or invalid new identity must not return a document")
+                } catch (_: IllegalStateException) {
+                    // The already-issued mutation must never be repeated to obtain its ID.
+                }
+                verify(exactly = 1) { ApiRepository.duplicateFile(any(), PARENT_ID, client) }
+            }
+        } finally {
+            coEvery { AccountUtils.getHttpClient(USER_ID) } throws IOException(NETWORK_BOUNDARY_MESSAGE)
+            unmockkObject(ApiRepository)
+        }
+    }
+
+    @Test
+    fun copyAndMoveRejectAFileAsTheTargetBeforeTransport() {
+        mockkObject(ApiRepository)
+        try {
+            try {
+                provider.copyDocument(fileDocId(), fileDocId())
+                fail("copy target must be a folder")
+            } catch (_: IllegalArgumentException) { }
+            try {
+                provider.moveDocument(fileDocId(), folderDocId(), fileDocId())
+                fail("move target must be a folder")
+            } catch (_: IllegalArgumentException) { }
+            verify(exactly = 0) { ApiRepository.duplicateFile(any(), any(), any()) }
+            verify(exactly = 0) { ApiRepository.moveFile(any(), any(), any()) }
+        } finally {
             unmockkObject(ApiRepository)
         }
     }

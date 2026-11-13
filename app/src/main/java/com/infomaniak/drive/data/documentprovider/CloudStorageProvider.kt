@@ -628,17 +628,23 @@ class CloudStorageProvider : DocumentsProvider() {
             val file =
                 mutationFile(realm, fileId, userDrive) ?: throw IllegalStateException("File not found")
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
-            mutationFile(realm, targetParentFileId, userDrive) ?: throw IllegalStateException("Target folder not found")
+            val targetParentFile = mutationFile(realm, targetParentFileId, userDrive)
+                ?: throw IllegalStateException("Target folder not found")
+            require(targetParentFile.isFolder()) { "The target must be a folder" }
 
             val client = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
             val apiResponse = ApiRepository.duplicateFile(file, targetParentFileId, client)
 
             if (apiResponse.isSuccess()) {
+                val copiedFile = apiResponse.data
+                check(copiedFile != null && copiedFile.id > Utils.ROOT_ID && copiedFile.id != fileId &&
+                    copiedFile.driveId == userDrive.driveId
+                ) { "Copy succeeded without a valid new document identity" }
 
                 // Refresh
                 scheduleRefresh()
 
-                return@use sourceDocumentId
+                return@use createFileDocumentId(targetParentDocumentId, copiedFile.id)
             } else {
                 throw RuntimeException("Copy document failed")
             }
@@ -672,6 +678,7 @@ class CloudStorageProvider : DocumentsProvider() {
             val targetParentFileId = getFileIdFromDocumentId(targetParentDocumentId)
             val targetParentFile =
                 mutationFile(realm, targetParentFileId, userDrive) ?: throw fileNotFoundException
+            require(targetParentFile.isFolder()) { "The target must be a folder" }
 
             val client = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
             val apiResponse = ApiRepository.moveFile(file, targetParentFile, client)
