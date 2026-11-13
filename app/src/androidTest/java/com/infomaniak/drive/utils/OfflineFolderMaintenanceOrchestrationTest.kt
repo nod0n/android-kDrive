@@ -230,7 +230,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
         // walk/pass stay fully real while NO fixture work reaches the shared queue.
         mockkObject(Utils)
         every { Utils.enqueueBulkDownloadWorker(any(), any(), any()) } answers {
-            recordedBulkEnqueues.add(firstArg())
+            recordedBulkEnqueues.add(secondArg<Int>())
         }
     }
 
