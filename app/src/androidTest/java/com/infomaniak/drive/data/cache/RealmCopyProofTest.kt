@@ -8,6 +8,7 @@ import io.realm.Realm
 import io.realm.RealmConfiguration
 import io.realm.RealmFieldType
 import io.realm.RealmResults
+import io.realm.annotations.RealmModule
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -54,6 +55,21 @@ import java.security.MessageDigest
  * anything else fails CLOSED. Output: one JSON verdict to the instrumentation
  * stream (field names, counts, digests and booleans only - never persisted
  * values). See PREPARE-REALM-COPY-PROOF-20261113-RESULT.txt.
+ *
+ * v2 config diagnostics: the config-era assertions run ONE PER PHASE under
+ * stable RC-CONFIG-* reason codes, each with its own sanitized catch, so one
+ * early failure can never mask the remaining evidence and reachability is
+ * explicit per phase (a phase gated on a failed prerequisite is recorded as
+ * "skipped"). Two presence booleans are computed BEFORE any builder runs by
+ * pure reflection on already-loaded classes - the runtime @RealmModule
+ * annotation on RealmModules.DriveFilesModule, and the generated
+ * io.realm.DriveFilesModuleMediator as seen from the module's own classloader
+ * (Class.forName with initialize=false; no build(), no asset IO, no writes).
+ * The negative-contract probe records the OBSERVED library exception class on
+ * a dedicated field ("none" when no exception, null when never reached):
+ * the assertion itself can never carry it. These markers make a config-build
+ * failure identifiable in one run; they are diagnostic only and are never a
+ * substitute for the row-identity comparison below.
  */
 class RealmCopyProofTest {
 
@@ -64,6 +80,17 @@ class RealmCopyProofTest {
     private var phase = "inputs"
     private var rowClass: String? = null
     private var assetFallbackDisabled = false
+
+    // v2 config diagnostics: one PhaseRecord per config phase, pure-reflection
+    // presence booleans computed before any build, and the negative probe's
+    // observed library exception class on its own dedicated field.
+    private val configPhases = mutableListOf<PhaseRecord>()
+    private var moduleAnnotationPresent = false
+    private var moduleMediatorPresent = false
+    private var negativeProbeObservedClass: String? = null // null: probe never reached
+    private var realmPhasesAttempted = false
+    private var beforeConfig: RealmConfiguration? = null
+    private var afterConfig: RealmConfiguration? = null
 
     @Test
     fun beforeAfterRealmCopiesAreRowIdentical() {
@@ -102,31 +129,86 @@ class RealmCopyProofTest {
         var errorRowClass: String? = null
         var shaAfter: Map<String, String> = emptyMap()
         try {
-            phase = "init"
-            Realm.init(context) // Idempotent library initialization; no production Realm is opened here.
-            phase = "asset-guard"
-            requireAbsentFallbackAsset()
-            phase = "before-config-build"
-            val beforeConfig = readOnlyConfiguration(before)
-            phase = "after-config-build"
-            val afterConfig = readOnlyConfiguration(after)
-            // Regression for the pinned builder's assetFile precondition.
-            // Building configurations never opens or writes either input.
-            phase = "negative-contract-check"
-            check(runCatching { copyConfiguration(before).readOnly().build() }.exceptionOrNull() is IllegalStateException)
-            phase = "readonly-flag-check"
-            check(beforeConfig.isReadOnly && afterConfig.isReadOnly)
-            phase = "path-identity-check"
-            check(before.canonicalFile == File(beforeConfig.path).canonicalFile && after.canonicalFile == File(afterConfig.path).canonicalFile)
-            phase = "open-before"
-            DynamicRealm.getInstance(beforeConfig).use { beforeRealm ->
-                phase = "open-after"
-                DynamicRealm.getInstance(afterConfig).use { afterRealm ->
-                    phase = "schema"
-                    infos = buildClassInfos(beforeRealm)
-                    schemaEqual = compareSchemas(beforeRealm, afterRealm)
-                    verdict = if (!schemaEqual) VERDICT_DIFFER else compareClasses(beforeRealm, afterRealm)
-                    phase = "close"
+            if (step("realm-init", RC_REALM_INIT) {
+                    Realm.init(context) // Idempotent library initialization; no production Realm is opened here.
+                }
+            ) {
+                val assetGuardOk = step("asset-guard", RC_ASSET_GUARD) { requireAbsentFallbackAsset() }
+                step("module-annotation-presence", RC_MODULE_ANNOTATION_PRESENCE) {
+                    // Pure reflection on the runtime class checkModule inspects; no build(), no writes.
+                    moduleAnnotationPresent = RealmModules.DriveFilesModule::class.java
+                        .isAnnotationPresent(RealmModule::class.java)
+                    check(moduleAnnotationPresent)
+                }
+                step("module-mediator-presence", RC_MODULE_MEDIATOR_PRESENCE) {
+                    // Presence only: initialize=false loads the generated mediator without
+                    // running any code in it. getModuleMediator resolves this class via
+                    // single-arg Class.forName from RealmConfiguration's DEFINING loader,
+                    // so the inspection mirrors that exact lookup (no build(), no writes).
+                    moduleMediatorPresent = try {
+                        Class.forName(
+                            DRIVE_MODULE_MEDIATOR,
+                            false,
+                            RealmConfiguration::class.java.classLoader,
+                        )
+                        true
+                    } catch (_: ClassNotFoundException) {
+                        false
+                    }
+                    check(moduleMediatorPresent)
+                }
+                if (assetGuardOk) {
+                    step("before-config-build", RC_BEFORE_CONFIG_BUILD) { beforeConfig = readOnlyConfiguration(before) }
+                    step("after-config-build", RC_AFTER_CONFIG_BUILD) { afterConfig = readOnlyConfiguration(after) }
+                } else {
+                    configPhases.add(PhaseRecord("before-config-build", RC_BEFORE_CONFIG_BUILD, "skipped", null))
+                    configPhases.add(PhaseRecord("after-config-build", RC_AFTER_CONFIG_BUILD, "skipped", null))
+                }
+                // Regression for the pinned builder's assetFile precondition.
+                // Building configurations never opens or writes either input.
+                // Pinned-bytecode reachability (verified host-side, javap of the
+                // pinned AAR): checkModule runs at the modules() SETTER (inside
+                // copyConfiguration), so annotation loss (C1a) surfaces here as
+                // IAE; the mediator lookup runs in build()'s createSchemaMediator
+                // AFTER the readOnly branch, so mediator absence (C1b) is NOT
+                // visible to this probe (which then sees exactly the readOnly
+                // ISE) - C1b is covered by the build-step classes plus the
+                // presence boolean. The OBSERVED library exception class is
+                // recorded on its own field: the assertion below can never carry it.
+                step("negative-contract-probe", RC_NEGATIVE_CONTRACT_PROBE) {
+                    val observed = runCatching { copyConfiguration(before).readOnly().build() }.exceptionOrNull()
+                    negativeProbeObservedClass = observed?.javaClass?.simpleName ?: "none"
+                    check(observed is IllegalStateException)
+                }
+                val cfgBefore = beforeConfig
+                val cfgAfter = afterConfig
+                if (cfgBefore != null && cfgAfter != null) {
+                    step("readonly-flag-check", RC_READONLY_FLAG_CHECK) {
+                        check(cfgBefore.isReadOnly && cfgAfter.isReadOnly)
+                    }
+                    step("path-identity-check", RC_PATH_IDENTITY_CHECK) {
+                        check(
+                            before.canonicalFile == File(cfgBefore.path).canonicalFile &&
+                                after.canonicalFile == File(cfgAfter.path).canonicalFile
+                        )
+                    }
+                } else {
+                    configPhases.add(PhaseRecord("readonly-flag-check", RC_READONLY_FLAG_CHECK, "skipped", null))
+                    configPhases.add(PhaseRecord("path-identity-check", RC_PATH_IDENTITY_CHECK, "skipped", null))
+                }
+                if (configPhases.all { it.status == "ok" }) {
+                    realmPhasesAttempted = true
+                    phase = "open-before"
+                    DynamicRealm.getInstance(requireNotNull(beforeConfig)).use { beforeRealm ->
+                        phase = "open-after"
+                        DynamicRealm.getInstance(requireNotNull(afterConfig)).use { afterRealm ->
+                            phase = "schema"
+                            infos = buildClassInfos(beforeRealm)
+                            schemaEqual = compareSchemas(beforeRealm, afterRealm)
+                            verdict = if (!schemaEqual) VERDICT_DIFFER else compareClasses(beforeRealm, afterRealm)
+                            phase = "close"
+                        }
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -146,6 +228,12 @@ class RealmCopyProofTest {
         val failure = StringBuilder()
         if (verdict != VERDICT_EQUAL) failure.append("verdict=$verdict; ")
         if (errorClass != null) failure.append("errorClass=$errorClass; phase=$errorPhase; rowClass=$errorRowClass; ")
+        if (configPhases.any { it.status != "ok" }) {
+            failure.append(
+                "config=" + configPhases.filter { it.status != "ok" }
+                    .joinToString(",") { "${it.rc}:${it.phase}:${it.status}" } + "; "
+            )
+        }
         if (!copiesUnchanged) failure.append("a copy was modified by the read; ")
         if (verdicts.isNotEmpty()) failure.append("diffs=${verdicts.take(20)}; ")
         if (unsupported.isNotEmpty()) failure.append("unsupported=${unsupported.take(20)}; ")
@@ -180,6 +268,24 @@ class RealmCopyProofTest {
             for (b in adversarial) {
                 assertEquals(a == b, str('s', a) == str('s', b), "encoding must reflect equality exactly")
             }
+        }
+    }
+
+    /**
+     * Runs ONE diagnostic phase. Records completion and the sanitized observed
+     * exception class at every catch; never rethrows - fail-closed is applied
+     * by the config gate, not by masking the remaining diagnostics. The class
+     * name is the only exception content that ever leaves this method.
+     */
+    private fun step(phaseName: String, rc: String, block: () -> Unit): Boolean {
+        phase = phaseName
+        return try {
+            block()
+            configPhases.add(PhaseRecord(phaseName, rc, "ok", null))
+            true
+        } catch (e: Throwable) {
+            configPhases.add(PhaseRecord(phaseName, rc, "failed", e.javaClass.simpleName))
+            false
         }
     }
 
@@ -494,6 +600,19 @@ class RealmCopyProofTest {
             append(",\"error_class\":").append(errorClass?.let { "\"$it\"" } ?: "null")
             append(",\"error_phase\":").append(errorPhase?.let { "\"$it\"" } ?: "null")
             append(",\"error_row_class\":").append(errorRowClass?.let { "\"${jsonSafe(it)}\"" } ?: "null")
+            append(",\"module_annotation_present\":").append(moduleAnnotationPresent)
+            append(",\"module_mediator_present\":").append(moduleMediatorPresent)
+            append(",\"negative_probe_observed_class\":")
+                .append(negativeProbeObservedClass?.let { "\"" + jsonSafe(it) + "\"" } ?: "null")
+            append(",\"realm_phases_attempted\":").append(realmPhasesAttempted)
+            append(",\"config_phases\":[")
+            append(
+                configPhases.joinToString(",") { rec ->
+                    "{\"phase\":\"" + rec.phase + "\",\"rc\":\"" + rec.rc + "\",\"status\":\"" + rec.status + "\"" +
+                        (rec.observedClass?.let { ",\"observed_class\":\"" + jsonSafe(it) + "\"" } ?: "") + "}"
+                }
+            )
+            append("]")
             append(",\"access_mode\":\"read-only-existing-input\"")
             append(",\"asset_fallback_disabled\":").append(assetFallbackDisabled)
             append(",\"schema_covers\":\"class,field,type,pk,required,nullable; index-status and schema-level")
@@ -552,6 +671,9 @@ class RealmCopyProofTest {
         val pkField: String?,
     )
 
+    /** One config-diagnostic phase outcome; observedClass is a sanitized simple name or null. */
+    private class PhaseRecord(val phase: String, val rc: String, val status: String, val observedClass: String?)
+
     companion object {
         private const val VERDICT_EQUAL = "EQUAL"
         private const val VERDICT_DIFFER = "DIFFER"
@@ -560,6 +682,26 @@ class RealmCopyProofTest {
         private const val UNSUPPORTED_TOKEN = "UNSUPPORTED"
         private const val NULL_ATOM = "N"
         private const val NO_FALLBACK_ASSET = "__realm_copy_proof_no_fallback__.realm"
+
+        // v2 config-diagnostics reason codes: stable ASCII identifiers, no
+        // semantics beyond identifying one phase each (execution order 001..009).
+        private const val RC_REALM_INIT = "RC-CONFIG-001"
+        private const val RC_ASSET_GUARD = "RC-CONFIG-002"
+        private const val RC_MODULE_ANNOTATION_PRESENCE = "RC-CONFIG-003"
+        private const val RC_MODULE_MEDIATOR_PRESENCE = "RC-CONFIG-004"
+        private const val RC_BEFORE_CONFIG_BUILD = "RC-CONFIG-005"
+        private const val RC_AFTER_CONFIG_BUILD = "RC-CONFIG-006"
+        private const val RC_NEGATIVE_CONTRACT_PROBE = "RC-CONFIG-007"
+        private const val RC_READONLY_FLAG_CHECK = "RC-CONFIG-008"
+        private const val RC_PATH_IDENTITY_CHECK = "RC-CONFIG-009"
+
+        // Generated by kapt for the app module (verified host-side in this tree:
+        // app/build/generated/source/kapt/*/debug/io/realm/DriveFilesModuleMediator.java,
+        // package-private in io.realm, extends RealmProxyMediator). The pinned
+        // getModuleMediator derives exactly "io.realm.<last-segment>Mediator" and
+        // resolves it with single-arg Class.forName from RealmConfiguration's
+        // defining loader; absence/uninstantiability is the C1b RealmException site.
+        private const val DRIVE_MODULE_MEDIATOR = "io.realm.DriveFilesModuleMediator"
 
         private val STAMP_REGEX = Regex("^[A-Za-z0-9_-]{1,64}$")
         private val HEX64_REGEX = Regex("^[0-9a-f]{64}$")
