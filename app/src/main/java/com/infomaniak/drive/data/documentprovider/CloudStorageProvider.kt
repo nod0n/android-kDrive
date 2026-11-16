@@ -840,7 +840,7 @@ class CloudStorageProvider : DocumentsProvider() {
                     latest?.let { ParcelFileDescriptor.open(it, ParcelFileDescriptor.MODE_READ_ONLY) }
                 }
             }
-            // w/rw/wa copy local bytes; explicit wt/rwt truncate. Each new source
+            // Non-truncating flags copy local bytes; truncating flags start empty. Each new source
             // stays separate from all pending and still-open sources.
             if (accessMode and ParcelFileDescriptor.MODE_TRUNCATE == 0) {
                 val source = localSource ?: getDataFile(context, file, userDrive, ParcelFileDescriptor.MODE_READ_ONLY)
