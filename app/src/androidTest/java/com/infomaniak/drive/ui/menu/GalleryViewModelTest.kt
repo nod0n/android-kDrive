@@ -30,6 +30,8 @@ import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.cache.FileMigration
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.data.models.File
+import com.infomaniak.drive.data.models.OfflineFolderRoot
+import com.infomaniak.drive.data.models.file.SpecialFolder.Gallery
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.RealmModules
 import io.realm.Realm
@@ -523,6 +525,84 @@ class GalleryViewModelTest {
         } finally {
             cancelAndJoinLoads(vm)
         }
+    }
+
+    @Test
+    fun emptyAllRefreshClearsOnlyCapturedGalleryMembershipAndStaysEmptyOffline() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        Realm.init(context)
+        val directory = Files.createTempDirectory(context.cacheDir.toPath(), "gallery-empty-").toFile()
+        val config = RealmConfiguration.Builder().directory(directory).name("fixture.realm")
+            .schemaVersion(FileMigration.DB_VERSION).migration(FileMigration())
+            .modules(RealmModules.LocalFilesModule()).build()
+        val scope = UserDrive(USER_ID, DRIVE_ID)
+        every { FileController.getRealmConfiguration(any()) } answers {
+            assertEquals(scope, firstArg<UserDrive?>(), "every cache open must use the captured scope")
+            config
+        }
+        every { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) } answers { callOriginal() }
+        val vm = GalleryViewModel()
+        try {
+            Realm.getInstance(config).use { realm ->
+                FileController.storeGalleryDrive(listOf(file(1, ExtensionTypes.IMAGE).apply { initUid() }), true, realm)
+                realm.executeTransaction {
+                    it.copyToRealm(file(2, ExtensionTypes.IMAGE).apply { initUid(); isOffline = true })
+                    it.copyToRealm(File(id = 3, driveId = DRIVE_ID, uid = "3_$DRIVE_ID", type = "dir"))
+                    it.copyToRealm(OfflineFolderRoot(folderId = 3, userId = USER_ID, driveId = DRIVE_ID).apply { initUid() })
+                }
+            }
+            every { ApiRepository.getLastGallery(DRIVE_ID, any(), null) } returns apiPage(emptyList(), null, false)
+            vm.loadLastGallery(DRIVE_ID, false)
+            assertTrue(awaitTrue { vm.galleryApiResult.value != null })
+            assertTrue(vm.galleryApiResult.value!!.files.isEmpty())
+            verify(exactly = 1) { FileController.storeGalleryDrive(match { it.isEmpty() }, true, scope) }
+            verify(exactly = 0) { FileController.removeOrphanFiles(any<UserDrive>()) }
+            Realm.getInstance(config).use { realm ->
+                assertEquals(0, realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()!!.children.size)
+                assertEquals(3L, realm.where(File::class.java).greaterThan(File::id.name, 0).count())
+                assertEquals(1L, realm.where(OfflineFolderRoot::class.java).count())
+            }
+            val previous = vm.galleryApiResult.value
+            vm.loadLastGallery(DRIVE_ID, true)
+            assertTrue(awaitTrue { vm.galleryApiResult.value !== previous })
+            assertTrue(vm.galleryApiResult.value!!.files.isEmpty())
+        } finally {
+            cancelAndJoinLoads(vm)
+            assertTrue(Realm.deleteRealm(config))
+            assertTrue(directory.deleteRecursively())
+        }
+    }
+
+    @Test
+    fun emptyFilteredFirstPageNeverWritesAllMembership() {
+        val vm = GalleryViewModel()
+        every { ApiRepository.getLastGallery(DRIVE_ID, any(), null) } returns apiPage(emptyList(), null, false)
+        try {
+            vm.setMediaFilter(GalleryMediaFilter.IMAGES)
+            vm.loadLastGallery(DRIVE_ID, false)
+            assertTrue(awaitTrue { vm.galleryApiResult.value != null })
+            assertTrue(vm.galleryApiResult.value!!.files.isEmpty())
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) }
+            verify(exactly = 0) { FileController.removeOrphanFiles(any<UserDrive>()) }
+        } finally { cancelAndJoinLoads(vm) }
+    }
+
+    @Test
+    fun emptyAllNextPageDoesNotReplaceMembershipOrSweepOrphans() {
+        val vm = GalleryViewModel()
+        every { ApiRepository.getLastGallery(DRIVE_ID, any(), null) } returns
+            apiPage(listOf(file(1, ExtensionTypes.IMAGE)), "next", true)
+        every { ApiRepository.getLastGallery(DRIVE_ID, any(), "next") } returns apiPage(emptyList(), null, false)
+        try {
+            vm.loadLastGallery(DRIVE_ID, false)
+            assertTrue(awaitTrue { vm.galleryApiResult.value != null })
+            val previous = vm.galleryApiResult.value
+            vm.loadMoreGallery(DRIVE_ID, false)
+            assertTrue(awaitTrue { vm.galleryApiResult.value !== previous })
+            verify(exactly = 1) { FileController.storeGalleryDrive(any(), true, any<UserDrive>()) }
+            verify(exactly = 0) { FileController.storeGalleryDrive(any(), false, any<UserDrive>()) }
+            verify(exactly = 1) { FileController.removeOrphanFiles(any<UserDrive>()) }
+        } finally { cancelAndJoinLoads(vm) }
     }
 
     @Test

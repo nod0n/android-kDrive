@@ -52,6 +52,7 @@ import com.infomaniak.drive.utils.RealmModules
 import com.infomaniak.drive.utils.SyncUtils
 import com.infomaniak.drive.utils.Utils
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.clearMocks
 import io.mockk.every
 import io.mockk.just
@@ -63,6 +64,9 @@ import io.mockk.unmockkObject
 import io.mockk.unmockkStatic
 import io.mockk.verify
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import io.realm.Realm
 import io.realm.RealmConfiguration
 import io.sentry.ScopeCallback
@@ -130,9 +134,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * ### Captured boundaries (declared seams — no access policy, cache decision or upload
  * transaction is stubbed)
- * - [AccountUtils]: identity + network boundary. Users list is empty; every
- *   `getHttpClient` call throws, so remote details/downloads exercise the provider's
- *   real catch/fallback paths, never a transfer.
+ * - [AccountUtils]: identity + network boundary. Users list is empty; by default
+ *   `getHttpClient` throws. Thumbnail and mutation cases substitute clients with
+ *   terminal interceptors returning synthetic responses; no socket is opened.
  * - [CloudStorageProvider.Companion.initRealm]: the provider's own repeated
  *   initialization boundary is captured (counted) so the suite never opens a
  *   default-realm handle through the provider — an open can create or migrate storage
@@ -185,7 +189,7 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * ### Explicitly NOT exercised
  * Real Binder/ContentResolver acquisition, persisted-URI grants, the system Files app,
- * remote mutation bodies (create/rename/copy/move success paths), thumbnail generation,
+ * remote mutation success bodies (create/rename/copy/move success paths),
  * the queryRoots refresh coroutine (users are mocked empty), ChromeOS branches — and
  * the ASYNC FOLDER FILL for a real folder. Traced: `FolderFilesProvider
  * .getCloudStorageFiles` requires the transport (`getHttpClient`) BEFORE serving any
@@ -523,8 +527,6 @@ class CloudStorageProviderTest {
         private fun cacheFile(): IOFile =
             IOFile(IOFile(currentCase.ownedSub("cache"), "cloud_storage/$USER_ID/$DRIVE_ID"), FILE_ID.toString())
 
-        private fun tempFile(): IOFile =
-            IOFile(IOFile(currentCase.ownedSub("files"), "cloud_storage_temp_files/$PARENT_ID"), FILE_NAME)
     }
 
     /**
@@ -1241,14 +1243,201 @@ class CloudStorageProviderTest {
         assertEquals(UploadFile.Type.CLOUD_STORAGE.name, stored.type)
         assertTrue(
             "the upload source must stay in the owned temp namespace",
-            stored.uri.contains("cloud_storage_temp_files/$PARENT_ID"),
+            stored.uri.contains("cloud_storage_temp_files/$USER_ID/$DRIVE_ID/$FILE_ID/"),
         )
         assertEquals("the real scheduling seam must have been called exactly once", 1, syncImmediatelyCalls.get())
-        assertTrue(tempFile().exists()) // the upload source is preserved
+        assertTrue(IOFile(Uri.parse(stored.uri).path!!).readBytes().contentEquals(FILE_BYTES))
         assertFalse(cache.exists()) // the old cache is dropped (completion already observed)
     }
 
+    @Test
+    fun collidingScopesAndReopenedDocumentsRetainEachUploadsOwnBytesInEitherCloseOrder() {
+        val scopes = listOf(USER_DRIVE, UserDrive(USER_ID + 1, DRIVE_ID), UserDrive(USER_ID, OTHER_DRIVE_ID))
+        scopes.drop(1).forEach { scope ->
+            FileController.getRealmInstance(scope).use { realm ->
+                realm.executeTransaction {
+                    it.copyToRealm(File(id = FILE_ID, uid = "${FILE_ID}_${scope.driveId}", driveId = scope.driveId,
+                        parentId = PARENT_ID, name = FILE_NAME, type = "file"))
+                }
+            }
+        }
+        FileController.getRealmInstance(USER_DRIVE).use { realm ->
+            realm.executeTransaction {
+                it.copyToRealm(File(id = FILE_ID + 1, uid = "${FILE_ID + 1}_$DRIVE_ID", driveId = DRIVE_ID,
+                    parentId = PARENT_ID, name = FILE_NAME, type = "file"))
+            }
+        }
+        val expected = mutableMapOf<String, String>()
+        for (reverse in listOf(false, true)) {
+            val documents = (scopes + USER_DRIVE).map { it to FILE_ID } + (USER_DRIVE to (FILE_ID + 1))
+            val opens = documents.mapIndexed { index, (scope, fileId) ->
+                val payload = "scope-${scope.userId}-${scope.driveId}-open-$index-reverse-$reverse"
+                val doc = "${scope.userId}/Fixture@${scope.driveId}/$fileId"
+                val stream = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(doc, "wt", null)!!).also {
+                    it.write(payload.toByteArray())
+                }
+                Triple(stream, payload, scope)
+            }
+            try {
+                (if (reverse) opens.reversed() else opens).forEach { (stream, payload, scope) ->
+                    val before = expected.size
+                    stream.close()
+                    assertTrue(awaitUntil { pendingUploads().size == before + 1 })
+                    val upload = pendingUploads().single { it.uri !in expected }
+                    assertEquals(scope.userId, upload.userId)
+                    assertEquals(scope.driveId, upload.driveId)
+                    expected[upload.uri] = payload
+                    assertEquals(payload, IOFile(Uri.parse(upload.uri).path!!).readText())
+                    expected.forEach { (uri, bytes) -> assertEquals(bytes, IOFile(Uri.parse(uri).path!!).readText()) }
+                }
+            } finally {
+                opens.forEach { it.first.close() }
+            }
+        }
+        assertEquals(10, expected.size)
+        assertEquals(10, pendingUploads().map { it.uri }.toSet().size)
+        assertTrue(awaitUntil { syncImmediatelyCalls.get() == 10 })
+        val disposed = expected.keys.first()
+        UploadFile.deleteAllFromUris(listOf(Uri.parse(disposed)))
+        assertFalse(IOFile(Uri.parse(disposed).path!!).exists())
+        assertEquals(9, pendingUploads().size)
+        expected.filterKeys { it != disposed }.forEach { (uri, bytes) ->
+            assertEquals(bytes, IOFile(Uri.parse(uri).path!!).readText())
+        }
+    }
+
+    @Test
+    fun aNontruncatingReopenCopiesPendingBytesWithoutChangingTheFirstUpload() {
+        val original = "pending-local-edit"
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+            it.write(original.toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 1 })
+        val first = pendingUploads().single()
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+            it.write("-appended".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 2 })
+        val second = pendingUploads().single { it.uri != first.uri }
+        assertEquals(original, IOFile(Uri.parse(first.uri).path!!).readText())
+        assertEquals("$original-appended", IOFile(Uri.parse(second.uri).path!!).readText())
+    }
+
+    @Test
+    fun editAppendAndTruncateModesUseOwnedSourcesAndNeverInterpretNamesAsPaths() {
+        val cache = cacheFile().apply { parentFile!!.mkdirs(); writeBytes(FILE_BYTES); setLastModified(MTIME_SECONDS * 1000) }
+        FileController.getRealmInstance(USER_DRIVE).use { realm ->
+            realm.executeTransaction { FileController.getFileProxyById(FILE_ID, customRealm = realm)!!.name = "../../escape.bin" }
+        }
+        val edited = "X" + String(FILE_BYTES).drop(1)
+        val expected = listOf(edited, edited + "X", "X")
+        listOf("rw", "wa", "rwt").forEachIndexed { index, mode ->
+            cache.writeBytes(FILE_BYTES)
+            cache.setLastModified(MTIME_SECONDS * 1000)
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), mode, null)!!).use {
+                it.write("X".toByteArray())
+            }
+            assertTrue(awaitUntil { pendingUploads().size == index + 1 && !cache.exists() })
+            val upload = pendingUploads().single { IOFile(Uri.parse(it.uri).path!!).readText() == expected[index] }
+            val source = IOFile(Uri.parse(upload.uri).path!!)
+            assertTrue(source.canonicalPath.startsWith(IOFile(currentCase.ownedSub("files"),
+                "cloud_storage_temp_files/$USER_ID/$DRIVE_ID/$FILE_ID").canonicalPath + "/"))
+            assertEquals("../../escape.bin", upload.fileName)
+        }
+    }
+
+    @Test
+    fun completedUploadSourcesAreNotUsedForANontruncatingReopen() {
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+            it.write("completed-old-edit".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 1 && syncImmediatelyCalls.get() == 1 && !cacheFile().exists() })
+        val completed = pendingUploads().single()
+        UploadFile.uploadFinished(Uri.parse(completed.uri))
+        cacheFile().apply {
+            parentFile!!.mkdirs()
+            writeBytes(FILE_BYTES)
+            setLastModified(MTIME_SECONDS * 1000)
+        }
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+            it.write("X".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 2 })
+        val reopened = pendingUploads().single { it.uri != completed.uri }
+        assertEquals(String(FILE_BYTES) + "X", IOFile(Uri.parse(reopened.uri).path!!).readText())
+        assertEquals("completed-old-edit", IOFile(Uri.parse(completed.uri).path!!).readText())
+    }
+
+    @Test
+    fun renameAndDeletePinTheDocumentClientWhileAnotherAccountIsCurrentWithoutReplay() {
+        clearMocks(AccountUtils, answers = false)
+        val requests = ConcurrentLinkedQueue<okhttp3.Request>()
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            requests.add(chain.request())
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                .code(403).message("fixture rejection").body("{}".toResponseBody()).build()
+        }.build()
+        every { AccountUtils.currentUserId } returns USER_ID + 1
+        coEvery { AccountUtils.getHttpClient(USER_ID) } returns client
+        try {
+            listOf<() -> Unit>(
+                { provider.renameDocument(fileDocId(), "renamed.bin") },
+                { provider.deleteDocument(fileDocId()) },
+            ).forEach { mutation ->
+                try { mutation(); fail("the rejected mutation must fail") } catch (_: RuntimeException) { }
+            }
+            assertEquals(listOf("POST", "DELETE"), requests.map { it.method })
+            assertTrue(requests.all { it.url.encodedPath.contains("/$DRIVE_ID/files/$FILE_ID") })
+            coVerify(exactly = 2) { AccountUtils.getHttpClient(USER_ID) }
+            coVerify(exactly = 0) { AccountUtils.getHttpClient(USER_ID + 1) }
+            FileController.getRealmInstance(USER_DRIVE).use { realm ->
+                assertEquals(FILE_NAME, FileController.getFileProxyById(FILE_ID, customRealm = realm)!!.name)
+            }
+        } finally {
+            every { AccountUtils.currentUserId } answers { callOriginal() }
+            coEvery { AccountUtils.getHttpClient(USER_ID) } throws IOException(NETWORK_BOUNDARY_MESSAGE)
+        }
+    }
+
+    @Test
+    fun thumbnailFailureCannotReuseAnotherAccountDriveOrResourceButKeepsSameScopeCache() {
+        val status = AtomicInteger(200)
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                .code(status.get()).message("fixture").body("thumbnail-A".toResponseBody()).build()
+        }.build()
+        coEvery { AccountUtils.getHttpClient(any()) } returns client
+        fun read(doc: String): String = provider.openDocumentThumbnail(doc, Point(64, 64), null).use {
+            ParcelFileDescriptor.AutoCloseInputStream(it.parcelFileDescriptor).use { input -> String(input.readBytes()) }
+        }
+        try {
+            assertEquals("thumbnail-A", read(fileDocId()))
+            status.set(403)
+            assertEquals("thumbnail-A", read(fileDocId()))
+            listOf(UserDrive(USER_ID + 1, DRIVE_ID), UserDrive(USER_ID, OTHER_DRIVE_ID)).forEach { scope ->
+                FileController.getRealmInstance(scope).use { realm ->
+                    realm.executeTransaction {
+                        it.copyToRealm(File(id = FILE_ID, uid = "${FILE_ID}_${scope.driveId}", driveId = scope.driveId,
+                            name = FILE_NAME, lastModifiedAt = MTIME_SECONDS, type = "file"))
+                    }
+                }
+                try { read("${scope.userId}/Fixture@${scope.driveId}/$FILE_ID"); fail("cross-scope cache served") }
+                catch (_: IOException) { }
+            }
+            FileController.getRealmInstance(USER_DRIVE).use { realm ->
+                realm.executeTransaction { FileController.getFileProxyById(FILE_ID, customRealm = realm)!!.lastModifiedAt++ }
+            }
+            try { read(fileDocId()); fail("old resource cache served") } catch (_: IOException) { }
+        } finally {
+            coEvery { AccountUtils.getHttpClient(any()) } throws IOException(NETWORK_BOUNDARY_MESSAGE)
+        }
+    }
+
     // ---- helpers -------------------------------------------------------------------
+
+    private fun pendingUploads(): List<UploadFile> = UploadFile.getRealmInstance().use { realm ->
+        realm.copyFromRealm(realm.where(UploadFile::class.java).findAll(), 0)
+    }
 
     /**
      * Detached copy: the managed row is copied inside the live Realm before it closes,
