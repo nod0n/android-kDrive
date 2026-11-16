@@ -67,6 +67,7 @@ import com.infomaniak.drive.utils.SyncUtils.syncImmediately
 import com.infomaniak.drive.utils.Utils
 import com.infomaniak.drive.utils.copyToCancellable
 import io.realm.Realm
+import io.realm.Sort
 import io.sentry.Sentry
 import io.sentry.SentryEvent
 import io.sentry.SentryLevel
@@ -497,11 +498,12 @@ class CloudStorageProvider : DocumentsProvider() {
 
         val fileId = getFileIdFromDocumentId(documentId)
 
-        return FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
+        val userDrive = createUserDrive(documentId)
+        return FileController.getRealmInstance(userDrive).use { realm ->
 
-            FileController.getFileProxyById(fileId, customRealm = realm)?.let { file ->
+            mutationFile(realm, fileId, userDrive)?.let { file ->
 
-                generateThumbnail(fileId, file, createUserDrive(documentId), signal)?.let { parcel ->
+                generateThumbnail(fileId, file, userDrive, signal)?.let { parcel ->
                     AssetFileDescriptor(parcel, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
                 }
 
@@ -511,9 +513,9 @@ class CloudStorageProvider : DocumentsProvider() {
 
     private fun generateThumbnail(fileId: Int, file: File, userDrive: UserDrive, signal: CancellationSignal?): ParcelFileDescriptor? {
         val thumbnailUrl = ApiRoutes.getThumbnailUrl(file)
-        // The URL includes the resource kind and modification identity. Hash it so no
+        // Include the resource kind and modification identity. Hash them so no
         // remote name/path (or public-share parameter) becomes a filesystem component.
-        val resourceKey = MessageDigest.getInstance("SHA-256").digest(thumbnailUrl.toByteArray())
+        val resourceKey = MessageDigest.getInstance("SHA-256").digest("$thumbnailUrl|${file.lastModifiedAt}".toByteArray())
             .joinToString("") { "%02x".format(it) }
         val outputFolder = IOFile(context?.cacheDir, "thumbnails/${userDrive.userId}/${userDrive.driveId}/$fileId")
             .apply { if (!exists()) mkdirs() }
@@ -525,14 +527,14 @@ class CloudStorageProvider : DocumentsProvider() {
             ParcelFileDescriptor.AutoCloseOutputStream(writePipe).use { writeStream ->
                 runCatching {
                     val okHttpClient = AccountUtils.getHttpClient(userDrive.userId)
-                    val response = DownloadOfflineFileManager.downloadFileResponseAsync(thumbnailUrl, okHttpClient)
-
-                    if (response.isSuccessful && DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
-                        writeStream.loadFromFile(outputFile)
-                    } else if (outputFile.exists()) {
-                        writeStream.loadFromFile(outputFile)
-                    } else {
-                        writePipe.closeWithError("No thumbnail available")
+                    DownloadOfflineFileManager.downloadFileResponseAsync(thumbnailUrl, okHttpClient).use { response ->
+                        if (response.isSuccessful && DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
+                            writeStream.loadFromFile(outputFile)
+                        } else if (outputFile.exists()) {
+                            writeStream.loadFromFile(outputFile)
+                        } else {
+                            writePipe.closeWithError("No thumbnail available")
+                        }
                     }
 
                 }.cancellable().onFailure { exception ->
@@ -571,11 +573,11 @@ class CloudStorageProvider : DocumentsProvider() {
 
         val context = context ?: throw IllegalStateException("Delete document failed: missing Android Context")
 
-        FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
-            FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
+        val userDrive = createUserDrive(documentId)
+        FileController.getRealmInstance(userDrive).use { realm ->
+            mutationFile(realm, getFileIdFromDocumentId(documentId), userDrive)?.let { file ->
 
                 // Delete
-                val userDrive = createUserDrive(documentId)
                 val client = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
                 val apiResponse = FileController.deleteFile(file, realm, userDrive, context = context, okHttpClient = client)
 
@@ -601,11 +603,12 @@ class CloudStorageProvider : DocumentsProvider() {
         SentryLog.d(TAG, "renameDocument(), id=$documentId")
         ensureExternalAccessAllowed()
 
-        FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
-            FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
+        val userDrive = createUserDrive(documentId)
+        FileController.getRealmInstance(userDrive).use { realm ->
+            mutationFile(realm, getFileIdFromDocumentId(documentId), userDrive)?.let { file ->
 
                 // Rename
-                val client = runBlocking { AccountUtils.getHttpClient(createUserDrive(documentId).userId) }
+                val client = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
                 val apiResponse = FileController.renameFile(file, displayName, realm, okHttpClient = client)
 
                 if (apiResponse.isSuccess()) {
@@ -805,7 +808,24 @@ class CloudStorageProvider : DocumentsProvider() {
         try {
             // rw/wa must start with existing bytes; w/wt/rwt intentionally truncate.
             if (accessMode and ParcelFileDescriptor.MODE_TRUNCATE == 0) {
-                val source = getDataFile(context, file, userDrive, ParcelFileDescriptor.MODE_READ_ONLY)
+                // A completed local edit may still be queued. Copy it; never hand an
+                // editor the queued upload's descriptor or modify/remove its source.
+                val pendingUri = UploadFile.getRealmInstance().use { realm ->
+                    realm.where(UploadFile::class.java)
+                        .equalTo(UploadFile::userId.name, userDrive.userId)
+                        .equalTo(UploadFile::driveId.name, userDrive.driveId)
+                        .equalTo(UploadFile::type.name, UploadFile.Type.CLOUD_STORAGE.name)
+                        .beginsWith(UploadFile::uri.name, folder.toUri().toString().trimEnd('/') + "/")
+                        .isNull(UploadFile::deletedAt.name)
+                        .isNull(UploadFile::uploadAt.name)
+                        .sort(UploadFile::fileCreatedAt.name, Sort.DESCENDING)
+                        .findFirst()?.uri
+                }
+                val source = if (pendingUri != null) {
+                    ParcelFileDescriptor.open(IOFile(Uri.parse(pendingUri).path!!), ParcelFileDescriptor.MODE_READ_ONLY)
+                } else {
+                    getDataFile(context, file, userDrive, ParcelFileDescriptor.MODE_READ_ONLY)
+                }
                 if (source == null) throw IOException("Cannot read existing document for editing")
                 ParcelFileDescriptor.AutoCloseInputStream(source).use { input ->
                     tempFile.outputStream().use { output -> input.copyTo(output) }
