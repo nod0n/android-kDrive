@@ -188,6 +188,13 @@ class GalleryViewModelTest {
         // Consent/Upload device runs show to be safe on object mocks.
         every { FileController.storeGalleryDrive(any(), any(), any<UserDrive>()) } returns Unit
         every { FileController.removeOrphanFiles(any<UserDrive>()) } returns Unit
+        // Orchestration tests must never resolve the default Realm for detached
+        // filtered rows. The isolated GalleryCacheMergeTest owns real overlay IO.
+        every { FileController.restoreGalleryOfflineState(any(), any<UserDrive>(), null) } answers {
+            val captured = currentFixtureScope()
+            assertEquals(UserDrive(captured.userId, captured.driveId), secondArg<UserDrive>())
+            Unit
+        }
 
         mockkObject(ApiRepository)
         mark("setUp done")

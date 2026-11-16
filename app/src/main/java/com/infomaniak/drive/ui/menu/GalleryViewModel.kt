@@ -22,11 +22,13 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.infomaniak.drive.data.api.ApiRepository
+import com.infomaniak.drive.data.api.CursorApiResponse
 import com.infomaniak.drive.data.cache.FileController
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IsComplete
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -44,7 +46,10 @@ data class GalleryPage(
     val scopeRevision: Long,
 )
 
-class GalleryViewModel : ViewModel() {
+class GalleryViewModel internal constructor(
+    private val data: GalleryDataSource = GalleryDataSource(),
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) : ViewModel() {
 
     val period = MutableStateFlow(GalleryPeriod.MONTH)
 
@@ -65,6 +70,7 @@ class GalleryViewModel : ViewModel() {
     internal var currentCursor: String? = null
 
     private var lastGalleryFiles = arrayListOf<File>()
+    private val consumedCursors = mutableSetOf<String>()
 
     /** Bumped on every request and scope change; responses of a superseded scope are dropped. */
     private var loadGeneration = 0
@@ -87,14 +93,27 @@ class GalleryViewModel : ViewModel() {
         val isComplete: Boolean,
         val nextCursor: String?,
         val isFirstPage: Boolean,
+        val fromApi: Boolean = true,
+        val consumedCursors: Set<String> = emptySet(),
     )
 
-    fun loadLastGallery(driveId: Int, ignoreCloud: Boolean) = synchronized(commitLock) {
-        lastGalleryFiles = arrayListOf()
-        loadGallery(driveId, ignoreCloud, isFirstPage = true)
+    /** Empty-view refresh continues a bounded sparse scan instead of restarting its first page. */
+    fun loadLastGallery(driveId: Int, ignoreCloud: Boolean, continueEmpty: Boolean = false) = synchronized(commitLock) {
+        val cursor = currentCursor
+        if (continueEmpty && !ignoreCloud && lastGalleryFiles.isEmpty() && cursor != null &&
+            lastScope == data.captureScope()
+        ) {
+            loadGallery(driveId, ignoreCloud = false, isFirstPage = false, cursor = cursor)
+        } else {
+            lastGalleryFiles = arrayListOf()
+            consumedCursors.clear()
+            currentCursor = null
+            loadGallery(driveId, ignoreCloud, isFirstPage = true)
+        }
     }
 
     fun loadMoreGallery(driveId: Int, ignoreCloud: Boolean) = synchronized(commitLock) {
+        if (lastScope != data.captureScope()) return@synchronized
         currentCursor?.let { loadGallery(driveId, ignoreCloud, isFirstPage = false, cursor = it) }
     }
 
@@ -108,13 +127,14 @@ class GalleryViewModel : ViewModel() {
         loadGeneration++
         getGalleryJob?.cancel()
         currentCursor = null
+        consumedCursors.clear()
         lastGalleryFiles = arrayListOf()
         mutableMediaFilter.value = filter
     }
 
     fun restoreGalleryFiles() = synchronized(commitLock) {
         val scope = lastScope
-        if (needToRestoreFiles && scope != null && scope == AccountUtils.captureCurrentScope()) {
+        if (needToRestoreFiles && scope != null && scope == data.captureScope()) {
             val isComplete = galleryApiResult.value?.isComplete ?: true
             galleryApiResult.value = GalleryPage(
                 ArrayList(lastGalleryFiles), isComplete, loadGeneration,
@@ -131,16 +151,17 @@ class GalleryViewModel : ViewModel() {
     ) {
         val generation = ++loadGeneration
         val filter = mediaFilter.value
-        val scope = AccountUtils.captureCurrentScope()
+        val scope = data.captureScope()
         if (scope.driveId != driveId) return
         getGalleryJob?.cancel()
-        getGalleryJob = viewModelScope.launch(Dispatchers.IO) {
+        val priorCursors = consumedCursors.toSet()
+        getGalleryJob = viewModelScope.launch(ioDispatcher) {
             val load = if (ignoreCloud) {
-                buildRealmLoad(generation, filter, scope)
+                fallbackLoad(generation, filter, scope, isFirstPage)
             } else {
-                fetchApiLoad(generation, filter, scope, isFirstPage, cursor)
+                fetchApiLoad(generation, filter, scope, isFirstPage, cursor, priorCursors)
             }
-            applyLoad(load)
+            load?.let { applyLoad(it) }
         }
     }
 
@@ -149,46 +170,67 @@ class GalleryViewModel : ViewModel() {
         filter: GalleryMediaFilter,
         scope: AccountUtils.CurrentScope,
     ): GalleryLoad {
-        val allFiles = FileController.getGalleryDrive(UserDrive(scope.userId, scope.driveId))
+        val allFiles = data.cachedFiles(UserDrive(scope.userId, scope.driveId))
         val files = if (filter.writesSharedCache) {
             allFiles
         } else {
             ArrayList(allFiles.filter { it.matchesMediaFilter(filter) })
         }
-        return GalleryLoad(generation, filter, scope, files, isComplete = true, nextCursor = null, isFirstPage = true)
+        return GalleryLoad(
+            generation, filter, scope, files, isComplete = true, nextCursor = null, isFirstPage = true, fromApi = false,
+        )
     }
 
-    private fun fetchApiLoad(
+    private fun fallbackLoad(
+        generation: Int,
+        filter: GalleryMediaFilter,
+        scope: AccountUtils.CurrentScope,
+        isFirstPage: Boolean,
+    ): GalleryLoad = if (isFirstPage) {
+        buildRealmLoad(generation, filter, scope)
+    } else {
+        // A full cache is a replacement, not a next page. Preserve both displayed and
+        // retained rows on failed pagination, and never rewrite cache membership on error.
+        GalleryLoad(generation, filter, scope, arrayListOf(), true, null, false, fromApi = false)
+    }
+
+    private fun isRequestCurrent(generation: Int, filter: GalleryMediaFilter, scope: AccountUtils.CurrentScope) =
+        synchronized(commitLock) {
+            generation == loadGeneration && filter == mediaFilter.value && scope == data.captureScope()
+        }
+
+    private suspend fun fetchApiLoad(
         generation: Int,
         filter: GalleryMediaFilter,
         scope: AccountUtils.CurrentScope,
         isFirstPage: Boolean,
         cursor: String?,
-    ): GalleryLoad {
-        val apiResponse = ApiRepository.getLastGallery(
-            driveId = scope.driveId,
-            types = filter.apiTypes.map { it.value },
-            cursor = cursor,
-        )
-        if (!apiResponse.isSuccess()) return buildRealmLoad(generation, filter, scope)
+        priorCursors: Set<String>,
+    ): GalleryLoad? {
+        var requestCursor = cursor
+        val consumed = priorCursors.toMutableSet()
+        // Bounded per user load: no recursive requests or unbounded scan behind an empty UI.
+        repeat(MAX_SPARSE_PAGES) { index ->
+            currentCoroutineContext().ensureActive()
+            if (!isRequestCurrent(generation, filter, scope)) return null
+            requestCursor?.let(consumed::add)
+            val response = data.fetch(scope.driveId, filter.apiTypes.map { it.value }, requestCursor)
+            currentCoroutineContext().ensureActive()
+            if (!isRequestCurrent(generation, filter, scope)) return null
+            if (!response.isSuccess()) return fallbackLoad(generation, filter, scope, isFirstPage)
 
-        val data = apiResponse.data
-        val files = when {
-            data.isNullOrEmpty() -> arrayListOf()
-            // Filtered results are matched locally too, so a response outside the requested
-            // types can never be presented as filtered; only ALL may fill the shared cache.
-            filter.writesSharedCache -> ArrayList(data)
-            else -> ArrayList(data.filter { it.matchesMediaFilter(filter) })
+            val files = ArrayList(response.data.orEmpty().filter { it.matchesMediaFilter(filter) })
+            // hasMore without a new usable cursor cannot progress. This also detects cycles
+            // across separate loads, without ever requesting a previously consumed cursor.
+            val next = response.cursor?.takeIf { response.hasMore && it.isNotBlank() && it !in consumed }
+            val load = GalleryLoad(
+                generation, filter, scope, files, isComplete = next == null, nextCursor = next,
+                isFirstPage = isFirstPage, consumedCursors = consumed.toSet(),
+            )
+            if (files.isNotEmpty() || next == null || index == MAX_SPARSE_PAGES - 1) return load
+            requestCursor = next
         }
-        return GalleryLoad(
-            generation = generation,
-            filter = filter,
-            scope = scope,
-            files = files,
-            isComplete = !apiResponse.hasMore,
-            nextCursor = apiResponse.cursor,
-            isFirstPage = isFirstPage,
-        )
+        error("bounded Gallery scan must return")
     }
 
     /**
@@ -202,19 +244,27 @@ class GalleryViewModel : ViewModel() {
         // IO only. The local cache commit and its state commit precede a coordinated
         // filter/account change, or observe it and decline. No network runs in this hold.
         synchronized(commitLock) {
-            AccountUtils.withCurrentScope {
+            data.withScope {
                 if (load.generation != loadGeneration || load.filter != mediaFilter.value ||
-                    load.scope != AccountUtils.captureCurrentScope()
-                ) return@withCurrentScope
+                    load.scope != data.captureScope()
+                ) return@withScope
                 val userDrive = UserDrive(load.scope.userId, load.scope.driveId)
-                if (load.filter.writesSharedCache && (load.isFirstPage || load.files.isNotEmpty())) {
-                    FileController.storeGalleryDrive(load.files, load.isFirstPage, userDrive)
+                if (load.fromApi && load.filter.writesSharedCache && (load.isFirstPage || load.files.isNotEmpty())) {
+                    data.store(load.files, load.isFirstPage, userDrive)
                     // An empty refresh only withdraws Gallery membership. Running the
                     // general orphan sweep here could erase unrelated offline root rows.
-                    if (load.isFirstPage && load.files.isNotEmpty()) FileController.removeOrphanFiles(userDrive)
+                    if (load.isFirstPage && load.files.isNotEmpty()) data.removeOrphans(userDrive)
+                } else if (!load.filter.writesSharedCache) {
+                    // Preserve offline presentation for detached filtered rows without
+                    // replacing Gallery membership or writing any Realm row.
+                    data.restoreOfflineState(load.files, userDrive)
                 }
                 currentCursor = load.nextCursor
-                if (load.isFirstPage) lastGalleryFiles = arrayListOf()
+                if (load.isFirstPage) {
+                    lastGalleryFiles = arrayListOf()
+                    consumedCursors.clear()
+                }
+                consumedCursors.addAll(load.consumedCursors)
                 lastGalleryFiles.addAll(load.files)
                 lastScope = load.scope
                 galleryApiResult.postValue(
@@ -225,13 +275,29 @@ class GalleryViewModel : ViewModel() {
     }
 
     fun isPageCurrent(page: GalleryPage): Boolean = synchronized(commitLock) {
-        val scope = AccountUtils.captureCurrentScope()
+        val scope = data.captureScope()
         page.generation == loadGeneration && page.userDrive == UserDrive(scope.userId, scope.driveId) &&
             page.scopeRevision == scope.revision
+    }
+
+    internal companion object {
+        const val MAX_SPARSE_PAGES = 8
     }
 
     override fun onCleared() {
         synchronized(commitLock) { getGalleryJob?.cancel() }
         super.onCleared()
     }
+}
+
+/** Gallery IO boundaries only; pagination and completion remain in the ViewModel. */
+internal open class GalleryDataSource {
+    open fun captureScope() = AccountUtils.captureCurrentScope()
+    open fun withScope(block: () -> Unit) = AccountUtils.withCurrentScope(block)
+    open fun fetch(driveId: Int, types: List<String>, cursor: String?): CursorApiResponse<ArrayList<File>> =
+        ApiRepository.getLastGallery(driveId, types, cursor)
+    open fun cachedFiles(scope: UserDrive) = FileController.getGalleryDrive(scope)
+    open fun store(files: List<File>, first: Boolean, scope: UserDrive) = FileController.storeGalleryDrive(files, first, scope)
+    open fun removeOrphans(scope: UserDrive) = FileController.removeOrphanFiles(scope)
+    open fun restoreOfflineState(files: List<File>, scope: UserDrive) = FileController.restoreGalleryOfflineState(files, scope)
 }

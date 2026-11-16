@@ -950,6 +950,8 @@ object FileController {
                     val galleryFolder = realm.where(File::class.java).equalTo(File::id.name, Gallery.id).findFirst()
                         ?: realm.copyToRealm(Gallery.file)
                     if (isFirstPage) galleryFolder.children = RealmList()
+                    // Gallery updates the same rows as folder listings: keep their indexed sort invariant.
+                    mediaList.forEach { it.sortedName = it.sortedName.lowercase().removeAccents() }
                     galleryFolder.children.addAll(realm, mediaList)
                 }
             }
@@ -959,6 +961,24 @@ object FileController {
 
     fun storeGalleryDrive(mediaList: List<File>, isFirstPage: Boolean, userDrive: UserDrive) {
         getRealmInstance(userDrive).use { storeGalleryDrive(mediaList, isFirstPage, customRealm = it) }
+    }
+
+    /** Filtered API rows never enter the shared cache, but their UI flags must remain local. */
+    internal fun restoreGalleryOfflineState(files: List<File>, userDrive: UserDrive, customRealm: Realm? = null) {
+        val restore: (Realm) -> Unit = { realm ->
+            files.filter { it.driveId == userDrive.driveId }.forEach { file ->
+                val local = realm.where(File::class.java)
+                    .equalTo(File::id.name, file.id)
+                    .equalTo(File::driveId.name, userDrive.driveId)
+                    .findFirst()
+                file.isOffline = local?.isOffline ?: false
+                file.isMarkedAsOffline = local?.isMarkedAsOffline ?: false
+                file.isDirectlyPinned = local?.isDirectlyPinned ?: false
+                file.offlineOwnedByRoot = local?.offlineOwnedByRoot ?: false
+                file.offlineNeedsAttention = local?.offlineNeedsAttention ?: false
+            }
+        }
+        customRealm?.let(restore) ?: getRealmInstance(userDrive).use(restore)
     }
 
     fun removeOrphanFiles(userDrive: UserDrive) {

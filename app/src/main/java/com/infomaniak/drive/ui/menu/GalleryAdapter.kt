@@ -47,6 +47,21 @@ class GalleryAdapter(
 
     private var lastSectionTitle = ""
 
+    /** Null has no request identity; API errors arrive as stamped cache-fallback pages instead. */
+    internal fun completePage(
+        page: GalleryPage?,
+        isPageCurrent: (GalleryPage) -> Boolean,
+        appendFiles: Boolean = true,
+    ): Boolean {
+        if (page == null || !isPageCurrent(page)) return false
+        stateRestorationPolicy = StateRestorationPolicy.PREVENT_WHEN_EMPTY
+        isComplete = page.isComplete
+        // Legacy's loader is independent of itemList. Even empty/error-fallback pages
+        // and recreation deliveries must pass through addAll to remove its skeletons.
+        addAll(if (appendFiles) formatList(page.files) else arrayListOf())
+        return true
+    }
+
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): GalleryViewHolder {
         val layoutInflater = LayoutInflater.from(parent.context)
         val binding = if (viewType == R.layout.title_recycler_section) {

@@ -185,34 +185,16 @@ class GalleryFragment : MultiSelectFragment(
         }
 
         galleryViewModel.galleryApiResult.observe(viewLifecycleOwner) { page ->
+            if (!galleryAdapter.completePage(page, galleryViewModel::isPageCurrent, appendFiles = !dataAlreadyLoaded)) {
+                return@observe
+            }
+            dataAlreadyLoaded = false
+
             // Empty state for a filtered query points out the filter instead of implying an empty gallery
             binding.noGalleryLayout.description =
                 if (galleryViewModel.mediaFilter.value.writesSharedCache) null
                 else R.string.galleryFilterEmptyMediaDescription
-
-            page?.let {
-                // A queued result of a superseded request must not reach the UI
-                if (!galleryViewModel.isPageCurrent(it)) return@observe
-
-                galleryAdapter.stateRestorationPolicy = RecyclerView.Adapter.StateRestorationPolicy.PREVENT_WHEN_EMPTY
-                if (dataAlreadyLoaded) {
-                    // When the data is still available after the fragment is recreated, there's no need to reload it again.
-                    dataAlreadyLoaded = false
-                    return@observe
-                }
-                galleryAdapter.isComplete = it.isComplete
-                val galleryList = galleryAdapter.formatList(it.files)
-                if (it.files.isNotEmpty()) galleryAdapter.addAll(galleryList)
-                binding.noGalleryLayout.toggleVisibility(galleryAdapter.galleryList.isEmpty())
-            } ?: run {
-                galleryAdapter.isComplete = true
-
-                binding.noGalleryLayout.toggleVisibility(
-                    noNetwork = !mainViewModel.hasNetwork,
-                    isVisible = galleryAdapter.galleryList.isEmpty(),
-                    showRefreshButton = true,
-                )
-            }
+            binding.noGalleryLayout.toggleVisibility(galleryAdapter.galleryList.isEmpty())
 
             onDownloadFinished()
 
@@ -261,7 +243,7 @@ class GalleryFragment : MultiSelectFragment(
         binding.galleryRecyclerView.layoutManager = gridLayoutManager
     }
 
-    private fun loadGallery(driveId: Int, isRefresh: Boolean = false) {
+    private fun loadGallery(driveId: Int, isRefresh: Boolean = false, continueEmpty: Boolean = false) {
         galleryAdapter.apply {
             if (isRefresh) clean()
 
@@ -270,7 +252,9 @@ class GalleryFragment : MultiSelectFragment(
             isDownloadingGallery = true
 
             val isNetworkAvailable = mainViewModel.hasNetwork
-            if (isRefresh) galleryViewModel.loadLastGallery(driveId, ignoreCloud = !isNetworkAvailable)
+            if (isRefresh) galleryViewModel.loadLastGallery(
+                driveId, ignoreCloud = !isNetworkAvailable, continueEmpty = continueEmpty,
+            )
             else if (isNetworkAvailable) galleryViewModel.loadMoreGallery(driveId, ignoreCloud = false)
         }
     }
@@ -313,7 +297,7 @@ class GalleryFragment : MultiSelectFragment(
     fun onRefreshGallery() {
         if (isResumed) {
             galleryAdapter.clearGallery()
-            loadGallery(AccountUtils.currentDriveId, isRefresh = true)
+            loadGallery(AccountUtils.currentDriveId, isRefresh = true, continueEmpty = true)
         }
     }
 
