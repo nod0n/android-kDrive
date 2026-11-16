@@ -24,6 +24,8 @@ import android.content.SharedPreferences
 import android.content.pm.ProviderInfo
 import android.graphics.Point
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.provider.DocumentsContract
@@ -99,6 +101,9 @@ import java.nio.file.Files
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -1307,6 +1312,41 @@ class CloudStorageProviderTest {
     }
 
     @Test
+    fun immediateReadWriteReopenCopiesClosedBytesBeforeTheCloseHandlerRuns() {
+        assertImmediateReopen("rw", "Xocal-edit")
+    }
+
+    @Test
+    fun immediateAppendReopenCopiesClosedBytesBeforeTheCloseHandlerRuns() {
+        assertImmediateReopen("wa", "local-editX")
+    }
+
+    private fun assertImmediateReopen(mode: String, expected: String) {
+        cacheFile().apply {
+            parentFile!!.mkdirs()
+            writeBytes(FILE_BYTES)
+            assertTrue(setLastModified(MTIME_SECONDS * 1000))
+        }
+        withMainLooperParked {
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+                it.write("local-edit".toByteArray())
+            }
+            val first = ownedWriteSources().single()
+            assertTrue("the close handler cannot publish while Main is parked", pendingUploads().isEmpty())
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), mode, null)!!).use {
+                it.write("X".toByteArray())
+            }
+            val second = ownedWriteSources().single { it != first }
+            assertEquals("local-edit", first.readText())
+            assertEquals(expected, second.readText())
+            assertTrue("neither close handler ran before the byte assertions", pendingUploads().isEmpty())
+            assertEquals(0, syncImmediatelyCalls.get())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 2 && syncImmediatelyCalls.get() == 2 })
+        assertEquals(setOf("local-edit", expected), pendingUploads().map { IOFile(Uri.parse(it.uri).path!!).readText() }.toSet())
+    }
+
+    @Test
     fun aNontruncatingReopenCopiesPendingBytesWithoutChangingTheFirstUpload() {
         val original = "pending-local-edit"
         ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
@@ -1434,6 +1474,34 @@ class CloudStorageProviderTest {
     }
 
     // ---- helpers -------------------------------------------------------------------
+
+    private fun ownedWriteSources(): Set<IOFile> =
+        IOFile(currentCase.ownedSub("files"), "cloud_storage_temp_files/$USER_ID/$DRIVE_ID/$FILE_ID")
+            .listFiles()?.toSet() ?: emptySet()
+
+    private fun withMainLooperParked(block: () -> Unit) {
+        assertFalse("the test must not run on Main", Looper.myLooper() == Looper.getMainLooper())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val exited = CountDownLatch(1)
+        val timedOut = AtomicBoolean(false)
+        assertTrue(Handler(Looper.getMainLooper()).post {
+            entered.countDown()
+            try {
+                if (!release.await(5, TimeUnit.SECONDS)) timedOut.set(true)
+            } finally {
+                exited.countDown()
+            }
+        })
+        try {
+            assertTrue("Main must be parked before opening descriptors", entered.await(5, TimeUnit.SECONDS))
+            block()
+        } finally {
+            release.countDown()
+            assertTrue("Main must be released before fixture teardown", exited.await(5, TimeUnit.SECONDS))
+            assertFalse("the byte assertions must finish before the barrier expires", timedOut.get())
+        }
+    }
 
     private fun pendingUploads(): List<UploadFile> = UploadFile.getRealmInstance().use { realm ->
         realm.copyFromRealm(realm.where(UploadFile::class.java).findAll(), 0)
