@@ -94,10 +94,12 @@ import kotlin.coroutines.EmptyCoroutineContext
 class CloudStorageProvider : DocumentsProvider() {
 
     private lateinit var cacheDir: IOFile
+    private class IssuedWrite(val source: IOFile, var published: Boolean = false)
+
     // Issued writers remain readable before the Handler/queue publishes their upload.
     // Like an ordinary file, a still-open writer can be snapshotted by a later open;
     // concurrent edits are not an atomic document transaction.
-    private val unpublishedWrites = linkedSetOf<IOFile>()
+    private val issuedWrites = mutableListOf<IssuedWrite>()
     private val cloudScope = CoroutineScope(
         CoroutineName("CloudStorage") + Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     )
@@ -808,43 +810,45 @@ class CloudStorageProvider : DocumentsProvider() {
         val cacheFile = file.getCacheFile(context, userDrive)
         val handler = Handler(context.mainLooper)
         val tempFile = IOFile.createTempFile("write-", ".tmp", folder)
+        val issuedWrite = IssuedWrite(tempFile)
 
         try {
             // rw/wa must start with existing bytes; w/wt/rwt intentionally truncate.
             if (accessMode and ParcelFileDescriptor.MODE_TRUNCATE == 0) {
                 // A completed local edit may still be queued. Copy it; never hand an
                 // editor the queued upload's descriptor or modify/remove its source.
-                val issuedSource = synchronized(unpublishedWrites) {
-                    unpublishedWrites.lastOrNull { it.parentFile == folder }?.let {
-                        ParcelFileDescriptor.open(it, ParcelFileDescriptor.MODE_READ_ONLY)
+                val localSource = synchronized(issuedWrites) {
+                    val pendingUris = UploadFile.getRealmInstance().use { realm ->
+                        realm.where(UploadFile::class.java)
+                            .equalTo(UploadFile::userId.name, userDrive.userId)
+                            .equalTo(UploadFile::driveId.name, userDrive.driveId)
+                            .equalTo(UploadFile::type.name, UploadFile.Type.CLOUD_STORAGE.name)
+                            .beginsWith(UploadFile::uri.name, folder.toUri().toString().trimEnd('/') + "/")
+                            .isNull(UploadFile::deletedAt.name)
+                            .isNull(UploadFile::uploadAt.name)
+                            .sort(UploadFile::fileCreatedAt.name, Sort.DESCENDING)
+                            .findAll().map { it.uri }
                     }
+                    // Queue publication must not move a newer issued writer behind an
+                    // older still-open one. Retain issue order until upload disposition.
+                    issuedWrites.removeAll {
+                        it.source.parentFile == folder && it.published && it.source.toUri().toString() !in pendingUris
+                    }
+                    val latest = issuedWrites.lastOrNull { it.source.parentFile == folder }?.source
+                        ?: pendingUris.firstOrNull()?.let { IOFile(Uri.parse(it).path!!) }
+                    latest?.let { ParcelFileDescriptor.open(it, ParcelFileDescriptor.MODE_READ_ONLY) }
                 }
-                val pendingUri = if (issuedSource == null) UploadFile.getRealmInstance().use { realm ->
-                    realm.where(UploadFile::class.java)
-                        .equalTo(UploadFile::userId.name, userDrive.userId)
-                        .equalTo(UploadFile::driveId.name, userDrive.driveId)
-                        .equalTo(UploadFile::type.name, UploadFile.Type.CLOUD_STORAGE.name)
-                        .beginsWith(UploadFile::uri.name, folder.toUri().toString().trimEnd('/') + "/")
-                        .isNull(UploadFile::deletedAt.name)
-                        .isNull(UploadFile::uploadAt.name)
-                        .sort(UploadFile::fileCreatedAt.name, Sort.DESCENDING)
-                        .findFirst()?.uri
-                } else null
-                val source = issuedSource ?: if (pendingUri != null) {
-                    ParcelFileDescriptor.open(IOFile(Uri.parse(pendingUri).path!!), ParcelFileDescriptor.MODE_READ_ONLY)
-                } else {
-                    getDataFile(context, file, userDrive, ParcelFileDescriptor.MODE_READ_ONLY)
-                }
+                val source = localSource ?: getDataFile(context, file, userDrive, ParcelFileDescriptor.MODE_READ_ONLY)
                 if (source == null) throw IOException("Cannot read existing document for editing")
                 ParcelFileDescriptor.AutoCloseInputStream(source).use { input ->
                     tempFile.outputStream().use { output -> input.copyTo(output) }
                 }
             }
-            synchronized(unpublishedWrites) { unpublishedWrites.add(tempFile) }
+            synchronized(issuedWrites) { issuedWrites.add(issuedWrite) }
             return ParcelFileDescriptor.open(tempFile, accessMode, handler) { exception: IOException? ->
                 if (exception == null) {
                     cloudScope.launch {
-                        UploadFile(
+                        val upload = UploadFile(
                             uri = tempFile.toUri().toString(),
                             driveId = userDrive.driveId,
                             fileCreatedAt = Date(),
@@ -853,14 +857,19 @@ class CloudStorageProvider : DocumentsProvider() {
                             remoteFolder = file.parentId,
                             type = UploadFile.Type.CLOUD_STORAGE.name,
                             userId = userDrive.userId,
-                        ).store()
-                        synchronized(unpublishedWrites) { unpublishedWrites.remove(tempFile) }
+                        )
+                        // Serialize metadata publication with source selection so a
+                        // newly queued writer cannot be pruned using an older Realm read.
+                        synchronized(issuedWrites) {
+                            upload.store()
+                            issuedWrite.published = true
+                        }
                         context.syncImmediately(isAutomaticTrigger = false)
                         cacheFile.delete() // Delete old cache
                     }
                 } else {
-                    synchronized(unpublishedWrites) {
-                        unpublishedWrites.remove(tempFile)
+                    synchronized(issuedWrites) {
+                        issuedWrites.remove(issuedWrite)
                         tempFile.delete() // This open never queued an upload.
                     }
                     exception.printStackTrace()
@@ -868,8 +877,8 @@ class CloudStorageProvider : DocumentsProvider() {
                 }
             } ?: throw IOException("Cannot open provider write source")
         } catch (exception: Exception) {
-            synchronized(unpublishedWrites) {
-                unpublishedWrites.remove(tempFile)
+            synchronized(issuedWrites) {
+                issuedWrites.remove(issuedWrite)
                 tempFile.delete() // Setup failed before ownership passed to the close listener.
             }
             throw exception

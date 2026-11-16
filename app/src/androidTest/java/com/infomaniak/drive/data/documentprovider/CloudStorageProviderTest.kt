@@ -79,6 +79,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.ContinuationInterceptor
@@ -1347,6 +1348,172 @@ class CloudStorageProviderTest {
     }
 
     @Test
+    fun appendReopenCopiesIssuedBytesWhileTheCloseUploadIsQueuedButCannotPublish() {
+        cacheFile().apply {
+            parentFile!!.mkdirs()
+            writeBytes(FILE_BYTES)
+            assertTrue(setLastModified(MTIME_SECONDS * 1000))
+        }
+        withUploadQueueParked { scope ->
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+                it.write("queue-held-edit".toByteArray())
+            }
+            // The parked queue task and the close listener's upload child both exist.
+            // This waits for listener delivery, never for the forbidden publication.
+            assertTrue(awaitUntil(2_000) { scope.coroutineContext[Job]!!.children.count() == 2 })
+            assertTrue(pendingUploads().isEmpty())
+            val first = ownedWriteSources().single()
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+                it.write("X".toByteArray())
+            }
+            assertEquals("queue-held-edit", first.readText())
+            assertEquals("queue-held-editX", ownedWriteSources().single { it != first }.readText())
+            assertTrue("the queue remains parked through the byte assertions", pendingUploads().isEmpty())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 2 && syncImmediatelyCalls.get() == 2 })
+    }
+
+    @Test
+    fun simultaneousNontruncatingOpensKeepIndependentSnapshotsAcrossOutOfOrderCloses() {
+        withMainLooperParked {
+            val first = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!)
+            try {
+                first.write("A".toByteArray())
+                val second = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!)
+                try {
+                    second.write("B".toByteArray())
+                    val third = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "rw", null)!!)
+                    try {
+                        third.write("C".toByteArray())
+                        second.close()
+                        first.close()
+                        third.close()
+                        assertEquals(setOf("A", "AB", "CB"), ownedWriteSources().map { it.readText() }.toSet())
+                        assertTrue(pendingUploads().isEmpty())
+                    } finally { third.close() }
+                } finally { second.close() }
+            } finally { first.close() }
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 3 && syncImmediatelyCalls.get() == 3 })
+        assertEquals(setOf("A", "AB", "CB"), pendingUploads().map { IOFile(Uri.parse(it.uri).path!!).readText() }.toSet())
+    }
+
+    @Test
+    fun failedCloseWithdrawsOnlyItsIssuedSourceAndKeepsThePreviousPendingEdit() {
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+            it.write("retained-edit".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 1 && syncImmediatelyCalls.get() == 1 })
+        val retained = IOFile(Uri.parse(pendingUploads().single().uri).path!!)
+        val failed = provider.openDocument(fileDocId(), "wt", null)!!
+        val failedSource = ownedWriteSources().single { it != retained }
+        failed.closeWithError("owned fixture close failure")
+        assertTrue(awaitUntil { !failedSource.exists() && captureExceptionCalls.get() == 1 })
+        assertEquals("retained-edit", retained.readText())
+        assertEquals(1, pendingUploads().size)
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+            it.write("X".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 2 })
+        assertEquals(setOf("retained-edit", "retained-editX"), pendingUploads().map { IOFile(Uri.parse(it.uri).path!!).readText() }.toSet())
+    }
+
+    @Test
+    fun failedDirectorySetupKeepsExistingIssuedBytes() {
+        val writer = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!)
+        val original = ownedWriteSources().single()
+        val folder = original.parentFile!!
+        val moved = IOFile(folder.parentFile, "owned-directory-held-for-failure")
+        try {
+            writer.write("retained-open-edit".toByteArray())
+            assertTrue(folder.renameTo(moved))
+            try {
+                folder.writeText("owned obstruction")
+                try {
+                    provider.openDocument(fileDocId(), "wt", null)
+                    fail("an obstructed owned directory must reject the open")
+                } catch (_: IllegalStateException) { }
+                assertEquals("retained-open-edit", IOFile(moved, original.name).readText())
+                assertTrue(pendingUploads().isEmpty())
+            } finally {
+                assertTrue(folder.delete())
+                assertTrue(moved.renameTo(folder))
+            }
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+                it.write("X".toByteArray())
+            }
+            assertEquals("retained-open-edit", original.readText())
+            assertEquals("retained-open-editX", ownedWriteSources().single { it != original }.readText())
+        } finally { writer.close() }
+        assertTrue(awaitUntil { pendingUploads().size == 2 })
+    }
+
+    @Test
+    fun providerCancellationRetainsIssuedBytesAcrossAnImmediateReopenWithoutPublishing() {
+        val scope = providerScope()
+        withMainLooperParked {
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+                it.write("cancelled-edit".toByteArray())
+                scope.coroutineContext[Job]!!.cancel()
+            }
+            val first = ownedWriteSources().single()
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+                it.write("X".toByteArray())
+            }
+            assertEquals("cancelled-edit", first.readText())
+            assertEquals("cancelled-editX", ownedWriteSources().single { it != first }.readText())
+        }
+        assertTrue(runBlocking { withTimeoutOrNull(5_000) { scope.coroutineContext[Job]!!.join(); true } } == true)
+        assertEquals(setOf("cancelled-edit", "cancelled-editX"), ownedWriteSources().map { it.readText() }.toSet())
+        assertTrue(pendingUploads().isEmpty())
+        assertEquals(0, syncImmediatelyCalls.get())
+    }
+
+    @Test
+    fun publicationAndAnOlderLateCloseDoNotRollBackTheLatestIssuedSnapshot() {
+        val older = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!)
+        try {
+            older.write("A".toByteArray())
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+                it.write("B".toByteArray())
+            }
+            assertTrue(awaitUntil { pendingUploads().size == 1 && syncImmediatelyCalls.get() == 1 })
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+                it.write("X".toByteArray())
+            }
+            assertTrue(awaitUntil { pendingUploads().size == 2 && syncImmediatelyCalls.get() == 2 })
+            assertEquals(setOf("AB", "ABX"), pendingUploads().map { IOFile(Uri.parse(it.uri).path!!).readText() }.toSet())
+        } finally { older.close() }
+        assertTrue(awaitUntil { pendingUploads().size == 3 && syncImmediatelyCalls.get() == 3 })
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+            it.write("Y".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 4 })
+        assertEquals(setOf("A", "AB", "ABX", "ABXY"), pendingUploads().map { IOFile(Uri.parse(it.uri).path!!).readText() }.toSet())
+    }
+
+    @Test
+    fun disposedLatestSourceCannotHideAnEarlierPendingEditOnReopen() {
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+            it.write("retained".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 1 && syncImmediatelyCalls.get() == 1 })
+        val first = pendingUploads().single()
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+            it.write("disposed".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 2 && syncImmediatelyCalls.get() == 2 })
+        val disposed = pendingUploads().single { it.uri != first.uri }
+        UploadFile.deleteAllFromUris(listOf(Uri.parse(disposed.uri)))
+        assertFalse(IOFile(Uri.parse(disposed.uri).path!!).exists())
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+            it.write("X".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 2 && syncImmediatelyCalls.get() == 3 })
+        assertEquals(setOf("retained", "retainedX"), pendingUploads().map { IOFile(Uri.parse(it.uri).path!!).readText() }.toSet())
+    }
+
+    @Test
     fun aNontruncatingReopenCopiesPendingBytesWithoutChangingTheFirstUpload() {
         val original = "pending-local-edit"
         ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
@@ -1478,6 +1645,28 @@ class CloudStorageProviderTest {
     private fun ownedWriteSources(): Set<IOFile> =
         IOFile(currentCase.ownedSub("files"), "cloud_storage_temp_files/$USER_ID/$DRIVE_ID/$FILE_ID")
             .listFiles()?.toSet() ?: emptySet()
+
+    private fun providerScope(): CoroutineScope = CloudStorageProvider::class.java.getDeclaredField("cloudScope")
+        .apply { isAccessible = true }.get(provider) as CoroutineScope
+
+    private fun withUploadQueueParked(block: (CoroutineScope) -> Unit) {
+        val scope = providerScope()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val timedOut = AtomicBoolean(false)
+        val gate = scope.launch {
+            entered.countDown()
+            if (!release.await(5, TimeUnit.SECONDS)) timedOut.set(true)
+        }
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            block(scope)
+        } finally {
+            release.countDown()
+            assertTrue(runBlocking { withTimeoutOrNull(5_000) { gate.join(); true } } == true)
+            assertFalse("queue publication must stay blocked through the byte assertions", timedOut.get())
+        }
+    }
 
     private fun withMainLooperParked(block: () -> Unit) {
         assertFalse("the test must not run on Main", Looper.myLooper() == Looper.getMainLooper())
