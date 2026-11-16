@@ -78,6 +78,7 @@ import io.sentry.protocol.SentryId
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -353,7 +354,7 @@ class CloudStorageProviderTest {
             // live case (a late task after teardown consumed the state) fails loudly
             // here instead of silently opening a realm in another case's namespace.
             every { UploadFile.getRealmInstance() } answers {
-                Realm.getInstance(syncFixtureConfig(currentCase.ownedRoot))
+                Realm.getInstance(currentCase.syncRealmConfig)
             }
 
             mockkObject(FileController)
@@ -371,7 +372,7 @@ class CloudStorageProviderTest {
             // placeholder for a concrete java.util collection return redefines the
             // ArrayList class chain on this agent (the recorded 4daa failure).
             every { DriveInfosController.getRealmInstance() } answers {
-                Realm.getInstance(driveInfosFixtureConfig(currentCase.ownedRoot))
+                Realm.getInstance(currentCase.driveInfosRealmConfig)
             }
 
             mockkObject(SyncUtils)
@@ -545,6 +546,12 @@ class CloudStorageProviderTest {
      */
     private class CaseState(val runToken: String) {
         lateinit var ownedRoot: IOFile
+        // Realm checks configuration equality across all live handles for one path.
+        // These migrations use identity equality, so rebuilding them per open rejects
+        // overlapping test-thread queries and provider-thread stores. Share only the
+        // immutable configuration; each caller still opens/closes its own Realm.
+        val syncRealmConfig: RealmConfiguration by lazy { syncFixtureConfig(ownedRoot) }
+        val driveInfosRealmConfig: RealmConfiguration by lazy { driveInfosFixtureConfig(ownedRoot) }
         lateinit var fixtureContext: Context
         lateinit var recordingResolver: RecordingContentResolver
         val hasOwnedRoot get() = ::ownedRoot.isInitialized
@@ -709,8 +716,8 @@ class CloudStorageProviderTest {
         var allOwnedRealmsDeleted = true
         if (state.hasOwnedRoot) {
             val ownedRealmConfigs = fileFixtureConfigs.values +
-                syncFixtureConfig(state.ownedRoot) +
-                driveInfosFixtureConfig(state.ownedRoot)
+                state.syncRealmConfig +
+                state.driveInfosRealmConfig
             ownedRealmConfigs.forEach { config ->
                 val realmFile = PlatformFile(config.path)
                 checked("delete owned fixture realm ${realmFile.name}") {
@@ -1593,6 +1600,36 @@ class CloudStorageProviderTest {
             assertEquals("unpublished-A", unpublishedSource.readText())
         } finally {
             unpublished.close()
+        }
+    }
+
+    @Test
+    fun aFixtureRealmConfigurationSupportsOverlappingQueryAndUploadThreads() {
+        val source = IOFile(currentCase.ownedSub("files"), "overlapping-fixture-upload.bin").apply {
+            writeBytes(FILE_BYTES)
+        }
+        val uri = Uri.fromFile(source).toString()
+        val testThread = Thread.currentThread()
+        UploadFile.getRealmInstance().use { queryRealm ->
+            DriveInfosController.getRealmInstance().use { driveRealm ->
+                val driveConfig = driveRealm.configuration
+                // Both handles stay open until the provider-thread work completes:
+                // fresh migration instances used to fail RealmCache validation here.
+                // async retains the exception for await instead of crashing the app.
+                val stored = providerScope().async {
+                    assertFalse(Thread.currentThread() === testThread)
+                    UploadFile(uri = uri, userId = USER_ID, driveId = DRIVE_ID).store()
+                    DriveInfosController.getRealmInstance().use { otherThreadRealm ->
+                        assertEquals(driveConfig, otherThreadRealm.configuration)
+                    }
+                }
+                assertTrue("the overlapping fixture store must complete", runBlocking {
+                    withTimeoutOrNull(5_000) { stored.await(); true } == true
+                })
+                queryRealm.refresh()
+                assertEquals(1L, queryRealm.where(UploadFile::class.java).equalTo("uri", uri).count())
+                assertTrue(source.readBytes().contentEquals(FILE_BYTES))
+            }
         }
     }
 
