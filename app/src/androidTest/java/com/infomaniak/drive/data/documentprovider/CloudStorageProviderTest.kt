@@ -1212,17 +1212,21 @@ class CloudStorageProviderTest {
     @Test
     fun theWriteCloseBoundaryStoresThePendingUploadOnlyAfterClose() {
         val cache = cacheFile()
+        val staleCacheBytes = "stale-cache-to-be-deleted".toByteArray()
         cache.parentFile?.mkdirs()
-        cache.writeBytes("stale-cache-to-be-deleted".toByteArray())
+        cache.writeBytes(staleCacheBytes)
 
         // Before the descriptor exists, nothing may be stored or scheduled.
         assertNull("nothing is stored before the write descriptor exists", storedUpload())
         assertEquals(0, syncImmediatelyCalls.get())
 
-        val descriptor = provider.openDocument(fileDocId(), "w", null)
+        // Android 15 parseMode("w") does not request truncation. This replacement-write
+        // boundary must not need readable old bytes from the deliberately stale cache.
+        val descriptor = provider.openDocument(fileDocId(), "wt", null)
         assertNotNull(descriptor)
         val stream = ParcelFileDescriptor.AutoCloseOutputStream(descriptor!!)
         try {
+            assertEquals("replacement source starts empty", 0L, descriptor.statSize)
             stream.write(FILE_BYTES)
             // The pending-open boundary, observed while the descriptor is STILL open:
             // the close coroutine cannot have started, so nothing may be stored or
@@ -1233,6 +1237,7 @@ class CloudStorageProviderTest {
                 0,
                 syncImmediatelyCalls.get(),
             )
+            assertTrue("old cache is preserved until close", cache.readBytes().contentEquals(staleCacheBytes))
         } finally {
             stream.close() // triggers the production close listener exactly once
         }
