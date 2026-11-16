@@ -83,6 +83,7 @@ import kotlinx.coroutines.sync.withLock
 import splitties.init.appCtx
 import java.io.IOException
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.util.Date
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -495,13 +496,12 @@ class CloudStorageProvider : DocumentsProvider() {
         ensureExternalAccessAllowed()
 
         val fileId = getFileIdFromDocumentId(documentId)
-        val userId = getUserId(documentId)
 
         return FileController.getRealmInstance(createUserDrive(documentId)).use { realm ->
 
             FileController.getFileProxyById(fileId, customRealm = realm)?.let { file ->
 
-                generateThumbnail(fileId, file, userId, signal)?.let { parcel ->
+                generateThumbnail(fileId, file, createUserDrive(documentId), signal)?.let { parcel ->
                     AssetFileDescriptor(parcel, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
                 }
 
@@ -509,18 +509,22 @@ class CloudStorageProvider : DocumentsProvider() {
         }
     }
 
-    private fun generateThumbnail(fileId: Int, file: File, userId: String, signal: CancellationSignal?): ParcelFileDescriptor? {
-        val outputFolder = IOFile(context?.cacheDir, "thumbnails").apply { if (!exists()) mkdirs() }
-        val name = "${fileId}_${file.name}"
-        val outputFile = IOFile(outputFolder, name)
+    private fun generateThumbnail(fileId: Int, file: File, userDrive: UserDrive, signal: CancellationSignal?): ParcelFileDescriptor? {
         val thumbnailUrl = ApiRoutes.getThumbnailUrl(file)
+        // The URL includes the resource kind and modification identity. Hash it so no
+        // remote name/path (or public-share parameter) becomes a filesystem component.
+        val resourceKey = MessageDigest.getInstance("SHA-256").digest(thumbnailUrl.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        val outputFolder = IOFile(context?.cacheDir, "thumbnails/${userDrive.userId}/${userDrive.driveId}/$fileId")
+            .apply { if (!exists()) mkdirs() }
+        val outputFile = IOFile(outputFolder, resourceKey)
 
         val (readPipe, writePipe) = ParcelFileDescriptor.createReliablePipe()
 
         val job = cloudScope.launch(Dispatchers.IO) {
             ParcelFileDescriptor.AutoCloseOutputStream(writePipe).use { writeStream ->
                 runCatching {
-                    val okHttpClient = AccountUtils.getHttpClient(userId.toInt())
+                    val okHttpClient = AccountUtils.getHttpClient(userDrive.userId)
                     val response = DownloadOfflineFileManager.downloadFileResponseAsync(thumbnailUrl, okHttpClient)
 
                     if (response.isSuccessful && DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
@@ -571,7 +575,9 @@ class CloudStorageProvider : DocumentsProvider() {
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
                 // Delete
-                val apiResponse = FileController.deleteFile(file, realm, context = context)
+                val userDrive = createUserDrive(documentId)
+                val client = runBlocking { AccountUtils.getHttpClient(userDrive.userId) }
+                val apiResponse = FileController.deleteFile(file, realm, userDrive, context = context, okHttpClient = client)
 
                 if (apiResponse.isSuccess()) {
 
@@ -599,7 +605,8 @@ class CloudStorageProvider : DocumentsProvider() {
             FileController.getFileProxyById(getFileIdFromDocumentId(documentId), customRealm = realm)?.let { file ->
 
                 // Rename
-                val apiResponse = FileController.renameFile(file, displayName, realm)
+                val client = runBlocking { AccountUtils.getHttpClient(createUserDrive(documentId).userId) }
+                val apiResponse = FileController.renameFile(file, displayName, realm, okHttpClient = client)
 
                 if (apiResponse.isSuccess()) {
                     // Refresh
@@ -780,44 +787,55 @@ class CloudStorageProvider : DocumentsProvider() {
         if (apiResponse.isSuccess() && file != null) {
             FileController.addFileTo(parentFolderId, file, userDrive)
 
-            createTempFile(getFileIdFromDocumentId(parentDocumentId), displayName)
-
             return createFileDocumentId(parentDocumentId, file.id)
         }
 
         throw RuntimeException("Copy file failed")
     }
 
-    private fun createTempFile(parentFileId: Int, displayName: String): IOFile {
-        val tempFileFolder = IOFile(cacheDir, "$parentFileId").apply { if (!exists()) mkdirs() }
-        return IOFile(tempFileFolder, displayName).apply { if (!exists()) createNewFile() }
-    }
-
     private fun writeDataFile(context: Context, file: File, userDrive: UserDrive, accessMode: Int): ParcelFileDescriptor? {
-        val tempFile = createTempFile(file.parentId, file.name)
+        // A queued UploadFile owns this URI until its own upload disposition. Never
+        // reuse it, even for another open of the same document before upload finishes.
+        val folder = IOFile(cacheDir, "${userDrive.userId}/${userDrive.driveId}/${file.id}")
+        check(folder.isDirectory || folder.mkdirs()) { "Cannot create provider write directory" }
+        val tempFile = IOFile.createTempFile("write-", ".tmp", folder)
         val cacheFile = file.getCacheFile(context, userDrive)
         val handler = Handler(context.mainLooper)
 
-        return ParcelFileDescriptor.open(tempFile, accessMode, handler) { exception: IOException? ->
-            if (exception == null) {
-                cloudScope.launch {
-                    UploadFile(
-                        uri = tempFile.toUri().toString(),
-                        driveId = userDrive.driveId,
-                        fileCreatedAt = Date(),
-                        fileName = file.name,
-                        fileSize = tempFile.length(),
-                        remoteFolder = file.parentId,
-                        type = UploadFile.Type.CLOUD_STORAGE.name,
-                        userId = userDrive.userId,
-                    ).store()
-                    context.syncImmediately(isAutomaticTrigger = false)
-                    cacheFile.delete() // Delete old cache
+        try {
+            // rw/wa must start with existing bytes; w/wt/rwt intentionally truncate.
+            if (accessMode and ParcelFileDescriptor.MODE_TRUNCATE == 0) {
+                val source = getDataFile(context, file, userDrive, ParcelFileDescriptor.MODE_READ_ONLY)
+                if (source == null) throw IOException("Cannot read existing document for editing")
+                ParcelFileDescriptor.AutoCloseInputStream(source).use { input ->
+                    tempFile.outputStream().use { output -> input.copyTo(output) }
                 }
-            } else {
-                exception.printStackTrace()
-                Sentry.captureException(exception) { scope -> scope.level = SentryLevel.INFO }
             }
+            return ParcelFileDescriptor.open(tempFile, accessMode, handler) { exception: IOException? ->
+                if (exception == null) {
+                    cloudScope.launch {
+                        UploadFile(
+                            uri = tempFile.toUri().toString(),
+                            driveId = userDrive.driveId,
+                            fileCreatedAt = Date(),
+                            fileName = file.name,
+                            fileSize = tempFile.length(),
+                            remoteFolder = file.parentId,
+                            type = UploadFile.Type.CLOUD_STORAGE.name,
+                            userId = userDrive.userId,
+                        ).store()
+                        context.syncImmediately(isAutomaticTrigger = false)
+                        cacheFile.delete() // Delete old cache
+                    }
+                } else {
+                    tempFile.delete() // This open never queued an upload.
+                    exception.printStackTrace()
+                    Sentry.captureException(exception) { scope -> scope.level = SentryLevel.INFO }
+                }
+            }
+        } catch (exception: Exception) {
+            tempFile.delete() // Setup failed before ownership passed to the close listener.
+            throw exception
         }
     }
 

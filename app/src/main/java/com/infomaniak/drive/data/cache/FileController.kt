@@ -401,8 +401,13 @@ object FileController {
         customRealm?.let(block) ?: getRealmInstance(userDrive).use(block)
     }
 
-    fun renameFile(file: File, newName: String, realm: Realm? = null): ApiResponse<CancellableAction> {
-        val apiResponse = ApiRepository.renameFile(file, newName)
+    fun renameFile(
+        file: File,
+        newName: String,
+        realm: Realm? = null,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<CancellableAction> {
+        val apiResponse = ApiRepository.renameFile(file, newName, okHttpClient)
         if (apiResponse.isSuccess()) {
             updateFile(file.id, realm) { localFile ->
                 localFile.name = newName
@@ -443,7 +448,8 @@ object FileController {
         userDrive: UserDrive? = null,
         context: Context,
         onSuccess: ((fileId: Int) -> Unit)? = null,
-    ): ApiResponse<CancellableAction> = ApiRepository.deleteFile(file).also { apiResponse ->
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<CancellableAction> = ApiRepository.deleteFile(file, okHttpClient).also { apiResponse ->
         if (apiResponse.isSuccess()) {
             runCatching {
                 deleteFileAndChildrenRec(filesToDelete = mutableListOf(file), realm, userDrive, context)

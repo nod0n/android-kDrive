@@ -307,8 +307,11 @@ object ApiRepository : ApiRepositoryCore() {
         return callApiWithCursor(url, GET, okHttpClient = okHttpClient)
     }
 
-    fun deleteFile(file: File): ApiResponse<CancellableAction> {
-        return callApi(ApiRoutes.fileURLV2(file), DELETE)
+    fun deleteFile(
+        file: File,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<CancellableAction> {
+        return callApi(ApiRoutes.fileURLV2(file), DELETE, okHttpClient = okHttpClient)
     }
 
     /** Photo-only dispatch: the authorization section invokes enqueue itself, never a later caller. */
@@ -349,8 +352,12 @@ object ApiRepository : ApiRepositoryCore() {
         }
     }
 
-    fun renameFile(file: File, newName: String): ApiResponse<CancellableAction> {
-        return callApi(ApiRoutes.renameFile(file), POST, mapOf("name" to newName))
+    fun renameFile(
+        file: File,
+        newName: String,
+        okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient,
+    ): ApiResponse<CancellableAction> {
+        return callApi(ApiRoutes.renameFile(file), POST, mapOf("name" to newName), okHttpClient = okHttpClient)
     }
 
     fun updateFolderColor(file: File, color: String): ApiResponse<Boolean> {

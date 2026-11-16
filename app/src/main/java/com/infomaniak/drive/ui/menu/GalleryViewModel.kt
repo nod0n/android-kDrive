@@ -207,9 +207,11 @@ class GalleryViewModel : ViewModel() {
                     load.scope != AccountUtils.captureCurrentScope()
                 ) return@withCurrentScope
                 val userDrive = UserDrive(load.scope.userId, load.scope.driveId)
-                if (load.filter.writesSharedCache && load.files.isNotEmpty()) {
+                if (load.filter.writesSharedCache && (load.isFirstPage || load.files.isNotEmpty())) {
                     FileController.storeGalleryDrive(load.files, load.isFirstPage, userDrive)
-                    if (load.isFirstPage) FileController.removeOrphanFiles(userDrive)
+                    // An empty refresh only withdraws Gallery membership. Running the
+                    // general orphan sweep here could erase unrelated offline root rows.
+                    if (load.isFirstPage && load.files.isNotEmpty()) FileController.removeOrphanFiles(userDrive)
                 }
                 currentCursor = load.nextCursor
                 if (load.isFirstPage) lastGalleryFiles = arrayListOf()
