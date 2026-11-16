@@ -4560,6 +4560,7 @@ class OfflineFolderMaintenanceOrchestrationTest {
                 val offline = JavaFile(caseDirectory, "offline")
                 val cache = JavaFile(caseDirectory, "cache")
                 Os.mkdir(cache.path, 0x1c0) // only this newly created, owned test namespace
+                Os.chmod(cache.path, 0x1c0) // mkdir can inherit setgid from the cache parent
                 val sentinel = JavaFile(cache, "sentinel")
                 if (scenario == "nonempty") sentinel.writeBytes(bodyV1)
                 if (scenario == "realm-conflict") JavaFile(config.path).writeBytes(bodyV1)
