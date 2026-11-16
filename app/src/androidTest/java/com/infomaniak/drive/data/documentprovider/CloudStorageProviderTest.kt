@@ -1514,6 +1514,89 @@ class CloudStorageProviderTest {
     }
 
     @Test
+    fun truncatingOpensPruneDisposedMetadataAcrossScopesButKeepPendingAndUnpublishedEdits() {
+        fun trackedSources(): List<IOFile> {
+            val records = CloudStorageProvider::class.java.getDeclaredField("issuedWrites")
+                .apply { isAccessible = true }.get(provider) as List<*>
+            return synchronized(records) {
+                records.map { record ->
+                    record!!.javaClass.getDeclaredField("source").apply { isAccessible = true }.get(record) as IOFile
+                }
+            }
+        }
+        fun liveUploads() = pendingUploads().filter { it.uploadAt == null && it.deletedAt == null }
+        val otherScope = UserDrive(USER_ID + 1, OTHER_DRIVE_ID)
+        val documents = listOf(otherScope, USER_DRIVE, otherScope, USER_DRIVE).mapIndexed { index, scope ->
+            val fileId = FILE_ID + index + 1
+            FileController.getRealmInstance(scope).use { realm ->
+                realm.executeTransaction {
+                    it.copyToRealm(File(id = fileId, uid = "${fileId}_${scope.driveId}", driveId = scope.driveId,
+                        parentId = PARENT_ID, name = FILE_NAME, type = "file"))
+                }
+            }
+            "${scope.userId}/Fixture@${scope.driveId}/$fileId"
+        }
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+            it.write("pending-A".toByteArray())
+        }
+        assertTrue(awaitUntil { liveUploads().size == 1 && syncImmediatelyCalls.get() == 1 })
+        val pending = liveUploads().single()
+        val pendingSource = IOFile(Uri.parse(pending.uri).path!!)
+        val unpublished = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!)
+        val unpublishedSource = trackedSources().single { it != pendingSource }
+        val preserved = listOf(pendingSource, unpublishedSource)
+        val completedOrDeletedSources = mutableListOf<IOFile>()
+        try {
+            unpublished.write("unpublished-A".toByteArray())
+            documents.take(3).forEachIndexed { index, document ->
+                ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(document, "wt", null)!!).use {
+                    it.write("disposition-$index".toByteArray())
+                    // Only truncating opens have occurred. Each new document/scope must
+                    // retire the previous disposed record, never either retained edit.
+                    assertEquals(3, trackedSources().size)
+                    assertEquals(preserved, trackedSources().filter { source -> source in preserved })
+                }
+                assertTrue(awaitUntil { liveUploads().size == 2 && syncImmediatelyCalls.get() == index + 2 })
+                val upload = liveUploads().single { it.uri != pending.uri }
+                val source = IOFile(Uri.parse(upload.uri).path!!)
+                when (index) {
+                    0 -> {
+                        UploadFile.uploadFinished(Uri.parse(upload.uri))
+                        completedOrDeletedSources.add(source)
+                    }
+                    1 -> {
+                        UploadFile.getRealmInstance().use { realm ->
+                            realm.executeTransaction {
+                                it.where(UploadFile::class.java).equalTo(UploadFile::uri.name, upload.uri)
+                                    .findFirst()!!.deletedAt = java.util.Date()
+                            }
+                        }
+                        completedOrDeletedSources.add(source)
+                    }
+                    else -> UploadFile.deleteAllFromUris(listOf(Uri.parse(upload.uri)))
+                }
+                assertEquals(1, liveUploads().size)
+            }
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(documents.last(), "wt", null)!!).use {
+                it.write("remaining-B".toByteArray())
+                assertEquals(3, trackedSources().size)
+                assertEquals(preserved, trackedSources().filter { source -> source in preserved })
+            }
+            // GC removed references only: disposition rows that retained files still
+            // own those exact bytes. The latest unpublished A also remains the source.
+            completedOrDeletedSources.forEachIndexed { index, source -> assertEquals("disposition-$index", source.readText()) }
+            ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!).use {
+                it.write("X".toByteArray())
+                assertEquals("unpublished-AX", trackedSources().last().readText())
+            }
+            assertEquals("pending-A", pendingSource.readText())
+            assertEquals("unpublished-A", unpublishedSource.readText())
+        } finally {
+            unpublished.close()
+        }
+    }
+
+    @Test
     fun aNontruncatingReopenCopiesPendingBytesWithoutChangingTheFirstUpload() {
         val original = "pending-local-edit"
         ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {

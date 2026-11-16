@@ -813,31 +813,36 @@ class CloudStorageProvider : DocumentsProvider() {
         val issuedWrite = IssuedWrite(tempFile)
 
         try {
-            // rw/wa must start with existing bytes; w/wt/rwt intentionally truncate.
-            if (accessMode and ParcelFileDescriptor.MODE_TRUNCATE == 0) {
-                // A completed local edit may still be queued. Copy it; never hand an
-                // editor the queued upload's descriptor or modify/remove its source.
-                val localSource = synchronized(issuedWrites) {
-                    val pendingUris = UploadFile.getRealmInstance().use { realm ->
-                        realm.where(UploadFile::class.java)
-                            .equalTo(UploadFile::userId.name, userDrive.userId)
-                            .equalTo(UploadFile::driveId.name, userDrive.driveId)
-                            .equalTo(UploadFile::type.name, UploadFile.Type.CLOUD_STORAGE.name)
-                            .beginsWith(UploadFile::uri.name, folder.toUri().toString().trimEnd('/') + "/")
-                            .isNull(UploadFile::deletedAt.name)
-                            .isNull(UploadFile::uploadAt.name)
-                            .sort(UploadFile::fileCreatedAt.name, Sort.DESCENDING)
-                            .findAll().map { it.uri }
-                    }
-                    // Queue publication must not move a newer issued writer behind an
-                    // older still-open one. Retain issue order until upload disposition.
+            val localSource = synchronized(issuedWrites) {
+                UploadFile.getRealmInstance().use { realm ->
+                    realm.refresh() // A cached non-Looper Realm must not prove absence from an old snapshot.
+                    val pendingUploads = realm.where(UploadFile::class.java)
+                        .equalTo(UploadFile::type.name, UploadFile.Type.CLOUD_STORAGE.name)
+                        .beginsWith(UploadFile::uri.name, cacheDir.toUri().toString().trimEnd('/') + "/")
+                        .isNull(UploadFile::deletedAt.name)
+                        .isNull(UploadFile::uploadAt.name)
+                        .sort(UploadFile::fileCreatedAt.name, Sort.DESCENDING)
+                        .findAll()
+                    val pendingUris = pendingUploads.map { it.uri }.toHashSet()
+                    // Every write-open prunes disposed published metadata across scopes,
+                    // including workflows that only truncate and never reopen a document.
+                    // An unpublished record is ambiguous: retain it regardless of row state.
                     issuedWrites.removeAll {
-                        it.source.parentFile == folder && it.published && it.source.toUri().toString() !in pendingUris
+                        it.published && it.source.toUri().toString() !in pendingUris
                     }
+                    if (accessMode and ParcelFileDescriptor.MODE_TRUNCATE != 0) return@use null
+                    val folderUri = folder.toUri().toString().trimEnd('/') + "/"
+                    val pendingUri = pendingUploads.firstOrNull {
+                        it.userId == userDrive.userId && it.driveId == userDrive.driveId && it.uri.startsWith(folderUri)
+                    }?.uri
                     val latest = issuedWrites.lastOrNull { it.source.parentFile == folder }?.source
-                        ?: pendingUris.firstOrNull()?.let { IOFile(Uri.parse(it).path!!) }
+                        ?: pendingUri?.let { IOFile(Uri.parse(it).path!!) }
                     latest?.let { ParcelFileDescriptor.open(it, ParcelFileDescriptor.MODE_READ_ONLY) }
                 }
+            }
+            // rw/wa copy local bytes; w/wt/rwt intentionally truncate. Each new source
+            // stays separate from all pending and still-open sources.
+            if (accessMode and ParcelFileDescriptor.MODE_TRUNCATE == 0) {
                 val source = localSource ?: getDataFile(context, file, userDrive, ParcelFileDescriptor.MODE_READ_ONLY)
                 if (source == null) throw IOException("Cannot read existing document for editing")
                 ParcelFileDescriptor.AutoCloseInputStream(source).use { input ->
