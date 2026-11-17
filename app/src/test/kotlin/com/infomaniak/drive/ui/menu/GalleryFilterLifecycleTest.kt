@@ -264,4 +264,29 @@ class GalleryFilterLifecycleTest {
         assertTrue(vm.isPageCurrent(vm.galleryApiResult.value!!))
         vm.galleryApiResult.removeObserver(observer)
     }
+
+    @Test
+    fun `committed response awaiting main publication does not start a duplicate request`() {
+        val publications = mutableListOf<Runnable>()
+        ArchTaskExecutor.getInstance().setDelegate(object : TaskExecutor() {
+            override fun executeOnDiskIO(runnable: Runnable) = runnable.run()
+            override fun postToMainThread(runnable: Runnable) { publications += runnable }
+            override fun isMainThread() = true
+        })
+        val fragment = fragment(galleryAdapterForTest())
+        initializeView(fragment)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, publications.size, "IO finished but LiveData has not published on main")
+        assertFalse(vm.galleryApiResult.isInitialized)
+        assertFalse(vm.needsGalleryLoad, "committed rows are not a missing filter load")
+        val generation = vm.currentLoadGeneration
+        initializeView(fragment)
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, data.requests.size)
+        assertEquals(generation, vm.currentLoadGeneration)
+        publications.forEach(Runnable::run)
+        assertTrue(vm.needToRestoreFiles)
+        assertEquals(listOf(7), vm.galleryApiResult.value!!.files.map { it.id })
+    }
+
 }

@@ -83,7 +83,7 @@ class GalleryViewModel internal constructor(
         hasLoadedCurrentFilter && galleryApiResult.isInitialized
     }
     internal val needsGalleryLoad get() = synchronized(commitLock) {
-        !needToRestoreFiles && getGalleryJob?.isActive != true
+        !hasLoadedCurrentFilter && getGalleryJob?.isActive != true
     }
 
     /**
