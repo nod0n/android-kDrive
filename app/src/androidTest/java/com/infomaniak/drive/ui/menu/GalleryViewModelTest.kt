@@ -350,7 +350,9 @@ class GalleryViewModelTest {
         val oldRequestEntered = CountDownLatch(1)
         val blockedOld = CountDownLatch(1)
         val answerTimedOut = AtomicBoolean(false)
-        val olderPage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE)), cursor = "older-cursor", hasMore = false)
+        // Keep both cursor sentinels usable: terminal pages correctly discard their cursor.
+        // Distinct nonterminal cursors preserve the stale-response assertion below.
+        val olderPage = apiPage(files = listOf(file(1, ExtensionTypes.IMAGE)), cursor = "older-cursor", hasMore = true)
         val callCount = AtomicInteger(0)
 
         every { ApiRepository.getLastGallery(driveId = DRIVE_ID, types = any(), cursor = null) } answers {
@@ -359,7 +361,7 @@ class GalleryViewModelTest {
                 if (!blockedOld.await(5, TimeUnit.SECONDS)) answerTimedOut.set(true)
                 olderPage
             } else {
-                apiPage(files = listOf(file(2, ExtensionTypes.IMAGE)), cursor = "newer-cursor", hasMore = false)
+                apiPage(files = listOf(file(2, ExtensionTypes.IMAGE)), cursor = "newer-cursor", hasMore = true)
             }
         }
 
