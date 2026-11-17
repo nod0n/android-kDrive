@@ -65,7 +65,8 @@ class GalleryFragment : MultiSelectFragment(
 
     override val noItemsIcon = R.drawable.ic_images
     override val noItemsTitle = R.string.picturesNoFile
-    override val noItemsInitialListView: View by lazy { binding.galleryFastScroller }
+    // Preview navigation recreates the view while retaining this fragment.
+    override val noItemsInitialListView: View get() = binding.galleryFastScroller
 
     private val galleryViewModel: GalleryViewModel by viewModels(ownerProducer = { requireParentFragment() })
     private lateinit var galleryAdapter: GalleryAdapter
