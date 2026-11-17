@@ -26,7 +26,10 @@ import androidx.core.view.marginBottom
 import androidx.core.view.marginTop
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
-import com.infomaniak.core.legacy.utils.getBackNavigationResult
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.navigation.fragment.findNavController
 import com.infomaniak.core.legacy.utils.safeBinding
 import com.infomaniak.core.legacy.utils.safeNavigate
 import com.infomaniak.core.legacy.utils.toPx
@@ -36,6 +39,8 @@ import com.infomaniak.drive.databinding.MultiSelectLayoutBinding
 import com.infomaniak.drive.extensions.enableEdgeToEdge
 import com.infomaniak.drive.ui.MainActivity
 import com.infomaniak.drive.ui.fileList.multiSelect.GalleryMultiSelectActionsBottomSheetDialog
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.launch
 
 class MenuGalleryFragment : Fragment() {
 
@@ -92,13 +97,7 @@ class MenuGalleryFragment : Fragment() {
             }
         }
 
-        getBackNavigationResult<GalleryPeriod>(GalleryPeriodBottomSheetDialog.GALLERY_PERIOD_KEY) {
-            galleryViewModel.period.value = it
-        }
-
-        getBackNavigationResult<GalleryMediaFilter>(GalleryMediaFilterBottomSheetDialog.GALLERY_MEDIA_FILTER_KEY) { filter ->
-            galleryViewModel.setMediaFilter(filter)
-        }
+        observeGallerySelections()
 
         multiSelectLayout.apply {
             selectAllButton.isGone = true
@@ -112,6 +111,33 @@ class MenuGalleryFragment : Fragment() {
         }
 
         adjustFastScrollBarScrollRange(galleryFragment)
+    }
+
+    private fun observeGallerySelections() {
+        // A floating sheet can be current when this view is recreated. Results
+        // belong to Gallery, and must not wait for another back-stack lifecycle event.
+        val results = findNavController().getBackStackEntry(R.id.menuGalleryFragment).savedStateHandle
+        val periodKey = GalleryPeriodBottomSheetDialog.GALLERY_PERIOD_KEY
+        val filterKey = GalleryMediaFilterBottomSheetDialog.GALLERY_MEDIA_FILTER_KEY
+
+        val owner = viewLifecycleOwner
+        owner.lifecycleScope.launch {
+            owner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    results.getStateFlow<GalleryPeriod?>(periodKey, null).filterNotNull().collect { period ->
+                        // Null consumes the value without detaching the flow from future writes.
+                        results[periodKey] = null
+                        galleryViewModel.period.value = period
+                    }
+                }
+                launch {
+                    results.getStateFlow<GalleryMediaFilter?>(filterKey, null).filterNotNull().collect { filter ->
+                        results[filterKey] = null
+                        galleryViewModel.setMediaFilter(filter)
+                    }
+                }
+            }
+        }
     }
 
     private fun MultiSelectLayoutBinding.setMultiSelectClickListeners(galleryFragment: GalleryFragment) = with(galleryFragment) {
