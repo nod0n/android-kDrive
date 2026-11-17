@@ -148,12 +148,8 @@ class GalleryFragment : MultiSelectFragment(
             if (progress == 100) galleryAdapter.updateOfflineStatus(fileId)
         }
 
-        if (!isGalleryAdapterInitialized) {
-            if (isCurrentlyInGallery) refreshTimer.start()
-            if (!galleryViewModel.needToRestoreFiles) {
-                loadGallery(AccountUtils.currentDriveId, isRefresh = true)
-            }
-        }
+        if (!isGalleryAdapterInitialized && isCurrentlyInGallery) refreshTimer.start()
+        loadGalleryIfNeeded()
 
         observeApiResultPagination()
         observePeriod()
@@ -277,16 +273,15 @@ class GalleryFragment : MultiSelectFragment(
     private fun observeMediaFilter() {
         viewLifecycleOwner.lifecycleScope.launch {
             viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-                var lastSeenFilter = galleryViewModel.mediaFilter.value
-                galleryViewModel.mediaFilter.collect { filter ->
-                    // The initial emission is the state onViewCreated already loaded with
-                    if (filter != lastSeenFilter) {
-                        lastSeenFilter = filter
-                        onMediaFilterChanged()
-                    }
-                }
+                // A navigation result can change the filter while this view is stopped.
+                // Check request state on every replay, including a return to the same filter.
+                galleryViewModel.mediaFilter.collect { loadGalleryIfNeeded() }
             }
         }
+    }
+
+    private fun loadGalleryIfNeeded() {
+        if (galleryViewModel.needsGalleryLoad) onMediaFilterChanged()
     }
 
     private fun onMediaFilterChanged() {

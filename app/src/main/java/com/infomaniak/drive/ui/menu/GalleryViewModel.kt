@@ -78,7 +78,13 @@ class GalleryViewModel internal constructor(
     val currentLoadGeneration: Int get() = synchronized(commitLock) { loadGeneration }
 
     val galleryApiResult = MutableLiveData<GalleryPage?>()
-    val needToRestoreFiles get() = galleryApiResult.isInitialized
+    private var hasLoadedCurrentFilter = false
+    val needToRestoreFiles get() = synchronized(commitLock) {
+        hasLoadedCurrentFilter && galleryApiResult.isInitialized
+    }
+    internal val needsGalleryLoad get() = synchronized(commitLock) {
+        !needToRestoreFiles && getGalleryJob?.isActive != true
+    }
 
     /**
      * A detached load result: computed fully off the shared state and stamped with the scope of
@@ -129,6 +135,9 @@ class GalleryViewModel internal constructor(
         currentCursor = null
         consumedCursors.clear()
         lastGalleryFiles = arrayListOf()
+        // Cleared rows are not an empty response for the new filter. A stopped/recreated
+        // view must request it before it can restore a completed page.
+        hasLoadedCurrentFilter = false
         mutableMediaFilter.value = filter
     }
 
@@ -267,6 +276,7 @@ class GalleryViewModel internal constructor(
                 consumedCursors.addAll(load.consumedCursors)
                 lastGalleryFiles.addAll(load.files)
                 lastScope = load.scope
+                hasLoadedCurrentFilter = true
                 galleryApiResult.postValue(
                     GalleryPage(load.files, load.isComplete, load.generation, userDrive, load.scope.revision),
                 )
