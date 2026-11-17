@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.infomaniak.drive" />
+    </queries>
+    <!-- AGP fills the first instrumentation element from its standard test configuration. -->
+    <instrumentation
+        android:name="androidx.test.runner.AndroidJUnitRunner"
+        android:targetPackage="com.infomaniak.drive" />
+    <!-- This separate debug entry targets the empty test application, never the real app. -->
+    <instrumentation
+        android:name="com.infomaniak.drive.data.cache.copyreader.OfflineCopyInstrumentation"
+        android:targetPackage="com.infomaniak.drive.test"
+        android:functionalTest="false"
+        android:handleProfiling="false" />
+</manifest>
