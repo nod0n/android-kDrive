@@ -32,8 +32,13 @@ public final class OfflineCopyInstrumentation extends Instrumentation {
             final ApplicationInfo code = isolated.getPackageManager().getApplicationInfo("com.infomaniak.drive", 0);
             CopyInputGuard.require(CopyInputGuard.sha256(new File(code.sourceDir)).equals(input.getString("mainSha")));
             // The app APK supplies code/native libraries only. File/dir access remains under the test UID.
+            final ApplicationInfo isolatedCode = new ApplicationInfo(isolated.getApplicationInfo());
+            isolatedCode.sourceDir = code.sourceDir;
+            isolatedCode.publicSourceDir = code.publicSourceDir;
+            isolatedCode.splitSourceDirs = code.splitSourceDirs;
+            isolatedCode.nativeLibraryDir = code.nativeLibraryDir;
             Context context = new ContextWrapper(isolated) {
-                @Override public ApplicationInfo getApplicationInfo() { return new ApplicationInfo(code); }
+                @Override public ApplicationInfo getApplicationInfo() { return new ApplicationInfo(isolatedCode); }
             };
             String apkPaths = isolated.getApplicationInfo().sourceDir + File.pathSeparator + code.sourceDir;
             PathClassLoader loader = new PathClassLoader(apkPaths, code.nativeLibraryDir, ClassLoader.getSystemClassLoader());
