@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.os.Process
 import android.system.Os
 import com.infomaniak.drive.data.cache.copyreader.TransitionCopyGuard.Operation
+import com.infomaniak.drive.data.cache.copyreader.TransitionCopyGuard.Scenario
 import com.infomaniak.drive.utils.RealmModules
 import io.realm.DynamicRealm
 import io.realm.DynamicRealmObject
@@ -45,6 +46,7 @@ object ArchivedTransitionCopyReader {
     private data class Cohort(
         val root: List<Any>, val observations: List<JSONObject>, val values: List<List<String>?>,
         val identities: List<List<Any>?>,
+        val hashes: List<String?>,
     )
 
     private class Location {
@@ -68,7 +70,7 @@ object ArchivedTransitionCopyReader {
         return Body(true, size, time, sha)
     }
 
-    private fun knownFiles(json: JSONObject, user: Long, drive: Long): List<KnownFile> {
+    private fun knownFiles(json: JSONObject, user: Long, drive: Long, scenario: Scenario): List<KnownFile> {
         val root = text(json, "rootName"); guard(root.matches(Regex("T0079-offline-[0-9]{8}")))
         val relativeRoot = text(json, "rootRelativePath")
         fun parts(value: String): List<String> = value.split('/').also { names ->
@@ -95,12 +97,15 @@ object ArchivedTransitionCopyReader {
                 guard(path.endsWith("/$user/$drive/$relative") && path.split('/').none { it in setOf(".", "..") })
             }
             KnownFile(alias, name, parents, relative, published, mapOf(
-                "before" to body(row.getJSONObject("before"), alias != "fresh_child"),
+                "before" to body(row.getJSONObject("before"), TransitionCopyGuard.beforePresent(scenario, i)),
                 "after" to body(row.getJSONObject("after"), true),
             ))
         }.also { files ->
             guard(files.map(KnownFile::name).distinct().size == 6)
-            guard(files.take(5).all { it.bodies.getValue("before") == it.bodies.getValue("after") })
+            files.forEachIndexed { i, file ->
+                val before = file.bodies.getValue("before"); val after = file.bodies.getValue("after")
+                TransitionCopyGuard.bodyPair(scenario, i, before.present, after.present, before == after)
+            }
             guard(files.last().bodies.getValue("after").size == 61L)
         }
     }
@@ -115,11 +120,12 @@ object ArchivedTransitionCopyReader {
         val sidecar = CopyInputGuard.child(root, "inputs.json"); stat(sidecar)
         guard(sidecar.length() in 1..32768 && CopyInputGuard.sha256(sidecar) == sidecarSha)
         val json = JSONObject(sidecar.readText())
-        keys(json, "protocol", "userId", "driveId", "originalRealmName", "rootName", "rootRelativePath", "childId", "files", "copies")
+        TransitionCopyGuard.inputFields(json.keys().asSequence().toSet(), json.has("scenario"))
+        val scenario = TransitionCopyGuard.scenario(if (json.has("scenario")) text(json, "scenario") else null)
         guard(number(json, "protocol") == 1L)
         val user = number(json, "userId"); val drive = number(json, "driveId")
         CopyInputGuard.scope(user, drive, text(json, "originalRealmName")); guard(number(json, "childId") > 0)
-        val known = knownFiles(json, user, drive)
+        val known = knownFiles(json, user, drive, scenario)
         val specs = json.getJSONArray("copies"); guard(specs.length() == 6)
         val checked = mutableListOf(sidecar to requireNotNull(sidecarSha))
         val copies = (0 until 6).map { i ->
@@ -137,6 +143,7 @@ object ArchivedTransitionCopyReader {
         var phase = "SCHEMA"; var failed = false
         val location = Location()
         val result = JSONObject().put("protocol", 1).put("entry", "readArchivedTransition")
+        if (scenario == Scenario.UNCHANGED_CHILD_CADENCE) result.put("scenario", scenario.name)
         try {
             try { context.assets.open(asset).use { guard(false) } } catch (_: FileNotFoundException) { /* No asset fallback. */ }
             location.at("NONE", "NONE", Operation.REALM_INIT)
@@ -178,16 +185,26 @@ object ArchivedTransitionCopyReader {
                         }
                         moduleResults.put(JSONObject().put("role", role).put("tables", tables))
                         if (role == "FILES") {
-                            val a = cohort(before, known, json, "before", user, drive, location)
-                            val b = cohort(after, known, json, "after", user, drive, location)
+                            val a = cohort(before, known, json, "before", user, drive, scenario, location)
+                            val b = cohort(after, known, json, "after", user, drive, scenario, location)
                             location.at(role, "NONE", Operation.PROJECT)
                             result.put("root", JSONObject().put("identityEqual", a.root.take(4) == b.root.take(4))
                                 .put("markedAtEqual", a.root.last() == b.root.last())
                                 .put("lifetimeEqual", TransitionCopyGuard.rootLifetimeEqual(a.root, b.root)))
                             result.put("files", JSONArray(aliases.mapIndexed { i, alias ->
+                                val comparable = TransitionCopyGuard.beforePresent(scenario, i)
                                 JSONObject().put("alias", alias).put("before", a.observations[i]).put("after", b.observations[i])
-                                    .put("rowIdentityComparable", i < 5).put("rowIdentityEqual", i < 5 && a.identities[i] == b.identities[i])
-                                    .put("protectiveValuesComparable", i < 5).put("protectiveValuesEqual", i < 5 && a.values[i] == b.values[i])
+                                    .put("rowIdentityComparable", comparable).put("rowIdentityEqual", comparable && a.identities[i] == b.identities[i])
+                                    .put("protectiveValuesComparable", comparable).put("protectiveValuesEqual", comparable && a.values[i] == b.values[i])
+                                    .also { out ->
+                                        if (scenario == Scenario.UNCHANGED_CHILD_CADENCE) {
+                                            out.put("serverContentHashEqual", a.hashes[i] == b.hashes[i])
+                                                .put("serverContentHashTransition", TransitionCopyGuard.hashTransition(a.hashes[i], b.hashes[i]))
+                                                .put("bodyPublicationValuesEqual", TransitionCopyGuard.bodyPublicationValuesEqual(
+                                                    requireNotNull(a.values[i]), requireNotNull(b.values[i]),
+                                                ))
+                                        }
+                                    }
                             }))
                         }
                     }
@@ -263,7 +280,7 @@ object ArchivedTransitionCopyReader {
         }
     }
 
-    private fun cohort(realm: DynamicRealm, inputs: List<KnownFile>, json: JSONObject, stage: String, user: Long, drive: Long, location: Location): Cohort {
+    private fun cohort(realm: DynamicRealm, inputs: List<KnownFile>, json: JSONObject, stage: String, user: Long, drive: Long, scenario: Scenario, location: Location): Cohort {
         fun singleFolder(name: String, parent: Long? = null): DynamicRealmObject {
             location.at("FILES", "File", if (parent == null) Operation.BIND_ROOT else Operation.BIND_PARENT)
             val query = realm.where("File").equalTo("driveId", drive).equalTo("name", name).equalTo("type", "dir")
@@ -279,6 +296,7 @@ object ArchivedTransitionCopyReader {
         val identity = listOf(registration.getString("uid")!!, user, drive, id, registration.getDate("markedAt").time)
         val observations = mutableListOf<JSONObject>(); val values = mutableListOf<List<String>?>()
         val identities = mutableListOf<List<Any>?>()
+        val hashes = mutableListOf<String?>()
         inputs.forEach { input ->
             var parent = root
             input.parents.drop(1).forEach { parent = singleFolder(it, parent.getLong("id")) }
@@ -286,7 +304,7 @@ object ArchivedTransitionCopyReader {
             val selected = realm.where("File").equalTo("driveId", drive).equalTo("parentId", parent.getLong("id"))
                 .equalTo("name", input.name).equalTo("type", "file").findAll()
             val body = input.bodies.getValue(stage); guard(selected.size == if (body.present) 1 else 0)
-            if (!body.present) { observations += JSONObject().put("presence", "ABSENT"); values += null; identities += null }
+            if (!body.present) { observations += JSONObject().put("presence", "ABSENT"); values += null; identities += null; hashes += null }
             else {
                 val row = selected.single()!!
                 identities += listOf(row.getLong("id"), drive, parent.getLong("id"), requireNotNull(row.getString("uid")))
@@ -294,6 +312,7 @@ object ArchivedTransitionCopyReader {
                 val basis = row.getLong("offlineBasisModifiedAt")
                 val size = if (row.isNull("offlineBasisSize")) null else row.getLong("offlineBasisSize")
                 val digest = row.getString("offlineContentDigest"); val published = row.getString("offlinePublishedPath")
+                val serverHash = row.getString("serverContentHash"); hashes += serverHash
                 val out = JSONObject().put("presence", "PRESENT")
                     .put("basisModifiedState", if (basis == 0L) "ZERO" else if (basis > 0) "POSITIVE" else "NEGATIVE")
                     .put("basisSizeState", if (size == null) "NULL" else if (size == 0L) "ZERO" else if (size > 0) "POSITIVE" else "NEGATIVE")
@@ -301,13 +320,14 @@ object ArchivedTransitionCopyReader {
                     .put("digestState", TransitionCopyGuard.stringState(digest, body.sha))
                     .put("publishedPathState", if (published in input.published) "MATCH" else TransitionCopyGuard.stringState(published, ""))
                     .put("rowPathMatchesArchive", row.getString("path")?.trim('/') == input.relative)
+                if (scenario == Scenario.UNCHANGED_CHILD_CADENCE) out.put("serverContentHashState", TransitionCopyGuard.hashState(serverHash))
                 protective.takeLast(5).forEach { out.put(it, row.getBoolean(it)) }
                 observations += out
                 val rule = TransitionSchema.modules.getValue("FILES").getValue("File")
                 values += protective.map { key -> value(row, "FILES", key, rule.fields.getValue(key), 0, location) }
             }
         }
-        return Cohort(identity, observations, values, identities)
+        return Cohort(identity, observations, values, identities, hashes)
     }
 
     private fun validateOutput(result: JSONObject) {
@@ -315,10 +335,12 @@ object ArchivedTransitionCopyReader {
             "rowIdentityComparable rowIdentityEqual protectiveValuesComparable protectiveValuesEqual presence basisModifiedState basisSizeState basisMtimeMatchesArchive " +
             "basisSizeMatchesArchive digestState publishedPathState rowPathMatchesArchive isOffline isMarkedAsOffline isDirectlyPinned " +
             "offlineOwnedByRoot offlineNeedsAttention modules role tables table mode beforeRows afterRows addedOrUnmatched " +
-            "removedOrUnmatched matchedChangedRows changedFields allLogicalValuesEqual").split(' ').toSet()
+            "removedOrUnmatched matchedChangedRows changedFields allLogicalValuesEqual scenario serverContentHashState " +
+            "serverContentHashEqual serverContentHashTransition bodyPublicationValuesEqual").split(' ').toSet()
         val names = TransitionSchema.modules.values.flatMap { tables -> tables.keys + tables.values.flatMap { it.fields.keys } }.toSet()
         val literals = ("readArchivedTransition READ_COMPLETE REJECTED SCHEMA QUERIES COMPLETE APP DRIVES FILES ABSENT PRESENT " +
-            "NULL EMPTY MATCH OTHER ZERO POSITIVE NEGATIVE PRIMARY_KEY SINGLETON BAG NONE").split(' ').toSet() +
+            "NULL EMPTY MATCH OTHER ZERO POSITIVE NEGATIVE PRIMARY_KEY SINGLETON BAG NONE NONEMPTY UNCHANGED_CHILD_CADENCE " +
+            "SAME_NONEMPTY DIFFERENT_NONEMPTY NONEMPTY_TO_ABSENT ABSENT_TO_NONEMPTY SAME_ABSENT ABSENT_STATE_CHANGED").split(' ').toSet() +
             aliases + names + Operation.values().map { it.name }
         fun check(value: Any?) {
             when (value) {

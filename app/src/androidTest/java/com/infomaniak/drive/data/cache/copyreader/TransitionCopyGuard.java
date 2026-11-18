@@ -1,8 +1,10 @@
 package com.infomaniak.drive.data.cache.copyreader;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -12,6 +14,59 @@ import java.util.Set;
 /** In-memory comparison only: stored keys/values never enter the returned projection. */
 public final class TransitionCopyGuard {
     private TransitionCopyGuard() {}
+
+    public enum Scenario { FRESH_CHILD_ADDED, UNCHANGED_CHILD_CADENCE }
+
+    /** No discriminator is the original, separately guarded absent-to-present contract. */
+    public static Scenario scenario(String value) {
+        if (value == null) return Scenario.FRESH_CHILD_ADDED;
+        CopyInputGuard.require(value.equals(Scenario.UNCHANGED_CHILD_CADENCE.name()));
+        return Scenario.UNCHANGED_CHILD_CADENCE;
+    }
+
+    public static void inputFields(Set<String> actual, boolean explicitScenario) {
+        Set<String> expected = new HashSet<>(Arrays.asList("protocol", "userId", "driveId", "originalRealmName",
+                "rootName", "rootRelativePath", "childId", "files", "copies"));
+        if (explicitScenario) expected.add("scenario");
+        fields(actual, expected);
+    }
+
+    public static boolean beforePresent(Scenario scenario, int alias) {
+        CopyInputGuard.require(scenario != null && alias >= 0 && alias < 6);
+        return alias < 5 || scenario == Scenario.UNCHANGED_CHILD_CADENCE;
+    }
+
+    public static void bodyPair(Scenario scenario, int alias, boolean before, boolean after, boolean equal) {
+        CopyInputGuard.require(before == beforePresent(scenario, alias) && after);
+        if (before) CopyInputGuard.require(equal);
+    }
+
+    public static String hashState(String value) {
+        if (value != null && !value.isEmpty()) {
+            boolean nonBlank = false;
+            for (char c : value.toCharArray()) {
+                nonBlank |= !Character.isWhitespace(c) && !Character.isSpaceChar(c);
+            }
+            CopyInputGuard.require(nonBlank);
+        }
+        return value == null ? "NULL" : value.isEmpty() ? "EMPTY" : "NONEMPTY";
+    }
+
+    public static String hashTransition(String before, String after) {
+        hashState(before);
+        hashState(after);
+        boolean a = before != null && !before.isEmpty(), b = after != null && !after.isEmpty();
+        if (a && b) return before.equals(after) ? "SAME_NONEMPTY" : "DIFFERENT_NONEMPTY";
+        if (a) return "NONEMPTY_TO_ABSENT";
+        if (b) return "ABSENT_TO_NONEMPTY";
+        return Objects.equals(before, after) ? "SAME_ABSENT" : "ABSENT_STATE_CHANGED";
+    }
+
+    public static boolean bodyPublicationValuesEqual(List<String> before, List<String> after) {
+        CopyInputGuard.require(before.size() == 11 && after.size() == 11);
+        // Basis mtime/size, digest, publication path and row path; hash identity and flags are separate.
+        return before.subList(0, 5).equals(after.subList(0, 5));
+    }
 
     public static void fields(Set<String> actual, Set<String> expected) {
         CopyInputGuard.require(actual.equals(expected));
