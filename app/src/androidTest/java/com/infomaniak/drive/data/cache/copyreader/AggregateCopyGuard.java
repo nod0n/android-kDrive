@@ -12,7 +12,8 @@ public final class AggregateCopyGuard {
 
     public static String entry(String value) {
         if (value == null) return "readFiveArchivedRows";
-        CopyInputGuard.require(value.equals("readFiveArchivedRows") || value.equals("readAggregateArchivedScope"));
+        CopyInputGuard.require(value.equals("readFiveArchivedRows") || value.equals("readAggregateArchivedScope")
+                || value.equals("readArchivedTransition"));
         return value;
     }
 
