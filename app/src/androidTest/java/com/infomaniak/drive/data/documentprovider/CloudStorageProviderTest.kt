@@ -1431,6 +1431,41 @@ class CloudStorageProviderTest {
     }
 
     @Test
+    fun failedCloseRetiresItsSourceSynchronouslyAndDefersDeletionToTheWorkerScope() {
+        ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!).use {
+            it.write("retained-edit".toByteArray())
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 1 && syncImmediatelyCalls.get() == 1 })
+        val retained = IOFile(Uri.parse(pendingUploads().single().uri).path!!)
+
+        // A doomed non-truncating open with real bytes: exactly the source a broken
+        // retirement would let a later open select. Opened before the park so the
+        // staging folder holds exactly the retained and the doomed sources.
+        val doomed = provider.openDocument(fileDocId(), "wa", null)!!
+        val doomedSource = ownedWriteSources().single { it != retained }
+        doomedSource.appendText("doomed-edit")
+        withUploadQueueParked {
+            doomed.closeWithError("owned fixture close failure")
+            // The error listener ran on the handler: retirement happened synchronously,
+            // while the parked worker scope still owns the deferred deletion.
+            assertTrue(awaitUntil(2_000) { captureExceptionCalls.get() == 1 })
+            assertTrue("the failed source survives until the worker deletes it", doomedSource.exists())
+            val reopen = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wa", null)!!)
+            val reopenedSource = ownedWriteSources().single { it != retained && it != doomedSource }
+            reopen.write("X".toByteArray())
+            reopen.close()
+            assertEquals(
+                "a failed source must be retired before any later open selects it",
+                "retained-editX", reopenedSource.readText(),
+            )
+            assertTrue("nothing may publish while the queue is parked", pendingUploads().size == 1)
+        }
+        assertTrue(awaitUntil { pendingUploads().size == 2 && syncImmediatelyCalls.get() == 2 })
+        assertEquals(setOf("retained-edit", "retained-editX"), pendingUploads().map { IOFile(Uri.parse(it.uri).path!!).readText() }.toSet())
+        assertTrue(awaitUntil { !doomedSource.exists() })
+    }
+
+    @Test
     fun failedDirectorySetupKeepsExistingIssuedBytes() {
         val writer = ParcelFileDescriptor.AutoCloseOutputStream(provider.openDocument(fileDocId(), "wt", null)!!)
         val original = ownedWriteSources().single()

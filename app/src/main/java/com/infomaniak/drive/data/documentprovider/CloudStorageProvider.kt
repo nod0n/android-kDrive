@@ -873,10 +873,12 @@ class CloudStorageProvider : DocumentsProvider() {
                         cacheFile.delete() // Delete old cache
                     }
                 } else {
-                    synchronized(issuedWrites) {
-                        issuedWrites.remove(issuedWrite)
-                        tempFile.delete() // This open never queued an upload.
-                    }
+                    // Retire synchronously on the error path so a later open can never
+                    // select this failed source, even while its deletion is still pending.
+                    synchronized(issuedWrites) { issuedWrites.remove(issuedWrite) }
+                    // This open never queued an upload: delete its owned staging off-main,
+                    // outside the list lock, on the existing worker scope.
+                    cloudScope.launch { tempFile.delete() }
                     exception.printStackTrace()
                     Sentry.captureException(exception) { scope -> scope.level = SentryLevel.INFO }
                 }
