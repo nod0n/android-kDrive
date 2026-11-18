@@ -136,6 +136,30 @@ object AggregateOfflineCopyReader {
                 .put("claimed", count { it.getBoolean("offlineOwnedByRoot") }).put("attention", count { it.getBoolean("offlineNeedsAttention") })
                 .put("covered", coverage.count { (row, state) -> row.getString("type") != "dir" && state == AggregateCopyGuard.Coverage.COVERED })
                 .put("orphanCandidates", coverage.count { (row, state) -> row.getString("type") != "dir" && row.getBoolean("offlineOwnedByRoot") && !row.getBoolean("isDirectlyPinned") && state == AggregateCopyGuard.Coverage.OUTSIDE })
+            // Detail is observational only: the original issue counters and certification stay unchanged.
+            fun primitive(row: DynamicRealmObject) = AggregateCopyGuard.FileState(
+                row.getLong("id"), row.getLong("driveId"), if (row.isNull("parentId")) null else row.getLong("parentId"), row.getString("type"),
+                row.getBoolean("isOffline"), row.getBoolean("isMarkedAsOffline"), row.getBoolean("isDirectlyPinned"),
+                row.getBoolean("offlineOwnedByRoot"), row.getBoolean("offlineNeedsAttention"),
+            )
+            val states = rows.associateWith(::primitive)
+            val unique = grouped.filterValues { it.size == 1 }.mapValues { states.getValue(it.value.single()) }
+            val duplicates = grouped.filterValues { it.size != 1 }.keys
+            val foreign = rows.filter { it.getLong("driveId") != input.drive }
+            val foreignIds = foreign.map { it.getLong("id") }.toSet()
+            fun details(observations: List<Map<String, Any>>): JSONArray {
+                val groups = observations.groupingBy { JSONObject(it).toString() }.eachCount()
+                guard(groups.size <= 256)
+                return JSONArray(groups.map { (row, count) -> JSONObject(row).put("count", count) })
+            }
+            counts.put("foreignDetails", details(foreign.map { row ->
+                AggregateCopyGuard.foreignDetail(states.getValue(row), input.drive, known(input.user, row.getLong("driveId")))
+            }))
+            val ancestry = validRoots.map { id -> AggregateCopyGuard.ancestryDetail("ROOT_ANCESTOR", id, input.drive, unique, duplicates, validRoots, foreignIds) } +
+                matching.filter { it.getBoolean("isOffline") || it.getBoolean("isMarkedAsOffline") || it.getBoolean("isDirectlyPinned") || it.getBoolean("offlineOwnedByRoot") }.map { row ->
+                    AggregateCopyGuard.ancestryDetail("ACTIVE_INTENT", row.getLong("id"), input.drive, unique, duplicates, validRoots, foreignIds)
+                }
+            counts.put("ancestryDetails", details(ancestry))
             if (input.user != user || input.drive != drive) return counts to null
             val scopes = sidecar.getJSONArray("legacyScopes")
             val scope = (0 until scopes.length()).map { scopes.getJSONObject(it) }.filter { number(it, "userId") == user && number(it, "driveId") == drive }
@@ -225,6 +249,13 @@ object AggregateOfflineCopyReader {
         check("result", result)
         listOf("selection", "legacy").forEach { name -> result.optJSONObject(name)?.let { check(name, it) } }
         listOf("drives", "files").forEach { name -> result.optJSONArray(name)?.let { array(name, it) } }
+        result.optJSONArray("files")?.let { files ->
+            for (i in 0 until files.length()) {
+                val file = files.getJSONObject(i)
+                array("foreignDetails", file.getJSONArray("foreignDetails"))
+                array("ancestryDetails", file.getJSONArray("ancestryDetails"))
+            }
+        }
         result.optJSONObject("sync")?.let { sync ->
             check("sync", sync)
             listOf("uploads", "settings", "pairings").forEach { name -> array(name, sync.getJSONArray(name)) }
