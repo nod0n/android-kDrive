@@ -1,6 +1,7 @@
 package com.infomaniak.drive.data.cache.copyreader;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -14,6 +15,33 @@ public final class TransitionCopyGuard {
 
     public static void fields(Set<String> actual, Set<String> expected) {
         CopyInputGuard.require(actual.equals(expected));
+    }
+
+    public static void persistedFields(Set<String> actual, Set<String> persisted, Set<String> computed) {
+        fields(actual, persisted);
+        CopyInputGuard.require(Collections.disjoint(persisted, computed));
+    }
+
+    public static void backlink(String alias, Set<String> persisted, String originSpec, String targetTable) {
+        CopyInputGuard.require(!persisted.contains(alias) && ("LIST:" + targetTable).equals(originSpec));
+    }
+
+    public enum Operation {
+        ASSET_CHECK, REALM_INIT, OPEN_COPY, SCHEMA_TABLES, SCHEMA_COLUMNS, SCHEMA_BACKLINKS,
+        SCHEMA_PRIMARY_KEY, SCHEMA_TYPES, BIND_SCOPE, READ_ROWS, READ_VALUE, COMPARE_VALUES,
+        BIND_ROOT, BIND_PARENT, BIND_FILE, PROJECT
+    }
+
+    public static Map<String, Object> location(String role, String table, Operation operation, Set<String> tables) {
+        CopyInputGuard.require(role.equals("NONE") || role.equals("APP") || role.equals("DRIVES") || role.equals("FILES"));
+        CopyInputGuard.require(table.equals("NONE") || tables.contains(table));
+        CopyInputGuard.require(!role.equals("NONE") || table.equals("NONE"));
+        CopyInputGuard.require(operation != null);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("role", role);
+        out.put("table", table);
+        out.put("operation", operation.name());
+        return out;
     }
 
     public static String stringState(String value, String expected) {

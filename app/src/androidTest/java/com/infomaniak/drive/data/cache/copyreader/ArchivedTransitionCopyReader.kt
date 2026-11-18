@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Bundle
 import android.os.Process
 import android.system.Os
+import com.infomaniak.drive.data.cache.copyreader.TransitionCopyGuard.Operation
 import com.infomaniak.drive.utils.RealmModules
 import io.realm.DynamicRealm
 import io.realm.DynamicRealmObject
@@ -45,6 +46,15 @@ object ArchivedTransitionCopyReader {
         val root: List<Any>, val observations: List<JSONObject>, val values: List<List<String>?>,
         val identities: List<List<Any>?>,
     )
+
+    private class Location {
+        var current = TransitionCopyGuard.location("NONE", "NONE", Operation.ASSET_CHECK, emptySet())
+            private set
+
+        fun at(role: String, table: String, operation: Operation) {
+            current = TransitionCopyGuard.location(role, table, operation, TransitionSchema.modules[role]?.keys.orEmpty())
+        }
+    }
 
     private fun body(json: JSONObject, present: Boolean): Body {
         keys(json, "present", "size", "mtimeSec", "sha256")
@@ -125,11 +135,14 @@ object ArchivedTransitionCopyReader {
         guard(copies.map { it.role to it.stage }.toSet() == roles.keys.flatMap { listOf(it to "before", it to "after") }.toSet())
         guard(root.list()?.toSet() == copies.map { it.file.name }.toSet() + "inputs.json")
         var phase = "SCHEMA"; var failed = false
+        val location = Location()
         val result = JSONObject().put("protocol", 1).put("entry", "readArchivedTransition")
         try {
             try { context.assets.open(asset).use { guard(false) } } catch (_: FileNotFoundException) { /* No asset fallback. */ }
+            location.at("NONE", "NONE", Operation.REALM_INIT)
             Realm.init(context)
             fun open(copy: Copy): DynamicRealm {
+                location.at(copy.role, "NONE", Operation.OPEN_COPY)
                 val module = when (copy.role) {
                     "APP" -> RealmModules.AppSettingsModule()
                     "DRIVES" -> RealmModules.DriveFilesModule()
@@ -145,25 +158,29 @@ object ArchivedTransitionCopyReader {
             roles.keys.forEach { role ->
                 open(copies.single { it.role == role && it.stage == "before" }).use { before ->
                     open(copies.single { it.role == role && it.stage == "after" }).use { after ->
-                        validateSchema(before, role); validateSchema(after, role)
+                        validateSchema(before, role, location); validateSchema(after, role, location)
                         phase = "QUERIES"
                         if (role == "APP") listOf(before, after).forEach { realm ->
+                            location.at(role, "AppSettings", Operation.BIND_SCOPE)
                             val rows = realm.where("AppSettings").findAll(); guard(rows.size == 1)
                             guard(rows.single()!!.getLong("_currentUserId") == user && rows.single()!!.getLong("_currentDriveId") == drive)
                         }
                         if (role == "DRIVES") listOf(before, after).forEach { realm ->
+                            location.at(role, "Drive", Operation.BIND_SCOPE)
                             val rows = realm.where("Drive").findAll(); guard(rows.size == 1)
                             guard(rows.single()!!.getLong("userId") == user && rows.single()!!.getLong("id") == drive)
                         }
                         val tables = JSONArray()
                         TransitionSchema.modules.getValue(role).forEach { (table, rule) ->
-                            val a = tableRows(before, role, table); val b = tableRows(after, role, table)
+                            val a = tableRows(before, role, table, location); val b = tableRows(after, role, table, location)
+                            location.at(role, table, Operation.COMPARE_VALUES)
                             tables.put(JSONObject(TransitionCopyGuard.delta(a, b, rule.primaryKey, rule.fields.keys)).put("table", table))
                         }
                         moduleResults.put(JSONObject().put("role", role).put("tables", tables))
                         if (role == "FILES") {
-                            val a = cohort(before, known, json, "before", user, drive)
-                            val b = cohort(after, known, json, "after", user, drive)
+                            val a = cohort(before, known, json, "before", user, drive, location)
+                            val b = cohort(after, known, json, "after", user, drive, location)
+                            location.at(role, "NONE", Operation.PROJECT)
                             result.put("root", JSONObject().put("identityEqual", a.root.take(4) == b.root.take(4))
                                 .put("markedAtEqual", a.root.last() == b.root.last())
                                 .put("lifetimeEqual", TransitionCopyGuard.rootLifetimeEqual(a.root, b.root)))
@@ -179,6 +196,7 @@ object ArchivedTransitionCopyReader {
             result.put("modules", moduleResults).put("status", "READ_COMPLETE").put("phase", "COMPLETE")
         } catch (_: Throwable) {
             failed = true; result.put("status", "REJECTED").put("phase", phase)
+                .put("failureLocation", JSONObject(location.current))
         } finally {
             val unchanged = checked.all { (file, sha) -> CopyInputGuard.sha256(file) == sha }
             result.put("allInputShaUnchanged", unchanged); guard(unchanged)
@@ -191,24 +209,35 @@ object ArchivedTransitionCopyReader {
         return result.toString()
     }
 
-    private fun validateSchema(realm: DynamicRealm, role: String) {
+    private fun validateSchema(realm: DynamicRealm, role: String, location: Location) {
         val tables = TransitionSchema.modules.getValue(role)
+        location.at(role, "NONE", Operation.SCHEMA_TABLES)
         guard(realm.schema.all.map { it.className }.toSet() == tables.keys)
         tables.forEach { (name, rule) ->
+            location.at(role, name, Operation.SCHEMA_COLUMNS)
             val schema = requireNotNull(realm.schema.get(name))
-            TransitionCopyGuard.fields(schema.fieldNames, rule.fields.keys + rule.computed)
+            // getFieldNames enumerates native persisted columns, not computed backlink aliases.
+            TransitionCopyGuard.persistedFields(schema.fieldNames, rule.fields.keys, rule.computed.keys)
+            location.at(role, name, Operation.SCHEMA_BACKLINKS)
+            rule.computed.forEach { (alias, origin) ->
+                TransitionCopyGuard.backlink(alias, rule.fields.keys, tables.getValue(origin.table).fields[origin.field], name)
+            }
+            location.at(role, name, Operation.SCHEMA_PRIMARY_KEY)
             guard((if (schema.hasPrimaryKey()) schema.primaryKey else null) == rule.primaryKey)
+            location.at(role, name, Operation.SCHEMA_TYPES)
             rule.fields.forEach { (field, type) -> guard(schema.getFieldType(field).name == type.substringBefore(':')) }
         }
     }
 
-    private fun tableRows(realm: DynamicRealm, role: String, table: String): List<Map<String, String>> {
+    private fun tableRows(realm: DynamicRealm, role: String, table: String, location: Location): List<Map<String, String>> {
+        location.at(role, table, Operation.READ_ROWS)
         val rows = realm.where(table).findAll(); guard(rows.size <= 5000)
         val rule = TransitionSchema.modules.getValue(role).getValue(table)
-        return rows.map { row -> rule.fields.mapValues { (field, type) -> value(row!!, role, field, type, 0) } }
+        return rows.map { row -> rule.fields.mapValues { (field, type) -> value(row!!, role, field, type, 0, location) } }
     }
 
-    private fun value(row: DynamicRealmObject, role: String, field: String, type: String, depth: Int): String {
+    private fun value(row: DynamicRealmObject, role: String, field: String, type: String, depth: Int, location: Location): String {
+        location.at(role, row.type, Operation.READ_VALUE)
         guard(depth <= 8)
         val kind = type.substringBefore(':')
         if (kind !in setOf("LIST", "INTEGER_LIST", "STRING_LIST") && row.isNull(field)) return "null"
@@ -216,8 +245,8 @@ object ArchivedTransitionCopyReader {
             if (child == null) return "null"
             val target = type.substringAfter(':'); guard(child.type == target)
             val rule = TransitionSchema.modules.getValue(role).getValue(target)
-            return rule.primaryKey?.let { key -> target + ":" + value(child, role, key, rule.fields.getValue(key), depth + 1) }
-                ?: JSONArray(rule.fields.map { (key, spec) -> value(child, role, key, spec, depth + 1) }).toString()
+            return rule.primaryKey?.let { key -> target + ":" + value(child, role, key, rule.fields.getValue(key), depth + 1, location) }
+                ?: JSONArray(rule.fields.map { (key, spec) -> value(child, role, key, spec, depth + 1, location) }).toString()
         }
         return when (kind) {
             "INTEGER" -> "integer:" + row.getLong(field)
@@ -234,13 +263,15 @@ object ArchivedTransitionCopyReader {
         }
     }
 
-    private fun cohort(realm: DynamicRealm, inputs: List<KnownFile>, json: JSONObject, stage: String, user: Long, drive: Long): Cohort {
+    private fun cohort(realm: DynamicRealm, inputs: List<KnownFile>, json: JSONObject, stage: String, user: Long, drive: Long, location: Location): Cohort {
         fun singleFolder(name: String, parent: Long? = null): DynamicRealmObject {
+            location.at("FILES", "File", if (parent == null) Operation.BIND_ROOT else Operation.BIND_PARENT)
             val query = realm.where("File").equalTo("driveId", drive).equalTo("name", name).equalTo("type", "dir")
             parent?.let { query.equalTo("parentId", it) }
             return query.findAll().also { guard(it.size == 1) }.single()!!
         }
         val root = singleFolder(text(json, "rootName")); val id = root.getLong("id")
+        location.at("FILES", "OfflineFolderRoot", Operation.BIND_ROOT)
         val registrations = realm.where("OfflineFolderRoot").findAll(); guard(registrations.size == 1)
         val registration = registrations.single()!!
         guard(registration.getString("uid") == "${id}_${drive}_$user" && registration.getLong("folderId") == id)
@@ -251,6 +282,7 @@ object ArchivedTransitionCopyReader {
         inputs.forEach { input ->
             var parent = root
             input.parents.drop(1).forEach { parent = singleFolder(it, parent.getLong("id")) }
+            location.at("FILES", "File", Operation.BIND_FILE)
             val selected = realm.where("File").equalTo("driveId", drive).equalTo("parentId", parent.getLong("id"))
                 .equalTo("name", input.name).equalTo("type", "file").findAll()
             val body = input.bodies.getValue(stage); guard(selected.size == if (body.present) 1 else 0)
@@ -272,21 +304,22 @@ object ArchivedTransitionCopyReader {
                 protective.takeLast(5).forEach { out.put(it, row.getBoolean(it)) }
                 observations += out
                 val rule = TransitionSchema.modules.getValue("FILES").getValue("File")
-                values += protective.map { key -> value(row, "FILES", key, rule.fields.getValue(key), 0) }
+                values += protective.map { key -> value(row, "FILES", key, rule.fields.getValue(key), 0, location) }
             }
         }
         return Cohort(identity, observations, values, identities)
     }
 
     private fun validateOutput(result: JSONObject) {
-        val literalKeys = ("protocol entry status phase allInputShaUnchanged root identityEqual markedAtEqual lifetimeEqual files alias before after " +
+        val literalKeys = ("protocol entry status phase failureLocation operation allInputShaUnchanged root identityEqual markedAtEqual lifetimeEqual files alias before after " +
             "rowIdentityComparable rowIdentityEqual protectiveValuesComparable protectiveValuesEqual presence basisModifiedState basisSizeState basisMtimeMatchesArchive " +
             "basisSizeMatchesArchive digestState publishedPathState rowPathMatchesArchive isOffline isMarkedAsOffline isDirectlyPinned " +
             "offlineOwnedByRoot offlineNeedsAttention modules role tables table mode beforeRows afterRows addedOrUnmatched " +
             "removedOrUnmatched matchedChangedRows changedFields allLogicalValuesEqual").split(' ').toSet()
         val names = TransitionSchema.modules.values.flatMap { tables -> tables.keys + tables.values.flatMap { it.fields.keys } }.toSet()
         val literals = ("readArchivedTransition READ_COMPLETE REJECTED SCHEMA QUERIES COMPLETE APP DRIVES FILES ABSENT PRESENT " +
-            "NULL EMPTY MATCH OTHER ZERO POSITIVE NEGATIVE PRIMARY_KEY SINGLETON BAG").split(' ').toSet() + aliases + names
+            "NULL EMPTY MATCH OTHER ZERO POSITIVE NEGATIVE PRIMARY_KEY SINGLETON BAG NONE").split(' ').toSet() +
+            aliases + names + Operation.values().map { it.name }
         fun check(value: Any?) {
             when (value) {
                 is JSONObject -> value.keys().asSequence().forEach { key -> guard(key in literalKeys || key in names); check(value.get(key)) }

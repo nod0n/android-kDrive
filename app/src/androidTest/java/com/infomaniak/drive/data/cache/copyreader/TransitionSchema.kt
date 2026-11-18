@@ -2,12 +2,17 @@ package com.infomaniak.drive.data.cache.copyreader
 
 /** Closed persisted-field whitelist for APP3, DRIVES4 and File20; no stored values. */
 internal object TransitionSchema {
-    data class Table(val primaryKey: String?, val fields: Map<String, String>, val computed: Set<String>)
+    data class Backlink(val table: String, val field: String)
+    data class Table(val primaryKey: String?, val fields: Map<String, String>, val computed: Map<String, Backlink>)
 
     private fun table(primary: String?, computed: String, vararg definitions: String): Table = Table(
         primary, definitions.flatMap { it.split(" ") }.associate { definition ->
             definition.substringBefore(":") to definition.substringAfter(":")
-        }, computed.split(" ").filter(String::isNotEmpty).toSet(),
+        }, computed.split(" ").filter(String::isNotEmpty).associate { definition ->
+            val parts = definition.split(':')
+            CopyInputGuard.require(parts.size == 3)
+            parts[0] to Backlink(parts[1], parts[2])
+        },
     )
 
     val modules = mapOf(
@@ -98,7 +103,7 @@ internal object TransitionSchema {
             "DropBoxValidity" to table(null, "",
                 "date:DATE hasExpired:BOOLEAN",
             ),
-            "File" to table("uid", "localParent",
+            "File" to table("uid", "localParent:File:children",
                 "uid:STRING id:INTEGER parentId:INTEGER driveId:INTEGER name:STRING sortedName:STRING",
                 "path:STRING type:STRING status:STRING visibility:STRING createdBy:INTEGER createdAt:INTEGER",
                 "addedAt:INTEGER lastModifiedAt:INTEGER deletedBy:INTEGER deletedAt:INTEGER users:INTEGER_LIST",
