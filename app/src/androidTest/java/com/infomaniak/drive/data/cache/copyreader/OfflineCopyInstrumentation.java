@@ -42,8 +42,12 @@ public final class OfflineCopyInstrumentation extends Instrumentation {
             };
             String apkPaths = isolated.getApplicationInfo().sourceDir + File.pathSeparator + code.sourceDir;
             PathClassLoader loader = new PathClassLoader(apkPaths, code.nativeLibraryDir, ClassLoader.getSystemClassLoader());
-            Class<?> reader = Class.forName("com.infomaniak.drive.data.cache.copyreader.OfflineAttentionCopyReader", true, loader);
-            String result = (String) reader.getMethod("readFiveArchivedRows", Context.class, Bundle.class).invoke(null, context, input);
+            String entry = AggregateCopyGuard.entry(input.getString("copyEntry"));
+            String readerName = entry.equals("readAggregateArchivedScope")
+                    ? "com.infomaniak.drive.data.cache.copyreader.AggregateOfflineCopyReader"
+                    : "com.infomaniak.drive.data.cache.copyreader.OfflineAttentionCopyReader";
+            Class<?> reader = Class.forName(readerName, true, loader);
+            String result = (String) reader.getMethod(entry, Context.class, Bundle.class).invoke(null, context, input);
             outcome.putString("copyReaderResult", result);
             finish(Activity.RESULT_OK, outcome);
         } catch (Throwable error) {
