@@ -59,6 +59,7 @@ open class AppSettings(
             .build()
 
         private val scope = CoroutineScope(Dispatchers.Default)
+        private val appLockWrites = AppLockWriteQueue(scope)
 
         private fun getRealmInstance() = Realm.getInstance(realmConfiguration)
 
@@ -106,7 +107,7 @@ open class AppSettings(
 
         /** Notify on the main thread only after the durable lock write has committed. */
         fun setAppSecurityLock(value: Boolean, onCommitted: () -> Unit) {
-            scope.launch {
+            appLockWrites.submit {
                 withContext(Dispatchers.IO) {
                     getRealmInstance().use { realm ->
                         realm.executeTransaction {
