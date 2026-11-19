@@ -31,7 +31,6 @@ import com.infomaniak.drive.data.documentprovider.CloudStorageProvider
 import com.infomaniak.drive.data.models.AppSettings
 import com.infomaniak.drive.databinding.ViewSwitchSettingsBinding
 import com.infomaniak.drive.twoFactorAuthManager
-import splitties.init.appCtx
 
 class AppSecuritySettingsActivity : AppCompatActivity() {
 
@@ -60,11 +59,12 @@ class AppSecuritySettingsActivity : AppCompatActivity() {
             isChecked = AppSettings.appSecurityLock
             setOnCheckedChangeListener { _, _ ->
                 // Reverse switch (before official parameter changed) by silent click
-                silentlyReverseSwitch(this) { shouldLock ->
-                    CloudStorageProvider.setDisabled(appCtx, isChecked)
-                    AppSettings.appSecurityLock = shouldLock
-                    if (shouldLock) AppLockManager.unlock()
-                }
+                authenticateAppLockChange(
+                    authenticate = { onSuccess -> silentlyReverseSwitch(this, onSuccess) },
+                    persistLock = AppSettings::setAppSecurityLock,
+                    notifyProviderChanged = CloudStorageProvider::notifyProviderChanged,
+                    unlock = AppLockManager::unlock,
+                )
             }
         }
     }

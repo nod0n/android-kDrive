@@ -34,6 +34,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 open class AppSettings(
     var _appSecurityEnabled: Boolean = false,
@@ -101,10 +102,24 @@ open class AppSettings(
         }
 
         var appSecurityLock: Boolean = getAppSettings()._appSecurityEnabled
-            set(value) {
-                field = value
-                updateAppSettings { _appSecurityEnabled = value }
+            private set
+
+        /** Notify on the main thread only after the durable lock write has committed. */
+        fun setAppSecurityLock(value: Boolean, onCommitted: () -> Unit) {
+            scope.launch {
+                withContext(Dispatchers.IO) {
+                    getRealmInstance().use { realm ->
+                        realm.executeTransaction {
+                            (getAppSettingsQuery(realm) ?: it.copyToRealm(AppSettings()))._appSecurityEnabled = value
+                        }
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    appSecurityLock = value
+                    onCommitted()
+                }
             }
+        }
 
         var onlyWifiSyncOffline: Boolean = getAppSettings()._onlyWifiSyncOffline
             set(value) {
