@@ -183,6 +183,7 @@ class PhotoTrashMissingBasisTest {
                 }
             }
         }
+        Unit
     }
 
     @Test
