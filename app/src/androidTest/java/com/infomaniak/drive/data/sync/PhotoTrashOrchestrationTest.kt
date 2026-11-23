@@ -21,6 +21,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.infomaniak.core.network.models.ApiResponse
 import com.infomaniak.core.network.models.ApiResponseStatus
 import com.infomaniak.drive.data.api.ApiRepository
+import com.infomaniak.drive.data.api.UploadTask
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.PhotoPairing
 import com.infomaniak.drive.data.models.SyncSettings
@@ -176,8 +177,10 @@ class PhotoTrashOrchestrationTest {
         mockkObject(ApiRepository)
         mockkObject(AccountUtils)
         every { AccountUtils.currentUserId } returns userId
+        every { AccountUtils.currentDriveId } returns driveId
         coEvery { AccountUtils.getHttpClient(any(), any(), any(), any()) } returns OkHttpClient()
         mockkObject(UploadFile.Companion)
+        every { UploadFile.getRealmInstance() } throws AssertionError("fixture must never open production Sync Realm")
         every { UploadFile.getAppSyncSettings() } answers {
             SyncSettings(
                 userId = userId,
@@ -197,17 +200,14 @@ class PhotoTrashOrchestrationTest {
         } finally {
             PhotoTrashController.endActivationWrite()
         }
-        every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
+        coEvery { ApiRepository.getPhotoTrashRemoteFile(any(), any()) } answers {
             remoteQueryGate()
-            ApiResponse(
-                result = ApiResponseStatus.SUCCESS,
-                data = File(id = remoteFileId, driveId = driveId).apply {
-                    if (remoteTrashed.get()) status = "trashed"
-                    lastModifiedAt = 1_700_000_000L
-                    size = contentA.size.toLong()
-                    serverContentHash = remoteHash.get()
-                },
-            )
+            File(id = remoteFileId, driveId = driveId).apply {
+                status = if (remoteTrashed.get()) "trashed" else "ok"
+                lastModifiedAt = 1_700_000_000L
+                size = contentA.size.toLong()
+                serverContentHash = remoteHash.get()
+            }
         }
     }
 
@@ -287,6 +287,153 @@ class PhotoTrashOrchestrationTest {
             .equalTo(PhotoPairing::uri.name, pairingUri)
             .findFirst()!!
             .let { realm.copyFromRealm(it, 0) }
+    }
+
+    private fun recordMissingBasis() {
+        PhotoTrashController.recordPairing(
+            mockContext, uploadFile(), File(id = remoteFileId, driveId = driveId), sha256Hex(contentA), config,
+        )
+        remoteHash.set(PhotoTrashServerHash.hashStreaming(ByteArrayInputStream(contentA)))
+    }
+
+    @Test
+    fun successfulUploadWithoutHashAcquiresBasisThroughNormalReconciliationOnly() {
+        // Real UploadTask, reply parsing, pairing transaction and reconciliation. Only
+        // platform/network boundaries are fake; every Realm access uses this fixture.
+        every { UploadFile.getRealmInstance() } answers { realm() }
+        every { UploadFile.uploadFinished(any()) } returns Unit
+        var transferred: ByteArray? = null
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            val bytes = okio.Buffer()
+            chain.request().body!!.writeTo(bytes)
+            transferred = bytes.readByteArray()
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body("""{"result":"success","data":{"id":$remoteFileId,"drive_id":$driveId}}""".toResponseBody())
+                .build()
+        }.build()
+        val upload = spyk(uploadFile())
+        every { upload.okHttpClient } returns client
+        assertTrue(runBlocking {
+            UploadTask(mockContext, upload, ::ignoreProgress, mockk(relaxed = true), mockk(relaxed = true)).start()
+        })
+        assertTrue(contentA.contentEquals(transferred))
+        val before = row()
+        assertNull(before.remoteContentHash)
+        assertEquals(sha256Hex(contentA), before.localContentDigest)
+        val token = PhotoTrashServerHash.hashStreaming(ByteArrayInputStream(contentA))
+        remoteHash.set(token)
+        assertEquals(0, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) })
+        assertEquals(token, row().remoteContentHash, "old code leaves this NULL")
+        assertEquals(before.pairedAt, row().pairedAt, "acquisition must not rebind")
+        assertEquals(before.localContentDigest, row().localContentDigest)
+        assertEquals(before.state, row().state)
+        assertEquals(0L, row().remoteTrashPendingSince)
+        assertEquals(0L, deleteRequests.get())
+    }
+
+    private suspend fun ignoreProgress(data: androidx.work.Data) = Unit
+
+    @Test
+    fun missingBasisRejectsMatchingReplacementOfBothSidesAfterUpload() {
+        recordMissingBasis()
+        resolverContent.set(contentB)
+        remoteHash.set(PhotoTrashServerHash.hashStreaming(ByteArrayInputStream(contentB)))
+        assertEquals(0, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) })
+        assertNull(row().remoteContentHash)
+        assertEquals(sha256Hex(contentA), row().localContentDigest)
+        assertEquals(0L, deleteRequests.get())
+    }
+
+    @Test
+    fun refusedAcquisitionPreservesOrdinaryRestoreBookkeepingBeforeALaterEvidencePass() {
+        recordMissingBasis()
+        realm().use { it.executeTransaction { r ->
+            r.where(PhotoPairing::class.java).findFirst()!!.apply {
+                lastObservedTrashed = true
+                lastLocalTrashReconciledAt = 1L
+                state = PhotoPairing.State.INCONCLUSIVE.name
+            }
+        } }
+        // A fresh present local item is an ordinary restore. Acquisition must not erase
+        // that history itself, nor strand the row by skipping the existing restore path.
+        assertEquals(0, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) })
+        assertNull(row().remoteContentHash)
+        assertFalse(row().lastObservedTrashed)
+        assertEquals(0L, row().lastLocalTrashReconciledAt)
+        assertEquals(0, runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) })
+        assertEquals(remoteHash.get(), row().remoteContentHash)
+        assertEquals(0L, deleteRequests.get())
+        assertEquals(0L, row().remoteTrashPendingSince)
+    }
+
+    @Test
+    fun missingBasisTransactionRejectsEveryConcurrentBindingFieldChangeAndDeletion() {
+        val mutations: List<(PhotoPairing) -> Unit> = listOf(
+            { it.userId++ }, { it.driveId++ }, { it.remoteFileId++ }, { it.fileName += "changed" },
+            { it.localSizeAtPairing++ }, { it.localModifiedAtPairing++ }, { it.localContentDigest = sha256Hex(contentB) },
+            { it.remoteContentHash = pairingHash }, { it.pairedAt = Date(it.pairedAt!!.time + 1) },
+            { it.activationEpoch++ }, { it.baselineTrashed = true }, { it.lastObservedTrashed = true },
+            { it.lastLocalTrashReconciledAt++ }, { it.remoteTrashPendingSince++ }, { it.lastRemoteTrashAppliedAt++ },
+            { it.state = PhotoPairing.State.DENIED.name },
+        )
+        mutations.forEachIndexed { index, mutate ->
+            realm().use { it.executeTransaction { r -> r.deleteAll() } }
+            recordMissingBasis()
+            assertEquals(0, runPassWithMidIoMutation {
+                realm().use { it.executeTransaction { r -> mutate(r.where(PhotoPairing::class.java).findFirst()!!) } }
+            })
+            val stored = row()
+            if (index == 7) assertEquals(pairingHash, stored.remoteContentHash) else assertNull(stored.remoteContentHash, "field $index")
+            parkAtRemoteQuery = false
+            remoteQueryCapture = CountDownLatch(1)
+            remoteQueryRelease = CountDownLatch(1)
+        }
+        realm().use { it.executeTransaction { r -> r.deleteAll() } }
+        recordMissingBasis()
+        assertEquals(0, runPassWithMidIoMutation { realm().use { it.executeTransaction { r -> r.deleteAll() } } })
+        assertTrue(PhotoTrashController.getPairings(config).isEmpty(), "deleted binding is never recreated")
+        assertEquals(0L, deleteRequests.get())
+    }
+
+    @Test
+    fun missingBasisRejectsAccountAbaAndActivationOrSettingsDrift() {
+        val currentUser = AtomicInteger(userId)
+        every { AccountUtils.currentUserId } answers { currentUser.get() }
+        val mutations: List<() -> Unit> = listOf(
+            {
+                AccountUtils.updateCurrentScope { currentUser.set(userId + 1); true }
+                AccountUtils.updateCurrentScope { currentUser.set(userId); true }
+            },
+            { settingsActivationEpoch.incrementAndGet() },
+            { syncSettingsEnabled.set(false) },
+            {
+                val revision = PhotoTrashController.beginActivationWrite()
+                PhotoTrashController.noteActivationWritten(userId, 0, true, revision)
+                PhotoTrashController.endActivationWrite()
+            },
+        )
+        mutations.forEach { mutate ->
+            realm().use { it.executeTransaction { r -> r.deleteAll() } }
+            settingsActivationEpoch.set(0)
+            syncSettingsEnabled.set(true)
+            recordMissingBasis()
+            assertEquals(0, runPassWithMidIoMutation(mutate))
+            assertNull(row().remoteContentHash)
+            parkAtRemoteQuery = false
+            remoteQueryCapture = CountDownLatch(1)
+            remoteQueryRelease = CountDownLatch(1)
+        }
+    }
+
+    @Test
+    fun cancelledMissingBasisQueryCannotWriteOrSwallowCancellation() = runBlocking {
+        recordMissingBasis()
+        coEvery { ApiRepository.getPhotoTrashRemoteFile(any(), any()) } throws kotlinx.coroutines.CancellationException("fixture")
+        org.junit.jupiter.api.Assertions.assertThrows(kotlinx.coroutines.CancellationException::class.java) {
+            runBlocking { PhotoTrashController.runLocalReconciliation(mockContext, config) }
+        }
+        assertNull(row().remoteContentHash)
+        assertEquals(0L, deleteRequests.get())
     }
 
     private fun uploadFile(uri: String = pairingUri) = UploadFile(
@@ -454,6 +601,29 @@ class PhotoTrashOrchestrationTest {
     @Test
     @DisplayName("a stored DENIED row expires on the pass's own restore observation and re-arms on re-delete")
     fun deniedRowExpiresThroughTheRealCatchUpPathAndReArms() {
+        // Real repository + route/status/decoder, intercepted only at the captured client's
+        // network boundary. No default account client or external network is permitted.
+        val wrongDrive = AtomicBoolean(false)
+        val ordinaryQueries = AtomicInteger()
+        val trashQueries = AtomicInteger()
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            val ordinary = request.url.encodedPath == "/3/drive/$driveId/files/$remoteFileId"
+            val trash = request.url.encodedPath == "/3/drive/$driveId/trash/$remoteFileId"
+            check(ordinary || trash)
+            check(request.url.queryParameter("with")!!.split(',').contains("hash"))
+            if (ordinary) ordinaryQueries.incrementAndGet() else trashQueries.incrementAndGet()
+            val code = if (ordinary && remoteTrashed.get()) 404 else 200
+            val returnedDrive = if (wrongDrive.get()) driveId + 1 else driveId
+            val status = if (remoteTrashed.get()) "trashed" else "ok"
+            val json = if (code == 404) "{}" else """{"result":"success","data":{
+                "id":$remoteFileId,"drive_id":$returnedDrive,"type":"file","status":"$status",
+                "size":${contentA.size},"last_modified_at":1700000000,"hash":"${remoteHash.get()}"}}"""
+            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(code)
+                .message("synthetic").body(json.toResponseBody()).build()
+        }.build()
+        coEvery { AccountUtils.getHttpClient(any(), any(), any(), any()) } returns client
+        coEvery { ApiRepository.getPhotoTrashRemoteFile(any(), any()) } coAnswers { callOriginal() }
         seedPairing(state = PhotoPairing.State.DENIED.name)
 
         // The denial is respected while the remote stays trashed: the pass neither re-asks
@@ -471,9 +641,18 @@ class PhotoTrashOrchestrationTest {
 
         // A re-delete (delivered through the REAL FILE_TRASH event path) arms a FRESH consent.
         remoteTrashed.set(true)
+        wrongDrive.set(true)
+        assertNull(runBlocking { PhotoTrashController.onRemoteTrashEvent(mockContext, remoteFileId, driveId, config) })
+        assertEquals(0L, row().remoteTrashPendingSince, "wrong returned identity never arms")
+        wrongDrive.set(false)
         val armed = runBlocking { PhotoTrashController.onRemoteTrashEvent(mockContext, remoteFileId, driveId, config) }
-        assertNotNull(armed, "the re-delete arms a consent again")
+        assertNotNull(armed, "the exact hash-bearing trash fallback arms a consent again")
         assertTrue(row().remoteTrashPendingSince > 0L)
+        assertNotNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "poll uses the same fallback")
+        remoteTrashed.set(false)
+        assertNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "ordinary restored200 expires pending")
+        assertEquals(0L, row().remoteTrashPendingSince)
+        assertTrue(ordinaryQueries.get() > trashQueries.get() && trashQueries.get() >= 3)
     }
 
     @Test

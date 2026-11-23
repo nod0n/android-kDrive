@@ -47,6 +47,8 @@ public final class OfflineCopyInstrumentation extends Instrumentation {
             switch (entry) {
                 case "readArchivedTransition": readerName = "com.infomaniak.drive.data.cache.copyreader.ArchivedTransitionCopyReader"; break;
                 case "readAggregateArchivedScope": readerName = "com.infomaniak.drive.data.cache.copyreader.AggregateOfflineCopyReader"; break;
+                case "readSyncScopeProjection": readerName = "com.infomaniak.drive.data.cache.copyreader.SyncScopeProjectionReader"; break;
+                case "readPhotoPairingBinding": readerName = "com.infomaniak.drive.data.cache.copyreader.PhotoPairingBindingReader"; break;
                 default: readerName = "com.infomaniak.drive.data.cache.copyreader.OfflineAttentionCopyReader";
             }
             Class<?> reader = Class.forName(readerName, true, loader);

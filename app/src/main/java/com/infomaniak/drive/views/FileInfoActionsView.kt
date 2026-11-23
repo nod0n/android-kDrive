@@ -90,8 +90,6 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.CancellationException
-import io.realm.RealmObject
 
 class FileInfoActionsView @JvmOverloads constructor(
     context: Context,
@@ -256,18 +254,24 @@ class FileInfoActionsView @JvmOverloads constructor(
      */
     private fun setupFolderOfflineState(folder: File) {
         val folderId = folder.id
+        val requestScope = AccountUtils.captureCurrentScope()
         val scope = (offlineUserScope ?: UserDrive()).copy(driveId = folder.driveId)
         binding.availableOffline.isGone = isSharedWithMe
         folderOfflineJob?.cancel()
         folderOfflineJob = ownerFragment.viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
-            val hasRoot = FileController.getRealmInstance(scope).use { realm ->
+            if (requestScope != AccountUtils.captureCurrentScope() || requestScope.userId != scope.userId ||
+                requestScope.driveId != scope.driveId) return@launch
+            val hasRoot = OfflineFolderSyncUtils.certifiedFreshRealm(scope).use { realm ->
                 realm.where(OfflineFolderRoot::class.java)
                     .equalTo(OfflineFolderRoot::folderId.name, folderId)
+                    .equalTo(OfflineFolderRoot::driveId.name, scope.driveId)
                     .count() > 0
             }
             val needsAttention = OfflineFolderSyncUtils.folderNeedsAttention(scope, folderId)
             withContext(Dispatchers.Main) {
-                if (currentFile.id == folderId && currentFile.driveId == scope.driveId && offlineUserScope?.userId == scope.userId) {
+                if (requestScope == AccountUtils.captureCurrentScope() && requestScope.userId == scope.userId &&
+                    requestScope.driveId == scope.driveId && currentFile.id == folderId &&
+                    currentFile.driveId == scope.driveId && offlineUserScope?.userId == scope.userId) {
                     binding.availableOfflineSwitch.isChecked = hasRoot
                     binding.availableOfflineText.setText(if (needsAttention) R.string.offlineFolderNeedsAttention else R.string.buttonAvailableOffline)
                 }
@@ -283,31 +287,10 @@ class FileInfoActionsView @JvmOverloads constructor(
      * not hold.
      */
     fun toggleFolderOfflineRoot(folder: File, isChecked: Boolean) {
-        val snapshot: File = if (RealmObject.isManaged(folder)) folder.freeze() else folder
         val userDrive = (offlineUserScope ?: UserDrive()).copy(driveId = folder.driveId)
-        ownerFragment.viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
-            val confirmed = try {
-                if (isChecked) OfflineFolderSyncUtils.markFolderOffline(context, snapshot, userDrive)
-                else OfflineFolderSyncUtils.unmarkFolderOffline(context, snapshot, userDrive)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                false
-            }
-            val needsAttention = OfflineFolderSyncUtils.folderNeedsAttention(userDrive, snapshot.id)
-            if (!confirmed) {
-                SentryLog.w(TAG, "Offline folder operation incomplete")
-            }
-            withContext(Dispatchers.Main) {
-                if (currentFile.id == snapshot.id && currentFile.driveId == snapshot.driveId) {
-                    setupFolderOfflineState(snapshot)
-                    when {
-                        !confirmed -> ownerFragment.showSnackbar(if (isChecked) R.string.anErrorHasOccurred else R.string.offlineRemovalRefused)
-                        needsAttention -> ownerFragment.showSnackbar(R.string.offlineCopyPreserved)
-                    }
-                }
-            }
-        }
+        // The click immediately pops this sheet. The activity ViewModel owns the accepted
+        // operation through its walk/withdrawal and final durable root update.
+        mainViewModel.setFolderOffline(folder.id, userDrive, isChecked)
     }
 
     fun setPrintVisibility(isGone: Boolean) {
@@ -426,44 +409,14 @@ class FileInfoActionsView @JvmOverloads constructor(
     }
 
     /**
-     * Download [currentFile] to put it offline
-     *
-     * @return true if the file has been successfully downloaded, false if its name contains forbidden characters
+     * Accept a direct-pin request; completion belongs to MainViewModel after this sheet pops.
+     * @return false only for a forbidden filename (the existing synchronous caller contract).
      */
     fun downloadAsOfflineFile(): Boolean = with(currentFile) {
-
         if (Utils.getInvalidFileNameCharacter(name) != null) return@with false
-
-        val cacheFile = getCacheFile(context)
-
-        if (cacheFile.exists() && path.isNotEmpty() && !isObsoleteOrNotIntact(cacheFile)) {
-            getOfflineFile(context)?.let { offlineFile ->
-                // FHNW-33dd ADDENDUM A4: the move refuses when an ACTIVE root covers this
-                // row and the destination holds the root contract's preserved bytes — the
-                // pin intent still commits, but the bytes are never deleted and isOffline
-                // stays under the root contract's control (the row is pending; the
-                // worker's early-return discipline does not flip it either).
-                val moved = Utils.moveCacheFileToOffline(file = this, cacheFile, offlineFile)
-                if (moved) {
-                    // Recorded synchronously BEFORE anything observes the file: the publication
-                    // gate reads this intent, so it must already be committed when a worker (or
-                    // the next sync pass) looks at the copy.
-                    FileController.updateOfflineStatus(id, isOffline = true)
-                    isOffline = true
-                }
-                FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
-                onItemClickListener.onCacheAddedToOffline()
-            }
-        } else {
-            // Same as above: the pin intent must be committed before the worker that will
-            // publish the downloaded copy can even start.
-            FileController.setDirectlyPinned(fileId = id, isDirectlyPinned = true) // independent pin intent
-            Utils.downloadAsOfflineFile(context, file = this)
-            if (isMarkedAsOffline) mainViewModel.updateOfflineFile.value = id
-        }
-        refreshBottomSheetUi(file = this)
-
-        return@with true
+        val scope = (offlineUserScope ?: UserDrive()).copy(driveId = driveId)
+        mainViewModel.pinFileOffline(id, scope)
+        true
     }
 
     fun createPublicShareLink(

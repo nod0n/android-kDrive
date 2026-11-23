@@ -274,11 +274,15 @@ class GalleryViewModel internal constructor(
                     consumedCursors.clear()
                 }
                 consumedCursors.addAll(load.consumedCursors)
-                lastGalleryFiles.addAll(load.files)
+                // IDs belong to this validated account/drive/query only. Keep the first visible
+                // row and its position; the raw cache update above can still refresh metadata.
+                val seenIds = lastGalleryFiles.mapTo(hashSetOf()) { it.id }
+                val newFiles = ArrayList(load.files.filter { seenIds.add(it.id) })
+                lastGalleryFiles.addAll(newFiles)
                 lastScope = load.scope
                 hasLoadedCurrentFilter = true
                 galleryApiResult.postValue(
-                    GalleryPage(load.files, load.isComplete, load.generation, userDrive, load.scope.revision),
+                    GalleryPage(newFiles, load.isComplete, load.generation, userDrive, load.scope.revision),
                 )
             }
         }

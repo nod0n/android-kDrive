@@ -120,6 +120,9 @@ object ArchivedTransitionCopyReader {
         val sidecar = CopyInputGuard.child(root, "inputs.json"); stat(sidecar)
         guard(sidecar.length() in 1..32768 && CopyInputGuard.sha256(sidecar) == sidecarSha)
         val json = JSONObject(sidecar.readText())
+        if (json.opt("scenario") == RemoteChildReleaseGuard.SCENARIO) {
+            return readRemoteChildRelease(context, root, sidecar, requireNotNull(sidecarSha), json)
+        }
         TransitionCopyGuard.inputFields(json.keys().asSequence().toSet(), json.has("scenario"))
         val scenario = TransitionCopyGuard.scenario(if (json.has("scenario")) text(json, "scenario") else null)
         guard(number(json, "protocol") == 1L)
@@ -214,6 +217,107 @@ object ArchivedTransitionCopyReader {
         } catch (_: Throwable) {
             failed = true; result.put("status", "REJECTED").put("phase", phase)
                 .put("failureLocation", JSONObject(location.current))
+        } finally {
+            val unchanged = checked.all { (file, sha) -> CopyInputGuard.sha256(file) == sha }
+            result.put("allInputShaUnchanged", unchanged); guard(unchanged)
+            validateOutput(result)
+            Files.newOutputStream(File(root, "result.json").toPath(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE).use {
+                Os.chmod(File(root, "result.json").path, 0b110000000); it.write(result.toString().toByteArray(Charsets.UTF_8))
+            }
+        }
+        guard(!failed)
+        return result.toString()
+    }
+
+    /** Later copied state only: the baseline predates creation, not the original claimed-to-clear transition. */
+    private fun readRemoteChildRelease(context: Context, root: File, sidecar: File, sidecarSha: String, json: JSONObject): String {
+        RemoteChildReleaseGuard.inputFields(json.keys().asSequence().toSet())
+        guard(number(json, "protocol") == 1L)
+        val user = number(json, "userId"); val drive = number(json, "driveId")
+        CopyInputGuard.scope(user, drive, text(json, "originalRealmName"))
+        val targetName = text(json, "targetName")
+        RemoteChildReleaseGuard.target(number(json, "targetId"), number(json, "targetParentId"), targetName)
+        guard(number(json, "childId") > 0)
+        val known = knownFiles(json, user, drive, Scenario.UNCHANGED_CHILD_CADENCE)
+        val specs = json.getJSONArray("copies"); guard(specs.length() == 2)
+        val checked = mutableListOf(sidecar to sidecarSha)
+        val copies = (0 until 2).map { i ->
+            val spec = specs.getJSONObject(i); keys(spec, "role", "stage", "file", "schema", "bytes", "sha256")
+            val stage = text(spec, "stage"); val name = text(spec, "file")
+            val file = CopyInputGuard.child(root, name); stat(file)
+            val sha = text(spec, "sha256")
+            RemoteChildReleaseGuard.copy(stage, i, text(spec, "role"), number(spec, "schema"), name,
+                file, number(spec, "bytes"), sha)
+            checked += file to sha
+            Copy("FILES", stage, file, sha)
+        }
+        guard(root.list()?.toSet() == copies.map { it.file.name }.toSet() + "inputs.json")
+        val location = Location(); var phase = "SCHEMA"; var failed = false
+        val result = JSONObject().put("protocol", 1).put("entry", "readArchivedTransition")
+            .put("scenario", RemoteChildReleaseGuard.SCENARIO).put("causalTransitionProven", false)
+        try {
+            try { context.assets.open(asset).use { guard(false) } } catch (_: FileNotFoundException) { /* No fallback. */ }
+            location.at("NONE", "NONE", Operation.REALM_INIT)
+            Realm.init(context)
+            fun open(copy: Copy): DynamicRealm {
+                location.at("FILES", "NONE", Operation.OPEN_COPY)
+                val config = RealmConfiguration.Builder().directory(root).name(copy.file.name).schemaVersion(20)
+                    .modules(RealmModules.LocalFilesModule()).assetFile(asset).readOnly().build()
+                val realm = DynamicRealm.getInstance(config)
+                if (realm.version != 20L) { realm.close(); guard(false) }
+                return realm
+            }
+            open(copies[0]).use { before ->
+                open(copies[1]).use { after ->
+                    validateSchema(before, "FILES", location); validateSchema(after, "FILES", location)
+                    phase = "QUERIES"
+                    val a = cohort(before, known, json, "before", user, drive, Scenario.UNCHANGED_CHILD_CADENCE, location)
+                    val b = cohort(after, known, json, "after", user, drive, Scenario.UNCHANGED_CHILD_CADENCE, location)
+                    // The known deep parent is independently bound by the six-original hierarchy.
+                    guard(a.identities.last()!![2] == 14L && b.identities.last()!![2] == 14L)
+                    location.at("FILES", "File", Operation.BIND_FILE)
+                    val baseline = before.where("File").equalTo("id", 19L).equalTo("driveId", drive).findAll()
+                    RemoteChildReleaseGuard.baselineCount(baseline.size)
+                    val selected = after.where("File").equalTo("id", 19L).equalTo("driveId", drive).findAll()
+                    guard(selected.size <= 1)
+                    val values = mutableMapOf<String, Any>(); var identity = false
+                    selected.singleOrNull()?.let { row ->
+                        identity = row.getString("type") == "file" && RemoteChildReleaseGuard.identity(
+                            row.getLong("id"), row.getLong("driveId"), if (row.isNull("parentId")) null else row.getLong("parentId"),
+                            row.getString("name"), row.getString("uid"), drive, targetName,
+                        )
+                        guard(identity) // Never project fields from a mismatched target.
+                        location.at("FILES", "File", Operation.READ_VALUE)
+                        listOf("isOffline", "isMarkedAsOffline", "isDirectlyPinned", "offlineOwnedByRoot", "offlineNeedsAttention")
+                            .forEach { values[it] = row.getBoolean(it) }
+                        values["basisModifiedState"] = RemoteChildReleaseGuard.numberState(row.getLong("offlineBasisModifiedAt"))
+                        values["basisSizeState"] = if (row.isNull("offlineBasisSize")) "NULL"
+                        else RemoteChildReleaseGuard.numberState(row.getLong("offlineBasisSize"))
+                        values["digestState"] = TransitionCopyGuard.hashState(row.getString("offlineContentDigest"))
+                        values["serverContentHashState"] = TransitionCopyGuard.hashState(row.getString("serverContentHash"))
+                        val relative = known.last().relative.substringBeforeLast('/') + "/" + targetName
+                        val published = known.last().published.map { it.substringBeforeLast('/') + "/" + targetName }
+                        val path = row.getString("offlinePublishedPath")
+                        values["publishedPathState"] = if (path in published) "MATCH" else TransitionCopyGuard.stringState(path, "")
+                        values["rowPathMatchesArchive"] = row.getString("path")?.trim('/') == relative
+                    }
+                    location.at("FILES", "NONE", Operation.PROJECT)
+                    result.put("target", JSONObject().put("before", JSONObject(RemoteChildReleaseGuard.observation(0, false, emptyMap())))
+                        .put("after", JSONObject(RemoteChildReleaseGuard.observation(selected.size, identity, values))))
+                    result.put("root", JSONObject().put("registrationCountBefore", 1).put("registrationCountAfter", 1)
+                        .put("identityEqual", a.root.take(4) == b.root.take(4)).put("markedAtEqual", a.root.last() == b.root.last())
+                        .put("lifetimeEqual", TransitionCopyGuard.rootLifetimeEqual(a.root, b.root)))
+                    result.put("files", JSONArray(aliases.mapIndexed { i, alias ->
+                        JSONObject().put("alias", alias).put("before", a.observations[i]).put("after", b.observations[i])
+                            .put("rowIdentityEqual", a.identities[i] == b.identities[i])
+                            .put("protectiveValuesEqual", a.values[i] == b.values[i])
+                    }))
+                }
+            }
+            result.put("status", "READ_COMPLETE").put("phase", "COMPLETE")
+        } catch (_: Throwable) {
+            failed = true
+            result.put("status", "REJECTED").put("phase", phase).put("failureLocation", JSONObject(location.current))
         } finally {
             val unchanged = checked.all { (file, sha) -> CopyInputGuard.sha256(file) == sha }
             result.put("allInputShaUnchanged", unchanged); guard(unchanged)
@@ -336,10 +440,11 @@ object ArchivedTransitionCopyReader {
             "basisSizeMatchesArchive digestState publishedPathState rowPathMatchesArchive isOffline isMarkedAsOffline isDirectlyPinned " +
             "offlineOwnedByRoot offlineNeedsAttention modules role tables table mode beforeRows afterRows addedOrUnmatched " +
             "removedOrUnmatched matchedChangedRows changedFields allLogicalValuesEqual scenario serverContentHashState " +
-            "serverContentHashEqual serverContentHashTransition bodyPublicationValuesEqual").split(' ').toSet()
+            "serverContentHashEqual serverContentHashTransition bodyPublicationValuesEqual target identityMatches " +
+            "registrationCountBefore registrationCountAfter causalTransitionProven").split(' ').toSet()
         val names = TransitionSchema.modules.values.flatMap { tables -> tables.keys + tables.values.flatMap { it.fields.keys } }.toSet()
         val literals = ("readArchivedTransition READ_COMPLETE REJECTED SCHEMA QUERIES COMPLETE APP DRIVES FILES ABSENT PRESENT " +
-            "NULL EMPTY MATCH OTHER ZERO POSITIVE NEGATIVE PRIMARY_KEY SINGLETON BAG NONE NONEMPTY UNCHANGED_CHILD_CADENCE " +
+            "NULL EMPTY MATCH OTHER ZERO POSITIVE NEGATIVE PRIMARY_KEY SINGLETON BAG NONE NONEMPTY UNCHANGED_CHILD_CADENCE REMOTE_CHILD_RELEASE " +
             "SAME_NONEMPTY DIFFERENT_NONEMPTY NONEMPTY_TO_ABSENT ABSENT_TO_NONEMPTY SAME_ABSENT ABSENT_STATE_CHANGED").split(' ').toSet() +
             aliases + names + Operation.values().map { it.name }
         fun check(value: Any?) {

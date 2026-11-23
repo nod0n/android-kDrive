@@ -19,6 +19,8 @@ package com.infomaniak.drive.data.api
 
 import androidx.collection.arrayMapOf
 import com.google.gson.JsonElement
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import com.infomaniak.core.auth.api.ApiRepositoryCore
 import com.infomaniak.core.auth.networking.AuthHttpClientProvider
 import com.infomaniak.core.ksuite.myksuite.ui.data.MyKSuiteData
@@ -65,11 +67,16 @@ import com.infomaniak.drive.data.models.upload.UploadSession.StartSessionBody
 import com.infomaniak.drive.data.models.upload.UploadSession.StartUploadSession
 import com.infomaniak.drive.data.models.upload.ValidChunks
 import com.infomaniak.drive.utils.AccountUtils
+import com.infomaniak.drive.data.sync.PhotoTrashServerHash
 import okhttp3.OkHttpClient
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Response
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.IOException
 import kotlin.coroutines.resumeWithException
@@ -401,6 +408,81 @@ object ApiRepository : ApiRepositoryCore() {
     fun getFileDetails(file: File, okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient): ApiResponse<File> {
         return callApi(ApiRoutes.getFileDetails(file), GET, okHttpClient = okHttpClient)
     }
+
+    /**
+     * Photo observation only: ApiResponse discards HTTP status, so it cannot select this
+     * fallback. Only the ordinary route's wire 404 permits a hash-bearing trash lookup.
+     * Both calls use the same captured account client, never the global current account.
+     */
+    internal suspend fun getPhotoTrashRemoteFile(file: File, okHttpClient: OkHttpClient): File? {
+        val fileId = file.id
+        val driveId = file.driveId
+        if (fileId <= 0 || driveId <= 0) return null
+        return withContext(Dispatchers.IO) {
+            val target = File(id = fileId, driveId = driveId)
+            try {
+                photoDetailsResponse(ApiRoutes.getFileDetailsWithHash(target), okHttpClient).use { response ->
+                    currentCoroutineContext().ensureActive()
+                    when (response.code) {
+                        404 -> Unit // Close the ordinary response before considering the fallback.
+                        200 -> {
+                            val observed = validatedPhotoDetails(response.body.string(), target, trashOnly = false)
+                            currentCoroutineContext().ensureActive()
+                            return@withContext observed
+                        }
+                        else -> return@withContext null
+                    }
+                }
+                currentCoroutineContext().ensureActive()
+                photoDetailsResponse(ApiRoutes.trashedFileWithHash(target), okHttpClient).use { response ->
+                    currentCoroutineContext().ensureActive()
+                    if (response.code != 200) null
+                    else validatedPhotoDetails(response.body.string(), target, trashOnly = true)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Network/decoding failure preserves; cancellation must never become evidence.
+                currentCoroutineContext().ensureActive()
+                null
+            }.also { currentCoroutineContext().ensureActive() }
+        }
+    }
+
+    private suspend fun photoDetailsResponse(url: String, client: OkHttpClient): Response {
+        currentCoroutineContext().ensureActive()
+        val call = client.newCall(ApiController.createRequest(url, GET, ApiController.generateRequestBody(null)))
+        return suspendCancellableCoroutine { continuation ->
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) = continuation.resumeWithException(e)
+                override fun onResponse(call: Call, response: Response) {
+                    continuation.resume(response) { _, value, _ -> value.close() }
+                }
+            })
+        }
+    }
+
+    private fun validatedPhotoDetails(body: String, target: File, trashOnly: Boolean): File? {
+        // Validate wire presence/types BEFORE File's default type/id fields or Gson coercion.
+        val envelope = JsonParser.parseString(body).takeIf { it.isJsonObject }?.asJsonObject ?: return null
+        if (envelope.photoString("result") != "success") return null
+        val data = envelope.get("data")?.takeIf { it.isJsonObject }?.asJsonObject ?: return null
+        if (data.photoLong("id") != target.id.toLong() || data.photoLong("drive_id") != target.driveId.toLong()) return null
+        if (data.photoString("type") != "file" || data.photoLong("size") == null || data.photoLong("last_modified_at") == null) return null
+        val status = data.photoString("status")
+        if (status != "trashed" && (trashOnly || status != "ok")) return null
+        val hash = data.photoString("hash")
+        if (trashOnly && PhotoTrashServerHash.parse(hash) !is PhotoTrashServerHash.Parsed.Supported) return null
+        return ApiController.gson.fromJson(data, File::class.java).apply { initUid() }
+    }
+
+    private fun JsonObject.photoString(name: String): String? = get(name)
+        ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
+
+    private fun JsonObject.photoLong(name: String): Long? = get(name)
+        ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }
+        ?.asString?.takeIf { it.matches(Regex("0|[1-9][0-9]*")) }?.toLongOrNull()
 
     fun getFileDetailsWithHash(file: File, okHttpClient: OkHttpClient = AuthHttpClientProvider.authOkHttpClient): ApiResponse<File> {
         return callApi(ApiRoutes.getFileDetailsWithHash(file), GET, okHttpClient = okHttpClient)

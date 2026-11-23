@@ -51,9 +51,12 @@ import com.infomaniak.drive.utils.PreviewPDFUtils.PasswordProtectedException
 import com.infomaniak.drive.utils.Utils.openWith
 import com.infomaniak.drive.utils.Utils.openWithIntentExceptkDrive
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.invoke
 import okhttp3.Response
 import java.io.BufferedInputStream
+import java.io.IOException
 import com.infomaniak.core.network.networking.DefaultHttpClientProvider.okHttpClient as unauthenticatedHttpClient
 
 private const val BUFFER_SIZE = 8192
@@ -183,15 +186,17 @@ suspend fun downloadFile(
     shouldBePdf: Boolean,
     onProgress: (progress: Int) -> Unit,
     isPublicShared: Boolean,
+    publishOriginal: ((IOFile) -> Unit)? = null,
 ) {
-    Dispatchers.IO { if (externalOutputFile.exists()) externalOutputFile.delete() }
     val baseDownloadUrl = ApiRoutes.getDownloadFileUrl(file)
     val downloadUrl = if (file.isOnlyOfficePreview()) {
         baseDownloadUrl.appendQueryParams(mapOf("as" to "pdf"))
     } else {
         baseDownloadUrl
     }
-    val downloadProgressInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor(onProgress = onProgress)
+    val downloadProgressInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor { progress ->
+        onProgress(if (publishOriginal == null) progress else progress.coerceAtMost(PROGRESS_COMPLETE - 1))
+    }
     val okHttpClient = when {
         isPublicShared -> unauthenticatedHttpClient
         else -> AuthHttpClientProvider.authOkHttpClient
@@ -215,13 +220,23 @@ suspend fun downloadFile(
             throw UnsupportedOperationException("File not supported")
         }
 
-        createTempFile(it, externalOutputFile)
+        createTempFile(it, externalOutputFile, publishOriginal)
         onProgress(PROGRESS_COMPLETE)
     }
 }
 
-private suspend fun createTempFile(response: Response, file: IOFile) = Dispatchers.IO {
-    BufferedInputStream(response.body?.byteStream(), BUFFER_SIZE).use { input ->
-        file.outputStream().use { output -> input.copyTo(output, BUFFER_SIZE) }
+private suspend fun createTempFile(response: Response, file: IOFile, publishOriginal: ((IOFile) -> Unit)?) = Dispatchers.IO {
+    // Keep the previous preview readable until a complete, still-wanted replacement is ready.
+    val staging = IOFile.createTempFile("preview_staging_", null, file.absoluteFile.parentFile)
+    try {
+        val body = response.body ?: throw IOException("Missing preview response body")
+        BufferedInputStream(body.byteStream(), BUFFER_SIZE).use { input ->
+            staging.outputStream().use { output -> input.copyToCancellable(output, BUFFER_SIZE) }
+        }
+        currentCoroutineContext().ensureActive()
+        if (publishOriginal != null) publishOriginal(staging)
+        else if (!staging.renameTo(file)) throw IOException("Could not publish preview")
+    } finally {
+        staging.delete()
     }
 }

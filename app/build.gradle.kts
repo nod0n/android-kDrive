@@ -1,4 +1,8 @@
+import com.android.build.gradle.tasks.factory.AndroidUnitTest
+import org.gradle.api.tasks.testing.Test
+import org.gradle.api.tasks.testing.junitplatform.JUnitPlatformOptions
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.io.File
 import java.util.Properties
 
 /**
@@ -108,6 +112,52 @@ android {
 
     testOptions.unitTests.all {
         it.testLogging { events("passed", "skipped", "failed", "standardOut", "standardError") }
+    }
+}
+
+
+// This fixture initializes eager account singletons which cannot be restored in its JVM.
+// Keep coverage in the normal lifecycle, but never share its worker with other classes.
+androidComponents.onVariants { variant ->
+    variant.hostTests["UnitTest"]?.let { unitTest ->
+        val ordinaryName = "test${variant.name.replaceFirstChar(Char::uppercaseChar)}UnitTest"
+        val isolated = mapOf(
+            "LogoutOffline" to "com.infomaniak.drive.utils.LogoutOfflineCleanupTest",
+            "OfflineRootRaces" to "com.infomaniak.drive.utils.OfflineRootRacesTest",
+        ).map { (name, className) -> tasks.register<Test>("${ordinaryName}Isolated$name") {
+            group = "verification"
+            description = "Runs only $className in its own ${variant.name} JVM."
+            val ordinary = tasks.named<Test>(ordinaryName).get()
+            testClassesDirs = ordinary.testClassesDirs
+            classpath = ordinary.classpath
+            ordinary.copyTo(this)
+            // AGP adds these paths in AndroidUnitTest.executeTests(), after fork configuration.
+            val nativeLibraries = (ordinary as AndroidUnitTest).testJniLibs
+            inputs.files(nativeLibraries)
+            doFirst {
+                val groups = nativeLibraries.get()
+                if (groups.isNotEmpty()) {
+                    val paths = listOfNotNull(ordinary.systemProperties["java.library.path"]?.toString()?.takeIf { it.isNotEmpty() }) +
+                        groups.flatten().map { it.asFile.absolutePath }
+                    systemProperty("java.library.path", paths.joinToString(File.pathSeparator))
+                }
+            }
+            useJUnitPlatform {
+                copyFrom(ordinary.options as JUnitPlatformOptions)
+                includeTags = setOf("jvm-isolated")
+                excludeTags = excludeTags - "jvm-isolated"
+            }
+            // Both guards are intentional: another tagged class must not enter this JVM.
+            include(className.replace('.', '/') + ".class")
+            filter { includeTestsMatching(className) }
+            maxParallelForks = 1
+            forkEvery = 1
+            testLogging { events("passed", "skipped", "failed", "standardOut", "standardError") }
+        } }
+        unitTest.configureTestTask { ordinary ->
+            ordinary.useJUnitPlatform { excludeTags("jvm-isolated") }
+            ordinary.dependsOn(isolated)
+        }
     }
 }
 
@@ -255,11 +305,10 @@ dependencies {
     testImplementation(libs.androidx.arch.core.testing)
     testImplementation(core.mockk.android)
     androidTestImplementation(core.mockk.android)
-    // Test-only runtime dependency, for MockK's reflective method scan only: every
-    // RealmObject inherits BaseRealm.asFlowable() whose signature references the OPTIONAL
-    // io.reactivex.rxjava2 types Realm was compiled with; instrumentation-time proxy
-    // creation loads them (device evidence: DEVICE-FUNCTIONAL-TRIAGE-1903). No production
-    // and no test code uses RxJava.
+    // MockK's JVM and instrumentation proxies reflect over Realm's optional RxJava2
+    // method signatures (Realm/BaseRealm.asFlowable). These types must be loadable
+    // even though neither production nor test code performs RxJava operations here.
+    testRuntimeOnly(libs.rxjava2)
     androidTestImplementation(libs.rxjava2)
     androidTestImplementation(libs.coroutines.test)
     androidTestImplementation(libs.androidx.ui.automator)

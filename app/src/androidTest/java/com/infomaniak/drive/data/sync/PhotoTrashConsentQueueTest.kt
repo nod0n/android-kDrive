@@ -18,8 +18,6 @@
 package com.infomaniak.drive.data.sync
 
 import androidx.test.core.app.ApplicationProvider
-import com.infomaniak.core.network.models.ApiResponse
-import com.infomaniak.core.network.models.ApiResponseStatus
 import com.infomaniak.drive.data.api.ApiRepository
 import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.PhotoPairing
@@ -158,18 +156,15 @@ class PhotoTrashConsentQueueTest {
             driveId = driveId,
             photoTrashSyncEnabled = true,
         )
-        every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
+        coEvery { ApiRepository.getPhotoTrashRemoteFile(any(), any()) } answers {
             remoteQueryGate()
             val requested = firstArg<File>()
-            ApiResponse(
-                result = ApiResponseStatus.SUCCESS,
-                data = File(id = requested.id, driveId = requested.driveId).apply {
-                    if (remoteTrashed.get()) status = "trashed"
-                    lastModifiedAt = 1_700_000_000L
-                    size = contentA.size.toLong()
-                    serverContentHash = remoteHash.get()
-                },
-            )
+            File(id = requested.id, driveId = requested.driveId).apply {
+                status = if (remoteTrashed.get()) "trashed" else "ok"
+                lastModifiedAt = 1_700_000_000L
+                size = contentA.size.toLong()
+                serverContentHash = remoteHash.get()
+            }
         }
     }
 
@@ -609,9 +604,9 @@ class PhotoTrashConsentQueueTest {
         // The override must stay routed through the counting gate: device evidence (device-8ad8)
         // showed a plain `returns` override REPLACES the setUp answer, so the poll verifiably
         // reached the seam (the state asserts passed) while the boundary counter stayed 0.
-        every { ApiRepository.getFileDetailsWithHash(any(), any()) } answers {
+        coEvery { ApiRepository.getPhotoTrashRemoteFile(any(), any()) } answers {
             remoteQueryGate()
-            ApiResponse(result = ApiResponseStatus.ERROR)
+            null
         }
 
         assertNull(runBlocking { PhotoTrashController.pollNextPendingConsent(mockContext, config) }, "an unreachable remote surfaces nothing")

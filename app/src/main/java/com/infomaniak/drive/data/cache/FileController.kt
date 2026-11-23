@@ -300,17 +300,22 @@ object FileController {
      * nor inside a publication's hold (the publication observes the completed pin, or — when
      * the pin commits first — the fresh in-hold reads decline before any filesystem effect).
      */
-    fun setDirectlyPinned(customRealm: Realm? = null, fileId: Int, isDirectlyPinned: Boolean) {
-        val block: (Realm) -> Unit? = { realm ->
+    fun setDirectlyPinned(customRealm: Realm? = null, fileId: Int, isDirectlyPinned: Boolean): Boolean {
+        val block: (Realm) -> Boolean = { realm ->
             OfflineCommitAuthority.withCommitAuthority {
+                var updated = false
                 realm.executeTransaction {
                     realm.where(File::class.java)
                         .equalTo(File::id.name, fileId)
-                        .findFirst()?.isDirectlyPinned = isDirectlyPinned
+                        .findFirst()?.let { file ->
+                            file.isDirectlyPinned = isDirectlyPinned
+                            updated = true
+                        }
                 }
+                updated
             }
         }
-        customRealm?.let(block) ?: getRealmInstance().use(block)
+        return customRealm?.let(block) ?: getRealmInstance().use(block)
     }
     //endregion
 

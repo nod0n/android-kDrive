@@ -30,11 +30,20 @@ import com.infomaniak.drive.data.models.File
 import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
 import com.infomaniak.drive.utils.IOFile
+import com.infomaniak.drive.utils.OfflineOpenData
+import com.infomaniak.drive.utils.RootOfflineOpen
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import okhttp3.Response
 
-class DownloadProgressViewModel : ViewModel() {
+class DownloadProgressViewModel internal constructor(
+    private val offlineOpenData: OfflineOpenData,
+    private val ioDispatcher: CoroutineDispatcher,
+) : ViewModel() {
+    constructor() : this(OfflineOpenData(), Dispatchers.IO)
 
     val downloadProgressLiveData = MutableLiveData(0)
     val localFile = SingleLiveEvent<File?>()
@@ -43,42 +52,50 @@ class DownloadProgressViewModel : ViewModel() {
         localFile.value = FileController.getFileByUidOrId(fileId, userDrive)
     }
 
-    fun downloadFile(context: Context, file: File, userDrive: UserDrive) = viewModelScope.launch(Dispatchers.IO) {
-        val outputFile = file.getStoredFile(context, userDrive)
-        if (outputFile == null) {
-            downloadProgressLiveData.postValue(null)
-            return@launch
-        }
-
-        if (file.isObsoleteOrNotIntact(outputFile)) {
+    fun downloadFile(context: Context, file: File, userDrive: UserDrive) = run {
+        val captured = if (file.isOffline && !userDrive.sharedWithMe && !file.isPublicShared()) offlineOpenData.captureScope() else null
+        viewModelScope.launch(ioDispatcher) {
             runCatching {
-                val apiResponse = DownloadOfflineFileManager.downloadFileResponse(
+                val output = file.getStoredFile(context, userDrive) ?: throw java.io.IOException("Missing original path")
+                val rootOpen = captured?.let { RootOfflineOpen(context, file.id, userDrive, output, offlineOpenData, it) }
+                if (rootOpen?.existingCopy() != null || !file.isObsoleteOrNotIntact(output)) {
+                    downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
+                    return@runCatching
+                }
+                DownloadOfflineFileManager.downloadFileResponse(
                     fileUrl = ApiRoutes.downloadFile(file),
                     downloadInterceptor = DownloadOfflineFileManager.downloadProgressInterceptor { progress ->
-                        downloadProgressLiveData.postValue(progress)
+                        // Streaming completion is not publication completion.
+                        downloadProgressLiveData.postValue(progress.coerceAtMost(PROGRESS_COMPLETE - 1))
                     }
-                )
-
-                if (apiResponse.isSuccessful) {
-                    saveData(file, outputFile, apiResponse)
-                } else {
-                    downloadProgressLiveData.postValue(null)
+                ).use { response ->
+                    if (!response.isSuccessful) throw java.io.IOException("Original download failed")
+                    if (rootOpen == null) {
+                        saveData(file, output, response)
+                    } else {
+                        val staging = IOFile.createTempFile("open_staging_", null, output.absoluteFile.parentFile)
+                        try {
+                            if (!DownloadOfflineFileManager.saveRemoteData(TAG, response, staging)) throw java.io.IOException("Missing original body")
+                            currentCoroutineContext().ensureActive()
+                            staging.setLastModified(file.getLastModifiedInMilliSecond())
+                            rootOpen.publish(staging)
+                            downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
+                        } finally { staging.delete() }
+                    }
                 }
             }.cancellable().onFailure { exception ->
                 if (exception !is java.io.IOException) SentryLog.e(TAG, "downloadFile failed", exception)
                 downloadProgressLiveData.postValue(null)
             }
-        } else {
-            downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
         }
     }
 
     private suspend fun saveData(file: File, outputFile: IOFile, response: Response) {
         if (outputFile.exists()) outputFile.delete()
         if (DownloadOfflineFileManager.saveRemoteData(TAG, response, outputFile)) {
+            outputFile.setLastModified(file.getLastModifiedInMilliSecond())
             downloadProgressLiveData.postValue(PROGRESS_COMPLETE)
         }
-        outputFile.setLastModified(file.getLastModifiedInMilliSecond())
     }
 
     companion object {

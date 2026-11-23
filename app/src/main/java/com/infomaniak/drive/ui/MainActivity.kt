@@ -270,6 +270,10 @@ class MainActivity : BaseActivity() {
         observeBulkDownloadRunning()
         observeDownloadCancellation()
         observeFailureDownloadWorkerOffline()
+        mainViewModel.offlinePinFailed.observe(this) { showSnackbar(R.string.anErrorHasOccurred) }
+        mainViewModel.folderOfflineResult.observe(this) { result ->
+            result.messageResId?.let { showSnackbar(it) }
+        }
         observeCurrentUserAvatar()
         observeCopyToDriveResult()
         observePhotoTrashConsents()

@@ -69,6 +69,11 @@ import com.infomaniak.drive.data.services.DownloadWorker
 import com.infomaniak.drive.ui.addFiles.UploadFilesHelper
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.DownloadOfflineFileManager
+import com.infomaniak.drive.utils.DirectOfflinePin
+import com.infomaniak.drive.utils.DirectOfflinePinData
+import com.infomaniak.drive.utils.FolderOfflineOperation
+import com.infomaniak.drive.utils.FolderOfflineOperationData
+import com.infomaniak.drive.utils.FolderOfflineResult
 import com.infomaniak.drive.utils.FileId
 import com.infomaniak.drive.utils.IOFile
 import com.infomaniak.drive.utils.OfflineFolderSyncUtils
@@ -119,6 +124,22 @@ class MainViewModel(
     val deleteFileFromHome = SingleLiveEvent<Boolean>()
     val refreshActivities = SingleLiveEvent<Boolean>()
     val updateOfflineFile = SingleLiveEvent<FileId>()
+    val offlinePinFailed = SingleLiveEvent<Unit>()
+    val folderOfflineResult = SingleLiveEvent<FolderOfflineResult>()
+    private val folderOfflineOperation by lazy { FolderOfflineOperation(viewModelScope, FolderOfflineOperationData(getContext())) }
+
+    fun setFolderOffline(folderId: Int, scope: UserDrive, enabled: Boolean) =
+        folderOfflineOperation.request(folderId, scope, enabled) { result ->
+            updateVisibleFiles.value = true
+            folderOfflineResult.value = result
+        }
+
+    private val directOfflinePin by lazy { DirectOfflinePin(viewModelScope, DirectOfflinePinData(getContext())) }
+
+    fun pinFileOffline(fileId: Int, userDrive: UserDrive) = directOfflinePin.request(fileId, userDrive) { completed ->
+        updateVisibleFiles.value = true
+        if (!completed) offlinePinFailed.value = Unit
+    }
 
     val updateVisibleFiles = MutableLiveData<Boolean>()
     val isBulkDownloadRunning = MutableLiveData<Boolean>()

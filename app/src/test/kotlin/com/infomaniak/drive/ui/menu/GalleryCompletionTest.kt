@@ -410,6 +410,212 @@ class GalleryCompletionTest {
     }
 
     @Test
+    fun dedupOverlapAppendsOnlyNewIdentityAndRestoresFirstSeenMetadata() {
+        val first = file(8).apply { name = "first-seen.png" }
+        val repeated = file(8).apply { name = "updated-in-cache.png" }
+        val data = Data().apply { answer = { cursor -> when (cursor) {
+            null -> page(file(1), first, cursor = "next", more = true)
+            "next" -> page(repeated, file(18))
+            else -> error("unexpected cursor")
+        } } }
+        val vm = model(data)
+        val adapter = galleryAdapterForTest()
+        observe(vm, adapter)
+        vm.loadLastGallery(scope.driveId, false)
+        drain(vm)
+        vm.loadMoreGallery(scope.driveId, false)
+        drain(vm)
+        assertEquals(listOf(18), vm.galleryApiResult.value!!.files.map { it.id })
+        assertEquals(listOf(1, 8, 18), adapter.galleryList.map { it.id })
+        assertTrue(adapter.galleryList[1] === first, "visible first-seen metadata and order stay stable")
+        assertEquals(listOf(listOf(1, 8) to true, listOf(8, 18) to false), data.stores,
+            "cache receives the original page, including metadata updates for existing identities")
+        assertTrue(adapter.isComplete)
+        assertEquals(4, adapter.itemCount, "one section and three unique cards")
+        detach(vm)
+        vm.restoreGalleryFiles()
+        val recreated = galleryAdapterForTest()
+        recreated.completePage(vm.galleryApiResult.value, vm::isPageCurrent)
+        assertEquals(listOf(1, 8, 18), recreated.galleryList.map { it.id })
+        assertTrue(recreated.galleryList[1] === first)
+    }
+
+    @Test
+    fun dedupWithinFirstAndLaterPagePreservesFirstOccurrenceOrder() {
+        val first = file(8).apply { name = "first.png" }
+        val data = Data().apply { answer = { cursor -> when (cursor) {
+            null -> page(first, file(8), file(1), cursor = "next", more = true)
+            "next" -> page(file(18), file(18), file(8), file(19), file(19))
+            else -> error("unexpected cursor")
+        } } }
+        val vm = model(data)
+        val adapter = galleryAdapterForTest()
+        observe(vm, adapter)
+        vm.loadLastGallery(scope.driveId, false)
+        drain(vm)
+        assertEquals(listOf(8, 1), adapter.galleryList.map { it.id })
+        vm.loadMoreGallery(scope.driveId, false)
+        drain(vm)
+        assertEquals(listOf(18, 19), vm.galleryApiResult.value!!.files.map { it.id })
+        assertEquals(listOf(8, 1, 18, 19), adapter.galleryList.map { it.id })
+        assertTrue(adapter.galleryList.first() === first)
+        assertEquals(5, adapter.itemCount)
+    }
+
+    @Test
+    fun dedupOnlyPageEndsLoaderRetainsCursorAndRecreationCanReachLaterUniqueRow() {
+        val data = Data().apply { answer = { cursor -> when (cursor) {
+            null -> page(file(8), cursor = "a", more = true)
+            "a" -> page(file(8), file(8), cursor = "b", more = true)
+            "b" -> page(file(18))
+            else -> error("unexpected cursor")
+        } } }
+        val vm = model(data)
+        var adapter = galleryAdapterForTest()
+        observe(vm, adapter)
+        vm.loadLastGallery(scope.driveId, false)
+        drain(vm)
+        adapter.showLoading()
+        assertEquals(5, adapter.itemCount)
+        vm.loadMoreGallery(scope.driveId, false)
+        drain(vm)
+        assertTrue(vm.galleryApiResult.value!!.files.isEmpty(), "a current empty append must still be delivered")
+        assertEquals(listOf(8), adapter.galleryList.map { it.id })
+        assertEquals(2, adapter.itemCount, "real completePage/addAll(empty) removes every loader")
+        assertFalse(adapter.isComplete, "duplicate-only is not service exhaustion")
+        assertEquals("b", vm.currentCursor)
+        detach(vm)
+        vm.restoreGalleryFiles()
+        adapter = galleryAdapterForTest()
+        observe(vm, adapter)
+        assertEquals(listOf(8), adapter.galleryList.map { it.id })
+        assertFalse(adapter.isComplete)
+        adapter.showLoading()
+        vm.loadMoreGallery(scope.driveId, false)
+        drain(vm)
+        assertEquals(listOf(null, "a", "b"), data.requests)
+        assertEquals(listOf(8, 18), adapter.galleryList.map { it.id })
+        assertTrue(adapter.isComplete)
+        assertNull(vm.currentCursor)
+        assertEquals(3, adapter.itemCount)
+    }
+
+    @Test
+    fun dedupRefreshAcceptsSameIdWithFreshFirstPageMetadata() {
+        val data = Data().apply { answer = { page(file(8)) } }
+        val vm = model(data)
+        val adapter = galleryAdapterForTest()
+        observe(vm, adapter)
+        vm.loadLastGallery(scope.driveId, false)
+        drain(vm)
+        val replacement = file(8).apply { name = "refreshed.png" }
+        data.answer = { cursor -> assertNull(cursor); page(replacement, file(8)) }
+        adapter.clearGallery()
+        vm.loadLastGallery(scope.driveId, false)
+        drain(vm)
+        assertEquals(listOf(8), adapter.galleryList.map { it.id })
+        assertTrue(adapter.galleryList.single() === replacement)
+        detach(vm)
+        vm.restoreGalleryFiles()
+        assertTrue(vm.galleryApiResult.value!!.files.single() === replacement)
+    }
+
+    @Test
+    fun dedupFilterResetDoesNotSuppressSameNumericId() {
+        val data = Data().apply { answer = { page(file(8)) } }
+        val vm = model(data)
+        val adapter = galleryAdapterForTest()
+        observe(vm, adapter)
+        vm.loadLastGallery(scope.driveId, false)
+        drain(vm)
+        for (filter in listOf(GalleryMediaFilter.IMAGES, GalleryMediaFilter.ALL)) {
+            val replacement = file(8).apply { name = "new-${filter.name}.png" }
+            vm.setMediaFilter(filter)
+            adapter.clearGallery()
+            data.answer = { page(replacement) }
+            vm.loadLastGallery(scope.driveId, false)
+            drain(vm)
+            assertEquals(listOf(8), adapter.galleryList.map { it.id })
+            assertTrue(adapter.galleryList.single() === replacement)
+            assertTrue(vm.isPageCurrent(vm.galleryApiResult.value!!))
+        }
+    }
+
+    @Test
+    fun dedupAccountDriveAndRevisionResetDoNotSuppressSameNumericId() {
+        val data = Data().apply { answer = { page(file(8), cursor = "old-next", more = true) } }
+        val vm = model(data)
+        val adapter = galleryAdapterForTest()
+        observe(vm, adapter)
+        vm.loadLastGallery(scope.driveId, false)
+        drain(vm)
+        for (nextScope in listOf(
+            AccountUtils.CurrentScope(102, 201, 2),
+            AccountUtils.CurrentScope(102, 202, 3),
+            AccountUtils.CurrentScope(102, 202, 4),
+        )) {
+            data.scope = nextScope
+            val requestCount = data.requests.size
+            vm.loadMoreGallery(nextScope.driveId, false)
+            drain(vm)
+            assertEquals(requestCount, data.requests.size, "old-scope cursor is unusable")
+            val replacement = file(8).apply { driveId = nextScope.driveId; name = "scope-${nextScope.revision}.png" }
+            data.answer = { cursor -> assertNull(cursor); page(replacement) }
+            adapter.clearGallery()
+            vm.loadLastGallery(nextScope.driveId, false)
+            drain(vm)
+            assertTrue(adapter.galleryList.single() === replacement)
+            assertEquals(UserDrive(nextScope.userId, nextScope.driveId), vm.galleryApiResult.value!!.userDrive)
+            assertEquals(nextScope.revision, vm.galleryApiResult.value!!.scopeRevision)
+        }
+    }
+
+    @Test
+    fun dedupOfflineAndFirstPageErrorFallbackRestoreUniqueCachedCardsWithoutWrites() {
+        for (offline in listOf(true, false)) {
+            val first = file(8)
+            val data = Data().apply { cached = arrayListOf(first, file(8), file(18)); answer = { failure() } }
+            val vm = model(data)
+            val adapter = galleryAdapterForTest()
+            observe(vm, adapter)
+            vm.loadLastGallery(scope.driveId, offline)
+            drain(vm)
+            assertEquals(listOf(8, 18), adapter.galleryList.map { it.id })
+            assertTrue(adapter.galleryList.first() === first)
+            assertTrue(data.stores.isEmpty())
+            assertEquals(0, data.orphanCalls)
+            assertEquals(if (offline) 0 else 1, data.requests.size)
+            detach(vm)
+            vm.restoreGalleryFiles()
+            assertEquals(listOf(8, 18), vm.galleryApiResult.value!!.files.map { it.id })
+        }
+    }
+
+    @Test
+    fun dedupOnlyCursorCycleCompletesWithoutLosingExistingCardOrLeavingLoader() {
+        val data = Data().apply { answer = { cursor -> when (cursor) {
+            null -> page(file(8), cursor = "a", more = true)
+            "a" -> page(file(8), file(8), cursor = "a", more = true)
+            else -> error("unexpected cursor")
+        } } }
+        val vm = model(data)
+        val adapter = galleryAdapterForTest()
+        observe(vm, adapter)
+        vm.loadLastGallery(scope.driveId, false)
+        drain(vm)
+        adapter.showLoading()
+        vm.loadMoreGallery(scope.driveId, false)
+        drain(vm)
+        assertEquals(listOf(8), adapter.galleryList.map { it.id })
+        assertTrue(adapter.isComplete)
+        assertNull(vm.currentCursor)
+        assertEquals(2, adapter.itemCount)
+        vm.loadMoreGallery(scope.driveId, false)
+        drain(vm)
+        assertEquals(listOf(null, "a"), data.requests)
+    }
+
+    @Test
     fun `normal Android ViewModel factory retains public no argument construction`() {
         val vm = ViewModelProvider.NewInstanceFactory().create(GalleryViewModel::class.java)
         models += vm

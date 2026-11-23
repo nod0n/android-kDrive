@@ -223,7 +223,7 @@ object OfflineFolderSyncUtils {
                 result to OfflineCommitAuthority.currentGenerationUnderAuthority()
             }
             immediate ?: withdrawSingleCopyInHold(
-                context, userDrive, selectedFile.id, otherRootSubtreeIds = null,
+                context, userDrive, selectedFile.id,
                 excludedRootFolderId = null, atRecordedPath = true, keepLiveRootCoverage = true,
                 withdrawDirectPin = true, requestGeneration = requestGeneration,
             )
@@ -458,7 +458,17 @@ object OfflineFolderSyncUtils {
     enum class WalkOutcome { COMPLETE, INCOMPLETE }
 
     /** Marks a folder (and its whole subtree) as persistently available offline. */
-    suspend fun markFolderOffline(context: Context, folder: File, userDrive: UserDrive): Boolean {
+    suspend fun markFolderOffline(context: Context, folder: File, userDrive: UserDrive): Boolean =
+        markFolderOffline(context, folder, userDrive, {}, { Utils.enqueueBulkDownloadWorker(context, it, userDrive) })
+
+    internal suspend fun markFolderOffline(
+        context: Context,
+        folder: File,
+        userDrive: UserDrive,
+        checkRequest: () -> Unit,
+        enqueue: (Int) -> Unit,
+    ): Boolean {
+        checkRequest()
         val root = OfflineFolderRoot(folderId = folder.id, driveId = userDrive.driveId, userId = userDrive.userId).apply { initUid() }
         // The registry mutation is a coordinated writer: it joins the commit authority so a
         // concurrent unmark of the same root (or a publication's registry reads) serializes
@@ -475,6 +485,7 @@ object OfflineFolderSyncUtils {
             userDrive = userDrive,
             rootFolderFile = folder,
             onFolderWithMarkedFiles = foldersWithMarkedFiles::add,
+            checkRequest = checkRequest,
         )
         if (outcome == WalkOutcome.INCOMPLETE) {
             // The root row stays: the next sync pass re-walks and completes the marking. A
@@ -483,7 +494,8 @@ object OfflineFolderSyncUtils {
         }
         // The existing bulk worker chain picks up every marked direct child per folder.
         foldersWithMarkedFiles.forEach { folderId ->
-            Utils.enqueueBulkDownloadWorker(context, folderId, userDrive)
+            checkRequest()
+            enqueue(folderId)
         }
         return outcome == WalkOutcome.COMPLETE
     }
@@ -496,41 +508,34 @@ object OfflineFolderSyncUtils {
      * deletion the root row is kept so the next pass retries; the return value reports that
      * retriable state.
      */
-    suspend fun unmarkFolderOffline(context: Context, folder: File, userDrive: UserDrive): Boolean {
+    suspend fun unmarkFolderOffline(context: Context, folder: File, userDrive: UserDrive): Boolean =
+        unmarkFolderOffline(context, folder, userDrive, {})
+
+    internal suspend fun unmarkFolderOffline(
+        context: Context,
+        folder: File,
+        userDrive: UserDrive,
+        checkRequest: () -> Unit,
+    ): Boolean {
+        checkRequest()
         val rootUid = OfflineFolderRoot.buildUid(folder.id, userDrive.driveId, userDrive.userId)
         val subtreeIds = collectSubtreeIdsFromCache(userDrive, folder.id)
-        // The subtree collection opens its own certified-fresh realm (a refresh) on this
-        // thread: running it inside the iteration of the registry's LIVE results invalidates
-        // the iterator (ConcurrentModificationException). Snapshot the primitive root ids
-        // first; the set-union semantics are unchanged.
-        val otherRootFolderIds = certifiedFreshRealm(userDrive).use { realm ->
-            realm.where(OfflineFolderRoot::class.java)
-                .notEqualTo(OfflineFolderRoot::uid.name, rootUid)
-                .findAll()
-                .map { it.folderId }
-                .toSet()
-        }
-        val otherRootSubtreeIds = otherRootFolderIds.flatMapTo(mutableSetOf()) {
-            collectSubtreeIdsFromCache(userDrive, it)
-        }
-
-        var allDeletionsConfirmed = true
-        subtreeIds.forEach { fileId ->
-            currentCoroutineContext().ensureActive()
+        val allDeletionsConfirmed = withdrawOfflineSubtree(subtreeIds) { fileId ->
+            checkRequest()
             // The whole per-file withdrawal (classification evidence OUTSIDE the authority,
             // then the fresh in-hold re-reads, the checked deletion and the state clear
             // INSIDE it) is serialized against every publication's final check-to-effect
             // interval AND every coordinated predicate writer, so neither can interleave
             // into the other's defined order.
-            val refusal = withdrawSingleCopyInHold(
+            withdrawSingleCopyInHold(
                 context = context,
                 userDrive = userDrive,
                 fileId = fileId,
-                otherRootSubtreeIds = otherRootSubtreeIds,
-                excludedRootFolderId = null,
+                // A cached tree writer can move this copy into another live root after
+                // enumeration. Only the fresh final-hold ancestry can authorize deletion.
+                excludedRootFolderId = folder.id,
                 atRecordedPath = false,
             )
-            if (refusal == RemovalResult.REFUSED) allDeletionsConfirmed = false
         }
 
         // BEYOND-SUBTREE OWNERSHIP RELEASE: rows the root contract owned whose cached row
@@ -543,7 +548,8 @@ object OfflineFolderSyncUtils {
         // preserve/delete decision as the in-subtree withdrawal — at the bytes' RECORDED
         // publication path first, because a moved-out row's derived path no longer
         // describes where they live.
-        val beyondSubtreeConfirmed = releaseOwnershipBeyondSubtree(context, userDrive, folder.id)
+        checkRequest()
+        val beyondSubtreeConfirmed = releaseOwnershipBeyondSubtree(context, userDrive, folder.id, checkRequest)
 
         // FINAL ATOMIC CLOSER: the root-row deletion shares ONE authority hold with a fresh
         // re-run of the release sweep, so the coordinated marking transactions of a walk
@@ -556,6 +562,7 @@ object OfflineFolderSyncUtils {
         // unmark, so a destructive decision is never made inside this bounded hold without
         // fresh digest evidence.
         val closerConfirmed = withContext(Dispatchers.IO) {
+            checkRequest()
             val job = currentCoroutineContext()[Job]
             OfflineCommitAuthority.withCommitAuthority {
                 var rowsWithBytesRemain = false
@@ -629,6 +636,19 @@ object OfflineFolderSyncUtils {
         // pass retries it, and the protected files stay covered meanwhile. The unmark is
         // only complete when EVERY release confirmed.
         return allDeletionsConfirmed && beyondSubtreeConfirmed && closerConfirmed
+    }
+
+    /** The actual cancellable subtree phase; cancellation must still prevent the final closer. */
+    internal suspend fun withdrawOfflineSubtree(
+        fileIds: Set<Int>,
+        withdraw: suspend (Int) -> RemovalResult,
+    ): Boolean {
+        var confirmed = true
+        for (fileId in fileIds) {
+            currentCoroutineContext().ensureActive()
+            if (withdraw(fileId) == RemovalResult.REFUSED) confirmed = false
+        }
+        return confirmed
     }
 
     /** The claimed-row state clear shared by every withdrawal/release path. */
@@ -708,11 +728,8 @@ object OfflineFolderSyncUtils {
      * the state clear. Refusal retains recoverable intent; preservation releases the
      * ended claim while keeping the bytes and recording that they need attention.
      *
-     * @param otherRootSubtreeIds the in-subtree loop's pre-computed other-roots snapshot
-     *   (overlapping-roots check); null selects the sweep's live registry check against
-     *   [excludedRootFolderId] instead
      * @param excludedRootFolderId the root whose own coverage must not keep the claim (the
-     *   sweep runs while its root row is still registered); null for the in-subtree loop
+     *   unmark/sweep runs while its root row is still registered)
      * @param atRecordedPath look the bytes up at their RECORDED publication path first (a
      *   moved-out row's derived path no longer describes where they live)
      */
@@ -720,7 +737,6 @@ object OfflineFolderSyncUtils {
         context: Context,
         userDrive: UserDrive,
         fileId: Int,
-        otherRootSubtreeIds: Set<Int>?,
         excludedRootFolderId: Int?,
         atRecordedPath: Boolean,
         keepLiveRootCoverage: Boolean = false,
@@ -778,7 +794,6 @@ object OfflineFolderSyncUtils {
                         if (file.isFolder()) return@withCommitAuthority RemovalResult.REFUSED
                         val coveredByOtherRoot = when {
                             keepLiveRootCoverage -> isRootCoveredCopy(file, realm, userDrive)
-                            otherRootSubtreeIds != null -> fileId in otherRootSubtreeIds
                             excludedRootFolderId != null -> isCoveredByRoot(file, realm, userDrive, excludedRootFolderId)
                             else -> false
                         }
@@ -887,6 +902,7 @@ object OfflineFolderSyncUtils {
         context: Context,
         userDrive: UserDrive,
         withdrawnRootFolderId: Int,
+        checkRequest: () -> Unit = {},
     ): Boolean {
         val claimedIds = certifiedFreshRealm(userDrive).use { realm ->
             realm.where(File::class.java)
@@ -898,6 +914,7 @@ object OfflineFolderSyncUtils {
         var allConfirmed = true
         claimedIds.forEach { fileId ->
             currentCoroutineContext().ensureActive()
+            checkRequest()
             // Each claimed row runs the SAME coordinated withdrawal as the in-subtree loop,
             // with the sweep's own contracts: the bytes are looked up at their RECORDED
             // publication path first, another live root's coverage keeps the claim, and a
@@ -907,7 +924,6 @@ object OfflineFolderSyncUtils {
                 context = context,
                 userDrive = userDrive,
                 fileId = fileId,
-                otherRootSubtreeIds = null,
                 excludedRootFolderId = withdrawnRootFolderId,
                 atRecordedPath = true,
             )
@@ -1225,22 +1241,32 @@ object OfflineFolderSyncUtils {
                 }
             }
             remoteFolder?.isTrashed() == true || details.error?.code == ErrorCode.OBJECT_NOT_FOUND -> {
-                OfflineCommitAuthority.withCommitAuthority {
+                val withdrawn = OfflineCommitAuthority.withCommitAuthority {
                     certifiedFreshRealm(userDrive).use { realm ->
+                        var removed = false
                         realm.executeTransaction { mutableRealm ->
-                            mutableRealm.where(OfflineFolderRoot::class.java)
+                            val query = mutableRealm.where(OfflineFolderRoot::class.java)
                                 .equalTo(OfflineFolderRoot::uid.name, root.uid)
-                                .findAll()
-                                .deleteAllFromRealm()
+                            val live = query.findFirst()
+                            if (live != null && live.markedAt.time == root.markedAt.time) {
+                                query.findAll().deleteAllFromRealm()
+                                removed = true
+                            }
                         }
+                        removed
                     }
                 }
-                SentryLog.i(
-                    TAG,
-                    "Offline root ${root.uid}: the remote folder is definitively " +
-                        "${if (remoteFolder?.isTrashed() == true) "trashed" else "gone"}; registration withdrawn, bytes preserved",
-                )
-                MissingRootResolution.DEFINITIVELY_GONE
+                if (withdrawn) {
+                    SentryLog.i(
+                        TAG,
+                        "Offline root ${root.uid}: the remote folder is definitively " +
+                            "${if (remoteFolder?.isTrashed() == true) "trashed" else "gone"}; registration withdrawn, bytes preserved",
+                    )
+                    MissingRootResolution.DEFINITIVELY_GONE
+                } else {
+                    SentryLog.i(TAG, "Offline root ${root.uid}: registration lifetime changed; stale withdrawal ignored")
+                    MissingRootResolution.UNRESOLVED
+                }
             }
             else -> {
                 SentryLog.w(
@@ -1282,6 +1308,7 @@ object OfflineFolderSyncUtils {
         rootFolderFile: File,
         onFileVisited: ((Int) -> Unit)? = null,
         onFolderWithMarkedFiles: ((Int) -> Unit)? = null,
+        checkRequest: () -> Unit = {},
     ): WalkOutcome {
         val okHttpClient = AccountUtils.getHttpClient(userDrive.userId, null)
         val rootUid = OfflineFolderRoot.buildUid(rootFolderFile.id, userDrive.driveId, userDrive.userId)
@@ -1291,6 +1318,7 @@ object OfflineFolderSyncUtils {
 
         while (queue.isNotEmpty()) {
             currentCoroutineContext().ensureActive()
+            checkRequest()
             val (folderId, folderFile) = queue.removeFirst()
             if (!visitedFolders.add(folderId)) continue
 
@@ -1299,10 +1327,12 @@ object OfflineFolderSyncUtils {
             var folderHasMarkedFiles = false
             do {
                 currentCoroutineContext().ensureActive()
+                checkRequest()
                 val response = Dispatchers.IO {
                     ApiRepository.getFolderFiles(okHttpClient, userDrive.driveId, folderId, cursor, SortType.NAME_AZ)
                 }
                 if (!response.isSuccess()) return WalkOutcome.INCOMPLETE
+                checkRequest()
                 val page = response.data ?: emptyList()
 
                 certifiedFreshRealm(userDrive).use { realm ->
@@ -1354,7 +1384,11 @@ object OfflineFolderSyncUtils {
                 }
 
                 page.filter { it.isFolder() && !it.isTrashed() }.forEach { child -> queue.add(child.id to child) }
-                cursor = response.cursor.takeIf { response.hasMore }
+                // More explicitly means unvisited rows. Missing/blank continuation is
+                // incomplete evidence, never permission for the pass-wide release.
+                cursor = if (response.hasMore) {
+                    response.cursor?.takeUnless { it.isBlank() } ?: return WalkOutcome.INCOMPLETE
+                } else null
                 isFirstPage = false
             } while (cursor != null)
 

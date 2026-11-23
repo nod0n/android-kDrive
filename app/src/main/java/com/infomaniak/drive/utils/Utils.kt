@@ -335,8 +335,13 @@ object Utils {
      * outside every root keep the unconditional baseline (the pre-existing direct-pin
      * semantics — no generic pin-preservation feature).
      */
-    fun moveCacheFileToOffline(file: File, cacheFile: IOFile, offlineFile: IOFile): Boolean {
-        val userDrive = UserDrive(driveId = file.driveId)
+    internal fun moveCacheFileToOffline(
+        file: File,
+        cacheFile: IOFile,
+        offlineFile: IOFile,
+        userDrive: UserDrive = UserDrive(driveId = file.driveId),
+        expectedScope: AccountUtils.CurrentScope? = null,
+    ): Boolean {
         val parentDir = offlineFile.parentFile
         if (parentDir == null || (!parentDir.exists() && !parentDir.mkdirs())) return false
         val staging = try {
@@ -350,7 +355,7 @@ object Utils {
             // copy; setting it on the staging file publishes it with the rename).
             staging.setLastModified(file.getLastModifiedInMilliSecond())
             var published = false
-            runCatching {
+            val publish = {
                 OfflineCommitAuthority.withCommitAuthority {
                     OfflineFolderSyncUtils.certifiedFreshRealm(userDrive).use { realm ->
                         val row = FileController.getFileProxyById(file.id, customRealm = realm)
@@ -358,8 +363,10 @@ object Utils {
                             // A vanished row refuses: the destination may hold bytes whose
                             // owner is unknown, and a fresh miss is not permission to act.
                             row == null -> return@withCommitAuthority
+                            // A direct unpin may have committed while this cache was staged.
+                            expectedScope != null && (!row.isDirectlyPinned || row.driveId != userDrive.driveId) -> return@withCommitAuthority
                             // The actively covered destination holds the root contract's
-                            // preserved bytes: refuse BEFORE the direct-pin commit.
+                            // preserved bytes: the pin intent must not replace them.
                             offlineFile.exists() && OfflineFolderSyncUtils.isRootCoveredCopy(row, realm, userDrive) -> return@withCommitAuthority
                             else -> {
                                 // G2 (FHNW-f094): POSIX rename(2) replaces the occupant
@@ -371,11 +378,19 @@ object Utils {
                                 // never removed in a post-rename cleanup either: after
                                 // success only the source cache is deleted (below).
                                 published = staging.renameTo(offlineFile)
+                                if (published && expectedScope != null) {
+                                    realm.executeTransaction { row.isOffline = true }
+                                }
                             }
                         }
                     }
                 }
-            } // a failed fresh read (unreadable view) leaves published=false: refuse conservatively
+            }
+            runCatching {
+                if (expectedScope == null) publish() else AccountUtils.withCurrentScope {
+                    if (AccountUtils.captureCurrentScope() == expectedScope) publish()
+                }
+            }.getOrElse { return false } // No success after a failed row/status commit.
             if (!published) return false
             cacheFile.delete()
             return true

@@ -399,6 +399,8 @@ object ApiRoutes {
 
     fun trashedFile(file: File) = "${trashURL(file)}?$fileExtraWithQuery"
 
+    internal fun trashedFileWithHash(file: File) = "${trashURL(file)}?$fileExtraWithQuery,hash"
+
     fun trashedFolderFiles(file: File, order: SortType) = "${trashURL(file)}/files?${orderQuery(order)}&$fileWithQuery"
 
     private fun thumbnailTrashFile(file: File) = "${trashURLV2(file)}/thumbnail?t=${file.lastModifiedAt}"

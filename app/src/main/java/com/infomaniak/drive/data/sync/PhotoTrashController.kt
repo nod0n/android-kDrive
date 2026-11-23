@@ -30,7 +30,9 @@ import com.infomaniak.drive.data.models.UserDrive
 import com.infomaniak.drive.utils.AccountUtils
 import io.realm.Realm
 import io.realm.RealmConfiguration
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.withContext
@@ -575,6 +577,7 @@ object PhotoTrashController {
         // compares it with the live settings, so any activation cycle mid-pass (even one
         // ending at the same enabled value) stops the pass as stale work.
         val passEpoch = settingsAtStart.photoTrashActivationEpoch
+        val passActivation = currentActivationSnapshot
 
         var propagated = 0
         val okHttpClient = AccountUtils.getHttpClient(passScope.userId, null)
@@ -584,6 +587,13 @@ object PhotoTrashController {
 
             val local = queryLocalMedia(context, pairing.uri)
             val remote = queryRemoteState(pairing, okHttpClient)
+            if (pairing.remoteContentHash == null &&
+                acquireMissingBasis(context, pairing, local, remote, passScope, passEpoch, passActivation, customRealmConfig)
+            ) {
+                // Even a successful acquisition is evidence only. A later normal pass must
+                // re-observe both sides before any trash or consent decision.
+                return@forEach
+            }
             val decision = PhotoTrashRules.decideLocalPropagation(
                 baselineTrashed = pairing.baselineTrashed,
                 lastObservedTrashed = pairing.lastObservedTrashed,
@@ -1010,6 +1020,81 @@ object PhotoTrashController {
 
     //region Realm state helpers
 
+    /** All persisted fields, including pending/completion stamps omitted by the destructive witness. */
+    private fun PhotoPairing.basisBinding() = PhotoTrashMissingBasis.Binding(
+        uri, userId, driveId, remoteFileId, fileName, localSizeAtPairing, localModifiedAtPairing,
+        localContentDigest, remoteContentHash, pairedAt?.time, activationEpoch, baselineTrashed,
+        lastObservedTrashed, lastLocalTrashReconciledAt, remoteTrashPendingSince, lastRemoteTrashAppliedAt, state,
+    )
+
+    private suspend fun acquireMissingBasis(
+        context: Context,
+        pairing: PhotoPairing,
+        local: PhotoTrashRules.LocalObservation?,
+        remote: PhotoTrashRules.RemoteObservation,
+        passScope: AccountUtils.CurrentScope,
+        passEpoch: Long,
+        activation: ActivationSnapshot?,
+        customRealmConfig: RealmConfiguration?,
+    ): Boolean {
+        if (activation == null || activation.userId != passScope.userId || !activation.optIn ||
+            activation.activationEpoch != passEpoch || pairing.userId != passScope.userId ||
+            pairing.activationEpoch != passEpoch || !remote.reachable
+        ) return false
+        val work = currentCoroutineContext()
+        val file = remote.file ?: return false
+        // For a NULL remote basis, recordPairing can only have obtained a nonnull digest
+        // from the actual direct/empty transfer. Its chunk fallback requires a nonnull
+        // finish hash. Do not sample a new SHA as a substitute for that recorded receipt.
+        return PhotoTrashMissingBasis.acquire(
+            binding = pairing.basisBinding(),
+            local = local,
+            remote = PhotoTrashMissingBasis.Remote(file.id, file.driveId, file.type, remote.size, remote.serverHash, remote.isTrashed),
+            openOriginal = {
+                val source = UploadFile(uri = pairing.uri, userId = pairing.userId, driveId = pairing.driveId)
+                context.contentResolver.openInputStream(source.getOriginalUri(context))
+            },
+        ) { observed, hash ->
+            work.ensureActive()
+            if (queryLocalMedia(context, observed.uri) != local) return@acquire false
+            // Settings IO is outside the account/launch locks and outside a transaction.
+            val settingsNow = UploadFile.getAppSyncSettings()
+            if (settingsNow?.userId != passScope.userId || !settingsNow.photoTrashSyncEnabled ||
+                settingsNow.photoTrashActivationEpoch != passEpoch
+            ) return@acquire false
+            beginBindingWrite()
+            try {
+                AccountUtils.withCurrentScope {
+                    if (AccountUtils.captureCurrentScope() != passScope) return@withCurrentScope false
+                    var acquired = false
+                    withPairingRealm(customRealmConfig) { realm ->
+                        realm.executeTransaction { mutable ->
+                            // Lock order matches settings writes: Realm transaction, then
+                            // launchGate. Never hold launchGate while waiting for Realm.
+                            synchronized(launchGate) {
+                                work.ensureActive()
+                                if (activationWritesUnsettled() != 0 || currentActivationSnapshot != activation ||
+                                    mirrorRevision.get() != activation.revision
+                                ) return@synchronized
+                                val row = mutable.where(PhotoPairing::class.java)
+                                    .equalTo(PhotoPairing::uri.name, observed.uri).findFirst()
+                                if (row?.basisBinding() == observed && row.remoteContentHash == null) {
+                                    noteBindingWritten(observed.uri)
+                                    row.remoteContentHash = hash
+                                    acquired = true
+                                }
+                                work.ensureActive()
+                            }
+                        }
+                    }
+                    acquired
+                }
+            } finally {
+                bindingWritesInFlight.decrementAndGet()
+            }
+        }
+    }
+
     /**
      * Whether the LIVE row still IS the pairing the detached [observed] copy was read from:
      * the full observed BINDING AND ACTIVATION identity — owner, drive, remote file, the
@@ -1178,16 +1263,16 @@ object PhotoTrashController {
         }.getOrNull()
     }
 
-    private fun queryRemoteState(pairing: PhotoPairing, okHttpClient: okhttp3.OkHttpClient): PhotoTrashRules.RemoteObservation {
-        val response = runCatching {
-            ApiRepository.getFileDetailsWithHash(
+    private suspend fun queryRemoteState(pairing: PhotoPairing, okHttpClient: okhttp3.OkHttpClient): PhotoTrashRules.RemoteObservation {
+        val file = runCatching {
+            ApiRepository.getPhotoTrashRemoteFile(
                 file = File(id = pairing.remoteFileId, driveId = pairing.driveId),
                 okHttpClient = okHttpClient,
             )
         }.onFailure { exception ->
+            if (exception is CancellationException) throw exception
             if (exception !is NetworkException) SentryLog.e(TAG, "Remote details failed", exception)
         }.getOrNull()
-        val file = response?.takeIf { it.isSuccess() }?.data
         return when {
             file == null -> PhotoTrashRules.RemoteObservation(reachable = false, isTrashed = false)
             else -> PhotoTrashRules.RemoteObservation(

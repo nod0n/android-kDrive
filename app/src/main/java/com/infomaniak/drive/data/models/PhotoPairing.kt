@@ -55,8 +55,9 @@ open class PhotoPairing(
      */
     var localContentDigest: String? = null,
     /**
-     * Server content hash of the created file at pairing (the response's with=hash identity);
-     * null = the response did not establish one. The remote side of every destructive
+     * Server content hash from the created-file response, or later details validated in
+     * one source read against the original upload SHA and the server's XXH3 identity.
+     * null = neither path established a basis. The remote side of every destructive
      * decision compares fresh remote hashes against this basis — an unbound basis is unknown
      * evidence and preserves.
      */

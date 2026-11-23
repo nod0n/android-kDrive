@@ -13,4 +13,16 @@
         android:targetPackage="com.infomaniak.drive.test"
         android:functionalTest="false"
         android:handleProfiling="false" />
+    <!-- Fixed two-class synthetic suite; separate from the archived-copy protocol. -->
+    <instrumentation
+        android:name="com.infomaniak.drive.data.sync.synthetic.SyntheticPhotoInstrumentation"
+        android:targetPackage="com.infomaniak.drive.test"
+        android:functionalTest="false"
+        android:handleProfiling="false" />
+    <!-- Genuine schema-7 migration, empty test application and synthetic-only filesystem. -->
+    <instrumentation
+        android:name="com.infomaniak.drive.data.sync.UploadMigrationInstrumentation"
+        android:targetPackage="com.infomaniak.drive.test"
+        android:functionalTest="false"
+        android:handleProfiling="false" />
 </manifest>

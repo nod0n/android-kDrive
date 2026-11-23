@@ -116,6 +116,7 @@ class UploadMigration : RealmMigration {
         if (oldVersionTemp < 8L) {
             schema.get(SyncSettings::class.java.simpleName)
                 ?.addField("onlyWifiSyncMedia", Boolean::class.java, FieldAttribute.REQUIRED)
+            oldVersionTemp = 8L
         }
 
         // Migrate to version 11: photo trash propagation opt-in and pairing table.

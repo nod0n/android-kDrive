@@ -38,6 +38,8 @@ import com.infomaniak.drive.data.models.file.FileExternalImport.FileExternalImpo
 import com.infomaniak.drive.data.models.file.FileVersion
 import com.infomaniak.drive.utils.AccountUtils
 import com.infomaniak.drive.utils.IOFile
+import com.infomaniak.drive.utils.OfflineOpenData
+import com.infomaniak.drive.utils.RootOfflineOpen
 import com.infomaniak.drive.utils.RealmListParceler.FileCategoryRealmListParceler
 import com.infomaniak.drive.utils.RealmListParceler.FileRealmListParceler
 import com.infomaniak.drive.utils.RealmListParceler.IntRealmListParceler
@@ -519,6 +521,20 @@ open class File(
         onProgress: (progress: Int) -> Unit,
         navigateToDownloadDialog: (suspend () -> Unit)? = null,
     ): IOFile {
+        return convertToIOFile(context, userDrive, shouldBePdf, onProgress, navigateToDownloadDialog, OfflineOpenData())
+    }
+
+    internal suspend fun convertToIOFile(
+        context: Context,
+        userDrive: UserDrive,
+        shouldBePdf: Boolean,
+        onProgress: (Int) -> Unit,
+        navigateToDownloadDialog: (suspend () -> Unit)? = null,
+        offlineOpenData: OfflineOpenData,
+    ): IOFile {
+        val captured = if (isOffline && !isOnlyOfficePreview() && !isPublicShared() && !userDrive.sharedWithMe) {
+            offlineOpenData.captureScope()
+        } else null
         val fileNeedDownload: Boolean
         val cacheFile: IOFile
         val isPublicShared: Boolean
@@ -535,10 +551,23 @@ open class File(
             fileNeedDownload = if (isOnlyOfficePreview()) isObsolete(cacheFile) else isObsoleteOrNotIntact(cacheFile)
         }
 
+        val rootOpen = captured?.let {
+            RootOfflineOpen(context, id, userDrive, cacheFile, offlineOpenData, it)
+        }
+        withContext(Dispatchers.IO) { rootOpen?.existingCopy() }?.let { return it }
         if (fileNeedDownload) {
             navigateToDownloadDialog?.invoke()
-            downloadFile(cacheFile, file = this, shouldBePdf, onProgress, isPublicShared)
-            Dispatchers.IO { cacheFile.setLastModified(getLastModifiedInMilliSecond()) }
+            downloadFile(
+                cacheFile, file = this, shouldBePdf, onProgress, isPublicShared,
+                publishOriginal = rootOpen?.let { open ->
+                    { staging ->
+                        staging.setLastModified(getLastModifiedInMilliSecond())
+                        open.publish(staging)
+                        Unit
+                    }
+                },
+            )
+            if (rootOpen == null) Dispatchers.IO { cacheFile.setLastModified(getLastModifiedInMilliSecond()) }
         }
 
         return cacheFile
@@ -558,8 +587,8 @@ open class File(
             val offlineFile = getOfflineFile(context, userDrive.userId)
 
             return cloudUri to if (isOffline && offlineFile != null) {
-                // We use the uri with scheme file because Microsoft Office don't support modifications from a content uri
-                if (isOnlyOfficePreview()) {
+                // Keep file URIs for Office editing, but grant plain-text readers access through FileProvider.
+                if (isOnlyOfficePreview() && getMimeType() != "text/plain") {
                     offlineFile.toUri()
                 } else {
                     FileProvider.getUriForFile(context, context.getString(R.string.FILE_AUTHORITY), offlineFile)
